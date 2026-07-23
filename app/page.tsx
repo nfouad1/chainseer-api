@@ -436,7 +436,7 @@ export default function Home() {
         <div className="hero-glow" aria-hidden="true" />
         <div className="eyebrow">
           <span className="status-dot" />
-          On-chain intelligence · Private beta
+          On-chain intelligence · Powered by Cypher Tempre Timechain
         </div>
         <h1>
           Know the contract

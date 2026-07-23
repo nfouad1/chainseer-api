@@ -35,6 +35,7 @@ test("server-renders the Chainseer product page", async () => {
   assert.match(html, /Robinhood Chain/);
   assert.match(html, /Timechain-sealed/);
   assert.match(html, /Powered by Cypher Tempre/);
+  assert.doesNotMatch(html, /Private beta/i);
   assert.match(html, /not financial advice/i);
   assert.doesNotMatch(html, /Your site is taking shape|react-loading-skeleton/);
   assert.doesNotMatch(html, /codex-preview/);
