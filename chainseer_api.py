@@ -592,6 +592,9 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
             "ring_hash": report.get("analysis_ring_hash"),
             "decision": (report.get("poq_verdict") or {}).get("decision"),
             "scores": report.get("poq_scores") or {},
+            "cognition": report.get("cognition") or {},
+            "cognitive_ring": report.get("cognitive_ring"),
+            "cognitive_ring_hash": report.get("cognitive_ring_hash"),
         },
         "analyzed_at": report.get("timestamp"),
         "disclaimer": (

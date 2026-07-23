@@ -5,8 +5,12 @@ Private production service for the Chainseer on-chain analysis website.
 Chainseer analyzes Robinhood Chain token contracts using block-pinned RPC
 queries, contract-source verification, liquidity and holder evidence,
 cross-source consistency checks, and an investor-oriented risk model.
-Completed analyses pass through Proof of Qualia and are appended to a Cypher
-Tempre Timechain as tamper-evident rings.
+Completed analyses pass through a non-bypassable Cypher Tempre cognitive loop:
+the agent recalls relevant rings, fires executable senses and modalities,
+screens the structured analysis through its covenant membrane, passes Proof of
+Qualia, and appends tamper-evident analysis and cognitive-completion rings.
+When a genuine capability gap is encountered, Cambium may grow a safe
+primitive faculty and seal an epoch hash over the persistent registry.
 
 ## Production architecture
 
@@ -16,6 +20,10 @@ Tempre Timechain as tamper-evident rings.
 - one Render instance in Frankfurt
 - persistent disk mounted at `/data`
 - Cypher Tempre v3.28.0 pinned to an exact source commit in the container image
+- persistent senses/modalities under `/data/chainseer_chain/registry`
+- fail-closed epoch verification for faculty-registry integrity
+- cognition receives trusted structured fields only, never raw upstream bodies
+- cognitive learning cannot alter the deterministic token score or lower risk
 - public responses omit raw upstream responses and internal query parameters
 
 The service must not be horizontally scaled while it uses a single filesystem

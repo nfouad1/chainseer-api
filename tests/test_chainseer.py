@@ -138,11 +138,40 @@ class ChainseerInfrastructureTests(unittest.TestCase):
 
             agent._seal_report(report)
 
-            ring = agent.tc.load()[-1]
+            rings = agent.tc.load()
+            ring = next(r for r in rings if r["ring_type"] == "token_analysis")
             self.assertEqual(ring["ring_type"], "token_analysis")
             self.assertEqual(ring["payload"]["block_pin"], 100)
             self.assertEqual(ring["payload"]["claim_evidence"]["contract"], ["F0000"])
+            self.assertEqual(
+                ring["payload"]["cognitive_loop"]["input_policy"],
+                "trusted_structured_fields_only",
+            )
+            self.assertTrue(
+                ring["payload"]["cognitive_loop"]["senses"]
+                or ring["payload"]["cognitive_loop"]["modalities"]
+            )
             self.assertEqual(report["analysis_ring"], ring["index"])
+            self.assertEqual(report["cognition"]["status"], "complete")
+            completion = next(
+                r for r in rings if r["ring_type"] == "cognitive_completion"
+            )
+            self.assertEqual(
+                completion["payload"]["analysis_ring"], report["analysis_ring"]
+            )
+            self.assertEqual(report["cognitive_ring"], completion["index"])
+
+    def test_partial_faculty_registry_fails_closed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            registry = Path(temp_dir) / "registry"
+            registry.mkdir()
+            (registry / "senses.json").write_text(
+                json.dumps({"registry": "senses", "senses": []}),
+                encoding="utf-8",
+            )
+            with patch.object(chainseer.RobinhoodRPC, "get_block_number", return_value=100):
+                with self.assertRaisesRegex(RuntimeError, "incomplete"):
+                    chainseer.Chainseer(chain_root=temp_dir)
 
     def test_rpc_uses_block_pin_and_request_cache(self):
         with tempfile.TemporaryDirectory() as temp_dir:

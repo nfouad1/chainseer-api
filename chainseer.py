@@ -46,6 +46,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import sys
 import threading
 import time
@@ -206,6 +207,278 @@ def _get_skill_dir() -> str:
         "Cypher Tempe skill not found. Expected timechain.py in one of:\n"
         + "\n".join(f"  {c}" for c in candidates)
     )
+
+
+COGNITIVE_LOOP_VERSION = "1.0"
+_COGNITIVE_REQUIRED_MODULES = (
+    "recall", "cambium", "epochs", "immune", "modality_ops",
+)
+_COGNITIVE_BASE_REGISTRIES = ("senses.json", "modalities.json")
+
+
+def _bootstrap_faculty_registry(chain_root: str | Path, skill_dir: str) -> Path:
+    """Create a private, persistent faculty registry without masking corruption.
+
+    A completely absent registry is a legitimate first boot and is seeded from
+    the pinned, read-only skill runtime. A partial registry is not repaired:
+    silently replacing one missing half would erase evidence of an interrupted
+    write or tampering.
+    """
+    root = Path(chain_root)
+    registry = root / "registry"
+    source = Path(skill_dir) / "registry"
+    present = {name: (registry / name).is_file() for name in _COGNITIVE_BASE_REGISTRIES}
+    if any(present.values()) and not all(present.values()):
+        missing = ", ".join(name for name, exists in present.items() if not exists)
+        raise RuntimeError(f"Faculty registry is incomplete; refusing repair: {missing}")
+    if not any(present.values()):
+        missing_source = [name for name in _COGNITIVE_BASE_REGISTRIES
+                          if not (source / name).is_file()]
+        if missing_source:
+            raise RuntimeError(
+                "Pinned Cypher Tempre runtime lacks faculty registries: "
+                + ", ".join(missing_source)
+            )
+        registry.mkdir(parents=True, exist_ok=True)
+        for name in _COGNITIVE_BASE_REGISTRIES:
+            shutil.copy2(source / name, registry / name)
+    return registry
+
+
+class ChainseerCognitiveLoop:
+    """Non-bypassable Timechain perception, recall, conscience, and growth."""
+
+    def __init__(self, chain_root: str | Path, skill_dir: str):
+        self.root = Path(chain_root)
+        _bootstrap_faculty_registry(self.root, skill_dir)
+        self.recall_module = _load_skill_module(skill_dir, "recall")
+        self.cambium_module = _load_skill_module(skill_dir, "cambium")
+        self.epochs_module = _load_skill_module(skill_dir, "epochs")
+        self.immune_module = _load_skill_module(skill_dir, "immune")
+        _load_skill_module(skill_dir, "modality_ops")
+        self.recall = self.recall_module.Recall(
+            self.root, registry_root=self.root
+        )
+        self.immune = self.immune_module.Immune(self.root)
+
+    def seal_bootstrap_epoch(self) -> dict | None:
+        return self.epochs_module.seal_epoch(
+            self.root, reason="Chainseer production faculty bootstrap"
+        )
+
+    def verify_registry(self) -> None:
+        ok, report = self.epochs_module.check_epoch(self.root)
+        if not ok:
+            raise RuntimeError(
+                "Faculty registry integrity verification failed: "
+                + "; ".join(report)
+            )
+
+    @staticmethod
+    def _safe_input(report: dict) -> str:
+        """Build a bounded cognition surface from trusted, deterministic fields.
+
+        Raw API bodies, token names, source code, and user-authored metadata are
+        deliberately excluded so external content cannot teach the self-model.
+        """
+        analysis = report.get("analysis") or {}
+        provenance = report.get("provenance") or {}
+        data = report.get("data") or {}
+        source = data.get("source_code") or {}
+        dex = data.get("dex_pairs") or {}
+        safe = {
+            "task": "on-chain token risk analysis",
+            "chain_id": report.get("chain_id"),
+            "token_address": report.get("token_address"),
+            "block_pin": provenance.get("block_pin"),
+            "evidence_fact_count": provenance.get("fact_count", 0),
+            "risk_level": analysis.get("risk_level"),
+            "legitimacy_score": analysis.get("legitimacy_score"),
+            "action_label": analysis.get("action_label"),
+            "component_scores": analysis.get("component_scores") or {},
+            "hard_stop_types": sorted(
+                str(value)[:120]
+                for value in (analysis.get("hard_stop_overrides") or [])
+            ),
+            "red_flag_count": len(analysis.get("red_flags") or []),
+            "yellow_flag_count": len(analysis.get("yellow_flags") or []),
+            "uncertain_components": sorted(
+                str(key)[:80]
+                for key in (analysis.get("uncertain_components") or {}).keys()
+            ),
+            "source_verified": bool(source.get("is_verified")),
+            "market_data_available": bool(dex.get("primary_price_usd")),
+            "liquidity_usd": dex.get("total_liquidity_usd"),
+        }
+        return json.dumps(safe, sort_keys=True, separators=(",", ":"), default=str)
+
+    @staticmethod
+    def _public_labels(labels: dict) -> dict:
+        computed = labels.get("computed") or {}
+        return {
+            "senses": [
+                {"id": item.get("id"), "name": item.get("name")}
+                for item in (labels.get("senses") or [])
+            ],
+            "modalities": [
+                {"id": item.get("id"), "name": item.get("name")}
+                for item in (labels.get("modalities") or [])
+            ],
+            "salience": labels.get("salience"),
+            "dissonance": labels.get("dissonance"),
+            "frames": list(labels.get("frames") or []),
+            "computed": computed,
+            "retrieved_faculties": list(labels.get("retrieved") or []),
+        }
+
+    @staticmethod
+    def _contains_injection_signal(computed: dict) -> bool:
+        for name in (
+            "Value-Breach and Injection Detection",
+            "Embedded-Intent Sensing",
+        ):
+            result = computed.get(name) or {}
+            injection = result.get("injection") or {}
+            if injection.get("count", 0) or result.get("override"):
+                return True
+        return False
+
+    def prepare(self, report: dict) -> dict:
+        self.verify_registry()
+        cognitive_input = self._safe_input(report)
+        screened = self.immune.screen(cognitive_input)
+        if screened.get("blocked"):
+            raise RuntimeError(
+                "Cognitive intake refused by the Timechain covenant membrane"
+            )
+        recalled = self.recall.retrieve(
+            cognitive_input,
+            context="Chainseer risk analysis; deterministic evidence remains authoritative.",
+            budget_tokens=650,
+            max_blocks=5,
+            neighbors=0,
+            use_index=True,
+        )
+        labels = recalled.get("query_labels") or self.recall.label(cognitive_input)
+        computed = labels.get("computed") or {}
+        if self._contains_injection_signal(computed):
+            raise RuntimeError(
+                "Cognitive faculty detected an unsafe instruction signal"
+            )
+        relevant = [
+            block.get("index") for block in (recalled.get("blocks") or [])
+            if isinstance(block.get("index"), int)
+        ]
+        cognition = {
+            "version": COGNITIVE_LOOP_VERSION,
+            "status": "prepared",
+            "input_policy": "trusted_structured_fields_only",
+            **self._public_labels(labels),
+            "relevant_rings": relevant,
+            "immune": {
+                "status": "admitted",
+                "covenant": screened.get("covenant"),
+            },
+            "growth": [],
+        }
+        if not cognition["senses"] and not cognition["modalities"]:
+            raise RuntimeError("Cognitive loop produced no active faculties")
+        report["cognition"] = cognition
+        report["_cognitive_input"] = cognitive_input
+        return cognition
+
+    def finalize(self, report: dict, analysis_ring: dict) -> dict:
+        cognition = report.get("cognition") or {}
+        if cognition.get("status") != "prepared":
+            raise RuntimeError("Cognitive loop was not prepared before sealing")
+        guard = self.immune_module.guard_turn(
+            self.root,
+            analysis_ring["index"],
+            input_text=report.pop("_cognitive_input", ""),
+            lesson="Chainseer production analysis covenant guard",
+        )
+        if guard.get("action") not in {None, "none", "clean"}:
+            raise RuntimeError(
+                "Cognitive post-seal guard rejected the analysis: "
+                + str(guard.get("action"))
+            )
+
+        salience = cognition.get("salience")
+        prior_salience = os.environ.get("CT_TURN_SALIENCE")
+        if isinstance(salience, (int, float)):
+            os.environ["CT_TURN_SALIENCE"] = str(int(salience))
+        try:
+            growth = self.cambium_module.fill_gap(
+                self.root,
+                self._safe_input(report),
+                context="Chainseer production token-risk capability gap",
+                both=True,
+                registry_root=self.root,
+            )
+        finally:
+            if prior_salience is None:
+                os.environ.pop("CT_TURN_SALIENCE", None)
+            else:
+                os.environ["CT_TURN_SALIENCE"] = prior_salience
+
+        cognition["growth"] = [
+            {
+                "action": item.get("action"),
+                "faculty": (item.get("faculty") or {}).get("name"),
+                "kind": (item.get("faculty") or {}).get("kind"),
+                "reason": item.get("reason"),
+            }
+            for item in (growth or [])
+        ]
+        if any(item.get("action") in {"born", "promoted", "woken"}
+               for item in (growth or [])):
+            self.epochs_module.seal_epoch(
+                self.root, reason=f"faculty change after analysis ring {analysis_ring['index']}"
+            )
+        self.verify_registry()
+        cognition["status"] = "complete"
+        cognition["analysis_ring"] = analysis_ring["index"]
+        completion = self.recall.tc.seal(
+            "cognitive_completion",
+            {
+                "summary": (
+                    "Chainseer cognitive loop completed for token analysis "
+                    f"ring {analysis_ring['index']}"
+                ),
+                "frame": "assertion",
+                "analysis_ring": analysis_ring["index"],
+                "analysis_ring_hash": analysis_ring["ring_hash"],
+                "cognitive_loop": cognition,
+            },
+            poq={
+                "coherence": 235,
+                "relevance": 245,
+                "novelty": 220,
+                "consistency": 240,
+                "depth": 230,
+                "covenant": 250,
+            },
+        )
+        completion_guard = self.immune_module.guard_turn(
+            self.root,
+            completion["index"],
+            input_text="Complete an evidence-bound Chainseer cognitive audit.",
+            lesson="Chainseer cognitive completion covenant guard",
+        )
+        if completion_guard.get("action") not in {None, "none", "clean"}:
+            raise RuntimeError(
+                "Cognitive completion guard rejected the analysis: "
+                + str(completion_guard.get("action"))
+            )
+        ok, verify_report = self.recall.tc.verify()
+        if not ok:
+            raise RuntimeError(
+                "Timechain failed after cognitive finalization: "
+                + "; ".join(verify_report)
+            )
+        report["cognitive_ring"] = completion["index"]
+        report["cognitive_ring_hash"] = completion["ring_hash"]
+        return cognition
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -823,14 +1096,18 @@ class Chainseer:
         self.poq_module = _load_skill_module(skill_dir, "poq")
 
         self.chain_root = chain_root or os.path.join(os.path.dirname(__file__), "chainseer_chain")
+        _bootstrap_faculty_registry(self.chain_root, skill_dir)
         self.tc = tc_module.Timechain(root=self.chain_root)
 
         if self.tc.height() == 0:
             self.tc.genesis(name="Chainseer")
             print(f"  New Timechain initialized at {self.chain_root}")
+        self.cognitive_loop = ChainseerCognitiveLoop(self.chain_root, skill_dir)
+        self.cognitive_loop.seal_bootstrap_epoch()
         ok, verify_report = self.tc.verify()
         if not ok:
             raise RuntimeError(f"Timechain integrity verification failed: {verify_report}")
+        self.cognitive_loop.verify_registry()
 
         print(f" Chainseer v7.0 -- Robinhood Chain On-Chain Intelligence")
         print(f" Chain ID: {self.chain_id} | RPC: {self.rpc_url}")
@@ -2411,6 +2688,7 @@ class Chainseer:
     # ── TIMECHAIN SEALING ───────────────────────────────────────────────────
 
     def _seal_report(self, report: dict):
+        cognition = self.cognitive_loop.prepare(report)
         poq = report.get("poq_scores", {})
         analysis = report["analysis"]
         candidate = (
@@ -2467,6 +2745,7 @@ class Chainseer:
                 "provenance": report["provenance"],
                 "claim_evidence": report.get("claim_evidence", {}),
                 "uncertain_components": report["analysis"].get("uncertain_components", {}),
+                "cognitive_loop": cognition,
             },
         )
         if ring is None:
@@ -2477,6 +2756,7 @@ class Chainseer:
         report["analysis_ring"] = ring.get("index")
         report["analysis_ring_hash"] = ring.get("ring_hash")
         report["poq_verdict"] = verdict
+        self.cognitive_loop.finalize(report, ring)
         print(f"  Sealed ring {ring.get('index', '?')} (hash: {ring.get('ring_hash', '?')[:16]}...)")
         print(f"  PoQ: coherence={poq['coherence']} relevance={poq['relevance']} "
               f"depth={poq['depth']} covenant={poq['covenant']}")

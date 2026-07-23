@@ -38,3 +38,15 @@ services:
         value: "3600"
       - key: CHAINSEER_SHUTDOWN_GRACE_SECONDS
         value: "20"
+      - key: CT_AUTOGROW
+        value: "1"
+      - key: CT_PROMOTE_AT
+        value: "1"
+      - key: CT_AUTOGROW_MIN_SALIENCE
+        value: "170"
+      - key: CT_SEMANTIC_GAP
+        value: "1"
+      - key: CT_IMMUNE_FAILCLOSED
+        value: "1"
+      - key: CT_AUTO_QUARANTINE
+        value: "1"

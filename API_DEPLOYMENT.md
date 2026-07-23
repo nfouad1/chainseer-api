@@ -32,8 +32,10 @@ multi-writer Timechain design.
 
 The container image pins Cypher Tempre to a specific source commit. The image
 contains the runtime only; it never contains local Chainseer memory. Production
-creates its own Genesis Ring on the persistent disk. Render's disk preserves
-the rings and blockspace across service deploys and restarts.
+creates its own Genesis Ring and a bootstrap faculty-registry epoch on the
+persistent disk. Render's disk preserves rings, blockspace, senses, modalities,
+and safely grown faculties across service deploys and restarts. A partial or
+epoch-mismatched registry fails startup instead of being silently repaired.
 
 Before each release:
 
@@ -42,6 +44,8 @@ Before each release:
 3. Deploy one instance.
 4. Confirm `/health/ready`.
 5. Run a known-contract analysis and confirm its ring index and hash.
+6. Confirm the public result contains `timechain.cognition.status=complete`
+   and a `timechain.cognitive_ring`.
 
 ## Domain
 

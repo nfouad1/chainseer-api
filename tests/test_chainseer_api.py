@@ -30,6 +30,13 @@ def sample_internal_report():
         "explorer_url": f"https://example.invalid/token/{TOKEN}",
         "analysis_ring": 42,
         "analysis_ring_hash": "f" * 64,
+        "cognitive_ring": 43,
+        "cognitive_ring_hash": "e" * 64,
+        "cognition": {
+            "status": "complete",
+            "senses": [{"id": 1, "name": "Grounding Stabilizer"}],
+            "modalities": [{"id": 2, "name": "Richness Scoring"}],
+        },
         "poq_scores": {
             "coherence": 230,
             "relevance": 240,
@@ -113,6 +120,8 @@ class PublicReportTests(unittest.TestCase):
         public = build_public_report(sample_internal_report())
         self.assertEqual(public["schema_version"], "1.0")
         self.assertEqual(public["timechain"]["ring"], 42)
+        self.assertEqual(public["timechain"]["cognitive_ring"], 43)
+        self.assertEqual(public["timechain"]["cognition"]["status"], "complete")
         self.assertEqual(public["evidence"]["facts"][0]["id"], "F0000")
         self.assertNotIn("query", public["evidence"]["facts"][0])
         self.assertEqual(len(public["evidence"]["ledger_hash"]), 64)
