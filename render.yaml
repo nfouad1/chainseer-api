@@ -8,7 +8,6 @@ services:
     dockerfilePath: ./Dockerfile.api
     dockerContext: .
     healthCheckPath: /health/ready
-    maxShutdownDelaySeconds: 180
     autoDeployTrigger: checksPass
     disk:
       name: chainseer-timechain
@@ -38,4 +37,4 @@ services:
       - key: CHAINSEER_RESULT_TTL_SECONDS
         value: "3600"
       - key: CHAINSEER_SHUTDOWN_GRACE_SECONDS
-        value: "180"
+        value: "20"
