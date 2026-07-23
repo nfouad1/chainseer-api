@@ -1,0 +1,46 @@
+name: Test production API
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.14"
+          cache: pip
+
+      - name: Install Python dependencies
+        run: python -m pip install -r requirements-api.txt
+
+      - name: Install pinned Cypher Tempre runtime
+        env:
+          CYPHER_TEMPRE_COMMIT: 5b7783f5c84706c5034273cc2772563d5d8fdb76
+        run: |
+          curl --fail --silent --show-error --location \
+            "https://github.com/cyberphysicsai/cypher-tempre-genesis/archive/${CYPHER_TEMPRE_COMMIT}.zip" \
+            --output "$RUNNER_TEMP/cypher-tempre.zip"
+          python -m zipfile -e \
+            "$RUNNER_TEMP/cypher-tempre.zip" \
+            "$RUNNER_TEMP/cypher-tempre"
+          echo "CHAINSEER_SKILL_DIR=$RUNNER_TEMP/cypher-tempre/cypher-tempre-genesis-${CYPHER_TEMPRE_COMMIT}/skills/codex/cypher-tempre-self-model" \
+            >> "$GITHUB_ENV"
+
+      - name: Compile
+        run: python -X utf8 -m py_compile chainseer.py chainseer_api.py
+
+      - name: Unit tests
+        run: python -X utf8 -m unittest discover -s tests -v
+
+      - name: Build production container
+        run: docker build --file Dockerfile.api --tag chainseer-api:test .
