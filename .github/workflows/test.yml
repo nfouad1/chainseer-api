@@ -19,6 +19,7 @@ jobs:
         with:
           python-version: "3.14"
           cache: pip
+          cache-dependency-path: requirements-api.txt
 
       - name: Install Python dependencies
         run: python -m pip install -r requirements-api.txt
