@@ -80,7 +80,20 @@ export default function Home() {
           <a href="#timechain">Timechain</a>
           <a href="#evidence">Evidence</a>
         </nav>
-        <a className="header-cta" href="#scanner">Scan contract</a>
+        <div className="header-actions">
+          <a
+            className="timechain-badge"
+            href="#timechain"
+            aria-label="Learn how Chainseer analysis is sealed with Cypher Tempre Timechain"
+          >
+            <span className="badge-glyph" aria-hidden="true">◆</span>
+            <span>
+              <strong>Timechain-sealed</strong>
+              <small>PoQ-verified analysis</small>
+            </span>
+          </a>
+          <a className="header-cta" href="#scanner">Scan contract</a>
+        </div>
       </header>
 
       <section className="hero" id="top">
@@ -102,7 +115,10 @@ export default function Home() {
         <form className="scanner" id="scanner" onSubmit={submitScan}>
           <div className="network-select" aria-label="Selected network">
             <span className="network-glyph">◆</span>
-            Base
+            <span>
+              <strong>Robinhood Chain</strong>
+              <small>Base · coming soon</small>
+            </span>
           </div>
           <label className="sr-only" htmlFor="contract-address">Contract address</label>
           <input
