@@ -3,6 +3,266 @@
 import { FormEvent, useState } from "react";
 
 const SAMPLE_ADDRESS = "0x407470F8D77d12417A6cfaC5940c2f8B5F4E8a27";
+const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
+
+type PublicReport = {
+  schema_version: string;
+  token: {
+    address: string;
+    name?: string;
+    symbol?: string;
+    chain: string;
+    chain_id?: number;
+    explorer_url?: string;
+  };
+  decision: {
+    action?: string;
+    risk_level?: string;
+    model_risk_level?: string;
+    score?: number;
+    confidence?: string;
+    confidence_detail?: string;
+    recommendation?: string;
+    hard_stops: Array<{
+      code?: string;
+      severity?: string;
+      reason?: string;
+      action?: string;
+    }>;
+  };
+  factors: Record<string, number>;
+  flags: {
+    red: string[];
+    yellow: string[];
+    green: string[];
+    unknown: Record<string, string>;
+  };
+  market: {
+    price_usd?: number | string | null;
+    market_cap_usd?: number | string | null;
+    liquidity_usd?: number | string | null;
+    volume_24h_usd?: number | string | null;
+    age?: string | null;
+  };
+  evidence: {
+    fact_count: number;
+    block_pin?: number;
+    ledger_hash?: string;
+    facts: Array<{
+      id?: string;
+      source?: string;
+      query_hash?: string;
+      response_hash?: string;
+      block?: number;
+      timestamp?: string;
+      cache_hit?: boolean;
+    }>;
+  };
+  timechain: {
+    ring?: number;
+    ring_hash?: string;
+    decision?: string;
+    scores: Record<string, number>;
+  };
+  analyzed_at?: string;
+  disclaimer: string;
+};
+
+type ScanState = "idle" | "submitting" | "analyzing" | "succeeded" | "failed";
+
+const factorNames: Record<string, string> = {
+  security: "Contract security",
+  honeypot_safety: "Honeypot safety",
+  liquidity: "Liquidity health",
+  lp_lock: "LP lock",
+  holder_distribution: "Holder distribution",
+  volume: "Volume quality",
+  maturity: "Token maturity",
+  creator_risk: "Creator risk",
+  wash_trading: "Wash trading",
+  deployer: "Deployer history",
+  sentiment: "Market sentiment",
+  trend: "Trend strength",
+};
+
+function errorMessage(body: unknown, fallback: string) {
+  if (!body || typeof body !== "object") return fallback;
+  if (
+    "error" in body &&
+    body.error &&
+    typeof body.error === "object" &&
+    "message" in body.error &&
+    typeof body.error.message === "string"
+  ) {
+    return body.error.message;
+  }
+  if ("detail" in body && typeof body.detail === "string") return body.detail;
+  return fallback;
+}
+
+function delay(milliseconds: number) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function formatMoney(value: number | string | null | undefined) {
+  const amount = Number(value);
+  if (!Number.isFinite(amount) || amount <= 0) return "Unknown";
+  return new Intl.NumberFormat("en-US", {
+    style: "currency",
+    currency: "USD",
+    notation: amount >= 1000 ? "compact" : "standard",
+    maximumFractionDigits: amount < 1 ? 6 : 2,
+  }).format(amount);
+}
+
+function LiveReport({ report }: { report: PublicReport }) {
+  const factorEntries = Object.entries(report.factors)
+    .filter(([key, value]) => key !== "legitimacy" && Number.isFinite(value))
+    .map(([key, value]) => ({
+      key,
+      label: factorNames[key] || key.replaceAll("_", " "),
+      score: Math.max(0, Math.min(100, Number(value))),
+    }));
+  const hardStops = report.decision.hard_stops || [];
+  const risk = (report.decision.risk_level || "Unknown").toLowerCase();
+
+  return (
+    <section className="live-report" id="live-report" aria-live="polite">
+      <div className="live-report-head">
+        <div>
+          <div className="eyebrow">
+            <span className="status-dot" />
+            Live sealed analysis
+          </div>
+          <h2>
+            {report.token.name || "Unknown token"}
+            {report.token.symbol ? ` (${report.token.symbol})` : ""}
+          </h2>
+          <p className="live-address">{report.token.address}</p>
+        </div>
+        <div className={`live-risk risk-${risk}`}>
+          <span>{report.decision.action || "REVIEW"}</span>
+          <strong>{report.decision.score ?? "—"}<small>/100</small></strong>
+          <em>{report.decision.risk_level || "Unknown"} risk</em>
+        </div>
+      </div>
+
+      <div className="live-summary-grid">
+        <article>
+          <span>Confidence</span>
+          <strong>{report.decision.confidence || "Limited"}</strong>
+          <p>{report.decision.confidence_detail || "Data completeness varies by source."}</p>
+        </article>
+        <article>
+          <span>Hard-stop gate</span>
+          <strong>{hardStops.length ? `${hardStops.length} triggered` : "Clear"}</strong>
+          <p>
+            {hardStops.length
+              ? hardStops.map((stop) => stop.code).filter(Boolean).join(" · ")
+              : "No automatic rejection condition was detected."}
+          </p>
+        </article>
+        <article>
+          <span>Market snapshot</span>
+          <strong>{formatMoney(report.market.liquidity_usd)} liquidity</strong>
+          <p>
+            {formatMoney(report.market.volume_24h_usd)} volume ·{" "}
+            {report.market.age || "Age unknown"}
+          </p>
+        </article>
+        <article>
+          <span>Evidence</span>
+          <strong>{report.evidence.fact_count} facts</strong>
+          <p>Block {report.evidence.block_pin?.toLocaleString() || "unknown"}</p>
+        </article>
+      </div>
+
+      <div className="live-recommendation">
+        <span>Investor interpretation</span>
+        <p>{report.decision.recommendation || "Review the evidence before making a decision."}</p>
+      </div>
+
+      {hardStops.length > 0 && (
+        <div className="live-hard-stops">
+          {hardStops.map((stop, index) => (
+            <article key={`${stop.code || "stop"}-${index}`}>
+              <span>{stop.severity || "Material"} hard stop</span>
+              <strong>{stop.code?.replaceAll("_", " ") || "Risk condition"}</strong>
+              <p>{stop.reason}</p>
+            </article>
+          ))}
+        </div>
+      )}
+
+      <div className="live-detail-grid">
+        <div className="live-factors">
+          <div className="panel-head">
+            <div><span className="panel-index">01</span><h3>Risk dimensions</h3></div>
+            <span>Higher is safer</span>
+          </div>
+          <div className="factor-grid">
+            {factorEntries.map((factor) => (
+              <div className="factor" key={factor.key}>
+                <div className="factor-label">
+                  <span>{factor.label}</span><strong>{factor.score}</strong>
+                </div>
+                <div className="bar">
+                  <span
+                    className={factor.score >= 70 ? "good" : "warn"}
+                    style={{ width: `${factor.score}%` }}
+                  />
+                </div>
+              </div>
+            ))}
+          </div>
+        </div>
+
+        <div className="live-evidence">
+          <div className="panel-head">
+            <div><span className="panel-index">02</span><h3>Verification</h3></div>
+            <div className="verified-seal"><span>◆</span> {report.timechain.decision || "SEALED"}</div>
+          </div>
+          <dl>
+            <div><dt>Timechain Ring</dt><dd>{report.timechain.ring ?? "—"}</dd></div>
+            <div><dt>Ring hash</dt><dd>{report.timechain.ring_hash?.slice(0, 20) || "—"}…</dd></div>
+            <div><dt>Ledger hash</dt><dd>{report.evidence.ledger_hash?.slice(0, 20) || "—"}…</dd></div>
+            <div><dt>Block pin</dt><dd>{report.evidence.block_pin?.toLocaleString() || "—"}</dd></div>
+          </dl>
+          {report.token.explorer_url && (
+            <a href={report.token.explorer_url} target="_blank" rel="noreferrer">
+              Open contract explorer ↗
+            </a>
+          )}
+        </div>
+      </div>
+
+      <div className="live-flags">
+        <article>
+          <span>Material concerns</span>
+          {(report.flags.red.length || report.flags.yellow.length) ? (
+            <ul>
+              {[...report.flags.red, ...report.flags.yellow].slice(0, 8).map((flag) => (
+                <li key={flag}>{flag}</li>
+              ))}
+            </ul>
+          ) : <p>No material concern was returned.</p>}
+        </article>
+        <article>
+          <span>Unknowns and limits</span>
+          {Object.keys(report.flags.unknown).length ? (
+            <ul>
+              {Object.entries(report.flags.unknown).slice(0, 8).map(([key, value]) => (
+                <li key={key}><strong>{factorNames[key] || key}:</strong> {value}</li>
+              ))}
+            </ul>
+          ) : <p>No unresolved component was returned.</p>}
+        </article>
+      </div>
+
+      <p className="live-disclaimer">{report.disclaimer}</p>
+    </section>
+  );
+}
 
 const factors = [
   { label: "Contract security", score: 94, tone: "good" },
@@ -46,24 +306,99 @@ const evidence = [
 export default function Home() {
   const [address, setAddress] = useState("");
   const [notice, setNotice] = useState("");
+  const [scanState, setScanState] = useState<ScanState>("idle");
+  const [liveReport, setLiveReport] = useState<PublicReport | null>(null);
 
-  function submitScan(event: FormEvent<HTMLFormElement>) {
+  async function submitScan(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const isAddress = /^0x[a-fA-F0-9]{40}$/.test(address.trim());
+    const normalizedAddress = address.trim();
 
-    if (!isAddress) {
+    if (!ADDRESS_RE.test(normalizedAddress)) {
       setNotice("Enter a valid 42-character EVM contract address.");
+      setScanState("failed");
       return;
     }
 
-    setNotice(
-      "The public analysis endpoint is not connected yet. Your address was not stored. Use the example report below to explore the interface.",
-    );
+    setScanState("submitting");
+    setLiveReport(null);
+    setNotice("Submitting the contract to the serialized analysis queue…");
+
+    try {
+      const submission = await fetch("/api/analyses", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ address: normalizedAddress }),
+      });
+      const submissionBody = await submission.json().catch(() => null);
+      if (!submission.ok) {
+        throw new Error(
+          errorMessage(submissionBody, "The analysis could not be submitted."),
+        );
+      }
+      const jobId =
+        submissionBody && typeof submissionBody.job_id === "string"
+          ? submissionBody.job_id
+          : "";
+      if (!/^[a-f0-9]{32}$/.test(jobId)) {
+        throw new Error("The analysis service returned an invalid job identifier.");
+      }
+
+      setScanState("analyzing");
+      setNotice(
+        submissionBody.cached
+          ? "Loading the recent sealed result…"
+          : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
+      );
+
+      for (let attempt = 0; attempt < 150; attempt += 1) {
+        if (attempt > 0) await delay(2_000);
+        const response = await fetch(
+          `/api/analyses?job=${encodeURIComponent(jobId)}`,
+          { cache: "no-store" },
+        );
+        const job = await response.json().catch(() => null);
+        if (!response.ok) {
+          throw new Error(
+            errorMessage(job, "The analysis status could not be retrieved."),
+          );
+        }
+        if (job.status === "succeeded" && job.result) {
+          setLiveReport(job.result as PublicReport);
+          setScanState("succeeded");
+          setNotice(
+            `Analysis sealed to Timechain Ring ${job.result.timechain?.ring ?? "—"}.`,
+          );
+          window.setTimeout(() => {
+            document.getElementById("live-report")?.scrollIntoView({
+              behavior: "smooth",
+              block: "start",
+            });
+          }, 50);
+          return;
+        }
+        if (job.status === "failed") {
+          throw new Error(
+            errorMessage(job, "The analysis failed without publishing a result."),
+          );
+        }
+      }
+      throw new Error("The analysis is taking longer than expected. Try again shortly.");
+    } catch (error) {
+      setScanState("failed");
+      setNotice(
+        error instanceof Error
+          ? error.message
+          : "The analysis could not be completed.",
+      );
+    }
   }
 
   function loadExample() {
     setAddress(SAMPLE_ADDRESS);
     setNotice("Example report loaded. All values below are demonstration data.");
+    setScanState("idle");
+    setLiveReport(null);
     document.getElementById("report")?.scrollIntoView({ behavior: "smooth" });
   }
 
@@ -132,7 +467,11 @@ export default function Home() {
             autoComplete="off"
             spellCheck={false}
           />
-          <button type="submit">Run risk scan</button>
+          <button type="submit" disabled={scanState === "submitting" || scanState === "analyzing"}>
+            {scanState === "submitting" || scanState === "analyzing"
+              ? "Analysis running…"
+              : "Run risk scan"}
+          </button>
         </form>
         <div className="scanner-meta">
           <span>No wallet connection</span>
@@ -149,6 +488,8 @@ export default function Home() {
         <div><strong>Block-pinned</strong><span>market evidence</span></div>
         <div><strong>Timechain</strong><span>tamper-evident memory</span></div>
       </section>
+
+      {liveReport && <LiveReport report={liveReport} />}
 
       <section className="report-shell" id="report">
         <div className="section-heading">
@@ -317,9 +658,9 @@ export default function Home() {
             </article>
           </div>
           <div className="timechain-trace">
-            <span>RING 749</span><i />
-            <span>RING 750</span><i />
-            <span className="trace-active">RING 751 · VERIFIED</span>
+            <span>RING N</span><i />
+            <span>RING N+1</span><i />
+            <span className="trace-active">RING N+2 · VERIFIED</span>
           </div>
         </div>
       </section>
@@ -340,7 +681,11 @@ export default function Home() {
           Chainseer provides informational risk analysis, not financial advice.
           Digital assets can lose all value.
         </p>
-        <span>© 2026 Chainseer</span>
+        <div className="footer-links">
+          <a href="/privacy">Privacy</a>
+          <a href="/terms">Terms</a>
+          <span>© 2026 Chainseer</span>
+        </div>
       </footer>
     </main>
   );
