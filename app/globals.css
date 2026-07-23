@@ -449,6 +449,46 @@ a { color: inherit; text-decoration: none; }
 .section-heading > p, .method-intro > p {
   margin: 0; color: var(--muted); font-size: 14px; line-height: 1.75;
 }
+.demo-report {
+  border: 1px solid var(--line);
+  background: rgba(14, 16, 14, 0.72);
+}
+.demo-report > summary {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 24px;
+  min-height: 92px;
+  padding: 22px 26px;
+  cursor: pointer;
+  list-style: none;
+}
+.demo-report > summary::-webkit-details-marker { display: none; }
+.demo-report > summary::after {
+  content: "+";
+  color: var(--acid);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 20px;
+}
+.demo-report[open] > summary {
+  border-bottom: 1px solid var(--line);
+}
+.demo-report[open] > summary::after { content: "−"; }
+.demo-report > summary > span:first-child {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+}
+.demo-report > summary strong {
+  color: var(--ink);
+  font-size: 15px;
+  font-weight: 540;
+}
+.demo-report > summary small {
+  color: var(--faint);
+  font-size: 11px;
+}
+.demo-content { padding: 16px; }
 .decision-grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; }
 .decision-card, .stops-card, .factor-panel, .evidence-panel {
   border: 1px solid var(--line);
@@ -460,7 +500,15 @@ a { color: inherit; text-decoration: none; }
   font-family: var(--font-geist-mono), monospace; font-size: 10px;
   letter-spacing: 0.1em; text-transform: uppercase;
 }
-.demo-tag { border: 1px solid #544b35; padding: 4px 7px; color: var(--amber); }
+.demo-tag {
+  border: 1px solid #544b35;
+  padding: 4px 7px;
+  color: var(--amber);
+  font-family: var(--font-geist-mono), monospace;
+  font-size: 9px;
+  letter-spacing: 0.08em;
+  white-space: nowrap;
+}
 .decision-word {
   margin-top: 35px; color: var(--amber); font-family: var(--font-geist-mono), monospace;
   font-size: clamp(56px, 8vw, 108px); line-height: 1; letter-spacing: -0.09em;
@@ -824,6 +872,14 @@ footer p { max-width: 430px; margin: 0 auto; line-height: 1.6; text-align: cente
   .scanner-meta { flex-wrap: wrap; gap: 8px 14px; line-height: 1.5; }
   .scanner-meta button { width: 100%; margin: 5px 0 0; text-align: left; }
   .signal-strip div { min-height: 90px; padding-left: 14px; }
+  .demo-report > summary {
+    align-items: flex-start;
+    flex-wrap: wrap;
+    min-height: 0;
+    padding: 18px;
+  }
+  .demo-report > summary::after { margin-left: auto; }
+  .demo-content { padding: 10px; }
   .live-report { margin-top: 60px; padding: 22px; }
   .live-report-head { flex-direction: column; }
   .live-risk { min-width: 0; text-align: left; }

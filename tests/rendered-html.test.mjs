@@ -85,6 +85,11 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   ]);
 
   assert.match(page, /\/api\/analyses/);
+  assert.match(page, /SAMPLE DATA · NOT LIVE/);
+  assert.match(page, /nothing was sealed/);
+  assert.match(page, /setShowExample\(false\)/);
+  assert.doesNotMatch(page, /0x407470F8D77d12417A6cfaC5940c2f8B5F4E8a27/);
+  assert.doesNotMatch(page, /ring_000751/);
   assert.match(apiRoute, /CHAINSEER_API_TOKEN/);
   assert.doesNotMatch(page, /CHAINSEER_API_TOKEN|NEXT_PUBLIC_CHAINSEER/);
   assert.match(packageJson, /"name": "chainseer-web"/);

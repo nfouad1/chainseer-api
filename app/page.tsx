@@ -2,7 +2,6 @@
 
 import { FormEvent, useState } from "react";
 
-const SAMPLE_ADDRESS = "0x407470F8D77d12417A6cfaC5940c2f8B5F4E8a27";
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 
 type PublicReport = {
@@ -281,24 +280,24 @@ const factors = [
 
 const evidence = [
   {
-    id: "FACT-1042",
+    id: "DEMO-001",
     label: "Source code verified",
     source: "Blockscout",
-    block: "35,184,921",
+    block: "Demo block",
     status: "confirmed",
   },
   {
-    id: "FACT-1048",
+    id: "DEMO-002",
     label: "No sell restriction detected",
     source: "GoPlus + RPC",
-    block: "35,184,921",
+    block: "Demo block",
     status: "confirmed",
   },
   {
-    id: "FACT-1054",
+    id: "DEMO-003",
     label: "Top 10 holders control 31.8%",
     source: "RPC",
-    block: "35,184,921",
+    block: "Demo block",
     status: "watch",
   },
 ];
@@ -308,6 +307,7 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [scanState, setScanState] = useState<ScanState>("idle");
   const [liveReport, setLiveReport] = useState<PublicReport | null>(null);
+  const [showExample, setShowExample] = useState(false);
 
   async function submitScan(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -321,6 +321,7 @@ export default function Home() {
 
     setScanState("submitting");
     setLiveReport(null);
+    setShowExample(false);
     setNotice("Submitting the contract to the serialized analysis queue…");
 
     try {
@@ -395,8 +396,8 @@ export default function Home() {
   }
 
   function loadExample() {
-    setAddress(SAMPLE_ADDRESS);
-    setNotice("Example report loaded. All values below are demonstration data.");
+    setShowExample(true);
+    setNotice("Demo report opened. Its token, evidence, score, and Timechain proof are fictional.");
     setScanState("idle");
     setLiveReport(null);
     document.getElementById("report")?.scrollIntoView({ behavior: "smooth" });
@@ -410,10 +411,10 @@ export default function Home() {
           <span>CHAINSEER</span>
         </a>
         <nav aria-label="Primary navigation">
-          <a href="#report">Example report</a>
+          <a href="#report">Demo report</a>
           <a href="#method">Method</a>
           <a href="#timechain">Timechain</a>
-          <a href="#evidence">Evidence</a>
+          <a href="#evidence" onClick={() => setShowExample(true)}>Evidence</a>
         </nav>
         <div className="header-actions">
           <a
@@ -477,7 +478,7 @@ export default function Home() {
           <span>No wallet connection</span>
           <span>No signature</span>
           <span>Evidence pinned to block</span>
-          <button type="button" onClick={loadExample}>Load example report →</button>
+          <button type="button" onClick={loadExample}>Open demo report →</button>
         </div>
         {notice && <p className="scan-notice" role="status">{notice}</p>}
       </section>
@@ -494,20 +495,33 @@ export default function Home() {
       <section className="report-shell" id="report">
         <div className="section-heading">
           <div>
-            <div className="eyebrow muted">Demonstration report</div>
+            <div className="eyebrow muted">Optional product walkthrough</div>
             <h2>See the decision, then inspect the proof.</h2>
           </div>
           <p>
-            Example data illustrates the report structure. It is not a live
-            assessment or investment recommendation.
+            Open the fictional demo to understand the report structure. A real
+            scan replaces it with fresh, sealed analysis.
           </p>
         </div>
 
+        <details
+          className="demo-report"
+          open={showExample}
+          onToggle={(event) => setShowExample(event.currentTarget.open)}
+        >
+          <summary>
+            <span>
+              <strong>Fictional demo report</strong>
+              <small>Sentinel Demo (DEMO) · no live token or on-chain lookup</small>
+            </span>
+            <span className="demo-tag">SAMPLE DATA · NOT LIVE</span>
+          </summary>
+          <div className="demo-content">
         <div className="decision-grid">
           <article className="decision-card">
             <div className="card-kicker">
               Effective action
-              <span className="demo-tag">EXAMPLE</span>
+              <span className="demo-tag">DEMO</span>
             </div>
             <div className="decision-word">WATCH</div>
             <p>
@@ -560,9 +574,9 @@ export default function Home() {
         <div className="evidence-panel" id="evidence">
           <div className="panel-head">
             <div><span className="panel-index">02</span><h3>Evidence ledger</h3></div>
-            <div className="verified-seal"><span>◆</span> Integrity verified</div>
+            <div className="verified-seal"><span>◆</span> Demo format only</div>
           </div>
-          <div className="evidence-table" role="table" aria-label="Evidence ledger">
+          <div className="evidence-table" role="table" aria-label="Fictional demonstration evidence ledger">
             <div className="evidence-row evidence-header" role="row">
               <span>Finding</span><span>Source</span><span>Block</span><span>Status</span>
             </div>
@@ -578,11 +592,13 @@ export default function Home() {
           <div className="chain-seal">
             <div>
               <span className="seal-mark">C</span>
-              <div><strong>Timechain proof</strong><span>Proof-of-Qualia sealed analysis</span></div>
+              <div><strong>Illustrative Timechain proof</strong><span>Format preview only · nothing was sealed</span></div>
             </div>
-            <code>ring_000751 · 1e184f4121cdff67…</code>
+            <code>demo_ring_0001 · fictional_hash</code>
           </div>
         </div>
+          </div>
+        </details>
       </section>
 
       <section className="method" id="method">
