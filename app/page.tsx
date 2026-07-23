@@ -77,6 +77,7 @@ export default function Home() {
         <nav aria-label="Primary navigation">
           <a href="#report">Example report</a>
           <a href="#method">Method</a>
+          <a href="#timechain">Timechain</a>
           <a href="#evidence">Evidence</a>
         </nav>
         <a className="header-cta" href="#scanner">Scan contract</a>
@@ -243,6 +244,67 @@ export default function Home() {
           <article><span>02</span><h3>Challenge</h3><p>Run hard-stop gates and test conflicting evidence before scoring.</p></article>
           <article><span>03</span><h3>Explain</h3><p>Translate the result into an investor-friendly action and watchlist.</p></article>
           <article><span>04</span><h3>Remember</h3><p>Seal evidence and compare later outcomes without rewriting history.</p></article>
+        </div>
+      </section>
+
+      <section className="timechain-section" id="timechain">
+        <div className="timechain-orbit" aria-hidden="true">
+          <span className="orbit-ring orbit-one" />
+          <span className="orbit-ring orbit-two" />
+          <span className="orbit-ring orbit-three" />
+          <span className="orbit-core">C</span>
+        </div>
+        <div className="timechain-content">
+          <div className="eyebrow">Powered by Cypher Tempre Timechain</div>
+          <h2>Analysis that cannot quietly rewrite its past.</h2>
+          <p className="timechain-lead">
+            Every completed Chainseer analysis and outcome reflection is sealed
+            as a cryptographically linked Timechain Ring. Each new Ring commits
+            to the one before it, creating a verifiable history of what the
+            agent observed, concluded, and later learned.
+          </p>
+          <div className="timechain-benefits">
+            <article>
+              <span>01 / Integrity</span>
+              <h3>Tamper-evident history</h3>
+              <p>
+                Editing an earlier Ring breaks the hash chain. Reports remain
+                auditable instead of becoming a silently changing narrative.
+              </p>
+            </article>
+            <article>
+              <span>02 / Conscience</span>
+              <h3>Proof-of-Qualia gate</h3>
+              <p>
+                Before sealing, PoQ challenges coherence, relevance,
+                consistency, depth, novelty, and alignment. Unsupported
+                certainty is surfaced rather than hidden.
+              </p>
+            </article>
+            <article>
+              <span>03 / Memory</span>
+              <h3>Learning with provenance</h3>
+              <p>
+                Later outcomes can be linked back to the original decision, so
+                Chainseer learns from results without altering the forecast it
+                actually made.
+              </p>
+            </article>
+            <article>
+              <span>04 / Evolution</span>
+              <h3>New faculties, sealed</h3>
+              <p>
+                When the agent encounters a genuine reasoning gap, Cambium can
+                grow a new sense or modality—and record where that capability
+                came from.
+              </p>
+            </article>
+          </div>
+          <div className="timechain-trace">
+            <span>RING 749</span><i />
+            <span>RING 750</span><i />
+            <span className="trace-active">RING 751 · VERIFIED</span>
+          </div>
         </div>
       </section>
 
