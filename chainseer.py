@@ -620,7 +620,9 @@ class ProvenanceLedger:
         if self.evidence_dir:
             evidence_file = self.evidence_dir / f"{resp_hash}.json"
             if not evidence_file.exists():
-                temp_file = evidence_file.with_suffix(".tmp")
+                temp_file = evidence_file.with_suffix(
+                    f".{os.getpid()}.{threading.get_ident()}.tmp"
+                )
                 temp_file.write_text(canonical, encoding="utf-8")
                 os.replace(temp_file, evidence_file)
             evidence_path = str(evidence_file)
@@ -639,6 +641,43 @@ class ProvenanceLedger:
         })
         self._dedup[dedup_key] = fact_id
         return fact_id
+
+    def absorb(self, other: "ProvenanceLedger") -> list[str]:
+        """Merge an isolated ledger while assigning deterministic local IDs."""
+        snapshot = other.to_dict()
+        other_block = snapshot.get("block_pin")
+        if (
+            self._block_pin is not None
+            and other_block is not None
+            and int(other_block) != int(self._block_pin)
+        ):
+            raise ValueError("cannot absorb provenance from another block pin")
+        added = []
+        for original in snapshot.get("facts") or []:
+            dedup_key = (
+                original.get("query_hash"),
+                original.get("response_hash"),
+            )
+            if dedup_key in self._dedup:
+                added.append(self._dedup[dedup_key])
+                continue
+            evidence_path = original.get("evidence_path")
+            if evidence_path:
+                path = Path(evidence_path)
+                if (
+                    not path.is_file()
+                    or hashlib.sha256(path.read_bytes()).hexdigest()
+                    != original.get("response_hash")
+                ):
+                    raise ValueError("isolated provenance evidence failed hash verification")
+            fact_id = f"F{len(self._facts):04d}"
+            fact = dict(original)
+            fact["fact_id"] = fact_id
+            fact["block"] = self._block_pin
+            self._facts.append(fact)
+            self._dedup[dedup_key] = fact_id
+            added.append(fact_id)
+        return added
 
     def to_dict(self) -> dict:
         return {

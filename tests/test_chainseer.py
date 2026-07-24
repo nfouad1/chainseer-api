@@ -239,6 +239,31 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             self.assertTrue(ledger_b.verify())
             self.assertTrue(ledger_b.to_dict()["facts"][0]["cache_hit"])
 
+    def test_isolated_provenance_absorbs_in_declared_order(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            evidence = Path(temp_dir) / "evidence"
+            main = chainseer.ProvenanceLedger(evidence)
+            first = chainseer.ProvenanceLedger(evidence)
+            second = chainseer.ProvenanceLedger(evidence)
+            for ledger in (main, first, second):
+                ledger.block_pin = 12345
+            second.record("http", {"url": "https://second.invalid"}, {"v": 2})
+            first.record("http", {"url": "https://first.invalid"}, {"v": 1})
+
+            main.absorb(first)
+            main.absorb(second)
+
+            facts = main.to_dict()["facts"]
+            self.assertEqual(
+                [fact["query"]["url"] for fact in facts],
+                ["https://first.invalid", "https://second.invalid"],
+            )
+            self.assertEqual(
+                [fact["fact_id"] for fact in facts],
+                ["F0000", "F0001"],
+            )
+            self.assertTrue(main.verify())
+
     def test_structured_analysis_validation(self):
         value = {
             "risk_level": "High",
