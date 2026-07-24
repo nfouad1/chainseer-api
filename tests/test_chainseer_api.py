@@ -73,6 +73,15 @@ def sample_internal_report():
                 "total_liquidity_usd": 100_000,
                 "total_volume_24h": 25_000,
                 "token_age_label": "2 days",
+                "primary_amm_version": "v4",
+            },
+            "lp_lock": {
+                "state": "custody_unverified",
+                "amm_version": "v4",
+                "method": "V4 position custody is not verified",
+                "locked": False,
+                "withdrawal_verified": False,
+                "hard_stop_eligible": False,
             },
         },
         "provenance": {
@@ -125,6 +134,14 @@ class PublicReportTests(unittest.TestCase):
         self.assertEqual(public["evidence"]["facts"][0]["id"], "F0000")
         self.assertNotIn("query", public["evidence"]["facts"][0])
         self.assertEqual(len(public["evidence"]["ledger_hash"]), 64)
+        self.assertEqual(
+            public["liquidity_custody"]["state"],
+            "custody_unverified",
+        )
+        self.assertEqual(public["liquidity_custody"]["amm_version"], "v4")
+        self.assertFalse(
+            public["liquidity_custody"]["withdrawal_verified"]
+        )
 
 
 class RateLimiterTests(unittest.TestCase):

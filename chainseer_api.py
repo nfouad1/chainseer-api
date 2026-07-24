@@ -517,6 +517,7 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
     data = report.get("data") or {}
     basic = data.get("basic_info") or {}
     dex = data.get("dex_pairs") or {}
+    liquidity_custody = data.get("lp_lock") or {}
     provenance = report.get("provenance") or {}
     evidence_facts = provenance.get("facts") or []
     public_facts = [
@@ -580,6 +581,20 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
             "liquidity_usd": dex.get("total_liquidity_usd"),
             "volume_24h_usd": dex.get("total_volume_24h"),
             "age": dex.get("token_age_label"),
+        },
+        "liquidity_custody": {
+            "state": liquidity_custody.get(
+                "state", "custody_unverified"
+            ),
+            "amm_version": liquidity_custody.get(
+                "amm_version", dex.get("primary_amm_version", "unknown")
+            ),
+            "method": liquidity_custody.get("method"),
+            "locked": bool(liquidity_custody.get("locked")),
+            "withdrawal_verified": bool(
+                liquidity_custody.get("withdrawal_verified")
+            ),
+            "withdrawable_pct": liquidity_custody.get("withdrawable_pct"),
         },
         "evidence": {
             "fact_count": provenance.get("fact_count", 0),
