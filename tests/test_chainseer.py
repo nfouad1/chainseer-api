@@ -61,6 +61,24 @@ class FakePoQ:
         return {"decision": "SEAL"}, {"index": 10, "ring_hash": "abc"}
 
 
+class FailOnLPTokenRPC:
+    def erc20_total_supply(self, _pair):
+        raise AssertionError(
+            "position-based pools must not be probed as ERC-20 LP tokens"
+        )
+
+
+class FakeV2LiquidityRPC:
+    def erc20_total_supply(self, _pair):
+        return 1_000
+
+    def erc20_balance_of(self, _pair, _holder):
+        return 0
+
+    def call(self, _address, _data):
+        raise chainseer.RPCError("selector unavailable", -1)
+
+
 class ChainseerInfrastructureTests(unittest.TestCase):
     @staticmethod
     def investor_fixture():
@@ -77,17 +95,29 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             },
             "dex_pairs": {
                 "total_liquidity_usd": 143_129.72,
+                "primary_liquidity_usd": 143_129.72,
                 "total_volume_24h": 118_189.64,
                 "primary_price_usd": 0.0008903,
                 "market_cap": 890_353,
                 "token_age_days": 2,
                 "token_age_label": "2 days",
                 "pair_count": 1,
+                "primary_amm_version": "v2",
                 "txns_24h": {"buys": 120, "sells": 97},
                 "on_chain_reserves": None,
             },
             "transfer_activity": {},
-            "lp_lock": {"locked": False, "method": "Not burned"},
+            "lp_lock": {
+                "state": "creator_withdrawable",
+                "locked": False,
+                "withdrawal_verified": True,
+                "hard_stop_eligible": True,
+                "withdrawable_pct": 82.0,
+                "amm_version": "v2",
+                "method": (
+                    "Token creator directly controls 82.0% of V2 LP supply"
+                ),
+            },
             "tax_estimate": {"available": False},
             "deployer": {},
             "blockscout_holders": {
@@ -231,6 +261,147 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertIn("EXTREME_CONCENTRATION", codes)
         self.assertEqual(analysis["confidence_grade"], "LIMITED")
 
+    def test_primary_market_selection_is_not_biased_toward_v2(self):
+        v2 = {
+            "pairAddress": "0x" + "1" * 40,
+            "labels": ["v2"],
+            "liquidity": {"usd": 100},
+            "quoteToken": {"address": chainseer.WETH_ADDRESS},
+        }
+        v4 = {
+            "pairAddress": "0x" + "2" * 64,
+            "labels": ["v4"],
+            "liquidity": {"usd": 50_000},
+            "quoteToken": {"address": chainseer.WETH_ADDRESS},
+        }
+
+        self.assertIs(
+            chainseer._pick_primary_pair({"pairs": [v2, v4]}),
+            v4,
+        )
+        self.assertEqual(chainseer._amm_version(v4), "v4")
+
+    def test_dex_analysis_ignores_pairs_from_other_chains(self):
+        robinhood_pair = {
+            "chainId": "robinhood",
+            "pairAddress": "0x" + "2" * 64,
+            "labels": ["v4"],
+            "liquidity": {"usd": 10_000},
+            "priceUsd": "0.25",
+        }
+        foreign_pair = {
+            "chainId": "base",
+            "pairAddress": "0x" + "1" * 40,
+            "labels": ["v2"],
+            "liquidity": {"usd": 1_000_000},
+            "priceUsd": "99",
+        }
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.rpc = FailOnLPTokenRPC()
+
+        result = agent._analyze_dex_pairs(
+            "0x" + "a" * 40,
+            {
+                "dexscreener": {
+                    "pairs": [foreign_pair, robinhood_pair],
+                },
+                "goplus_security": {},
+            },
+        )
+
+        self.assertEqual(
+            result["primary_pair_address"],
+            robinhood_pair["pairAddress"],
+        )
+        self.assertEqual(result["primary_price_usd"], 0.25)
+        self.assertEqual(result["total_liquidity_usd"], 10_000)
+        self.assertEqual(result["discarded_foreign_pair_count"], 1)
+
+    def test_position_based_pools_are_custody_unverified_not_unlocked(self):
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.rpc = FailOnLPTokenRPC()
+
+        fixtures = [
+            {
+                "primary_pair_address": "0x" + "a" * 40,
+                "primary_amm_version": "v3",
+                "primary_liquidity_usd": 20_000,
+            },
+            {
+                "primary_pair_address": "0x" + "b" * 64,
+                "primary_amm_version": "v4",
+                "primary_liquidity_usd": 20_000,
+            },
+        ]
+        for dex_data in fixtures:
+            with self.subTest(version=dex_data["primary_amm_version"]):
+                custody = agent._verify_lp_lock(
+                    "0x" + "c" * 40, dex_data
+                )
+                self.assertEqual(custody["state"], "custody_unverified")
+                self.assertFalse(custody["hard_stop_eligible"])
+                self.assertIn("position", custody["method"].lower())
+
+    def test_unverified_v4_custody_does_not_trigger_unlocked_lp_stop(self):
+        data = self.investor_fixture()
+        data["blockscout_holders"]["adj_top_1_pct"] = 10
+        data["dex_pairs"]["primary_amm_version"] = "v4"
+        data["lp_lock"] = {
+            "state": "custody_unverified",
+            "locked": False,
+            "withdrawal_verified": False,
+            "hard_stop_eligible": False,
+            "amm_version": "v4",
+            "method": "V4 position owner is not verified",
+        }
+
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        analysis = agent._analyze(data)
+        codes = {
+            item["code"] for item in analysis["hard_stop_overrides"]
+        }
+
+        self.assertNotIn("UNLOCKED_LP", codes)
+        self.assertEqual(analysis["component_scores"]["lp_lock"], 50)
+        self.assertIn("lp_lock", analysis["uncertain_components"])
+        self.assertFalse(
+            any(
+                "lp not locked" in flag.lower()
+                for flag in analysis["red_flags"]
+            )
+        )
+
+    def test_verified_v2_creator_control_is_creator_withdrawable(self):
+        creator = "0x" + "d" * 40
+        holder = {
+            "address": creator,
+            "is_contract": False,
+            "balance_raw": "800",
+        }
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.rpc = FakeV2LiquidityRPC()
+        agent.ledger = None
+        dex_data = {
+            "primary_pair_address": "0x" + "e" * 40,
+            "primary_amm_version": "v2",
+            "primary_liquidity_usd": 25_000,
+        }
+
+        with patch(
+            "chainseer._fetch_blockscout_holders",
+            return_value=[holder],
+        ):
+            custody = agent._verify_lp_lock(
+                "0x" + "f" * 40,
+                dex_data,
+                creator_address=creator,
+            )
+
+        self.assertEqual(custody["state"], "creator_withdrawable")
+        self.assertTrue(custody["withdrawal_verified"])
+        self.assertTrue(custody["hard_stop_eligible"])
+        self.assertEqual(custody["withdrawable_pct"], 80.0)
+
     def test_source_verification_conflict_never_emits_verified_green_flag(self):
         data = self.investor_fixture()
         data["goplus_security"] = {"is_open_source": "1"}
@@ -277,6 +448,8 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertIn("Model score:", summary)
         self.assertIn("Risk override:", summary)
         self.assertIn("Top real holder controls 82.5%", summary)
+        self.assertIn("LIQUIDITY CUSTODY", summary)
+        self.assertIn("CREATOR WITHDRAWABLE", summary)
         self.assertLess(summary.index("ACTION: AVOID"), summary.index("MARKET"))
 
         output = StringIO()
@@ -286,6 +459,7 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertIn("EXECUTIVE DECISION", full)
         self.assertIn("HARD-STOP RISKS", full)
         self.assertIn("TECHNICAL SCORECARD", full)
+        self.assertIn("Liquidity Custody", full)
         self.assertLess(full.index("EXECUTIVE DECISION"), full.index("TECHNICAL SCORECARD"))
 
     def test_reflection_is_append_only_and_separates_market_outcome(self):

@@ -286,6 +286,7 @@ class ChainseerCognitiveLoop:
         data = report.get("data") or {}
         source = data.get("source_code") or {}
         dex = data.get("dex_pairs") or {}
+        liquidity_custody = data.get("lp_lock") or {}
         safe = {
             "task": "on-chain token risk analysis",
             "chain_id": report.get("chain_id"),
@@ -309,6 +310,8 @@ class ChainseerCognitiveLoop:
             "source_verified": bool(source.get("is_verified")),
             "market_data_available": bool(dex.get("primary_price_usd")),
             "liquidity_usd": dex.get("total_liquidity_usd"),
+            "primary_amm_version": dex.get("primary_amm_version"),
+            "liquidity_custody_state": liquidity_custody.get("state"),
         }
         return json.dumps(safe, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -490,6 +493,7 @@ RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
 EXPLORER = "https://robinhoodchain.blockscout.com"
 EXPLORER_TOKEN = f"{EXPLORER}/token/"
 DEXSCREENER_BASE = "https://api.dexscreener.com/latest/dex"
+DEXSCREENER_CHAIN_ID = "robinhood"
 GOPLUS_BASE = "https://api.gopluslabs.io/api/v1"
 BLOCKSCOUT_BASE = "https://robinhoodchain.blockscout.com/api/v2"
 WETH_ADDRESS = "0x0Bd7D308f8E1639FAb988df18A8011f41EAcAD73"
@@ -927,23 +931,42 @@ def _fetch_dexscreener_token(token_address: str, ledger: "ProvenanceLedger" = No
         return {"pairs": [], "pair_count": 0}
 
 
+LIQUIDITY_CUSTODY_STATES = {
+    "locked",
+    "protocol_secured",
+    "creator_withdrawable",
+    "custody_unverified",
+    "not_applicable",
+}
+
+
+def _amm_version(pair: dict) -> str:
+    """Identify an AMM version without assuming every pair is Uniswap V2."""
+    labels = {str(label).lower() for label in pair.get("labels", [])}
+    for version in ("v4", "v3", "v2"):
+        if version in labels:
+            return version
+
+    pair_id = str(pair.get("pairAddress") or "")
+    if re.fullmatch(r"0x[a-fA-F0-9]{64}", pair_id):
+        return "v4"
+    return "unknown"
+
+
 def _pick_primary_pair(dexscreener_data: dict) -> dict:
-    """Select the primary DEX pair (highest liquidity v2 pair)."""
+    """Select the highest-liquidity market, independent of AMM version."""
     pairs = dexscreener_data.get("pairs", [])
     if not pairs:
         return {}
 
-    # Prefer v2 pairs with WETH as quote, then highest liquidity
-    weth_pairs = [p for p in pairs if "v2" in p.get("labels", [])
-                  and p.get("quoteToken", {}).get("address", "").lower() == WETH_ADDRESS.lower()]
-    if weth_pairs:
-        return max(weth_pairs, key=lambda p: _safe_float(p.get("liquidity", {}).get("usd")))
-
-    v2_pairs = [p for p in pairs if "v2" in p.get("labels", [])]
-    if v2_pairs:
-        return max(v2_pairs, key=lambda p: _safe_float(p.get("liquidity", {}).get("usd")))
-
-    return max(pairs, key=lambda p: _safe_float(p.get("liquidity", {}).get("usd")))
+    return max(
+        pairs,
+        key=lambda p: (
+            _safe_float(p.get("liquidity", {}).get("usd")),
+            p.get("quoteToken", {}).get("address", "").lower()
+            == WETH_ADDRESS.lower(),
+        ),
+    )
 
 
 def _fetch_blockscout_address(token_address: str, ledger: "ProvenanceLedger" = None) -> dict:
@@ -1177,9 +1200,13 @@ class Chainseer:
         data["dex_pairs"] = self._analyze_dex_pairs(token, data)
         claim_evidence["dex_pairs"] = self.ledger.fact_ids_since(checkpoint)
 
-        print(" Phase 4/8: LP lock + timelock verification...")
+        print(" Phase 4/8: Liquidity custody verification...")
         checkpoint = self.ledger.checkpoint()
-        data["lp_lock"] = self._verify_lp_lock(token, data["dex_pairs"])
+        data["lp_lock"] = self._verify_lp_lock(
+            token,
+            data["dex_pairs"],
+            creator_address=data["blockscout_address"].get("creator_address"),
+        )
         claim_evidence["lp_lock"] = self.ledger.fact_ids_since(checkpoint)
 
         print(" Phase 5/8: Tax estimation...")
@@ -1268,14 +1295,20 @@ class Chainseer:
         """Analyze DEX pairs using DexScreener data + on-chain reserves."""
         dexscreener = data.get("dexscreener", {})
         goplus = data.get("goplus_security", {})
-        pairs = dexscreener.get("pairs", [])
-        primary = _pick_primary_pair(dexscreener)
+        all_pairs = dexscreener.get("pairs", [])
+        pairs = [
+            pair for pair in all_pairs
+            if str(pair.get("chainId", "")).lower() == DEXSCREENER_CHAIN_ID
+        ]
+        primary = _pick_primary_pair({"pairs": pairs})
 
         result = {
             "pair_count": len(pairs),
+            "discarded_foreign_pair_count": len(all_pairs) - len(pairs),
             "primary_pair_address": primary.get("pairAddress"),
             "primary_dex": primary.get("dexId"),
             "primary_labels": primary.get("labels", []),
+            "primary_amm_version": _amm_version(primary),
         }
 
         # Market data from DexScreener (all pairs aggregated)
@@ -1335,7 +1368,9 @@ class Chainseer:
 
         # On-chain reserves for primary pair
         pair_addr = primary.get("pairAddress")
-        if pair_addr and pair_addr != "0x" + "0" * 40:
+        if (result["primary_amm_version"] == "v2"
+                and ADDRESS_RE.fullmatch(str(pair_addr or ""))
+                and pair_addr != ZERO_ADDRESS):
             try:
                 reserves = self.rpc.pair_get_reserves(pair_addr)
                 t0 = self.rpc.pair_token0(pair_addr)
@@ -1576,8 +1611,8 @@ class Chainseer:
 
         return result
 
-    def _verify_lp_lock(self, token: str, dex_data: dict) -> dict:
-        """Deep verification of LP lock status.
+    def _inspect_v2_lp_token(self, token: str, dex_data: dict) -> dict:
+        """Collect V2 LP-token burn, holder, and timelock evidence.
 
         Checks: (1) Burn to dead addresses, (2) Known timelock contracts
         (Unicrypt, TeamFinance, PinkLock, TrustSwap), (3) Top LP holder
@@ -1631,7 +1666,9 @@ class Chainseer:
                 result["locked"] = False
 
                 # Find the top LP holder via Blockscout
-                lp_holders = _fetch_blockscout_holders(pair_addr, limit=5, ledger=self.ledger)
+                lp_holders = _fetch_blockscout_holders(
+                    pair_addr, limit=5, ledger=getattr(self, "ledger", None)
+                )
                 for h in lp_holders:
                     addr = h.get("address", "")
                     if not addr or addr.lower() in [dead_addr.lower(), null_addr.lower()]:
@@ -1661,7 +1698,158 @@ class Chainseer:
 
         return result
 
-    # ── NEW: Historical Trend Analysis (multi-dimensional) ─────────────────
+    # ── Liquidity custody classification ────────────────────────────────────
+    def _verify_lp_lock(self, token: str, dex_data: dict,
+                        creator_address: str = None) -> dict:
+        """Classify liquidity custody without conflating unknown with unlocked.
+
+        V2 pools expose fungible LP tokens and can be evaluated using burn,
+        timelock, and holder balances. V3/V4 liquidity is position-based, so
+        Chainseer reports custody as unverified until it can prove the position
+        owner and withdrawal restrictions.
+        """
+        pair_addr = dex_data.get("primary_pair_address")
+        amm_version = str(
+            dex_data.get("primary_amm_version") or "unknown"
+        ).lower()
+        liquidity_usd = _safe_float(dex_data.get("primary_liquidity_usd"))
+        base = {
+            "state": "custody_unverified",
+            "locked": False,
+            "withdrawal_verified": False,
+            "hard_stop_eligible": False,
+            "amm_version": amm_version,
+            "pair_address": pair_addr,
+            "method": "Liquidity custody has not been verified",
+        }
+
+        if not pair_addr or pair_addr == ZERO_ADDRESS:
+            if liquidity_usd <= 0:
+                return {
+                    **base,
+                    "state": "not_applicable",
+                    "method": "No funded primary liquidity pool found",
+                }
+            return {
+                **base,
+                "method": (
+                    "Liquidity is reported, but no canonical pair identifier "
+                    "is available"
+                ),
+            }
+
+        if amm_version == "v4":
+            return {
+                **base,
+                "method": (
+                    "Uniswap V4 uses position custody and a pool id, not an "
+                    "ERC-20 LP token; position ownership and withdrawal "
+                    "restrictions are not yet verified"
+                ),
+            }
+        if amm_version == "v3":
+            return {
+                **base,
+                "method": (
+                    "Uniswap V3 liquidity is position-based, not an ERC-20 LP "
+                    "token; position ownership and withdrawal restrictions "
+                    "are not yet verified"
+                ),
+            }
+        if amm_version != "v2":
+            return {
+                **base,
+                "method": (
+                    "AMM version is unknown; Chainseer will not apply V2 LP "
+                    "token assumptions"
+                ),
+            }
+        if not ADDRESS_RE.fullmatch(str(pair_addr)):
+            return {
+                **base,
+                "method": "V2 pair identifier is not a valid contract address",
+            }
+
+        v2_evidence = self._inspect_v2_lp_token(token, dex_data)
+        result = {**base, **v2_evidence, "amm_version": "v2"}
+        burn_pct = _safe_float(result.get("burn_pct"))
+        timelock = result.get("timelock") or {}
+        timelock_pct = _safe_float(timelock.get("locked_pct"))
+        lp_supply = _safe_int(result.get("lp_total_supply_raw"))
+
+        result.update({
+            "state": "custody_unverified",
+            "locked": False,
+            "withdrawal_verified": False,
+            "hard_stop_eligible": False,
+        })
+        if lp_supply <= 0:
+            if liquidity_usd <= 0:
+                result.update({
+                    "state": "not_applicable",
+                    "method": "V2 pair has no LP supply or funded liquidity",
+                })
+            else:
+                result["method"] = (
+                    "Dex market data reports liquidity, but V2 LP supply is "
+                    "zero or unavailable; custody cannot be verified"
+                )
+            return result
+
+        if burn_pct >= 95:
+            result.update({
+                "state": "locked",
+                "locked": True,
+                "method": f"Burned to dead address ({burn_pct}%)",
+            })
+            return result
+
+        if timelock.get("detected") and timelock_pct >= 95:
+            result.update({
+                "state": "protocol_secured",
+                "locked": True,
+                "method": (
+                    f"{timelock.get('platform', 'Recognized')} timelock "
+                    f"({timelock_pct}% locked, unlocks "
+                    f"{timelock.get('release_date', '?')})"
+                ),
+            })
+            return result
+
+        result["method"] = (
+            f"Only {max(burn_pct, timelock_pct):.2f}% of V2 LP supply is "
+            "verified as burned or timelocked; remaining custody is unverified"
+        )
+        holders = _fetch_blockscout_holders(
+            pair_addr, limit=5, ledger=getattr(self, "ledger", None)
+        )
+        normalized_creator = str(creator_address or "").lower()
+        if normalized_creator:
+            for holder_info in holders:
+                holder = str(holder_info.get("address") or "")
+                balance = _safe_int(holder_info.get("balance_raw", "0"))
+                holder_pct = round(balance / lp_supply * 100, 2)
+                if (
+                    holder.lower() == normalized_creator
+                    and not holder_info.get("is_contract")
+                    and holder_pct >= 50
+                ):
+                    result.update({
+                        "state": "creator_withdrawable",
+                        "withdrawal_verified": True,
+                        "hard_stop_eligible": True,
+                        "withdrawal_controller": holder,
+                        "withdrawable_pct": holder_pct,
+                        "method": (
+                            f"Token creator directly controls {holder_pct}% "
+                            "of V2 LP supply"
+                        ),
+                    })
+                    break
+
+        return result
+
+    # ── Historical Trend Analysis (multi-dimensional) ───────────────────────
 
     # Key metrics to track across analyses (from sealed component_scores)
     _TREND_METRICS = ["security", "liquidity", "holder_distribution", "volume",
@@ -2350,16 +2538,35 @@ class Chainseer:
             scores["creator_risk"] = 70
 
         # ── 8. LP Lock (0-100) ───────────────────────────────────────────────
-        if lp_lock.get("locked"):
+        custody_state = lp_lock.get("state")
+        if custody_state not in LIQUIDITY_CUSTODY_STATES:
+            custody_state = (
+                "locked" if lp_lock.get("locked") else "custody_unverified"
+            )
+
+        if custody_state in {"locked", "protocol_secured"}:
             scores["lp_lock"] = 95
-            flags["green"].append(f"LP locked: {lp_lock.get('method', 'Unknown')}")
+            flags["green"].append(
+                f"Liquidity custody {custody_state.replace('_', ' ')}: "
+                f"{lp_lock.get('method', 'Unknown')}"
+            )
+        elif custody_state == "creator_withdrawable":
+            scores["lp_lock"] = 15
+            flags["red"].append(
+                f"Creator-withdrawable liquidity: "
+                f"{lp_lock.get('method', 'Unknown')}"
+            )
+        elif custody_state == "not_applicable":
+            scores["lp_lock"] = 50
         else:
-            liq = dex.get("total_liquidity_usd", 0)
-            if liq > 0:
-                scores["lp_lock"] = 15
-                flags["red"].append(f"LP NOT locked ({lp_lock.get('method', 'Unknown')}) -- rug pull risk")
-            else:
-                scores["lp_lock"] = 50
+            scores["lp_lock"] = 50
+            reason = lp_lock.get(
+                "method", "Liquidity custody could not be verified"
+            )
+            uncertain["lp_lock"] = reason
+            flags["yellow"].append(
+                f"Liquidity custody unverified: {reason}"
+            )
 
         # ── 9. Wash Trading (0-100) ────────────────────────────────────────
         if wash.get("available"):
@@ -2549,11 +2756,20 @@ class Chainseer:
         if deployer.get("deployer_is_scam") or bs_addr.get("is_scam"):
             hard_stop("SCAM_FLAG", "Critical", "Token or deployer is scam-flagged", "AVOID")
 
-        liquidity_usd = _safe_float(dex.get("total_liquidity_usd"))
-        if liquidity_usd > 0 and not lp_lock.get("locked"):
+        liquidity_usd = _safe_float(dex.get("primary_liquidity_usd"))
+        if (
+            liquidity_usd > 0
+            and custody_state == "creator_withdrawable"
+            and lp_lock.get("withdrawal_verified")
+            and lp_lock.get("hard_stop_eligible")
+        ):
+            withdrawable_pct = _safe_float(
+                lp_lock.get("withdrawable_pct")
+            )
             hard_stop(
                 "UNLOCKED_LP", "High",
-                f"Liquidity is funded (${liquidity_usd:,.0f}) but the LP is not verified as locked",
+                f"The creator can withdraw {withdrawable_pct:.1f}% of the "
+                f"primary V2 liquidity position (${liquidity_usd:,.0f})",
                 "AVOID",
             )
 
@@ -2840,6 +3056,7 @@ class Chainseer:
         data = report["data"]
         basic = data.get("basic_info", {})
         dex = data.get("dex_pairs", {})
+        lp_lock = data.get("lp_lock", {})
         prov = report.get("provenance", {})
 
         name = basic.get("name", "Unknown")
@@ -2902,6 +3119,15 @@ class Chainseer:
         lines.append("  " + "  ·  ".join(market_parts))
         if mcap and liquidity:
             lines.append(f"  Market cap / liquidity: {_safe_float(mcap) / liquidity:.1f}x")
+        lines.append("")
+
+        custody_state = lp_lock.get("state", "custody_unverified")
+        lines.append("LIQUIDITY CUSTODY")
+        lines.append(
+            f"  {custody_state.replace('_', ' ').upper()}  ·  "
+            f"AMM {str(lp_lock.get('amm_version', 'unknown')).upper()}"
+        )
+        lines.append(f"  {lp_lock.get('method', 'Custody evidence unavailable')}")
         lines.append("")
 
         hard_stops = analysis.get("hard_stop_overrides", [])
@@ -3071,9 +3297,14 @@ class Chainseer:
             print(f"   DexScreener Boosts:     ACTIVE ({boosts_active} pts)")
         else:
             print(f"   DexScreener Boosts:     None")
-        print(f"   LP Locked:              {'YES' if dex.get('lp_locked') else 'NO'}")
-        if dex.get("lp_locked_percent"):
-            print(f"   LP Lock %:              {dex.get('lp_locked_percent', 0):.1f}%")
+        print(
+            f"   Primary AMM:            "
+            f"{str(dex.get('primary_amm_version', 'unknown')).upper()}"
+        )
+        print(
+            f"   Liquidity Custody:      "
+            f"{str(lp_lock.get('state', 'custody_unverified')).upper()}"
+        )
         print()
 
         # Security details
@@ -3112,27 +3343,21 @@ class Chainseer:
             print(f"   ETH in pool: {reserves.get('reserve_eth', 0):.4f}")
         print()
 
-        # LP lock verification
+        # Liquidity custody verification
         if lp_lock.get("pair_address"):
-            print(f" LP Lock Verification:")
-            print(f"   Pair: {lp_lock.get('pair_address', '?')}")
-            burn_pct = lp_lock.get("burn_pct", 0)
-            print(f"   LP burned: {burn_pct:.1f}%")
+            print(f" Liquidity Custody Verification:")
+            print(f"   Pair / pool id: {lp_lock.get('pair_address', '?')}")
+            print(f"   AMM version: {str(lp_lock.get('amm_version', 'unknown')).upper()}")
+            print(f"   State: {str(lp_lock.get('state', 'custody_unverified')).upper()}")
             print(f"   Status: {lp_lock.get('method', 'Unknown')}")
-            if lp_lock.get("locked"):
-                print(f"   VERDICT: LOCKED")
-            else:
-                if lp_lock.get("timelock_detected"):
-                    tl = lp_lock["timelock"]
-                    print(f"   VERDICT: TIMELOCKED ({tl.get('platform', 'Unknown')})")
-                    rel_ts = tl.get("release_timestamp", 0)
-                    if rel_ts:
-                        from datetime import datetime, timezone
-                        rel_dt = datetime.fromtimestamp(rel_ts, tz=timezone.utc)
-                        print(f"   Release date: {rel_dt.strftime('%Y-%m-%d %H:%M UTC')}")
-                    print(f"   LP locked %: {tl.get('locked_pct', 0):.1f}%")
-                else:
-                    print(f"   VERDICT: NOT LOCKED -- rug pull risk")
+            if "burn_pct" in lp_lock:
+                print(f"   LP burned: {lp_lock.get('burn_pct', 0):.1f}%")
+            timelock = lp_lock.get("timelock") or {}
+            if timelock.get("detected"):
+                print(
+                    f"   Timelock: {timelock.get('platform', 'Unknown')} "
+                    f"({timelock.get('locked_pct', 0):.1f}%)"
+                )
         print()
 
         # Blockscout holders (if available)
