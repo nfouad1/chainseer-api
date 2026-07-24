@@ -44,6 +44,7 @@ Robinhood Chain:
 import importlib.util
 import hashlib
 import json
+import math
 import os
 import re
 import shutil
@@ -868,6 +869,71 @@ def _safe_int(val, default=0) -> int:
         return default
 
 
+HOLDER_AGE_COHORTS = (
+    (1.0, 100, "<1 day"),
+    (3.0, 250, "1-3 days"),
+    (7.0, 450, "3-7 days"),
+    (14.0, 750, "7-14 days"),
+    (30.0, 1250, "14-30 days"),
+    (90.0, 2500, "30-90 days"),
+    (float("inf"), 5000, "90+ days"),
+)
+
+
+def _holder_base_score(holder_count: int, age_days) -> dict:
+    """Score holder adoption against an age cohort without rewarding tiny bases.
+
+    The old linear curve treated every token as mature and required 5,000
+    holders for a high score. This curve compares adoption with a transparent
+    age-band target, while absolute caps keep a very young token with a handful
+    of sybil wallets from receiving a strong score. Unknown age deliberately
+    retains the mature 5,000-holder target.
+    """
+    holder_count = max(0, _safe_int(holder_count))
+    parsed_age = None
+    if age_days is not None:
+        try:
+            candidate_age = float(age_days)
+            if math.isfinite(candidate_age) and candidate_age >= 0:
+                parsed_age = candidate_age
+        except (TypeError, ValueError, OverflowError):
+            pass
+
+    if parsed_age is None:
+        cohort_label = "unknown age (conservative)"
+        target = 5000
+    else:
+        _, target, cohort_label = next(
+            cohort for cohort in HOLDER_AGE_COHORTS
+            if parsed_age < cohort[0]
+        )
+
+    ratio = holder_count / target if target else 0.0
+    score = 20.0 + 60.0 * math.sqrt(min(ratio, 1.0))
+    score += 15.0 * min(max(ratio - 1.0, 0.0), 1.0)
+
+    # Absolute adoption floors prevent age normalization from rewarding a
+    # launch whose apparent holder count is still trivial or easily sybilable.
+    if holder_count < 10:
+        score = min(score, 25.0)
+    elif holder_count < 25:
+        score = min(score, 40.0)
+    elif holder_count < 50:
+        score = min(score, 55.0)
+    elif holder_count < 100:
+        score = min(score, 65.0)
+
+    return {
+        "score": round(max(0.0, min(95.0, score)), 2),
+        "holder_count": holder_count,
+        "age_days": parsed_age,
+        "cohort": cohort_label,
+        "target_holders": target,
+        "cohort_ratio": round(ratio, 3),
+        "method": "age_cohort_v1",
+    }
+
+
 def _http_get_json(url: str, *, params: dict = None, timeout: int = 15,
                    ledger: ProvenanceLedger = None):
     """Fetch JSON through the shared bounded TTL cache and preserve provenance."""
@@ -1217,7 +1283,13 @@ class Chainseer:
         latest_block = pin_block
         data["transfer_activity"] = self._check_transfer_activity(token, latest_block)
         data["deployer"] = self._analyze_deployer_and_creation(token)
-        data["blockscout_holders"] = self._analyze_holders_blockscout(token)
+        data["blockscout_holders"] = self._analyze_holders_blockscout(
+            token,
+            verified_amm_addresses=data["dex_pairs"].get(
+                "verified_amm_addresses", []
+            ),
+            total_supply_raw=data["basic_info"].get("total_supply_raw"),
+        )
         data["wash_trading"] = self._detect_wash_trading(token, latest_block)
         claim_evidence["activity_and_holders"] = self.ledger.fact_ids_since(checkpoint)
 
@@ -1309,6 +1381,14 @@ class Chainseer:
             "primary_dex": primary.get("dexId"),
             "primary_labels": primary.get("labels", []),
             "primary_amm_version": _amm_version(primary),
+            # Only addresses supplied by a Robinhood-chain DEX market record
+            # are eligible for structural AMM exclusion in holder analysis.
+            # V4 pool ids are 32-byte identifiers, not holder addresses.
+            "verified_amm_addresses": sorted({
+                str(pair.get("pairAddress")).lower()
+                for pair in pairs
+                if ADDRESS_RE.fullmatch(str(pair.get("pairAddress") or ""))
+            }),
         }
 
         # Market data from DexScreener (all pairs aggregated)
@@ -1483,24 +1563,38 @@ class Chainseer:
 
         return result
 
-    def _analyze_holders_blockscout(self, token: str) -> dict:
-        """Fetch top holders from Blockscout API (more complete than log scanning).
+    def _analyze_holders_blockscout(
+        self,
+        token: str,
+        *,
+        verified_amm_addresses=None,
+        total_supply_raw=None,
+    ) -> dict:
+        """Fetch and classify top holders using explicit market evidence.
 
-        Excludes known AMM pair contracts from concentration analysis since
-        LP tokens held in the pair are structural, not whale signals.
+        Only holder addresses independently identified as Robinhood-chain AMM
+        markets are excluded. Other contracts, including EIP-7702 accounts,
+        remain economic holders. Concentration uses total token supply when it
+        is available; a top-20 sample is never silently labelled as supply.
         """
         holders = _fetch_blockscout_holders(token, limit=20, ledger=self.ledger)
         if not holders:
             return {"holders": [], "blockscout_available": False}
 
-        # Compute concentration excluding pair/AMM contracts
+        verified_amm = {
+            str(address).lower()
+            for address in (verified_amm_addresses or [])
+            if ADDRESS_RE.fullmatch(str(address or ""))
+        }
+        # Compute concentration excluding only verified pair/AMM addresses.
         total_raw = 0
-        dex_pairs = set()
+        excluded_amm = set()
         eoa_count = 0
         contract_count = 0
         scam_flagged = []
         proxy_holders = []
         eip7702_count = 0
+        unclassified_contracts = []
 
         for h in holders:
             bal = _safe_int(h.get("balance_raw", "0"))
@@ -1510,10 +1604,15 @@ class Chainseer:
             addr = h.get("address", "").lower()
             addr_info = h.get("address_info", {})
 
-            # Collect pair/AMM contracts to exclude from concentration
+            # Dual-source identity: the address must be a Robinhood-chain
+            # market in DexScreener and a contract in Blockscout.
+            if addr in verified_amm and h.get("is_contract"):
+                excluded_amm.add(addr)
+
             if h.get("is_contract"):
-                dex_pairs.add(addr)
                 contract_count += 1
+                if addr not in verified_amm:
+                    unclassified_contracts.append(addr)
                 # Check for proxy contracts (suspicious obfuscation)
                 proxy_type = addr_info.get("proxy_type")
                 if proxy_type and proxy_type not in ("eip7702",):
@@ -1528,15 +1627,32 @@ class Chainseer:
             else:
                 eoa_count += 1
 
-        # Recompute total excluding pair contracts (structural LP holders)
-        non_pair_total = sum(h["balance_parsed"] for h in holders
-                           if h.get("address", "").lower() not in dex_pairs)
+        # Retain sample totals for diagnostics, but use actual token supply as
+        # the concentration denominator whenever the pinned RPC read provides it.
+        non_pair_total = sum(
+            h["balance_parsed"] for h in holders
+            if h.get("address", "").lower() not in excluded_amm
+        )
+        supply_raw = _safe_int(total_supply_raw)
+        concentration_denominator = supply_raw if supply_raw > 0 else total_raw
+        concentration_basis = (
+            "total_supply" if supply_raw > 0 else "top_holders_sample"
+        )
         result = {
             "holders": holders,
             "blockscout_available": True,
             "total_parsed": total_raw,
             "non_pair_total": non_pair_total,
-            "pair_contracts_excluded": list(dex_pairs),
+            "total_supply_raw": supply_raw or None,
+            "concentration_denominator_raw": concentration_denominator,
+            "concentration_basis": concentration_basis,
+            "concentration_complete": supply_raw > 0,
+            "pair_contracts_excluded": sorted(excluded_amm),
+            "verified_amm_addresses": sorted(verified_amm),
+            "amm_verification_method": (
+                "DexScreener Robinhood pair + Blockscout contract"
+            ),
+            "unclassified_contract_holders": unclassified_contracts,
             "eoa_holders_count": eoa_count,
             "contract_holders_count": contract_count,
             "scam_flagged_holders": scam_flagged,
@@ -1545,21 +1661,40 @@ class Chainseer:
             "eip7702_count": eip7702_count,
         }
 
-        if total_raw > 0 and holders:
+        if concentration_denominator > 0 and holders:
             # Raw concentration (includes pair contracts)
-            result["top_1_pct"] = round(holders[0].get("balance_parsed", 0) / total_raw * 100, 2)
+            result["top_1_pct"] = round(
+                holders[0].get("balance_parsed", 0)
+                / concentration_denominator * 100,
+                2,
+            )
             top10 = sum(h.get("balance_parsed", 0) for h in holders[:10])
-            result["top_10_pct"] = round(top10 / total_raw * 100, 2)
-            whales = [h for h in holders if h.get("balance_parsed", 0) / total_raw > 0.05]
+            result["top_10_pct"] = round(
+                top10 / concentration_denominator * 100, 2
+            )
+            whales = [
+                h for h in holders
+                if h.get("balance_parsed", 0)
+                / concentration_denominator > 0.05
+            ]
             result["whale_count"] = len(whales)
 
             # Adjusted concentration (excludes pair contracts) — more accurate for scoring
             if non_pair_total > 0:
-                non_pair_holders = [h for h in holders if h.get("address", "").lower() not in dex_pairs]
+                non_pair_holders = [
+                    h for h in holders
+                    if h.get("address", "").lower() not in excluded_amm
+                ]
                 if non_pair_holders:
-                    result["adj_top_1_pct"] = round(non_pair_holders[0].get("balance_parsed", 0) / non_pair_total * 100, 2)
+                    result["adj_top_1_pct"] = round(
+                        non_pair_holders[0].get("balance_parsed", 0)
+                        / concentration_denominator * 100,
+                        2,
+                    )
                     adj_top10 = sum(h.get("balance_parsed", 0) for h in non_pair_holders[:10])
-                    result["adj_top_10_pct"] = round(adj_top10 / non_pair_total * 100, 2)
+                    result["adj_top_10_pct"] = round(
+                        adj_top10 / concentration_denominator * 100, 2
+                    )
 
         return result
 
@@ -2234,6 +2369,7 @@ class Chainseer:
         bs_holders = data.get("blockscout_holders", {})
         wash = data.get("wash_trading", {})
         bs_addr = data.get("blockscout_address", {})
+        bs_token = data.get("blockscout_token", {})
         source = data.get("source_code", {})
         trend = data.get("trend", {})
         gp_open_source = None
@@ -2427,41 +2563,128 @@ class Chainseer:
             pct = dex.get("lp_locked_percent", 0)
             scores["liquidity"] = min(100, scores["liquidity"] + 10)
 
-        # ── 4. Holder distribution (0-100, GoPlus-driven) ───────────────────
+        # ── 4. Holder distribution (0-100, age + concentration) ─────────────
         holder_count = _safe_int(gp.get("holder_count", 0))
+        holder_count_source = "GoPlus"
+        if holder_count <= 0:
+            holder_count = _safe_int(
+                bs_token.get("holders_count")
+                or deployer.get("blockscout_holders_count")
+            )
+            holder_count_source = "Blockscout"
+
+        holder_assessment = None
         if holder_count > 0:
-            scores["holder_distribution"] = min(95, 30 + min(holder_count, 5000) / 5000 * 65)
-            if holder_count > 1000:
-                flags["green"].append(f"Strong holder base: {holder_count:,} holders")
-            elif holder_count > 200:
-                flags["green"].append(f"Decent holder count: {holder_count:,}")
-            elif holder_count > 50:
-                flags["yellow"].append(f"Few holders: {holder_count:,}")
+            holder_assessment = _holder_base_score(
+                holder_count, dex.get("token_age_days")
+            )
+            holder_assessment["source"] = holder_count_source
+            scores["holder_distribution"] = holder_assessment["score"]
+            ratio = holder_assessment["cohort_ratio"]
+            cohort = holder_assessment["cohort"]
+            target = holder_assessment["target_holders"]
+            if holder_assessment["age_days"] is None:
+                flags["yellow"].append(
+                    "Token age unknown; holder adoption uses the conservative "
+                    "90+ day benchmark"
+                )
+            if ratio >= 1.0 and holder_count >= 100:
+                flags["green"].append(
+                    f"Strong holder adoption for {cohort}: "
+                    f"{holder_count:,}/{target:,} benchmark"
+                )
+            elif ratio >= 0.5 and holder_count >= 100:
+                flags["green"].append(
+                    f"Healthy holder adoption for {cohort}: "
+                    f"{holder_count:,}/{target:,} benchmark"
+                )
+            elif ratio >= 0.2:
+                flags["yellow"].append(
+                    f"Below-cohort holder adoption: "
+                    f"{holder_count:,}/{target:,} benchmark ({cohort})"
+                )
             else:
-                flags["red"].append(f"Very few holders: {holder_count:,} (concentrated)")
+                flags["red"].append(
+                    f"Weak holder adoption for {cohort}: "
+                    f"{holder_count:,}/{target:,} benchmark"
+                )
+        else:
+            scores["holder_distribution"] = 50
+            uncertain["holder_distribution"] = (
+                "Holder count unavailable from GoPlus and Blockscout"
+            )
 
-            # Top holders from GoPlus
-            holders_list = gp.get("holders", [])
-            if holders_list:
-                top1 = _safe_float(holders_list[0].get("percent")) * 100
-                if top1 > 50:
-                    flags["red"].append(f"Top holder has {top1:.1f}% of supply")
-                    scores["holder_distribution"] = max(0, scores["holder_distribution"] - 30)
-                elif top1 > 20:
-                    flags["yellow"].append(f"Top holder has {top1:.1f}% of supply")
-                    scores["holder_distribution"] = max(0, scores["holder_distribution"] - 15)
-
-        # Blockscout-adjusted holder concentration (excludes pair/AMM contracts)
-        if bs_holders.get("blockscout_available") and bs_holders.get("adj_top_1_pct") is not None:
+        # Prefer total-supply concentration with only verified AMMs excluded.
+        has_complete_blockscout_concentration = (
+            bs_holders.get("blockscout_available")
+            and bs_holders.get("adj_top_1_pct") is not None
+            and bs_holders.get("concentration_complete", True)
+        )
+        if has_complete_blockscout_concentration:
             adj_top1 = bs_holders["adj_top_1_pct"]
+            if holder_assessment is not None:
+                holder_assessment["largest_non_amm_holder_pct"] = adj_top1
+                holder_assessment["concentration_source"] = (
+                    "Blockscout holders / pinned total supply"
+                )
             if adj_top1 > 50:
-                flags["red"].append(f"Top real holder has {adj_top1:.1f}% (excl. pair contracts)")
+                flags["red"].append(
+                    f"Top non-AMM holder has {adj_top1:.1f}% of supply"
+                )
                 scores["holder_distribution"] = max(0, scores.get("holder_distribution", 50) - 30)
             elif adj_top1 > 20:
-                flags["yellow"].append(f"Top real holder has {adj_top1:.1f}% (excl. pair contracts)")
+                flags["yellow"].append(
+                    f"Top non-AMM holder has {adj_top1:.1f}% of supply"
+                )
                 scores["holder_distribution"] = max(0, scores.get("holder_distribution", 50) - 15)
+            elif adj_top1 <= 10:
+                flags["green"].append(
+                    f"Low non-AMM concentration: largest holder "
+                    f"{adj_top1:.1f}% of supply"
+                )
         else:
-            scores["holder_distribution"] = 50  # GoPlus had no data
+            # GoPlus is a fallback only when supply-based Blockscout
+            # concentration is unavailable. Ignore any independently verified
+            # AMM address rather than treating the pool as a whale.
+            verified_amms = {
+                str(address).lower()
+                for address in bs_holders.get("verified_amm_addresses", [])
+            }
+            holders_list = [
+                holder for holder in gp.get("holders", [])
+                if str(
+                    holder.get("address")
+                    or holder.get("holder_address")
+                    or ""
+                ).lower() not in verified_amms
+            ]
+            if holders_list:
+                top1 = _safe_float(holders_list[0].get("percent")) * 100
+                if holder_assessment is not None:
+                    holder_assessment["largest_non_amm_holder_pct"] = top1
+                    holder_assessment["concentration_source"] = "GoPlus fallback"
+                if top1 > 50:
+                    flags["red"].append(
+                        f"Top holder has {top1:.1f}% of supply"
+                    )
+                    scores["holder_distribution"] = max(
+                        0, scores["holder_distribution"] - 30
+                    )
+                elif top1 > 20:
+                    flags["yellow"].append(
+                        f"Top holder has {top1:.1f}% of supply"
+                    )
+                    scores["holder_distribution"] = max(
+                        0, scores["holder_distribution"] - 15
+                    )
+            if (
+                bs_holders.get("blockscout_available")
+                and not bs_holders.get("concentration_complete", False)
+            ):
+                uncertain["holder_concentration"] = (
+                    "Total supply denominator unavailable; top-holder sample "
+                    "was not treated as a complete concentration measure"
+                )
 
         # ── 5. Volume & activity (0-100) ─────────────────────────────────
         vol_24h = dex.get("total_volume_24h", 0)
@@ -2778,7 +3001,7 @@ class Chainseer:
             severity = "Critical" if top_holder_pct >= 80 else "High"
             hard_stop(
                 "EXTREME_CONCENTRATION", severity,
-                f"Top real holder controls {top_holder_pct:.1f}% of observed non-pair holdings",
+                f"Top non-AMM holder controls {top_holder_pct:.1f}% of token supply",
                 "AVOID" if severity == "Critical" else "HIGH-RISK SPECULATION",
             )
 
@@ -2836,6 +3059,7 @@ class Chainseer:
             "hard_stop_overrides": hard_stops,
             "component_scores": scores,
             "weights": weights,
+            "holder_assessment": holder_assessment,
             "green_flags": flags["green"],
             "red_flags": flags["red"],
             "yellow_flags": flags["yellow"],
@@ -3335,6 +3559,23 @@ class Chainseer:
             print(f"   Mint:        {'Yes' if contract.get('has_mint_function') else 'No'}")
         print()
 
+        holder_assessment = analysis.get("holder_assessment") or {}
+        if holder_assessment:
+            print(" Holder Adoption Calibration:")
+            print(
+                f"   Observed: {holder_assessment.get('holder_count', 0):,} "
+                f"via {holder_assessment.get('source', 'unknown')}"
+            )
+            print(
+                f"   Age cohort: {holder_assessment.get('cohort', 'unknown')} "
+                f"(benchmark {holder_assessment.get('target_holders', 0):,})"
+            )
+            print(
+                f"   Adoption ratio: "
+                f"{holder_assessment.get('cohort_ratio', 0) * 100:.1f}%"
+            )
+            print()
+
         # On-chain reserves (if available)
         reserves = dex.get("on_chain_reserves")
         if reserves:
@@ -3364,13 +3605,26 @@ class Chainseer:
         if bs_holders.get("blockscout_available"):
             holders = bs_holders.get("holders", [])
             excluded = bs_holders.get("pair_contracts_excluded", [])
-            print(f" Top Holders (Blockscout, {len(holders)} loaded, {len(excluded)} pair contracts excluded):")
+            print(
+                f" Top Holders (Blockscout, {len(holders)} loaded, "
+                f"{len(excluded)} verified AMM addresses excluded):"
+            )
             if bs_holders.get("adj_top_1_pct") is not None:
-                print(f"   Top 1 real holder: {bs_holders['adj_top_1_pct']}% (adjusted excl. pairs)")
-                print(f"   Top 10 real holders: {bs_holders.get('adj_top_10_pct', '?')}% (adjusted)")
+                print(
+                    f"   Top 1 non-AMM holder: "
+                    f"{bs_holders['adj_top_1_pct']}% of supply"
+                )
+                print(
+                    f"   Top 10 non-AMM holders: "
+                    f"{bs_holders.get('adj_top_10_pct', '?')}% of supply"
+                )
             else:
                 print(f"   Top 1 concentration: {bs_holders.get('top_1_pct', '?')}%")
                 print(f"   Top 10 concentration: {bs_holders.get('top_10_pct', '?')}%")
+            print(
+                f"   Concentration basis: "
+                f"{bs_holders.get('concentration_basis', 'legacy')}"
+            )
             print(f"   Whale count (>5%): {bs_holders.get('whale_count', 0)}")
             # Holder enrichment summary
             eoa_ct = bs_holders.get("eoa_holders_count", 0)
@@ -3391,8 +3645,12 @@ class Chainseer:
                 bal = h.get("balance_parsed", 0)
                 is_contract = " [contract]" if h.get("is_contract") else ""
                 name = f" ({h.get('name')})" if h.get("name") else ""
-                if bs_holders.get("total_parsed", 0) > 0:
-                    pct = bal / bs_holders["total_parsed"] * 100
+                denominator = bs_holders.get(
+                    "concentration_denominator_raw",
+                    bs_holders.get("total_parsed", 0),
+                )
+                if denominator > 0:
+                    pct = bal / denominator * 100
                     print(f"   {i+1:>2}. {addr}...{is_contract}{name} -- {pct:.2f}%")
         print()
 
