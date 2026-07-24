@@ -317,6 +317,102 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertEqual(result["total_liquidity_usd"], 10_000)
         self.assertEqual(result["discarded_foreign_pair_count"], 1)
 
+    def test_holder_analysis_excludes_only_verified_amm_and_uses_supply(self):
+        pool = "0x" + "a" * 40
+        eoa = "0x" + "b" * 40
+        eip7702 = "0x" + "c" * 40
+        holders = [
+            {
+                "address": pool,
+                "is_contract": True,
+                "balance_raw": "330",
+                "address_info": {},
+            },
+            {
+                "address": eoa,
+                "is_contract": False,
+                "balance_raw": "40",
+                "address_info": {},
+            },
+            {
+                "address": eip7702,
+                "is_contract": True,
+                "balance_raw": "20",
+                "address_info": {"proxy_type": "eip7702"},
+            },
+        ]
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.ledger = None
+
+        with patch(
+            "chainseer._fetch_blockscout_holders",
+            return_value=holders,
+        ):
+            result = agent._analyze_holders_blockscout(
+                "0x" + "d" * 40,
+                # The EOA is deliberately included in the market candidate
+                # list; dual-source classification must keep it counted.
+                verified_amm_addresses=[pool, eoa],
+                total_supply_raw=1000,
+            )
+
+        self.assertEqual(result["pair_contracts_excluded"], [pool])
+        self.assertIn(eip7702, result["unclassified_contract_holders"])
+        self.assertEqual(result["eip7702_count"], 1)
+        self.assertEqual(result["concentration_basis"], "total_supply")
+        self.assertTrue(result["concentration_complete"])
+        self.assertEqual(result["top_1_pct"], 33.0)
+        self.assertEqual(result["adj_top_1_pct"], 4.0)
+
+    def test_unverified_contract_holder_is_not_excluded(self):
+        contract_holder = "0x" + "a" * 40
+        holders = [
+            {
+                "address": contract_holder,
+                "is_contract": True,
+                "balance_raw": "600",
+                "address_info": {},
+            },
+            {
+                "address": "0x" + "b" * 40,
+                "is_contract": False,
+                "balance_raw": "100",
+                "address_info": {},
+            },
+        ]
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.ledger = None
+
+        with patch(
+            "chainseer._fetch_blockscout_holders",
+            return_value=holders,
+        ):
+            result = agent._analyze_holders_blockscout(
+                "0x" + "d" * 40,
+                verified_amm_addresses=[],
+                total_supply_raw=1000,
+            )
+
+        self.assertEqual(result["pair_contracts_excluded"], [])
+        self.assertIn(
+            contract_holder, result["unclassified_contract_holders"]
+        )
+        self.assertEqual(result["adj_top_1_pct"], 60.0)
+
+    def test_holder_base_score_is_age_aware_and_sybil_capped(self):
+        young = chainseer._holder_base_score(669, 9)
+        mature = chainseer._holder_base_score(669, 100)
+        unknown = chainseer._holder_base_score(669, None)
+        tiny = chainseer._holder_base_score(9, 0.1)
+
+        self.assertEqual(young["cohort"], "7-14 days")
+        self.assertEqual(young["target_holders"], 750)
+        self.assertGreater(young["score"], 75)
+        self.assertGreater(young["score"], mature["score"])
+        self.assertEqual(unknown["target_holders"], 5000)
+        self.assertEqual(unknown["score"], mature["score"])
+        self.assertLessEqual(tiny["score"], 25)
+
     def test_position_based_pools_are_custody_unverified_not_unlocked(self):
         agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
         agent.rpc = FailOnLPTokenRPC()
@@ -447,7 +543,7 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertIn("ACTION: AVOID", summary)
         self.assertIn("Model score:", summary)
         self.assertIn("Risk override:", summary)
-        self.assertIn("Top real holder controls 82.5%", summary)
+        self.assertIn("Top non-AMM holder controls 82.5%", summary)
         self.assertIn("LIQUIDITY CUSTODY", summary)
         self.assertIn("CREATOR WITHDRAWABLE", summary)
         self.assertLess(summary.index("ACTION: AVOID"), summary.index("MARKET"))
