@@ -1,5 +1,5 @@
 """
-Chainseer v7.0 -- On-Chain Intelligence Agent for Robinhood Chain
+Chainseer -- On-Chain Intelligence Agent for Robinhood Chain
 
 Integrates with:
   - Cypher Tempe Timechain for persistent, verifiable memory & trend analysis
@@ -9,11 +9,11 @@ Integrates with:
   - Direct RPC for DEX pair reserves, self-contained tax estimation,
     timelock verification, and 3-window wash trading detection
 
-v7.0 provenance tracking (modeled on Mizukara's Fact/Provenance architecture):
+Provenance tracking (modeled on Mizukara's Fact/Provenance architecture):
   - Every data fetch (RPC + HTTP) is recorded in a ProvenanceLedger
   - Each fact cites its exact query spec + SHA-256 hash of the response
   - Scans are pinned to a single block number for reproducibility
-  - The full report is independently verifiable end-to-end
+  - Reports are tamper-evident and internally consistent with retained evidence
 
 v6.0 features:
   - 12-factor weighted scoring model (security, honeypot_safety, liquidity,
@@ -66,6 +66,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 
 import requests
 
+CHAINSEER_VERSION = "7.0"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 ZERO_ADDRESS = "0x" + "0" * 40
 
@@ -567,8 +568,9 @@ class ProvenanceLedger:
       (2) the SHA-256 hash of the raw response
       (3) the block number the scan was pinned to
 
-    This makes every scan independently verifiable: two scans at the same
-    block produce byte-for-byte identical provenance records.
+    This makes retained scan evidence tamper-evident and internally
+    consistent. RPC reads are block-pinned where supported; ``verify()`` does
+    not re-execute external RPC or HTTP queries.
     """
 
     def __init__(self, evidence_dir: str | Path = None):
@@ -993,10 +995,6 @@ def _http_get_json(url: str, *, params: dict = None, timeout: int = 15,
     fetched_at = _HTTP_CACHE.set(key, data)
     fact_id = ledger.record("http", query, data, fetched_at=fetched_at) if ledger else None
     return data, fact_id, False
-    try:
-        return int(val)
-    except (ValueError, TypeError):
-        return default
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1237,7 +1235,10 @@ class Chainseer:
             raise RuntimeError(f"Timechain integrity verification failed: {verify_report}")
         self.cognitive_loop.verify_registry()
 
-        print(f" Chainseer v7.0 -- Robinhood Chain On-Chain Intelligence")
+        print(
+            f" Chainseer v{CHAINSEER_VERSION} -- "
+            "Robinhood Chain On-Chain Intelligence"
+        )
         print(f" Chain ID: {self.chain_id} | RPC: {self.rpc_url}")
         print(f" Timechain root: {self.chain_root}")
         print(f" Latest block: {self.rpc.get_block_number():,}")
@@ -3465,7 +3466,7 @@ class Chainseer:
         bs_holders = data.get("blockscout_holders", {})
 
         print("=" * 72)
-        print(" CHAINSEER ANALYSIS REPORT v7.0")
+        print(f" CHAINSEER ANALYSIS REPORT v{CHAINSEER_VERSION}")
         print("=" * 72)
 
         # Token identity
@@ -3816,7 +3817,10 @@ def main():
     ensure_utf8_runtime()
 
     if len(sys.argv) < 2:
-        print("Chainseer v7.1 — Robinhood Chain On-Chain Intelligence")
+        print(
+            f"Chainseer v{CHAINSEER_VERSION} — "
+            "Robinhood Chain On-Chain Intelligence"
+        )
         print()
         print("Usage: py chainseer.py <token_address> [--full] [rpc_url]")
         print()

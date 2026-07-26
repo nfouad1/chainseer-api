@@ -1,4 +1,5 @@
 import json
+import inspect
 import sys
 import tempfile
 import types
@@ -80,6 +81,25 @@ class FakeV2LiquidityRPC:
 
 
 class ChainseerInfrastructureTests(unittest.TestCase):
+    def test_version_dead_code_and_verification_scope_are_honest(self):
+        source = Path(chainseer.__file__).read_text(encoding="utf-8")
+        http_source = inspect.getsource(chainseer._http_get_json)
+        provenance_doc = " ".join(
+            inspect.getdoc(chainseer.ProvenanceLedger).split()
+        )
+
+        self.assertEqual(chainseer.CHAINSEER_VERSION, "7.0")
+        self.assertNotIn("v7.1", source)
+        self.assertEqual(source.count('"7.0"'), 1)
+        self.assertNotIn("return int(val)", http_source)
+        self.assertNotIn("independently verifiable end-to-end", source)
+        self.assertNotIn("byte-for-byte identical provenance", source)
+        self.assertIn("tamper-evident and internally consistent", source)
+        self.assertIn(
+            "does not re-execute external RPC or HTTP queries",
+            provenance_doc,
+        )
+
     @staticmethod
     def investor_fixture():
         return {
