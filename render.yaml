@@ -38,6 +38,12 @@ services:
         value: "3600"
       - key: CHAINSEER_SHUTDOWN_GRACE_SECONDS
         value: "20"
+      - key: CHAINSEER_WATCHER_ENABLED
+        value: "1"
+      - key: CHAINSEER_WATCHER_INTERVAL_SECONDS
+        value: "15"
+      - key: CHAINSEER_WATCHER_CONFIRMATIONS
+        value: "2"
       - key: CT_AUTOGROW
         value: "1"
       - key: CT_PROMOTE_AT

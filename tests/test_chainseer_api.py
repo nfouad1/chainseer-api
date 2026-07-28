@@ -64,6 +64,31 @@ def sample_internal_report():
             "yellow_flags": ["Young token"],
             "green_flags": ["Verified source"],
             "uncertain_components": {"lp_lock": "Lock data unavailable"},
+            "extended_evidence": {
+                "social_attention": {
+                    "status": "observed",
+                    "trust": "low",
+                    "bounded_score": 60,
+                    "channels": [{"type": "twitter", "url": "https://example.test"}],
+                    "dexscreener_boosts": 2,
+                    "can_trigger_hard_stop": False,
+                    "caveat": "Manipulable context.",
+                },
+                "cross_chain": {
+                    "status": "provider_attested",
+                    "foreign_markets": [{"chain": "base", "pairs": 1}],
+                    "flow_records": [{"source_tx_hash": "0x" + "a" * 64}],
+                    "verified_flow_count": 1,
+                    "can_trigger_hard_stop": False,
+                    "caveat": "Provider-attested.",
+                },
+                "mev_exposure": {
+                    "status": "pre_trade_quote_required",
+                    "risk_level": "Indeterminate",
+                    "warnings": ["Quote required."],
+                    "scoring_scope": "execution_risk_only",
+                },
+            },
         },
         "data": {
             "basic_info": {"name": "Example", "symbol": "EX"},
@@ -141,6 +166,16 @@ class PublicReportTests(unittest.TestCase):
         self.assertEqual(public["liquidity_custody"]["amm_version"], "v4")
         self.assertFalse(
             public["liquidity_custody"]["withdrawal_verified"]
+        )
+        self.assertEqual(
+            public["extended_evidence"]["social_attention"]["trust"], "low"
+        )
+        self.assertEqual(
+            public["extended_evidence"]["mev_exposure"]["scoring_scope"],
+            "execution_risk_only",
+        )
+        self.assertNotIn(
+            "flow_records", public["extended_evidence"]["cross_chain"]
         )
 
 
@@ -250,6 +285,29 @@ class ServiceTests(unittest.TestCase):
                     second.acquire()
             finally:
                 first.release()
+            second.acquire()
+            second.release()
+            third = SingleProcessLease(root)
+            third.acquire()
+            third.release()
+
+    def test_authenticated_watch_state_is_managed_by_service(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            service._agent = FakeAgent()
+            service.start()
+            try:
+                subscription = service.watch_subscribe(TOKEN)
+                self.assertEqual(subscription["token_address"], TOKEN)
+                status = service.watch_status()
+                self.assertFalse(status["enabled"])
+                self.assertEqual(len(status["subscriptions"]), 1)
+                self.assertTrue(service.watch_unsubscribe(TOKEN))
+                self.assertEqual(
+                    service.watch_status()["subscriptions"], []
+                )
+            finally:
+                service.stop()
 
 
 if __name__ == "__main__":

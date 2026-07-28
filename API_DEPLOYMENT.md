@@ -7,8 +7,11 @@ Frankfurt with a persistent disk mounted at `/data`.
 
 Every completed analysis appends to one Timechain head. The API therefore runs
 one worker, holds a filesystem lease, and deliberately stays at one service
-instance. Do not enable horizontal scaling until Chainseer has a coordinated
-multi-writer Timechain design.
+instance. The confirmed-block watcher is scheduled inside that same process,
+so analyses, watch transitions, outcomes, and calibration evidence all share
+one ordered writer. Do not run the standalone watcher beside the API or enable
+horizontal scaling until Chainseer has a coordinated multi-writer Timechain
+design.
 
 ## Render setup
 
@@ -28,6 +31,16 @@ multi-writer Timechain design.
 8. Store the same API token as the secret `CHAINSEER_API_TOKEN` in Sites.
 9. Redeploy the website, then run one public scanner smoke test.
 
+The Blueprint enables the watcher at a 15-second poll interval with two block
+confirmations. Watch subscriptions are authenticated:
+
+- `GET /v1/watch`
+- `POST /v1/watch` with `{"address":"0x..."}`
+- `DELETE /v1/watch/{address}`
+
+These endpoints only manage monitoring. The production API has no private-key,
+transaction-signing, or broadcast capability.
+
 ## Timechain durability
 
 The container image pins Cypher Tempre to a specific source commit. The image
@@ -46,6 +59,7 @@ Before each release:
 5. Run a known-contract analysis and confirm its ring index and hash.
 6. Confirm the public result contains `timechain.cognition.status=complete`
    and a `timechain.cognitive_ring`.
+7. Confirm `/health/ready` reports the watcher enabled and no watcher error.
 
 ## Domain
 

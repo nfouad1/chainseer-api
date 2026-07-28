@@ -15,7 +15,7 @@ Provenance tracking (modeled on Mizukara's Fact/Provenance architecture):
   - Scans are pinned to a single block number for reproducibility
   - Reports are tamper-evident and internally consistent with retained evidence
 
-v6.0 features:
+v7.1 features:
   - 12-factor weighted scoring model (security, honeypot_safety, liquidity,
     lp_lock, holder_distribution, volume, maturity, creator_risk, wash_trading,
     deployer, sentiment, trend)
@@ -25,6 +25,10 @@ v6.0 features:
   - Holder enrichment (EOA vs contract, scam flags, proxy detection)
   - Deployer rug history via Blockscout flags + GoPlus cross-reference
   - DexScreener boosts as sentiment signal
+  - Confirmed-block state-change watcher with drift alerts
+  - Automated outcome collection and tighten-only calibration proposals
+  - Non-signing, Timechain-sealed TradePermit pre-trade boundary
+  - Separate MEV, cross-chain, and low-trust social/KOL evidence channels
 
 Every analysis is sealed as a ring with PoQ self-evaluation.
 
@@ -66,7 +70,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 
 import requests
 
-CHAINSEER_VERSION = "7.0"
+CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 ZERO_ADDRESS = "0x" + "0" * 40
 
@@ -733,6 +737,11 @@ class RobinhoodRPC:
         self.context = context
         self.ledger = context.ledger
 
+    def unbind_context(self):
+        """Leave an analysis snapshot before watcher/latest-block operations."""
+        self.context = None
+        self.ledger = None
+
     def _block_tag(self, explicit=None) -> str:
         if explicit is not None:
             return hex(explicit) if isinstance(explicit, int) else explicit
@@ -776,6 +785,10 @@ class RobinhoodRPC:
         result = self._call("eth_blockNumber")
         return int(result, 16) if result else 0
 
+    def get_block(self, block: int | str) -> dict:
+        tag = hex(block) if isinstance(block, int) else block
+        return self._call("eth_getBlockByNumber", [tag, False]) or {}
+
     def get_balance(self, address: str, block=None) -> int:
         result = self._call("eth_getBalance", [address, self._block_tag(block)])
         return int(result, 16) if result else 0
@@ -799,27 +812,33 @@ class RobinhoodRPC:
     def call(self, to_address: str, data: str, block=None) -> str:
         return self._call("eth_call", [{"to": to_address, "data": data}, self._block_tag(block)])
 
-    def erc20_name(self, token: str) -> str:
-        return _decode_string(self.call(token, ABI_NAME + "0" * 56))
+    def erc20_name(self, token: str, block=None) -> str:
+        return _decode_string(
+            self.call(token, ABI_NAME + "0" * 56, block=block)
+        )
 
-    def erc20_symbol(self, token: str) -> str:
-        return _decode_string(self.call(token, ABI_SYMBOL + "0" * 56))
+    def erc20_symbol(self, token: str, block=None) -> str:
+        return _decode_string(
+            self.call(token, ABI_SYMBOL + "0" * 56, block=block)
+        )
 
-    def erc20_decimals(self, token: str) -> int:
-        raw = self.call(token, ABI_DECIMALS + "0" * 56)
+    def erc20_decimals(self, token: str, block=None) -> int:
+        raw = self.call(token, ABI_DECIMALS + "0" * 56, block=block)
         return int(raw, 16) if raw else 18
 
-    def erc20_total_supply(self, token: str) -> int:
-        raw = self.call(token, ABI_TOTAL_SUPPLY + "0" * 56)
+    def erc20_total_supply(self, token: str, block=None) -> int:
+        raw = self.call(token, ABI_TOTAL_SUPPLY + "0" * 56, block=block)
         return int(raw, 16) if raw else 0
 
-    def erc20_owner(self, token: str) -> str:
-        return _decode_address(self.call(token, ABI_OWNER + "0" * 56))
+    def erc20_owner(self, token: str, block=None) -> str:
+        return _decode_address(
+            self.call(token, ABI_OWNER + "0" * 56, block=block)
+        )
 
-    def erc20_balance_of(self, token: str, address: str) -> int:
+    def erc20_balance_of(self, token: str, address: str, block=None) -> int:
         """Read ERC-20 balanceOf(address). Returns raw integer."""
         padded_addr = address.lower().replace("0x", "").zfill(64)
-        raw = self.call(token, ABI_BALANCE_OF + padded_addr)
+        raw = self.call(token, ABI_BALANCE_OF + padded_addr, block=block)
         return int(raw, 16) if raw else 0
 
     def pair_get_reserves(self, pair_address: str) -> dict:
@@ -1208,13 +1227,21 @@ def _fetch_serial_deployer(deployer_address: str, ledger: "ProvenanceLedger" = N
 class Chainseer:
     """On-chain intelligence agent for Robinhood Chain."""
 
-    def __init__(self, rpc_url: str = RPC_URL, chain_root: str = None):
+    def __init__(
+        self,
+        rpc_url: str = RPC_URL,
+        chain_root: str = None,
+        cross_chain_provider=None,
+        social_kol_provider=None,
+    ):
         self.rpc_url = rpc_url
         # Provenance ledger — created per-analysis in analyze_token()
         self.ledger = None
         self.rpc = RobinhoodRPC(rpc_url)
         self.chain_id = CHAIN_ID
         self.explorer = EXPLORER
+        self.cross_chain_provider = cross_chain_provider
+        self.social_kol_provider = social_kol_provider
 
         # Initialize Timechain
         skill_dir = _get_skill_dir()
@@ -1246,17 +1273,24 @@ class Chainseer:
 
     # ── MAIN ENTRY POINT ───────────────────────────────────────────────────
 
-    def analyze_token(self, token_address: str, full_report: bool = False) -> dict:
+    def analyze_token(
+        self,
+        token_address: str,
+        full_report: bool = False,
+        block_pin: int | None = None,
+    ) -> dict:
         """Full token analysis with GoPlus + DexScreener + on-chain RPC.
 
-        Every fetch is recorded in the provenance ledger so the entire
-        report can be independently verified: each claim cites its exact
-        query and the SHA-256 hash of the response.
+        Every fetch is recorded in the provenance ledger so retained evidence
+        can be checked for tamper-evident internal consistency: each claim
+        cites its exact query and response hash.
 
         Args:
             token_address: the token contract to analyze
             full_report: if True, print the detailed 12-factor report;
                          if False (default), print the investor summary
+            block_pin: optional historical/current block for all RPC reads;
+                       mutable HTTP evidence remains timestamped, not historical
         """
         token = token_address.strip()
         if not ADDRESS_RE.fullmatch(token):
@@ -1269,7 +1303,18 @@ class Chainseer:
         # ── Initialize provenance ledger + pin to current block ─────────────
         self.rpc.ledger = None
         self.rpc.context = None
-        pin_block = self.rpc.get_block_number()
+        latest_block = self.rpc.get_block_number()
+        if block_pin is None:
+            pin_block = latest_block
+        else:
+            pin_block = int(block_pin)
+            if pin_block < 0 or pin_block > latest_block:
+                return {
+                    "error": "Invalid block pin",
+                    "address": token,
+                    "requested_block": pin_block,
+                    "latest_block": latest_block,
+                }
         self.ledger = ProvenanceLedger(Path(self.chain_root) / "evidence")
         self.ledger.block_pin = pin_block
         self.scan_context = ScanContext(self.chain_id, pin_block, self.ledger)
@@ -1293,6 +1338,30 @@ class Chainseer:
         data["blockscout_address"] = _fetch_blockscout_address(token, ledger=self.ledger)
         data["blockscout_token"] = _fetch_blockscout_token(token, ledger=self.ledger)
         data["source_code"] = _fetch_blockscout_source(token, ledger=self.ledger)
+        for key, provider in (
+            ("cross_chain_flow_records", self.cross_chain_provider),
+            ("social_kol_records", self.social_kol_provider),
+        ):
+            if provider is None:
+                data[key] = []
+                continue
+            try:
+                adapter_value = provider(token, pin_block)
+                data[key] = (
+                    adapter_value if isinstance(adapter_value, list) else []
+                )
+                self.ledger.record(
+                    source="adapter",
+                    query={
+                        "adapter": key,
+                        "token_address": token,
+                        "block_pin": pin_block,
+                    },
+                    response_raw=data[key],
+                )
+            except Exception as exc:
+                data[key] = []
+                data[f"{key}_error"] = str(exc)
         claim_evidence["external_apis"] = self.ledger.fact_ids_since(checkpoint)
 
         print(" Phase 2/8: On-chain reads...")
@@ -1335,6 +1404,13 @@ class Chainseer:
 
         print(" Phase 7/8: Trend analysis (historical rings)...")
         data["trend"] = self._build_token_trend(token)
+        from chainseer_controls import build_extended_evidence
+
+        data.update(
+            build_extended_evidence(
+                data, primary_chain_id=DEXSCREENER_CHAIN_ID
+            )
+        )
 
         # ── Phase 8: Analysis + scoring ────────────────────────────────────
         print(" Running analysis...")
@@ -1347,6 +1423,7 @@ class Chainseer:
             "token_symbol": data["basic_info"].get("symbol"),
             "chain_id": self.chain_id,
             "chain": "robinhood",
+            "analysis_version": CHAINSEER_VERSION,
             "timestamp": datetime.now(timezone.utc).isoformat(),
             "explorer_url": f"{EXPLORER_TOKEN}{token}",
             "data": data,
@@ -1397,6 +1474,9 @@ class Chainseer:
 
         return {
             "bytecode_size": len(code_hex),
+            "bytecode_hash": hashlib.sha256(
+                code_hex.encode("utf-8")
+            ).hexdigest(),
             "owner": owner,
             "ownership_renounced": is_zero_owner,
             "has_mint_function": has_mint,
@@ -2938,13 +3018,22 @@ class Chainseer:
         else:
             scores["trend"] = 70  # neutral — no history
 
-        # ── 12. Sentiment (0-100, DexScreener boosts) ─────────────────────────
+        # ── 12. Sentiment (low-trust, bounded context) ─────────────────────────
+        social_attention = data.get("social_attention", {})
         boosts_active = dex.get("boosts_active", 0)
+        scores["sentiment"] = min(
+            70,
+            max(50, _safe_float(social_attention.get("bounded_score"), 50)),
+        )
         if boosts_active and boosts_active > 0:
-            scores["sentiment"] = 85
-            flags["green"].append(f"Active DexScreener boost ({boosts_active} points) — community attention")
-        else:
-            scores["sentiment"] = 60  # neutral — no boost data
+            flags["yellow"].append(
+                f"DexScreener boost observed ({boosts_active} points); "
+                "social attention is manipulable and cannot override hard stops"
+            )
+        if social_attention.get("status") == "limited":
+            uncertain["social_attention"] = (
+                "No provider-attested KOL evidence; social context remains limited"
+            )
 
         # ── OVERALL COMPOSITE ──────────────────────────────────────────────
         weights = {
@@ -3108,6 +3197,11 @@ class Chainseer:
             "confidence": confidence_label,
             "confidence_grade": confidence_grade,
             "confidence_limiters": major_unknowns,
+            "extended_evidence": {
+                "social_attention": data.get("social_attention", {}),
+                "cross_chain": data.get("cross_chain", {}),
+                "mev_exposure": data.get("mev_exposure", {}),
+            },
         }
 
     # ── PoQ SELF-EVALUATION ────────────────────────────────────────────────
@@ -3151,13 +3245,13 @@ class Chainseer:
         for key in ["goplus_security", "dexscreener", "basic_info", "contract_audit",
                     "dex_pairs", "transfer_activity", "lp_lock", "tax_estimate",
                     "deployer", "blockscout_holders", "wash_trading", "blockscout_address",
-                    "trend"]:
+                    "trend", "social_attention", "cross_chain", "mev_exposure"]:
             d = data.get(key, {})
             if d and not d.get("error") and (isinstance(d, dict) and len(d) > 0):
                 sources_filled += 1
             elif isinstance(d, list) and len(d) > 0:
                 sources_filled += 1
-        depth_ratio = sources_filled / 13
+        depth_ratio = sources_filled / 16
         scores["depth"] = int(100 + depth_ratio * 120)
 
         # Honest uncertainty and traceable evidence are the covenant-facing signals.
@@ -3209,6 +3303,7 @@ class Chainseer:
             extra_payload={
                 "token_address": report["token_address"],
                 "token_name": report.get("token_name"),
+                "analysis_version": report.get("analysis_version"),
                 "legitimacy_score": report["analysis"]["legitimacy_score"],
                 "risk_level": report["analysis"]["risk_level"],
                 "model_risk_level": report["analysis"].get("model_risk_level"),
@@ -3274,11 +3369,17 @@ class Chainseer:
         other = {k: v for k, v in outcomes.items() if k not in security_keys | market_keys}
         token = original.get("payload", {}).get("token_address")
         original_risk = original.get("payload", {}).get("risk_level")
+        original_score = original.get("payload", {}).get("legitimacy_score")
+        analysis_version = original.get("payload", {}).get(
+            "analysis_version", "pre-versioned"
+        )
         adverse_security_event = any(bool(security.get(k)) for k in (
             "rug_pull", "honeypot_observed", "exploit", "owner_privilege_used"
         )) or _safe_float(security.get("liquidity_removed_pct")) >= 50
         calibration = {
+            "analysis_version": analysis_version,
             "original_risk_level": original_risk,
+            "original_legitimacy_score": original_score,
             "adverse_security_event": adverse_security_event,
             "dangerous_false_negative": adverse_security_event and original_risk in {"Low", "Medium"},
         }

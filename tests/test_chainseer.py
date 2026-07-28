@@ -88,9 +88,9 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             inspect.getdoc(chainseer.ProvenanceLedger).split()
         )
 
-        self.assertEqual(chainseer.CHAINSEER_VERSION, "7.0")
-        self.assertNotIn("v7.1", source)
-        self.assertEqual(source.count('"7.0"'), 1)
+        self.assertEqual(chainseer.CHAINSEER_VERSION, "7.1")
+        self.assertNotIn('CHAINSEER_VERSION = "7.0"', source)
+        self.assertEqual(source.count('"7.1"'), 1)
         self.assertNotIn("return int(val)", http_source)
         self.assertNotIn("independently verifiable end-to-end", source)
         self.assertNotIn("byte-for-byte identical provenance", source)

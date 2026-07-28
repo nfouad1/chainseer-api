@@ -16,6 +16,11 @@ primitive faculty and seal an epoch hash over the persistent registry.
 
 - FastAPI HTTP boundary with bearer authentication and per-client rate limits
 - one bounded analysis queue and one worker
+- a confirmed-block watcher in the same single-writer process
+- event-triggered rescans for ownership, proxy, transfer, and LP-burn drift
+- one-time, block-bound TradePermits with mandatory executable-quote MEV checks
+- append-only security and market outcomes with tighten-only calibration proposals
+- bounded social/KOL context and provider-attested cross-chain-flow adapters
 - one process lease protecting the Timechain head
 - one Render instance in Frankfurt
 - persistent disk mounted at `/data`
@@ -45,6 +50,9 @@ Render reads [`render.yaml`](render.yaml) and builds
 [`Dockerfile.api`](Dockerfile.api). Follow
 [`API_DEPLOYMENT.md`](API_DEPLOYMENT.md) for secrets, health checks, website
 integration, backups, and domain configuration.
+
+See [`CHAINSEER_CONTROLS.md`](CHAINSEER_CONTROLS.md) for watcher, calibration,
+TradePermit, MEV, social/KOL, and cross-chain adapter operation.
 
 Never commit API tokens, environment files, local Timechain rings, learning
 databases, or analysis reports.
