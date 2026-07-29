@@ -12,6 +12,7 @@ from chainseer_api import (
     Settings,
     SingleProcessLease,
     SlidingWindowRateLimiter,
+    WatchRequest,
     _server_port,
     build_public_report,
     deterministic_benchmark_split,
@@ -203,6 +204,14 @@ class AnalyzeRequestTests(unittest.TestCase):
     def test_rejects_invalid_solana_mint(self):
         with self.assertRaises(ValidationError):
             AnalyzeRequest(network="solana", address="2" * 32)
+
+    def test_watch_request_accepts_solana_mint(self):
+        request = WatchRequest(
+            network="solana",
+            address=SOLANA_MINT,
+        )
+        self.assertEqual(request.network, "solana")
+        self.assertEqual(request.address, SOLANA_MINT)
 
     def test_network_address_types_do_not_cross(self):
         with self.assertRaises(ValidationError):
@@ -488,10 +497,25 @@ class ServiceTests(unittest.TestCase):
             try:
                 subscription = service.watch_subscribe(TOKEN)
                 self.assertEqual(subscription["token_address"], TOKEN)
+                solana_subscription = service.watch_subscribe(
+                    SOLANA_MINT,
+                    "solana",
+                )
+                self.assertEqual(
+                    solana_subscription["token_address"],
+                    SOLANA_MINT,
+                )
                 status = service.watch_status()
                 self.assertFalse(status["enabled"])
-                self.assertEqual(len(status["subscriptions"]), 1)
+                self.assertEqual(len(status["subscriptions"]), 2)
+                self.assertEqual(
+                    status["subscription_counts"],
+                    {"robinhood": 1, "solana": 1},
+                )
                 self.assertTrue(service.watch_unsubscribe(TOKEN))
+                self.assertTrue(
+                    service.watch_unsubscribe(SOLANA_MINT, "solana")
+                )
                 self.assertEqual(
                     service.watch_status()["subscriptions"], []
                 )

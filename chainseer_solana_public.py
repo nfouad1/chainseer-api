@@ -138,6 +138,23 @@ class SolanaRPC:
             [mint, {"commitment": "confirmed"}],
         )
 
+    def get_signatures_for_address(
+        self,
+        address: str,
+        *,
+        limit: int = 25,
+    ):
+        return self._call(
+            "getSignaturesForAddress",
+            [
+                address,
+                {
+                    "commitment": "confirmed",
+                    "limit": max(1, min(1_000, int(limit))),
+                },
+            ],
+        )
+
     def get_multiple_accounts(
         self,
         addresses: list[str],

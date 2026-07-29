@@ -1,7 +1,7 @@
 # Chainseer monitoring and execution controls
 
-`chainseer_controls.py` adds four deliberately separated capabilities to the
-Robinhood Chain analyzer:
+`chainseer_controls.py` adds deliberately separated monitoring and execution
+controls to the Robinhood Chain and Solana analyzers:
 
 1. confirmed-block monitoring and state-drift alerts;
 2. automated outcome collection with tighten-only calibration proposals;
@@ -19,6 +19,19 @@ method. A TradePermit is an authorization artifact, not a transaction.
 - The watcher scans ownership/upgrade, LP-burn, and token-transfer logs, then
   performs a full analysis only after a meaningful change, a holder refresh
   window, an outcome horizon, or the maximum refresh interval.
+- The Solana watcher incrementally indexes confirmed mint signatures and
+  compares compact snapshots of the token program, mint/freeze authorities,
+  extensions, supply, largest accounts, primary market, liquidity, and price.
+  Routine signatures and small account rotations remain observational; they
+  do not cause an expensive full analysis.
+- Material Solana changes trigger a full analysis after a short debounce.
+  Authority, program, supply, extension, or market-identity changes bypass the
+  debounce. A periodic confirmed-state reconciliation catches missed provider
+  events.
+- Optional holder, market, and signature-provider failures are recorded as
+  `infrastructure_indeterminate` and retain the last confirmed observation;
+  they never become a fabricated token state change. Mint-account and supply
+  failures remain fail-closed for that watcher cycle.
 - Reorgs are detected by comparing the previously processed block hash.
 - Analyses, watcher transitions, outcomes, calibration adoption, permit issue,
   and permit consumption are sealed into the Timechain.
@@ -34,6 +47,29 @@ method. A TradePermit is an authorization artifact, not a transaction.
   authorization, not the token legitimacy score.
 
 ## Watch tokens
+
+The authenticated production API accepts either network:
+
+```bash
+curl -X POST "https://api.usechainseer.com/v1/watch" \
+  -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"network":"solana","address":"YourSolanaMint"}'
+```
+
+Solana cursors and alerts are stored separately:
+
+```text
+chainseer_chain/controls/solana_watcher_state.json
+chainseer_chain/controls/solana_watcher_alerts.jsonl
+```
+
+Each material alert carries the confirmed slot, compact event evidence, the
+fresh analysis ring, a content hash, and a `solana_watch_transition` Timechain
+ring. The watcher remains observation-only: it cannot sign or broadcast a
+transaction.
+
+The standalone CLI below continues to manage Robinhood Chain subscriptions.
 
 Global options must precede the command:
 

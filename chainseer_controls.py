@@ -26,6 +26,7 @@ from typing import Any, Callable
 CONTROL_SCHEMA_VERSION = "1.0"
 PERMIT_VERSION = "1.0"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 TX_HASH_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
 ZERO_ADDRESS = "0x" + "0" * 40
 DEAD_ADDRESS = "0x" + "0" * 36 + "dead"
@@ -42,6 +43,8 @@ UPGRADED_TOPIC = (
 ADMIN_CHANGED_TOPIC = (
     "0x7e644d79422f17c01e4894b5f4f588d331ebfa28653d42ae832dc59e38c9798f"
 )
+BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
+BASE58_INDEX = {char: index for index, char in enumerate(BASE58_ALPHABET)}
 
 
 def utc_now_iso(now: float | None = None) -> str:
@@ -100,6 +103,26 @@ def _atomic_write_json(path: Path, value: Any) -> None:
 
 def _topic_address(address: str) -> str:
     return "0x" + address.lower().replace("0x", "").zfill(64)
+
+
+def _is_solana_pubkey(value: str) -> bool:
+    """Validate canonical 32-byte base58 keys without importing an adapter."""
+    text = str(value or "").strip()
+    if not SOLANA_ADDRESS_RE.fullmatch(text):
+        return False
+    number = 0
+    try:
+        for char in text:
+            number = number * 58 + BASE58_INDEX[char]
+    except KeyError:
+        return False
+    raw = (
+        number.to_bytes((number.bit_length() + 7) // 8, "big")
+        if number
+        else b""
+    )
+    leading_zeroes = len(text) - len(text.lstrip("1"))
+    return len(b"\x00" * leading_zeroes + raw) == 32
 
 
 def normalize_cross_chain_records(records: Any) -> list[dict[str, Any]]:
@@ -400,6 +423,43 @@ class WatchConfig:
             raise ValueError("outcome baseline interval must be at least one hour")
 
 
+@dataclass(frozen=True)
+class SolanaWatchConfig:
+    """Noise-aware trigger thresholds for confirmed Solana observations."""
+
+    poll_seconds: float = 3.0
+    signature_limit: int = 25
+    minimum_rescan_slots: int = 8
+    max_reconcile_slots: int = 900
+    liquidity_delta_bps: int = 1_500
+    price_delta_bps: int = 2_500
+    holder_delta_bps: int = 500
+    recent_signature_capacity: int = 100
+
+    def __post_init__(self) -> None:
+        if self.poll_seconds <= 0:
+            raise ValueError("poll_seconds must be positive")
+        if not 1 <= self.signature_limit <= 1_000:
+            raise ValueError("signature_limit must be between 1 and 1000")
+        if self.minimum_rescan_slots < 1 or self.max_reconcile_slots < 1:
+            raise ValueError("Solana rescan slot intervals must be positive")
+        if self.minimum_rescan_slots > self.max_reconcile_slots:
+            raise ValueError(
+                "minimum_rescan_slots cannot exceed max_reconcile_slots"
+            )
+        for value in (
+            self.liquidity_delta_bps,
+            self.price_delta_bps,
+            self.holder_delta_bps,
+        ):
+            if value < 1:
+                raise ValueError("Solana event thresholds must be positive")
+        if self.recent_signature_capacity < self.signature_limit:
+            raise ValueError(
+                "recent_signature_capacity must cover signature_limit"
+            )
+
+
 class SingleWriterLease:
     """Coordinate with chainseer_api.py's one-writer Timechain lease."""
 
@@ -525,6 +585,45 @@ class WatchStore:
         return removed
 
 
+class SolanaWatchStore(WatchStore):
+    """Separate atomic cursors and append-only alerts for Solana mints."""
+
+    def __init__(self, root: str | Path):
+        super().__init__(root)
+        self.state_path = self.root / "solana_watcher_state.json"
+        self.alert_path = self.root / "solana_watcher_alerts.jsonl"
+
+    def subscribe(self, mint: str) -> dict[str, Any]:
+        if not _is_solana_pubkey(mint):
+            raise ValueError("invalid Solana mint address")
+        state = self.load()
+        state["subscriptions"].setdefault(
+            mint,
+            {
+                "network": "solana",
+                "token_address": mint,
+                "created_at": utc_now_iso(),
+                "last_observed_slot": None,
+                "last_full_scan_slot": None,
+                "last_signature": None,
+                "recent_signatures": [],
+                "quick_fingerprint": None,
+                "quick_snapshot": None,
+                "latest_analysis": None,
+                "analyses": [],
+            },
+        )
+        self.save(state)
+        return state["subscriptions"][mint]
+
+    def unsubscribe(self, mint: str) -> bool:
+        state = self.load()
+        removed = state["subscriptions"].pop(mint, None) is not None
+        if removed:
+            self.save(state)
+        return removed
+
+
 def _analysis_view(report: dict[str, Any]) -> dict[str, Any]:
     data = report.get("data") or {}
     analysis = report.get("analysis") or {}
@@ -580,6 +679,104 @@ def _diff_views(before: dict[str, Any] | None, after: dict[str, Any]) -> dict[st
         if before.get(key) != after.get(key)
     }
     return {"initial": False, "changes": changes}
+
+
+def _solana_analysis_view(report: dict[str, Any]) -> dict[str, Any]:
+    data = report.get("data") or {}
+    analysis = report.get("analysis") or {}
+    basic = data.get("basic_info") or {}
+    dex = data.get("dex_pairs") or {}
+    concentration = data.get("holder_concentration") or {}
+    execution = data.get("execution_evidence") or {}
+    return {
+        "analysis_ring": report.get("analysis_ring"),
+        "analysis_ring_hash": report.get("analysis_ring_hash"),
+        "slot_anchor": (report.get("provenance") or {}).get("block_pin"),
+        "timestamp": report.get("timestamp"),
+        "risk_level": analysis.get("risk_level"),
+        "score": analysis.get("legitimacy_score"),
+        "hard_stop_codes": sorted(
+            str(item.get("code"))
+            for item in analysis.get("hard_stop_overrides") or []
+            if isinstance(item, dict) and item.get("code")
+        ),
+        "mint_authority": basic.get("mint_authority"),
+        "freeze_authority": basic.get("freeze_authority"),
+        "owner_program": basic.get("owner_program"),
+        "supply_raw": basic.get("supply_raw"),
+        "extensions": sorted(str(value) for value in basic.get("extensions") or []),
+        "holder_count": basic.get("jupiter_holder_count"),
+        "top1_total_supply_pct": concentration.get(
+            "top1_total_supply_pct"
+        ),
+        "top10_total_supply_pct": concentration.get(
+            "top10_total_supply_pct"
+        ),
+        "pair_address": dex.get("primary_pair"),
+        "dex_id": dex.get("primary_amm_version"),
+        "price_usd": dex.get("primary_price_usd"),
+        "liquidity_usd": dex.get("total_liquidity_usd"),
+        "market_cap": dex.get("market_cap"),
+        "roundtrip_retention_pct": execution.get(
+            "roundtrip_retention_pct"
+        ),
+    }
+
+
+def _solana_diff_views(
+    before: dict[str, Any] | None,
+    after: dict[str, Any],
+) -> dict[str, Any]:
+    if not before:
+        return {"initial": True, "changes": {}}
+    keys = (
+        "risk_level",
+        "score",
+        "hard_stop_codes",
+        "mint_authority",
+        "freeze_authority",
+        "owner_program",
+        "supply_raw",
+        "extensions",
+        "holder_count",
+        "top1_total_supply_pct",
+        "top10_total_supply_pct",
+        "pair_address",
+        "dex_id",
+        "price_usd",
+        "liquidity_usd",
+        "market_cap",
+        "roundtrip_retention_pct",
+    )
+    return {
+        "initial": False,
+        "changes": {
+            key: {"before": before.get(key), "after": after.get(key)}
+            for key in keys
+            if before.get(key) != after.get(key)
+        },
+    }
+
+
+def _relative_delta_bps(before: Any, after: Any) -> float | None:
+    left = _safe_float(before, -1.0)
+    right = _safe_float(after, -1.0)
+    if left <= 0 or right < 0:
+        return None
+    return abs(right - left) / left * 10_000
+
+
+def credential_safe_error(error: Any, *, limit: int = 320) -> str:
+    """Return a bounded diagnostic that is safe to persist or expose."""
+    text = str(error)
+    text = re.sub(r"https?://[^\s)\]\"']+", "<redacted-url>", text)
+    text = re.sub(
+        r"(?i)\b(api[-_]?key|access[-_]?token|token|secret|authorization)"
+        r"\s*[=:]\s*[^\s,;]+",
+        r"\1=<redacted>",
+        text,
+    )
+    return text[:limit]
 
 
 class OutcomeCollector:
@@ -1549,6 +1746,638 @@ class ChainseerWatcher:
         while True:
             summary = self.run_once()
             print(canonical_json(summary), flush=True)
+            time.sleep(self.config.poll_seconds)
+
+
+class SolanaEventWatcher:
+    """Confirmed Solana event index with material-delta rescans and reconciliation."""
+
+    CRITICAL_EVENT_TYPES = {
+        "owner_program_changed",
+        "mint_authority_changed",
+        "freeze_authority_changed",
+        "token_extensions_changed",
+        "supply_changed",
+        "market_disappeared",
+        "primary_market_changed",
+    }
+
+    def __init__(
+        self,
+        analyzer: Any,
+        *,
+        timechain_agent: Any | None = None,
+        control_root: str | Path,
+        config: SolanaWatchConfig | None = None,
+        clock: Callable[[], float] = time.time,
+    ):
+        self.analyzer = analyzer
+        self.timechain_agent = (
+            timechain_agent
+            if timechain_agent is not None
+            else getattr(analyzer, "timechain_agent", None)
+        )
+        self.config = config or SolanaWatchConfig()
+        self.clock = clock
+        self.store = SolanaWatchStore(Path(control_root) / "controls")
+
+    @staticmethod
+    def _event(
+        event_type: str,
+        *,
+        severity: str,
+        before: Any,
+        after: Any,
+        triggers_rescan: bool,
+        evidence: dict[str, Any] | None = None,
+    ) -> dict[str, Any]:
+        value = {
+            "event_type": event_type,
+            "severity": severity,
+            "before": before,
+            "after": after,
+            "triggers_rescan": triggers_rescan,
+            "evidence": evidence or {},
+        }
+        value["event_hash"] = canonical_hash(value)
+        return value
+
+    def _quick_snapshot(
+        self,
+        mint: str,
+        *,
+        observed_slot: int,
+        seen_signatures: set[str],
+        previous: dict[str, Any] | None = None,
+    ) -> tuple[
+        dict[str, Any],
+        list[dict[str, Any]],
+        list[str],
+        list[dict[str, str]],
+    ]:
+        infrastructure_indeterminate: list[dict[str, str]] = []
+        account_result = (
+            self.analyzer.rpc.get_account_info(mint, encoding="jsonParsed")
+            or {}
+        )
+        account_value = account_result.get("value")
+        if not account_value:
+            raise RuntimeError("confirmed Solana mint account is unavailable")
+        parsed = ((account_value.get("data") or {}).get("parsed") or {})
+        info = parsed.get("info") or {}
+        if parsed.get("type") != "mint":
+            raise RuntimeError("watched Solana address is no longer a mint")
+
+        supply_result = self.analyzer.rpc.get_token_supply(mint) or {}
+        supply_value = supply_result.get("value") or {}
+        supply_raw = _safe_int(
+            supply_value.get("amount"),
+            _safe_int(info.get("supply")),
+        )
+        previous = previous or {}
+        try:
+            largest_result = (
+                self.analyzer.rpc.get_token_largest_accounts(mint) or {}
+            )
+            largest = largest_result.get("value") or []
+            normalized_accounts = [
+                {
+                    "address": str(item.get("address") or ""),
+                    "amount": _safe_int(item.get("amount")),
+                }
+                for item in largest[:20]
+                if isinstance(item, dict)
+            ]
+            top1_raw = sum(
+                item["amount"] for item in normalized_accounts[:1]
+            )
+            top10_raw = sum(
+                item["amount"] for item in normalized_accounts[:10]
+            )
+            top1_pct = (
+                round(100 * top1_raw / supply_raw, 6)
+                if supply_raw > 0
+                else None
+            )
+            top10_pct = (
+                round(100 * top10_raw / supply_raw, 6)
+                if supply_raw > 0
+                else None
+            )
+            largest_accounts_hash = canonical_hash(normalized_accounts)
+            holder_slot = _safe_int(
+                (largest_result.get("context") or {}).get("slot"),
+                observed_slot,
+            )
+        except Exception as exc:
+            message = credential_safe_error(exc)
+            infrastructure_indeterminate.append(
+                {
+                    "source": "solana_rpc.getTokenLargestAccounts",
+                    "message": message,
+                }
+            )
+            top1_pct = previous.get("top1_total_supply_pct")
+            top10_pct = previous.get("top10_total_supply_pct")
+            largest_accounts_hash = previous.get(
+                "largest_accounts_hash"
+            )
+            holder_slot = previous.get("holder_slot")
+
+        try:
+            pairs = self.analyzer.dexscreener.token_pairs(mint)
+            pair = self.analyzer._market_pair(mint, pairs)
+            base = (pair or {}).get("baseToken") or {}
+            market = {
+                "pair_address": (pair or {}).get("pairAddress"),
+                "dex_id": (pair or {}).get("dexId"),
+                "price_usd": (
+                    _safe_float((pair or {}).get("priceUsd"), None)
+                    if base.get("address") == mint
+                    else None
+                ),
+                "liquidity_usd": _safe_float(
+                    ((pair or {}).get("liquidity") or {}).get("usd"),
+                    None,
+                ),
+                "market_cap": _safe_float(
+                    (pair or {}).get("marketCap"),
+                    None,
+                ),
+                "fdv": _safe_float((pair or {}).get("fdv"), None),
+            }
+        except Exception as exc:
+            message = credential_safe_error(exc)
+            infrastructure_indeterminate.append(
+                {
+                    "source": "dexscreener.token_pairs",
+                    "message": message,
+                }
+            )
+            market = dict(previous.get("market") or {})
+        extensions = sorted(
+            str(value)
+            for value in self.analyzer._extension_names(info)
+        )
+        snapshot = {
+            "observed_slot": observed_slot,
+            "account_slot": _safe_int(
+                (account_result.get("context") or {}).get("slot"),
+                observed_slot,
+            ),
+            "supply_slot": _safe_int(
+                (supply_result.get("context") or {}).get("slot"),
+                observed_slot,
+            ),
+            "holder_slot": holder_slot,
+            "owner_program": account_value.get("owner"),
+            "mint_authority": info.get("mintAuthority"),
+            "freeze_authority": info.get("freezeAuthority"),
+            "extensions": extensions,
+            "decimals": _safe_int(
+                supply_value.get("decimals"),
+                _safe_int(info.get("decimals")),
+            ),
+            "supply_raw": supply_raw,
+            "top1_total_supply_pct": top1_pct,
+            "top10_total_supply_pct": top10_pct,
+            "largest_accounts_hash": largest_accounts_hash,
+            "market": market,
+        }
+        fingerprint_payload = {
+            key: value
+            for key, value in snapshot.items()
+            if key
+            not in {
+                "observed_slot",
+                "account_slot",
+                "supply_slot",
+                "holder_slot",
+            }
+        }
+        snapshot["fingerprint"] = canonical_hash(fingerprint_payload)
+
+        try:
+            signatures = self.analyzer.rpc.get_signatures_for_address(
+                mint,
+                limit=self.config.signature_limit,
+            )
+        except Exception as exc:
+            message = credential_safe_error(exc)
+            infrastructure_indeterminate.append(
+                {
+                    "source": "solana_rpc.getSignaturesForAddress",
+                    "message": message,
+                }
+            )
+            signatures = []
+        new_signatures = [
+            {
+                "signature": str(item.get("signature") or ""),
+                "slot": _safe_int(item.get("slot")),
+                "confirmation_status": item.get("confirmationStatus"),
+                "failed": item.get("err") is not None,
+                "block_time": item.get("blockTime"),
+            }
+            for item in signatures or []
+            if isinstance(item, dict)
+            and item.get("signature")
+            and str(item.get("signature")) not in seen_signatures
+        ]
+        signature_order = [
+            str(item.get("signature"))
+            for item in signatures or []
+            if isinstance(item, dict) and item.get("signature")
+        ]
+        snapshot["infrastructure_indeterminate"] = (
+            infrastructure_indeterminate
+        )
+        return (
+            snapshot,
+            new_signatures,
+            signature_order,
+            infrastructure_indeterminate,
+        )
+
+    def _classify_events(
+        self,
+        before: dict[str, Any] | None,
+        after: dict[str, Any],
+        new_signatures: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        if not before:
+            return []
+        events: list[dict[str, Any]] = []
+
+        def changed(
+            field: str,
+            event_type: str,
+            severity: str = "high",
+        ) -> None:
+            if before.get(field) != after.get(field):
+                events.append(
+                    self._event(
+                        event_type,
+                        severity=severity,
+                        before=before.get(field),
+                        after=after.get(field),
+                        triggers_rescan=True,
+                    )
+                )
+
+        changed("owner_program", "owner_program_changed", "critical")
+        changed("mint_authority", "mint_authority_changed", "critical")
+        changed("freeze_authority", "freeze_authority_changed", "critical")
+        changed("extensions", "token_extensions_changed", "critical")
+        changed("supply_raw", "supply_changed", "high")
+
+        old_market = before.get("market") or {}
+        new_market = after.get("market") or {}
+        old_pair = old_market.get("pair_address")
+        new_pair = new_market.get("pair_address")
+        if old_pair != new_pair:
+            if old_pair and not new_pair:
+                event_type, severity = "market_disappeared", "critical"
+            elif not old_pair and new_pair:
+                event_type, severity = "market_created", "high"
+            else:
+                event_type, severity = "primary_market_changed", "critical"
+            events.append(
+                self._event(
+                    event_type,
+                    severity=severity,
+                    before=old_pair,
+                    after=new_pair,
+                    triggers_rescan=True,
+                    evidence={
+                        "before_dex": old_market.get("dex_id"),
+                        "after_dex": new_market.get("dex_id"),
+                    },
+                )
+            )
+
+        liquidity_delta = _relative_delta_bps(
+            old_market.get("liquidity_usd"),
+            new_market.get("liquidity_usd"),
+        )
+        if (
+            old_pair == new_pair
+            and liquidity_delta is not None
+            and liquidity_delta >= self.config.liquidity_delta_bps
+        ):
+            events.append(
+                self._event(
+                    "liquidity_changed",
+                    severity="high",
+                    before=old_market.get("liquidity_usd"),
+                    after=new_market.get("liquidity_usd"),
+                    triggers_rescan=True,
+                    evidence={"delta_bps": round(liquidity_delta, 2)},
+                )
+            )
+
+        price_delta = _relative_delta_bps(
+            old_market.get("price_usd"),
+            new_market.get("price_usd"),
+        )
+        if (
+            old_pair == new_pair
+            and price_delta is not None
+            and price_delta >= self.config.price_delta_bps
+        ):
+            events.append(
+                self._event(
+                    "price_moved",
+                    severity="medium",
+                    before=old_market.get("price_usd"),
+                    after=new_market.get("price_usd"),
+                    triggers_rescan=True,
+                    evidence={"delta_bps": round(price_delta, 2)},
+                )
+            )
+
+        holder_delta = max(
+            abs(
+                _safe_float(after.get(field))
+                - _safe_float(before.get(field))
+            )
+            * 100
+            for field in (
+                "top1_total_supply_pct",
+                "top10_total_supply_pct",
+            )
+        )
+        holder_set_changed = (
+            before.get("largest_accounts_hash")
+            != after.get("largest_accounts_hash")
+        )
+        if holder_delta >= self.config.holder_delta_bps:
+            events.append(
+                self._event(
+                    "holder_concentration_changed",
+                    severity="high",
+                    before={
+                        "top1": before.get("top1_total_supply_pct"),
+                        "top10": before.get("top10_total_supply_pct"),
+                    },
+                    after={
+                        "top1": after.get("top1_total_supply_pct"),
+                        "top10": after.get("top10_total_supply_pct"),
+                    },
+                    triggers_rescan=True,
+                    evidence={"maximum_delta_bps": round(holder_delta, 2)},
+                )
+            )
+        elif holder_set_changed:
+            events.append(
+                self._event(
+                    "largest_accounts_rotated",
+                    severity="observational",
+                    before=before.get("largest_accounts_hash"),
+                    after=after.get("largest_accounts_hash"),
+                    triggers_rescan=False,
+                )
+            )
+
+        if new_signatures:
+            events.append(
+                self._event(
+                    "confirmed_mint_activity",
+                    severity="observational",
+                    before=None,
+                    after=len(new_signatures),
+                    triggers_rescan=False,
+                    evidence={
+                        "signature_count": len(new_signatures),
+                        "signature_hash": canonical_hash(new_signatures),
+                        "failed_count": sum(
+                            bool(item.get("failed"))
+                            for item in new_signatures
+                        ),
+                    },
+                )
+            )
+        return events
+
+    def _seal_transition(
+        self,
+        alert: dict[str, Any],
+    ) -> dict[str, Any] | None:
+        agent = self.timechain_agent
+        if agent is None:
+            return None
+        verdict, ring = agent.poq_module.gate_and_seal(
+            agent.tc,
+            (
+                f"Solana watcher detected {alert['reason']} for "
+                f"{alert['token_address']} at confirmed slot "
+                f"{alert['slot']}."
+            ),
+            context=canonical_json(alert),
+            ring_type="solana_watch_transition",
+            external_scores={
+                "coherence": 245,
+                "relevance": 252,
+                "novelty": 235,
+                "consistency": 245,
+                "depth": 242,
+                "covenant": 252,
+            },
+            declared_evidence=max(1, len(alert.get("events") or [])),
+            extra_payload=alert,
+        )
+        if ring is None:
+            return None
+        return {
+            "ring": ring.get("index"),
+            "ring_hash": ring.get("ring_hash"),
+            "decision": verdict.get("decision"),
+        }
+
+    def run_once(self) -> dict[str, Any]:
+        now = self.clock()
+        state = self.store.load()
+        if not state["subscriptions"]:
+            return {
+                "head_slot": None,
+                "subscriptions": 0,
+                "events_observed": 0,
+                "material_events": 0,
+                "rescans": 0,
+                "alerts": 0,
+                "infrastructure_indeterminate": [],
+                "errors": [],
+            }
+
+        head_slot = self.analyzer.rpc.get_slot()
+        summary = {
+            "head_slot": head_slot,
+            "subscriptions": len(state["subscriptions"]),
+            "events_observed": 0,
+            "material_events": 0,
+            "rescans": 0,
+            "alerts": 0,
+            "infrastructure_indeterminate": [],
+            "errors": [],
+        }
+        for mint, subscription in state["subscriptions"].items():
+            try:
+                last_slot = subscription.get("last_observed_slot")
+                if last_slot is not None and int(last_slot) >= head_slot:
+                    continue
+                seen = set(subscription.get("recent_signatures") or [])
+                (
+                    quick,
+                    new_signatures,
+                    signature_order,
+                    infrastructure_indeterminate,
+                ) = self._quick_snapshot(
+                    mint,
+                    observed_slot=head_slot,
+                    seen_signatures=seen,
+                    previous=subscription.get("quick_snapshot"),
+                )
+                summary["infrastructure_indeterminate"].extend(
+                    {
+                        "token_address": mint,
+                        **item,
+                    }
+                    for item in infrastructure_indeterminate
+                )
+                events = self._classify_events(
+                    subscription.get("quick_snapshot"),
+                    quick,
+                    new_signatures,
+                )
+                summary["events_observed"] += len(events)
+                material = [
+                    event
+                    for event in events
+                    if event.get("triggers_rescan")
+                ]
+                summary["material_events"] += len(material)
+
+                pending_by_hash = {
+                    str(event.get("event_hash")): event
+                    for event in subscription.get("pending_events") or []
+                    if isinstance(event, dict) and event.get("event_hash")
+                }
+                for event in material:
+                    pending_by_hash[event["event_hash"]] = event
+                pending = list(pending_by_hash.values())[-50:]
+
+                latest = subscription.get("latest_analysis") or {}
+                last_full = subscription.get("last_full_scan_slot")
+                reconcile_due = (
+                    last_full is None
+                    or head_slot - int(last_full)
+                    >= self.config.max_reconcile_slots
+                )
+                critical_pending = any(
+                    event.get("event_type") in self.CRITICAL_EVENT_TYPES
+                    for event in pending
+                )
+                cooldown_clear = (
+                    last_full is None
+                    or head_slot - int(last_full)
+                    >= self.config.minimum_rescan_slots
+                )
+                should_rescan = (
+                    not latest
+                    or reconcile_due
+                    or (bool(pending) and (critical_pending or cooldown_clear))
+                )
+
+                if should_rescan:
+                    report = self.analyzer.analyze_token(mint)
+                    current = _solana_analysis_view(report)
+                    drift = _solana_diff_views(latest or None, current)
+                    summary["rescans"] += 1
+                    subscription["latest_analysis"] = current
+                    subscription["last_full_scan_slot"] = head_slot
+                    baselines = subscription.setdefault("analyses", [])
+                    baselines.append(current)
+                    subscription["analyses"] = baselines[-200:]
+
+                    new_stops = sorted(
+                        set(current.get("hard_stop_codes") or [])
+                        - set(latest.get("hard_stop_codes") or [])
+                    )
+                    score_delta = abs(
+                        _safe_float(current.get("score"))
+                        - _safe_float(latest.get("score"))
+                    )
+                    reconciliation_drift = (
+                        bool(latest)
+                        and not pending
+                        and (bool(new_stops) or score_delta >= 5.0)
+                    )
+                    if pending or reconciliation_drift:
+                        reasons = [
+                            str(event.get("event_type"))
+                            for event in pending
+                        ]
+                        if reconciliation_drift:
+                            reasons.append("reconciliation_drift")
+                        alert = {
+                            "schema_version": CONTROL_SCHEMA_VERSION,
+                            "network": "solana",
+                            "type": "state_change",
+                            "reason": ",".join(dict.fromkeys(reasons)),
+                            "token_address": mint,
+                            "slot": head_slot,
+                            "observed_at": utc_now_iso(now),
+                            "events": pending,
+                            "observational_events": [
+                                event
+                                for event in events
+                                if not event.get("triggers_rescan")
+                            ],
+                            "drift": drift,
+                            "new_hard_stops": new_stops,
+                            "analysis_ring": report.get("analysis_ring"),
+                            "analysis_ring_hash": report.get(
+                                "analysis_ring_hash"
+                            ),
+                        }
+                        alert["alert_hash"] = canonical_hash(alert)
+                        alert["timechain"] = self._seal_transition(alert)
+                        self.store.append_alert(alert)
+                        summary["alerts"] += 1
+                    pending = []
+
+                recent = list(
+                    dict.fromkeys(
+                        signature_order
+                        + list(subscription.get("recent_signatures") or [])
+                    )
+                )[: self.config.recent_signature_capacity]
+                subscription["recent_signatures"] = recent
+                subscription["last_signature"] = recent[0] if recent else None
+                subscription["last_observed_slot"] = head_slot
+                subscription["quick_snapshot"] = quick
+                subscription["quick_fingerprint"] = quick["fingerprint"]
+                subscription["pending_events"] = pending
+                subscription["last_events"] = events
+                subscription["last_infrastructure_indeterminate"] = (
+                    infrastructure_indeterminate
+                )
+                subscription["last_error"] = None
+            except Exception as exc:
+                message = credential_safe_error(exc)
+                summary["errors"].append(
+                    {"token_address": mint, "error": message}
+                )
+                subscription["last_error"] = {
+                    "at": utc_now_iso(now),
+                    "message": message,
+                }
+        self.store.save(state)
+        return summary
+
+    def run_forever(self) -> None:
+        while True:
+            print(canonical_json(self.run_once()), flush=True)
             time.sleep(self.config.poll_seconds)
 
 

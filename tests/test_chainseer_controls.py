@@ -10,6 +10,7 @@ import chainseer_controls as controls
 TOKEN = "0x" + "1" * 40
 PAIR = "0x" + "2" * 40
 RECIPIENT = "0x" + "3" * 40
+SOLANA_MINT = "So11111111111111111111111111111111111111112"
 
 
 class FakeTimechain:
@@ -148,6 +149,153 @@ class FakeAgent:
             "ring": ring,
             "verdict": {"decision": "SEAL"},
             "calibration": ring["payload"]["calibration"],
+        }
+
+
+class FakeSolanaRPC:
+    def __init__(self):
+        self.slot = 100
+        self.mint_authority = None
+        self.signatures = []
+        self.fail_largest_accounts = False
+
+    def get_slot(self):
+        return self.slot
+
+    def get_account_info(self, _mint, encoding="jsonParsed"):
+        self.asserted_encoding = encoding
+        return {
+            "context": {"slot": self.slot},
+            "value": {
+                "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "data": {
+                    "parsed": {
+                        "type": "mint",
+                        "info": {
+                            "decimals": 6,
+                            "supply": "1000000",
+                            "mintAuthority": self.mint_authority,
+                            "freezeAuthority": None,
+                        },
+                    }
+                },
+            },
+        }
+
+    def get_token_supply(self, _mint):
+        return {
+            "context": {"slot": self.slot},
+            "value": {"amount": "1000000", "decimals": 6},
+        }
+
+    def get_token_largest_accounts(self, _mint):
+        if self.fail_largest_accounts:
+            raise RuntimeError(
+                "synthetic provider rate limit at "
+                "https://rpc.example/?api-key=secret"
+            )
+        return {
+            "context": {"slot": self.slot},
+            "value": [
+                {"address": "holder-a", "amount": "300000"},
+                {"address": "holder-b", "amount": "200000"},
+            ],
+        }
+
+    def get_signatures_for_address(self, _mint, limit=25):
+        return self.signatures[:limit]
+
+
+class FakeDexScreener:
+    def __init__(self):
+        self.price = "1.0"
+        self.liquidity = 100_000
+
+    def token_pairs(self, mint):
+        return [
+            {
+                "chainId": "solana",
+                "pairAddress": "pair-a",
+                "dexId": "raydium",
+                "baseToken": {"address": mint},
+                "quoteToken": {"address": "quote"},
+                "priceUsd": self.price,
+                "liquidity": {"usd": self.liquidity},
+                "marketCap": 1_000_000,
+                "fdv": 1_000_000,
+            }
+        ]
+
+
+class FakeSolanaAnalyzer:
+    def __init__(self, timechain_agent):
+        self.rpc = FakeSolanaRPC()
+        self.dexscreener = FakeDexScreener()
+        self.timechain_agent = timechain_agent
+        self.scan_count = 0
+
+    @staticmethod
+    def _extension_names(_info):
+        return []
+
+    @staticmethod
+    def _market_pair(_mint, pairs):
+        return pairs[0] if pairs else None
+
+    def analyze_token(self, mint):
+        self.scan_count += 1
+        ring = {
+            "index": len(self.timechain_agent.tc.rings),
+            "ring_hash": f"solana-analysis-{self.scan_count}",
+            "ring_type": "solana_token_analysis",
+            "payload": {},
+        }
+        self.timechain_agent.tc.rings.append(ring)
+        return {
+            "token_address": mint,
+            "timestamp": controls.utc_now_iso(),
+            "analysis_ring": ring["index"],
+            "analysis_ring_hash": ring["ring_hash"],
+            "provenance": {"block_pin": self.rpc.slot},
+            "analysis": {
+                "risk_level": (
+                    "High" if self.rpc.mint_authority else "Low"
+                ),
+                "legitimacy_score": (
+                    35 if self.rpc.mint_authority else 85
+                ),
+                "hard_stop_overrides": (
+                    [{"code": "mint_authority_active"}]
+                    if self.rpc.mint_authority
+                    else []
+                ),
+            },
+            "data": {
+                "basic_info": {
+                    "owner_program": (
+                        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                    ),
+                    "mint_authority": self.rpc.mint_authority,
+                    "freeze_authority": None,
+                    "supply_raw": 1_000_000,
+                    "extensions": [],
+                    "jupiter_holder_count": 2,
+                },
+                "holder_concentration": {
+                    "top1_total_supply_pct": 30,
+                    "top10_total_supply_pct": 50,
+                },
+                "dex_pairs": {
+                    "primary_pair": "pair-a",
+                    "primary_amm_version": "raydium",
+                    "primary_price_usd": float(self.dexscreener.price),
+                    "total_liquidity_usd": self.dexscreener.liquidity,
+                    "market_cap": 1_000_000,
+                },
+                "execution_evidence": {
+                    "roundtrip_retention_pct": 98,
+                },
+            },
         }
 
 
@@ -306,6 +454,111 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             alert = json.loads(alerts[-1])
             self.assertEqual(alert["type"], "state_change")
             self.assertIsNotNone(alert["timechain"]["ring"])
+
+    def test_solana_watcher_rescans_on_confirmed_authority_change(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+                config=controls.SolanaWatchConfig(
+                    minimum_rescan_slots=8,
+                    max_reconcile_slots=900,
+                ),
+            )
+            watcher.store.subscribe(SOLANA_MINT)
+            first = watcher.run_once()
+            self.assertEqual(first["rescans"], 1)
+            self.assertEqual(first["alerts"], 0)
+
+            analyzer.rpc.slot = 101
+            analyzer.rpc.mint_authority = "authority-a"
+            analyzer.rpc.signatures = [
+                {
+                    "signature": "signature-a",
+                    "slot": 101,
+                    "confirmationStatus": "confirmed",
+                    "err": None,
+                    "blockTime": 1_700_000_000,
+                }
+            ]
+            second = watcher.run_once()
+            self.assertEqual(second["material_events"], 1)
+            self.assertEqual(second["rescans"], 1)
+            self.assertEqual(second["alerts"], 1)
+            alert = json.loads(
+                watcher.store.alert_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()[-1]
+            )
+            self.assertEqual(alert["network"], "solana")
+            self.assertIn("mint_authority_changed", alert["reason"])
+            self.assertEqual(
+                alert["timechain"]["decision"],
+                "SEAL",
+            )
+            self.assertEqual(
+                timechain_agent.tc.rings[-1]["ring_type"],
+                "solana_watch_transition",
+            )
+
+    def test_solana_watcher_debounces_small_holder_rotation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(SOLANA_MINT)
+            watcher.run_once()
+
+            analyzer.rpc.slot = 101
+            analyzer.rpc.signatures = [
+                {
+                    "signature": "signature-b",
+                    "slot": 101,
+                    "confirmationStatus": "confirmed",
+                    "err": None,
+                }
+            ]
+            second = watcher.run_once()
+            self.assertEqual(second["rescans"], 0)
+            self.assertEqual(second["alerts"], 0)
+            self.assertGreaterEqual(second["events_observed"], 1)
+
+    def test_solana_watcher_separates_optional_rpc_failure_from_token_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            analyzer.rpc.fail_largest_accounts = True
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(SOLANA_MINT)
+            result = watcher.run_once()
+            self.assertEqual(result["errors"], [])
+            self.assertEqual(result["rescans"], 1)
+            self.assertEqual(
+                result["infrastructure_indeterminate"][0]["source"],
+                "solana_rpc.getTokenLargestAccounts",
+            )
+            diagnostic = result["infrastructure_indeterminate"][0]["message"]
+            self.assertNotIn("https://", diagnostic)
+            self.assertNotIn("secret", diagnostic)
+            subscription = watcher.store.load()["subscriptions"][
+                SOLANA_MINT
+            ]
+            self.assertIsNone(
+                subscription["quick_snapshot"][
+                    "top10_total_supply_pct"
+                ]
+            )
 
 
 class CalibrationTests(unittest.TestCase):
