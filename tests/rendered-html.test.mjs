@@ -34,6 +34,8 @@ test("server-renders the Chainseer product page", async () => {
   assert.match(html, /<title>Chainseer/);
   assert.match(html, /Robinhood Chain/);
   assert.match(html, /Solana/);
+  assert.match(html, /EVM · block-pinned/);
+  assert.match(html, /SPL · slot-anchored/);
   assert.match(html, /Timechain-sealed/);
   assert.match(html, /Powered by Cypher Tempre/);
   assert.doesNotMatch(html, /Private beta/i);
@@ -80,13 +82,22 @@ test("publishes robots and sitemap metadata", async () => {
 });
 
 test("keeps secrets server-side and removes the starter preview", async () => {
-  const [page, apiRoute, packageJson] = await Promise.all([
+  const [page, apiRoute, styles, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/analyses/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
 
   assert.match(page, /\/api\/analyses/);
+  assert.match(page, /className="chain-switch"/);
+  assert.match(page, /data-network=\{network\}/);
+  assert.match(page, /aria-pressed=\{network === "solana"\}/);
+  assert.doesNotMatch(page, /<select/);
+  assert.match(styles, /\.theme-solana/);
+  assert.match(styles, /#9945ff/i);
+  assert.match(styles, /#14f195/i);
+  assert.match(styles, /\.theme-robinhood/);
   assert.match(page, /SAMPLE DATA · NOT LIVE/);
   assert.match(page, /nothing was sealed/);
   assert.match(page, /setShowExample\(false\)/);

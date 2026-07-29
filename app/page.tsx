@@ -431,8 +431,17 @@ export default function Home() {
     document.getElementById("report")?.scrollIntoView({ behavior: "smooth" });
   }
 
+  function selectNetwork(nextNetwork: Network) {
+    if (nextNetwork === network) return;
+    setNetwork(nextNetwork);
+    setAddress("");
+    setNotice("");
+    setLiveReport(null);
+    setScanState("idle");
+  }
+
   return (
-    <main>
+    <main className={`chain-theme theme-${network}`} data-network={network}>
       <header className="site-header">
         <a className="brand" href="#top" aria-label="Chainseer home">
           <span className="brand-mark" aria-hidden="true">C</span>
@@ -477,50 +486,66 @@ export default function Home() {
         </p>
 
         <form className="scanner" id="scanner" onSubmit={submitScan}>
-          <div className="network-select">
-            <span className="network-glyph">◆</span>
-            <label className="sr-only" htmlFor="analysis-network">
-              Analysis network
-            </label>
-            <select
-              id="analysis-network"
-              value={network}
-              onChange={(event) => {
-                setNetwork(event.target.value as Network);
-                setAddress("");
-                setNotice("");
-                setLiveReport(null);
-                setScanState("idle");
-              }}
+          <fieldset className="chain-switch">
+            <legend>Analysis network</legend>
+            <button
+              type="button"
+              className={`chain-option robinhood-option ${
+                network === "robinhood" ? "selected" : ""
+              }`}
+              aria-pressed={network === "robinhood"}
+              onClick={() => selectNetwork("robinhood")}
             >
-              <option value="robinhood">Robinhood Chain</option>
-              <option value="solana">Solana</option>
-            </select>
-            <small>{network === "solana" ? "SPL · live" : "EVM · live"}</small>
+              <span className="chain-icon robinhood-icon" aria-hidden="true">◆</span>
+              <span className="chain-option-copy">
+                <strong>Robinhood Chain</strong>
+                <small>EVM · block-pinned</small>
+              </span>
+              <span className="chain-live">Live</span>
+            </button>
+            <button
+              type="button"
+              className={`chain-option solana-option ${
+                network === "solana" ? "selected" : ""
+              }`}
+              aria-pressed={network === "solana"}
+              onClick={() => selectNetwork("solana")}
+            >
+              <span className="chain-icon solana-icon" aria-hidden="true">
+                <i /><i /><i />
+              </span>
+              <span className="chain-option-copy">
+                <strong>Solana</strong>
+                <small>SPL · slot-anchored</small>
+              </span>
+              <span className="chain-live">Live</span>
+            </button>
+          </fieldset>
+          <div className="scanner-entry">
+            <label className="sr-only" htmlFor="contract-address">
+              {network === "solana" ? "SPL mint address" : "Contract address"}
+            </label>
+            <input
+              id="contract-address"
+              value={address}
+              onChange={(event) => {
+                setAddress(event.target.value);
+                setNotice("");
+              }}
+              placeholder={
+                network === "solana"
+                  ? "Paste a Solana mint address..."
+                  : "Paste a contract address 0x..."
+              }
+              autoComplete="off"
+              spellCheck={false}
+            />
+            <button type="submit" disabled={scanState === "submitting" || scanState === "analyzing"}>
+              {scanState === "submitting" || scanState === "analyzing"
+                ? "Analysis running…"
+                : "Run risk scan"}
+            </button>
           </div>
-          <label className="sr-only" htmlFor="contract-address">
-            {network === "solana" ? "SPL mint address" : "Contract address"}
-          </label>
-          <input
-            id="contract-address"
-            value={address}
-            onChange={(event) => {
-              setAddress(event.target.value);
-              setNotice("");
-            }}
-            placeholder={
-              network === "solana"
-                ? "Paste a Solana mint address..."
-                : "Paste a contract address 0x..."
-            }
-            autoComplete="off"
-            spellCheck={false}
-          />
-          <button type="submit" disabled={scanState === "submitting" || scanState === "analyzing"}>
-            {scanState === "submitting" || scanState === "analyzing"
-              ? "Analysis running…"
-              : "Run risk scan"}
-          </button>
         </form>
         <div className="scanner-meta">
           <span>No wallet connection</span>
