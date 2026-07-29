@@ -81,7 +81,9 @@ TradePermit, MEV, social/KOL, and cross-chain adapter operation.
 See [`BENCHMARK.md`](BENCHMARK.md) for the versioned, time-separated benchmark
 schema and deterministic evaluation workflow. Benchmark v1 keeps token outcomes
 separate from infrastructure failures and emits hashes suitable for Timechain
-sealing after PoQ review.
+sealing after PoQ review. Its production workflow captures immutable predictions
+before outcomes, appends independently reviewed outcome evidence later, and
+materializes non-overwriting evaluator snapshots.
 
 Never commit API tokens, environment files, local Timechain rings, learning
 databases, or analysis reports.

@@ -13,14 +13,17 @@ import argparse
 import hashlib
 import json
 import math
+import os
 import re
 from collections import defaultdict
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
 
 BENCHMARK_SCHEMA_VERSION = "1.0"
+CASEBANK_SCHEMA_VERSION = "1.0"
+MIN_BENIGN_OBSERVATION_SECONDS = 7 * 24 * 60 * 60
 NETWORKS = {"robinhood", "solana"}
 LABELS = {"adverse_security", "benign", "infrastructure_failure"}
 SPLITS = {"train", "validation", "test"}
@@ -91,9 +94,12 @@ def _finite_float(
 
 
 def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
+    source = Path(path)
+    if not source.exists():
+        return []
     records: list[dict[str, Any]] = []
     for line_number, raw in enumerate(
-        Path(path).read_text(encoding="utf-8").splitlines(),
+        source.read_text(encoding="utf-8").splitlines(),
         start=1,
     ):
         if not raw.strip():
@@ -110,6 +116,119 @@ def load_jsonl(path: str | Path) -> list[dict[str, Any]]:
             )
         records.append(value)
     return records
+
+
+def _record_hash(record: dict[str, Any], field: str) -> str:
+    return canonical_hash(
+        {key: value for key, value in record.items() if key != field}
+    )
+
+
+def _append_jsonl(path: str | Path, record: dict[str, Any]) -> None:
+    destination = Path(path)
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    encoded = (canonical_json(record) + "\n").encode("utf-8")
+    descriptor = os.open(
+        destination,
+        os.O_APPEND
+        | os.O_CREAT
+        | os.O_WRONLY
+        | getattr(os, "O_BINARY", 0),
+        0o600,
+    )
+    try:
+        remaining = encoded
+        while remaining:
+            written = os.write(descriptor, remaining)
+            if written <= 0:
+                raise OSError("append-only JSONL write made no progress")
+            remaining = remaining[written:]
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _write_new_jsonl(
+    path: str | Path,
+    records: Iterable[dict[str, Any]],
+) -> None:
+    destination = Path(path)
+    if destination.exists():
+        raise BenchmarkValidationError(
+            f"refusing to overwrite immutable benchmark snapshot: {destination}"
+        )
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    temporary = destination.with_name(destination.name + ".tmp")
+    if temporary.exists():
+        temporary.unlink()
+    with temporary.open("w", encoding="utf-8", newline="\n") as handle:
+        for record in records:
+            handle.write(canonical_json(record) + "\n")
+        handle.flush()
+        os.fsync(handle.fileno())
+    os.replace(temporary, destination)
+
+
+def _validate_prediction_fields(
+    prediction: dict[str, Any],
+    prefix: str,
+    expected_cutoff: datetime,
+) -> None:
+    analyzer = str(prediction.get("analyzer") or "").strip()
+    version = str(prediction.get("analyzer_version") or "").strip()
+    if not analyzer or not version:
+        raise BenchmarkValidationError(
+            f"{prefix}.analyzer and analyzer_version are required"
+        )
+    analyzed_at = _parse_iso(
+        prediction.get("analyzed_at"),
+        f"{prefix}.analyzed_at",
+    )
+    cutoff = _parse_iso(
+        prediction.get("evidence_cutoff"),
+        f"{prefix}.evidence_cutoff",
+    )
+    if cutoff != expected_cutoff:
+        raise BenchmarkValidationError(
+            f"{prefix}.evidence_cutoff must exactly match its case"
+        )
+    if analyzed_at < cutoff:
+        raise BenchmarkValidationError(
+            f"{prefix}.analyzed_at cannot predate evidence_cutoff"
+        )
+    if prediction.get("legitimacy_score") is not None:
+        _finite_float(
+            prediction["legitimacy_score"],
+            f"{prefix}.legitimacy_score",
+            minimum=0,
+            maximum=100,
+        )
+    if prediction.get("risk_probability") is not None:
+        _finite_float(
+            prediction["risk_probability"],
+            f"{prefix}.risk_probability",
+            minimum=0,
+            maximum=1,
+        )
+    _finite_float(
+        prediction.get("latency_ms"),
+        f"{prefix}.latency_ms",
+        minimum=0,
+    )
+    _finite_float(
+        prediction.get("evidence_age_seconds"),
+        f"{prefix}.evidence_age_seconds",
+        minimum=0,
+    )
+    if not isinstance(prediction.get("infrastructure_indeterminate"), bool):
+        raise BenchmarkValidationError(
+            f"{prefix}.infrastructure_indeterminate must be boolean"
+        )
+    report_hash = prediction.get("report_hash")
+    if report_hash is not None and not HASH_RE.fullmatch(str(report_hash)):
+        raise BenchmarkValidationError(
+            f"{prefix}.report_hash must be a SHA-256 hex digest"
+        )
 
 
 def validate_cases(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
@@ -150,8 +269,20 @@ def validate_cases(records: Iterable[dict[str, Any]]) -> list[dict[str, Any]]:
             raise BenchmarkValidationError(
                 f"{prefix}.outcome_observed_at must be after evidence_cutoff"
             )
+        if (
+            case.get("label") == "benign"
+            and (outcome - cutoff).total_seconds()
+            < MIN_BENIGN_OBSERVATION_SECONDS
+        ):
+            raise BenchmarkValidationError(
+                f"{prefix} benign outcomes require seven days of observation"
+            )
         refs = case.get("outcome_evidence_refs")
-        if not isinstance(refs, list) or not refs:
+        if (
+            not isinstance(refs, list)
+            or not refs
+            or any(not str(item).strip() for item in refs)
+        ):
             raise BenchmarkValidationError(
                 f"{prefix}.outcome_evidence_refs must be a non-empty list"
             )
@@ -184,62 +315,603 @@ def validate_predictions(
                 f"duplicate prediction for {analyzer}@{version}:{case_id}"
             )
         seen.add(identity)
-        analyzed_at = _parse_iso(
-            prediction.get("analyzed_at"),
-            f"{prefix}.analyzed_at",
-        )
-        cutoff = _parse_iso(
-            prediction.get("evidence_cutoff"),
-            f"{prefix}.evidence_cutoff",
-        )
         case_cutoff = _parse_iso(
             case_by_id[case_id]["evidence_cutoff"],
             f"case[{case_id}].evidence_cutoff",
         )
-        if cutoff != case_cutoff:
-            raise BenchmarkValidationError(
-                f"{prefix}.evidence_cutoff must exactly match its case"
-            )
-        if analyzed_at < cutoff:
-            raise BenchmarkValidationError(
-                f"{prefix}.analyzed_at cannot predate evidence_cutoff"
-            )
-        if prediction.get("legitimacy_score") is not None:
-            _finite_float(
-                prediction["legitimacy_score"],
-                f"{prefix}.legitimacy_score",
-                minimum=0,
-                maximum=100,
-            )
-        if prediction.get("risk_probability") is not None:
-            _finite_float(
-                prediction["risk_probability"],
-                f"{prefix}.risk_probability",
-                minimum=0,
-                maximum=1,
-            )
-        _finite_float(
-            prediction.get("latency_ms"),
-            f"{prefix}.latency_ms",
-            minimum=0,
+        _validate_prediction_fields(prediction, prefix, case_cutoff)
+    return predictions
+
+
+def _normalize_network(public_report: dict[str, Any]) -> str:
+    token = public_report.get("token") or {}
+    chain = str(token.get("chain") or "").strip().lower()
+    chain_id = str(token.get("chain_id") or "").strip().lower()
+    if "solana" in chain or chain_id == "mainnet-beta":
+        return "solana"
+    if "robinhood" in chain or chain_id == "4663":
+        return "robinhood"
+    raise BenchmarkValidationError(
+        "public report does not identify a supported benchmark network"
+    )
+
+
+def _derive_evidence_age_seconds(
+    public_report: dict[str, Any],
+    cutoff: datetime,
+) -> float | None:
+    timestamps = []
+    for fact in (public_report.get("evidence") or {}).get("facts") or []:
+        value = fact.get("timestamp")
+        if not value:
+            continue
+        try:
+            observed = _parse_iso(value, "evidence.fact.timestamp")
+        except BenchmarkValidationError:
+            continue
+        if observed <= cutoff:
+            timestamps.append(observed)
+    if not timestamps:
+        return None
+    return max(0.0, (cutoff - max(timestamps)).total_seconds())
+
+
+def build_observation_from_report(
+    document: dict[str, Any],
+    *,
+    cohort: str,
+    split: str,
+    analyzer: str,
+    analyzer_version: str,
+    latency_ms: float | None = None,
+    evidence_age_seconds: float | None = None,
+    risk_probability: float | None = None,
+    case_id: str | None = None,
+    captured_at: str | None = None,
+) -> dict[str, Any]:
+    """Freeze one public report as a future-outcome benchmark observation."""
+    wrapper = document if isinstance(document.get("result"), dict) else {}
+    report = wrapper.get("result") or document
+    if not isinstance(report, dict):
+        raise BenchmarkValidationError("report document must be a JSON object")
+    if str(report.get("schema_version") or "") != "1.1":
+        raise BenchmarkValidationError(
+            "capture requires a Chainseer public report with schema_version 1.1"
         )
-        _finite_float(
-            prediction.get("evidence_age_seconds"),
-            f"{prefix}.evidence_age_seconds",
-            minimum=0,
+    if split not in SPLITS:
+        raise BenchmarkValidationError(
+            f"split must be one of {sorted(SPLITS)}"
         )
-        if not isinstance(
-            prediction.get("infrastructure_indeterminate"), bool
+    cohort = str(cohort or "").strip()
+    if not cohort:
+        raise BenchmarkValidationError("cohort is required")
+    analyzer = str(analyzer or "").strip()
+    analyzer_version = str(analyzer_version or "").strip()
+    if not analyzer or not analyzer_version:
+        raise BenchmarkValidationError(
+            "analyzer and analyzer_version are required"
+        )
+
+    token = report.get("token") or {}
+    token_address = str(token.get("address") or "").strip()
+    if not token_address:
+        raise BenchmarkValidationError(
+            "public report token.address is required"
+        )
+    network = _normalize_network(report)
+    cutoff_text = str(report.get("analyzed_at") or "").strip()
+    cutoff = _parse_iso(cutoff_text, "report.analyzed_at")
+
+    if latency_ms is None and wrapper:
+        started = _parse_iso(wrapper.get("started_at"), "job.started_at")
+        finished = _parse_iso(wrapper.get("finished_at"), "job.finished_at")
+        latency_ms = max(0.0, (finished - started).total_seconds() * 1000)
+    if latency_ms is None:
+        raise BenchmarkValidationError(
+            "latency_ms is required when the report is not wrapped in a job response"
+        )
+    latency_ms = _finite_float(
+        latency_ms,
+        "latency_ms",
+        minimum=0,
+    )
+
+    if evidence_age_seconds is None:
+        evidence_age_seconds = _derive_evidence_age_seconds(report, cutoff)
+    if evidence_age_seconds is None:
+        raise BenchmarkValidationError(
+            "evidence_age_seconds is required when fact timestamps are unavailable"
+        )
+    evidence_age_seconds = _finite_float(
+        evidence_age_seconds,
+        "evidence_age_seconds",
+        minimum=0,
+    )
+    if risk_probability is not None:
+        risk_probability = _finite_float(
+            risk_probability,
+            "risk_probability",
+            minimum=0,
+            maximum=1,
+        )
+
+    captured_text = captured_at or datetime.now(timezone.utc).isoformat()
+    captured = _parse_iso(captured_text, "captured_at")
+    analyzed_text = str(wrapper.get("finished_at") or cutoff_text)
+    analyzed = _parse_iso(analyzed_text, "analyzed_at")
+    if analyzed < cutoff:
+        raise BenchmarkValidationError(
+            "job.finished_at cannot predate report.analyzed_at"
+        )
+    if captured < analyzed:
+        raise BenchmarkValidationError(
+            "captured_at cannot predate analyzed_at"
+        )
+
+    identity = {
+        "network": network,
+        "token_address": (
+            token_address.lower() if network == "robinhood" else token_address
+        ),
+        "evidence_cutoff": cutoff_text,
+    }
+    resolved_case_id = str(case_id or "").strip()
+    if not resolved_case_id:
+        resolved_case_id = f"case-{canonical_hash(identity)[:16]}"
+
+    decision = report.get("decision") or {}
+    hard_stops = decision.get("hard_stops") or []
+    infrastructure = (
+        (report.get("evidence") or {}).get("infrastructure_indeterminate")
+        or []
+    )
+    observation = {
+        "record_type": "prediction_observation",
+        "casebank_schema_version": CASEBANK_SCHEMA_VERSION,
+        "case_id": resolved_case_id,
+        "network": network,
+        "cohort": cohort,
+        "token_address": identity["token_address"],
+        "split": split,
+        "evidence_cutoff": cutoff_text,
+        "analyzer": analyzer,
+        "analyzer_version": analyzer_version,
+        "analyzed_at": analyzed_text,
+        "risk_level": decision.get("risk_level") or "Unknown",
+        "action": decision.get("action") or "REVIEW",
+        "hard_stop_count": len(hard_stops),
+        "legitimacy_score": decision.get("legitimacy_score"),
+        "infrastructure_indeterminate": bool(infrastructure),
+        "latency_ms": round(float(latency_ms), 3),
+        "evidence_age_seconds": round(float(evidence_age_seconds), 3),
+        "report_hash": canonical_hash(report),
+        "captured_at": captured_text,
+        "source_schema_version": report.get("schema_version"),
+        "anchor_type": (report.get("evidence") or {}).get("anchor_type"),
+        "anchor_value": (report.get("evidence") or {}).get("block_pin"),
+        "timechain_ring": (report.get("timechain") or {}).get("ring"),
+        "timechain_ring_hash": (report.get("timechain") or {}).get(
+            "ring_hash"
+        ),
+    }
+    if risk_probability is not None:
+        observation["risk_probability"] = risk_probability
+    observation["observation_hash"] = _record_hash(
+        observation,
+        "observation_hash",
+    )
+    validate_observations([observation])
+    return observation
+
+
+def validate_observations(
+    records: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    observations = list(records)
+    identities: set[tuple[str, str, str]] = set()
+    case_metadata: dict[str, tuple[Any, ...]] = {}
+    for index, observation in enumerate(observations):
+        prefix = f"observation[{index}]"
+        if observation.get("record_type") != "prediction_observation":
+            raise BenchmarkValidationError(
+                f"{prefix}.record_type must be prediction_observation"
+            )
+        if observation.get("casebank_schema_version") != CASEBANK_SCHEMA_VERSION:
+            raise BenchmarkValidationError(
+                f"{prefix}.casebank_schema_version is unsupported"
+            )
+        case_id = str(observation.get("case_id") or "").strip()
+        if not case_id:
+            raise BenchmarkValidationError(f"{prefix}.case_id is required")
+        if observation.get("network") not in NETWORKS:
+            raise BenchmarkValidationError(
+                f"{prefix}.network must be one of {sorted(NETWORKS)}"
+            )
+        if observation.get("split") not in SPLITS:
+            raise BenchmarkValidationError(
+                f"{prefix}.split must be one of {sorted(SPLITS)}"
+            )
+        if not str(observation.get("cohort") or "").strip():
+            raise BenchmarkValidationError(f"{prefix}.cohort is required")
+        if not str(observation.get("token_address") or "").strip():
+            raise BenchmarkValidationError(
+                f"{prefix}.token_address is required"
+            )
+        cutoff = _parse_iso(
+            observation.get("evidence_cutoff"),
+            f"{prefix}.evidence_cutoff",
+        )
+        _validate_prediction_fields(observation, prefix, cutoff)
+        captured = _parse_iso(
+            observation.get("captured_at"),
+            f"{prefix}.captured_at",
+        )
+        analyzed = _parse_iso(
+            observation.get("analyzed_at"),
+            f"{prefix}.analyzed_at",
+        )
+        if captured < analyzed:
+            raise BenchmarkValidationError(
+                f"{prefix}.captured_at cannot predate analyzed_at"
+            )
+        observation_hash = str(
+            observation.get("observation_hash") or ""
+        )
+        if not HASH_RE.fullmatch(observation_hash):
+            raise BenchmarkValidationError(
+                f"{prefix}.observation_hash must be a SHA-256 hex digest"
+            )
+        if observation_hash != _record_hash(
+            observation,
+            "observation_hash",
         ):
             raise BenchmarkValidationError(
-                f"{prefix}.infrastructure_indeterminate must be boolean"
+                f"{prefix}.observation_hash does not match record content"
             )
-        report_hash = prediction.get("report_hash")
-        if report_hash is not None and not HASH_RE.fullmatch(str(report_hash)):
+        identity = (
+            str(observation.get("analyzer")),
+            str(observation.get("analyzer_version")),
+            case_id,
+        )
+        if identity in identities:
             raise BenchmarkValidationError(
-                f"{prefix}.report_hash must be a SHA-256 hex digest"
+                f"duplicate observation for {identity[0]}@{identity[1]}:{case_id}"
             )
-    return predictions
+        identities.add(identity)
+        metadata = (
+            observation.get("network"),
+            observation.get("cohort"),
+            observation.get("token_address"),
+            observation.get("split"),
+            observation.get("evidence_cutoff"),
+            observation.get("anchor_type"),
+            observation.get("anchor_value"),
+        )
+        previous = case_metadata.setdefault(case_id, metadata)
+        if previous != metadata:
+            raise BenchmarkValidationError(
+                f"case {case_id} has conflicting observation metadata"
+            )
+    return observations
+
+
+def append_observation(
+    path: str | Path,
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    existing = load_jsonl(path)
+    validate_observations([*existing, observation])
+    _append_jsonl(path, observation)
+    return observation
+
+
+def build_outcome_record(
+    observations: Iterable[dict[str, Any]],
+    *,
+    case_id: str,
+    label: str,
+    outcome_observed_at: str,
+    evidence_refs: Iterable[str],
+    reviewer: str,
+    notes: str | None = None,
+) -> dict[str, Any]:
+    checked = validate_observations(observations)
+    case_observations = [
+        item for item in checked if item["case_id"] == case_id
+    ]
+    if not case_observations:
+        raise BenchmarkValidationError(
+            f"no captured observation exists for case {case_id}"
+        )
+    if label not in LABELS:
+        raise BenchmarkValidationError(
+            f"label must be one of {sorted(LABELS)}"
+        )
+    reviewer = str(reviewer or "").strip()
+    if not reviewer:
+        raise BenchmarkValidationError("reviewer is required")
+    refs = [str(item).strip() for item in evidence_refs if str(item).strip()]
+    if not refs:
+        raise BenchmarkValidationError(
+            "at least one outcome evidence reference is required"
+        )
+    cutoff = _parse_iso(
+        case_observations[0]["evidence_cutoff"],
+        "evidence_cutoff",
+    )
+    observed = _parse_iso(outcome_observed_at, "outcome_observed_at")
+    if observed <= cutoff:
+        raise BenchmarkValidationError(
+            "outcome_observed_at must be after evidence_cutoff"
+        )
+    window_seconds = (observed - cutoff).total_seconds()
+    if (
+        label == "benign"
+        and window_seconds < MIN_BENIGN_OBSERVATION_SECONDS
+    ):
+        raise BenchmarkValidationError(
+            "benign outcomes require at least seven days of observation"
+        )
+    outcome = {
+        "record_type": "outcome_observation",
+        "casebank_schema_version": CASEBANK_SCHEMA_VERSION,
+        "case_id": case_id,
+        "label": label,
+        "outcome_observed_at": outcome_observed_at,
+        "outcome_evidence_refs": refs,
+        "reviewer": reviewer,
+        "observation_window_seconds": round(window_seconds, 3),
+    }
+    if notes:
+        outcome["notes"] = str(notes)
+    outcome["outcome_hash"] = _record_hash(outcome, "outcome_hash")
+    validate_outcomes([outcome], checked)
+    return outcome
+
+
+def validate_outcomes(
+    records: Iterable[dict[str, Any]],
+    observations: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    outcomes = list(records)
+    checked_observations = validate_observations(observations)
+    case_by_id = {
+        item["case_id"]: item for item in checked_observations
+    }
+    seen: set[str] = set()
+    for index, outcome in enumerate(outcomes):
+        prefix = f"outcome[{index}]"
+        if outcome.get("record_type") != "outcome_observation":
+            raise BenchmarkValidationError(
+                f"{prefix}.record_type must be outcome_observation"
+            )
+        if outcome.get("casebank_schema_version") != CASEBANK_SCHEMA_VERSION:
+            raise BenchmarkValidationError(
+                f"{prefix}.casebank_schema_version is unsupported"
+            )
+        case_id = str(outcome.get("case_id") or "").strip()
+        if case_id not in case_by_id:
+            raise BenchmarkValidationError(
+                f"{prefix}.case_id has no captured observation"
+            )
+        if case_id in seen:
+            raise BenchmarkValidationError(
+                f"duplicate outcome for case {case_id}"
+            )
+        seen.add(case_id)
+        if outcome.get("label") not in LABELS:
+            raise BenchmarkValidationError(
+                f"{prefix}.label must be one of {sorted(LABELS)}"
+            )
+        cutoff = _parse_iso(
+            case_by_id[case_id]["evidence_cutoff"],
+            f"case[{case_id}].evidence_cutoff",
+        )
+        observed = _parse_iso(
+            outcome.get("outcome_observed_at"),
+            f"{prefix}.outcome_observed_at",
+        )
+        if observed <= cutoff:
+            raise BenchmarkValidationError(
+                f"{prefix}.outcome_observed_at must be after evidence_cutoff"
+            )
+        expected_window = (observed - cutoff).total_seconds()
+        declared_window = _finite_float(
+            outcome.get("observation_window_seconds"),
+            f"{prefix}.observation_window_seconds",
+            minimum=0,
+        )
+        if abs(float(declared_window) - expected_window) > 0.001:
+            raise BenchmarkValidationError(
+                f"{prefix}.observation_window_seconds is inconsistent"
+            )
+        if (
+            outcome.get("label") == "benign"
+            and expected_window < MIN_BENIGN_OBSERVATION_SECONDS
+        ):
+            raise BenchmarkValidationError(
+                f"{prefix} benign outcomes require seven days of observation"
+            )
+        refs = outcome.get("outcome_evidence_refs")
+        if (
+            not isinstance(refs, list)
+            or not refs
+            or any(not str(item).strip() for item in refs)
+        ):
+            raise BenchmarkValidationError(
+                f"{prefix}.outcome_evidence_refs must be a non-empty list"
+            )
+        if not str(outcome.get("reviewer") or "").strip():
+            raise BenchmarkValidationError(f"{prefix}.reviewer is required")
+        outcome_hash = str(outcome.get("outcome_hash") or "")
+        if not HASH_RE.fullmatch(outcome_hash):
+            raise BenchmarkValidationError(
+                f"{prefix}.outcome_hash must be a SHA-256 hex digest"
+            )
+        if outcome_hash != _record_hash(outcome, "outcome_hash"):
+            raise BenchmarkValidationError(
+                f"{prefix}.outcome_hash does not match record content"
+            )
+    return outcomes
+
+
+def append_outcome(
+    path: str | Path,
+    observations: Iterable[dict[str, Any]],
+    outcome: dict[str, Any],
+) -> dict[str, Any]:
+    existing = load_jsonl(path)
+    validate_outcomes([*existing, outcome], observations)
+    _append_jsonl(path, outcome)
+    return outcome
+
+
+def _prediction_from_observation(
+    observation: dict[str, Any],
+) -> dict[str, Any]:
+    fields = (
+        "case_id",
+        "analyzer",
+        "analyzer_version",
+        "analyzed_at",
+        "evidence_cutoff",
+        "risk_level",
+        "action",
+        "hard_stop_count",
+        "legitimacy_score",
+        "risk_probability",
+        "infrastructure_indeterminate",
+        "latency_ms",
+        "evidence_age_seconds",
+        "report_hash",
+        "anchor_type",
+        "anchor_value",
+        "timechain_ring",
+        "timechain_ring_hash",
+    )
+    return {
+        field: observation[field]
+        for field in fields
+        if field in observation
+    }
+
+
+def materialize_case_bank(
+    observations: Iterable[dict[str, Any]],
+    outcomes: Iterable[dict[str, Any]],
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    checked_observations = validate_observations(observations)
+    checked_outcomes = validate_outcomes(outcomes, checked_observations)
+    observation_by_case: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for observation in checked_observations:
+        observation_by_case[observation["case_id"]].append(observation)
+    outcome_by_case = {
+        outcome["case_id"]: outcome for outcome in checked_outcomes
+    }
+    cases: list[dict[str, Any]] = []
+    predictions: list[dict[str, Any]] = []
+    for case_id in sorted(outcome_by_case):
+        outcome = outcome_by_case[case_id]
+        source = observation_by_case[case_id][0]
+        cases.append(
+            {
+                "case_id": case_id,
+                "network": source["network"],
+                "cohort": source["cohort"],
+                "token_address": source["token_address"],
+                "split": source["split"],
+                "evidence_cutoff": source["evidence_cutoff"],
+                "anchor_type": source.get("anchor_type"),
+                "anchor_value": source.get("anchor_value"),
+                "outcome_observed_at": outcome["outcome_observed_at"],
+                "label": outcome["label"],
+                "outcome_evidence_refs": outcome[
+                    "outcome_evidence_refs"
+                ],
+                "reviewer": outcome["reviewer"],
+                "observation_window_seconds": outcome[
+                    "observation_window_seconds"
+                ],
+                "outcome_hash": outcome["outcome_hash"],
+            }
+        )
+        predictions.extend(
+            _prediction_from_observation(item)
+            for item in sorted(
+                observation_by_case[case_id],
+                key=lambda value: (
+                    value["analyzer"],
+                    value["analyzer_version"],
+                ),
+            )
+        )
+    if not cases:
+        raise BenchmarkValidationError(
+            "no finalized outcomes are available to materialize"
+        )
+    validate_cases(cases)
+    validate_predictions(predictions, cases)
+    return cases, predictions
+
+
+def case_bank_status(
+    observations: Iterable[dict[str, Any]],
+    outcomes: Iterable[dict[str, Any]],
+) -> dict[str, Any]:
+    checked_observations = validate_observations(observations)
+    checked_outcomes = validate_outcomes(outcomes, checked_observations)
+    case_ids = {item["case_id"] for item in checked_observations}
+    finalized_ids = {item["case_id"] for item in checked_outcomes}
+    return {
+        "casebank_schema_version": CASEBANK_SCHEMA_VERSION,
+        "observations": len(checked_observations),
+        "cases": len(case_ids),
+        "pending_cases": len(case_ids - finalized_ids),
+        "finalized_cases": len(finalized_ids),
+        "analyzers": sorted(
+            {
+                f"{item['analyzer']}@{item['analyzer_version']}"
+                for item in checked_observations
+            }
+        ),
+        "networks": {
+            network: len(
+                {
+                    item["case_id"]
+                    for item in checked_observations
+                    if item["network"] == network
+                }
+            )
+            for network in sorted(NETWORKS)
+        },
+        "cohorts": {
+            cohort: len(
+                {
+                    item["case_id"]
+                    for item in checked_observations
+                    if item["cohort"] == cohort
+                }
+            )
+            for cohort in sorted(
+                {item["cohort"] for item in checked_observations}
+            )
+        },
+        "observation_ledger_hash": canonical_hash(
+            sorted(
+                checked_observations,
+                key=lambda item: item["observation_hash"],
+            )
+        ),
+        "outcome_ledger_hash": canonical_hash(
+            sorted(
+                checked_outcomes,
+                key=lambda item: item["outcome_hash"],
+            )
+        ),
+        "minimum_benign_observation_hours": (
+            MIN_BENIGN_OBSERVATION_SECONDS // 3600
+        ),
+    }
 
 
 def _rate(numerator: int, denominator: int) -> float | None:
@@ -600,14 +1272,81 @@ def _write_report(path: str | Path, report: dict[str, Any]) -> None:
     )
 
 
+def _load_json_document(path: str | Path) -> dict[str, Any]:
+    try:
+        value = json.loads(Path(path).read_text(encoding="utf-8"))
+    except json.JSONDecodeError as exc:
+        raise BenchmarkValidationError(
+            f"{path} is not valid JSON"
+        ) from exc
+    if not isinstance(value, dict):
+        raise BenchmarkValidationError(
+            f"{path} must contain a JSON object"
+        )
+    return value
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Evaluate time-separated Chainseer benchmark records"
+        description=(
+            "Capture and evaluate time-separated Chainseer benchmark records"
+        )
     )
     commands = parser.add_subparsers(dest="command", required=True)
-    validate = commands.add_parser("validate")
-    validate.add_argument("--cases", required=True)
-    validate.add_argument("--predictions", required=True)
+
+    capture = commands.add_parser(
+        "capture",
+        help="append one immutable public-report prediction observation",
+    )
+    capture.add_argument("--report", required=True)
+    capture.add_argument("--observations", required=True)
+    capture.add_argument("--cohort", required=True)
+    capture.add_argument("--split", choices=sorted(SPLITS), required=True)
+    capture.add_argument("--analyzer", default="chainseer")
+    capture.add_argument("--analyzer-version", required=True)
+    capture.add_argument("--latency-ms", type=float)
+    capture.add_argument("--evidence-age-seconds", type=float)
+    capture.add_argument("--risk-probability", type=float)
+    capture.add_argument("--case-id")
+    capture.add_argument("--captured-at")
+
+    label = commands.add_parser(
+        "label",
+        help="append a later independently reviewed outcome",
+    )
+    label.add_argument("--observations", required=True)
+    label.add_argument("--outcomes", required=True)
+    label.add_argument("--case-id", required=True)
+    label.add_argument("--label", choices=sorted(LABELS), required=True)
+    label.add_argument("--observed-at", required=True)
+    label.add_argument(
+        "--evidence-ref",
+        action="append",
+        required=True,
+        dest="evidence_refs",
+    )
+    label.add_argument("--reviewer", required=True)
+    label.add_argument("--notes")
+
+    status_command = commands.add_parser(
+        "status",
+        help="validate and summarize the append-only case-bank ledgers",
+    )
+    status_command.add_argument("--observations", required=True)
+    status_command.add_argument("--outcomes", required=True)
+
+    materialize = commands.add_parser(
+        "materialize",
+        help="create immutable evaluator snapshots from finalized cases",
+    )
+    materialize.add_argument("--observations", required=True)
+    materialize.add_argument("--outcomes", required=True)
+    materialize.add_argument("--cases", required=True)
+    materialize.add_argument("--predictions", required=True)
+
+    validate_command = commands.add_parser("validate")
+    validate_command.add_argument("--cases", required=True)
+    validate_command.add_argument("--predictions", required=True)
     run = commands.add_parser("evaluate")
     run.add_argument("--cases", required=True)
     run.add_argument("--predictions", required=True)
@@ -619,6 +1358,97 @@ def main() -> int:
         choices=sorted(SPLITS),
     )
     args = parser.parse_args()
+
+    if args.command == "capture":
+        observation = build_observation_from_report(
+            _load_json_document(args.report),
+            cohort=args.cohort,
+            split=args.split,
+            analyzer=args.analyzer,
+            analyzer_version=args.analyzer_version,
+            latency_ms=args.latency_ms,
+            evidence_age_seconds=args.evidence_age_seconds,
+            risk_probability=args.risk_probability,
+            case_id=args.case_id,
+            captured_at=args.captured_at,
+        )
+        append_observation(args.observations, observation)
+        print(
+            canonical_json(
+                {
+                    "captured": True,
+                    "case_id": observation["case_id"],
+                    "observation_hash": observation["observation_hash"],
+                    "report_hash": observation["report_hash"],
+                }
+            )
+        )
+        return 0
+
+    if args.command == "label":
+        observations = validate_observations(
+            load_jsonl(args.observations)
+        )
+        outcome = build_outcome_record(
+            observations,
+            case_id=args.case_id,
+            label=args.label,
+            outcome_observed_at=args.observed_at,
+            evidence_refs=args.evidence_refs,
+            reviewer=args.reviewer,
+            notes=args.notes,
+        )
+        append_outcome(args.outcomes, observations, outcome)
+        print(
+            canonical_json(
+                {
+                    "labeled": True,
+                    "case_id": outcome["case_id"],
+                    "label": outcome["label"],
+                    "outcome_hash": outcome["outcome_hash"],
+                    "observation_window_seconds": outcome[
+                        "observation_window_seconds"
+                    ],
+                }
+            )
+        )
+        return 0
+
+    if args.command == "status":
+        print(
+            canonical_json(
+                case_bank_status(
+                    load_jsonl(args.observations),
+                    load_jsonl(args.outcomes),
+                )
+            )
+        )
+        return 0
+
+    if args.command == "materialize":
+        cases, predictions = materialize_case_bank(
+            load_jsonl(args.observations),
+            load_jsonl(args.outcomes),
+        )
+        if Path(args.cases).resolve() == Path(args.predictions).resolve():
+            raise BenchmarkValidationError(
+                "cases and predictions must use different paths"
+            )
+        _write_new_jsonl(args.cases, cases)
+        _write_new_jsonl(args.predictions, predictions)
+        print(
+            canonical_json(
+                {
+                    "materialized": True,
+                    "cases": len(cases),
+                    "predictions": len(predictions),
+                    "case_bank_hash": canonical_hash(cases),
+                    "prediction_bank_hash": canonical_hash(predictions),
+                }
+            )
+        )
+        return 0
+
     cases = validate_cases(load_jsonl(args.cases))
     predictions = validate_predictions(load_jsonl(args.predictions), cases)
     if args.command == "validate":

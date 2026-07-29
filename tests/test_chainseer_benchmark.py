@@ -1,9 +1,19 @@
+import tempfile
 import unittest
+from pathlib import Path
 
 from chainseer_benchmark import (
     BenchmarkValidationError,
+    append_observation,
+    append_outcome,
+    build_observation_from_report,
+    build_outcome_record,
+    case_bank_status,
     evaluate,
+    load_jsonl,
+    materialize_case_bank,
     validate_cases,
+    validate_observations,
 )
 
 
@@ -59,6 +69,39 @@ def prediction(
     return value
 
 
+def public_report():
+    return {
+        "schema_version": "1.1",
+        "token": {
+            "address": "0x" + "1" * 40,
+            "chain": "Robinhood Chain",
+            "chain_id": 4663,
+        },
+        "decision": {
+            "risk_level": "Medium",
+            "action": "REVIEW",
+            "legitimacy_score": 71.5,
+            "hard_stops": [],
+        },
+        "evidence": {
+            "block_pin": 123,
+            "anchor_type": "block_pin",
+            "infrastructure_indeterminate": [],
+            "facts": [
+                {
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                    "response_hash": "1" * 64,
+                }
+            ],
+        },
+        "timechain": {
+            "ring": 10,
+            "ring_hash": "2" * 64,
+        },
+        "analyzed_at": "2026-01-01T00:00:01+00:00",
+    }
+
+
 class BenchmarkValidationTests(unittest.TestCase):
     def test_requires_outcome_after_evidence_cutoff(self):
         invalid = case("bad-time", "benign")
@@ -74,6 +117,114 @@ class BenchmarkValidationTests(unittest.TestCase):
                     case("duplicate", "adverse_security"),
                 ]
             )
+
+
+class ProductionCaseBankTests(unittest.TestCase):
+    def observation(self):
+        return build_observation_from_report(
+            public_report(),
+            cohort="launch",
+            split="validation",
+            analyzer="chainseer",
+            analyzer_version="commit-deadbeef",
+            latency_ms=850,
+            captured_at="2026-01-01T00:00:02+00:00",
+        )
+
+    def test_capture_is_hashed_and_duplicate_append_is_refused(self):
+        observation = self.observation()
+        self.assertEqual(observation["evidence_age_seconds"], 1.0)
+        self.assertEqual(observation["network"], "robinhood")
+        self.assertEqual(observation["anchor_type"], "block_pin")
+        self.assertEqual(observation["anchor_value"], 123)
+        self.assertEqual(len(observation["observation_hash"]), 64)
+
+        tampered = dict(observation)
+        tampered["action"] = "AVOID"
+        with self.assertRaises(BenchmarkValidationError):
+            validate_observations([tampered])
+
+        with tempfile.TemporaryDirectory() as directory:
+            ledger = Path(directory) / "observations.jsonl"
+            append_observation(ledger, observation)
+            self.assertEqual(len(load_jsonl(ledger)), 1)
+            with self.assertRaises(BenchmarkValidationError):
+                append_observation(ledger, observation)
+
+    def test_job_wrapper_derives_analysis_latency(self):
+        observation = build_observation_from_report(
+            {
+                "started_at": "2026-01-01T00:00:00+00:00",
+                "finished_at": "2026-01-01T00:00:03+00:00",
+                "result": public_report(),
+            },
+            cohort="launch",
+            split="test",
+            analyzer="chainseer",
+            analyzer_version="commit-deadbeef",
+            captured_at="2026-01-01T00:00:04+00:00",
+        )
+        self.assertEqual(observation["latency_ms"], 3000.0)
+        self.assertEqual(
+            observation["analyzed_at"],
+            "2026-01-01T00:00:03+00:00",
+        )
+
+    def test_benign_outcome_requires_seven_days_and_materializes(self):
+        observation = self.observation()
+        with self.assertRaises(BenchmarkValidationError):
+            build_outcome_record(
+                [observation],
+                case_id=observation["case_id"],
+                label="benign",
+                outcome_observed_at="2026-01-02T00:00:01+00:00",
+                evidence_refs=["review:test:too-early"],
+                reviewer="reviewer-1",
+            )
+        outcome = build_outcome_record(
+            [observation],
+            case_id=observation["case_id"],
+            label="benign",
+            outcome_observed_at="2026-01-09T00:00:01+00:00",
+            evidence_refs=["review:test:seven-day-window"],
+            reviewer="reviewer-1",
+        )
+        cases, predictions = materialize_case_bank(
+            [observation],
+            [outcome],
+        )
+        self.assertEqual(len(cases), 1)
+        self.assertEqual(len(predictions), 1)
+        self.assertEqual(cases[0]["outcome_hash"], outcome["outcome_hash"])
+        self.assertEqual(cases[0]["anchor_value"], 123)
+        self.assertEqual(predictions[0]["timechain_ring"], 10)
+        self.assertNotIn("captured_at", predictions[0])
+
+    def test_status_keeps_pending_and_finalized_cases_separate(self):
+        observation = self.observation()
+        pending = case_bank_status([observation], [])
+        self.assertEqual(pending["pending_cases"], 1)
+        self.assertEqual(pending["finalized_cases"], 0)
+        with self.assertRaises(BenchmarkValidationError):
+            materialize_case_bank([observation], [])
+
+        outcome = build_outcome_record(
+            [observation],
+            case_id=observation["case_id"],
+            label="adverse_security",
+            outcome_observed_at="2026-01-01T00:10:01+00:00",
+            evidence_refs=["review:test:adverse-event"],
+            reviewer="reviewer-1",
+        )
+        with tempfile.TemporaryDirectory() as directory:
+            outcomes_path = Path(directory) / "outcomes.jsonl"
+            append_outcome(outcomes_path, [observation], outcome)
+            status = case_bank_status(
+                [observation],
+                load_jsonl(outcomes_path),
+            )
+        self.assertEqual(status["pending_cases"], 0)
+        self.assertEqual(status["finalized_cases"], 1)
 
 
 class BenchmarkMetricTests(unittest.TestCase):
