@@ -17,6 +17,7 @@ from chainseer_api import (
     deterministic_benchmark_split,
 )
 from chainseer_benchmark import load_jsonl
+from chainseer_entity_graph import build_robinhood_entity_graph
 
 
 TOKEN = "0x" + "a" * 40
@@ -123,6 +124,16 @@ def sample_internal_report():
                 "adj_top_10_pct": 24.5,
                 "concentration_basis": "total_supply",
             },
+            "entity_graph": build_robinhood_entity_graph(
+                TOKEN,
+                {
+                    "deployer": {
+                        "creator_address": "0x" + "b" * 40,
+                        "creation_tx_hash": "0x" + "c" * 64,
+                    }
+                },
+                block_pin=12345,
+            ),
         },
         "provenance": {
             "block_pin": 12345,
@@ -203,7 +214,7 @@ class AnalyzeRequestTests(unittest.TestCase):
 class PublicReportTests(unittest.TestCase):
     def test_public_schema_omits_raw_queries(self):
         public = build_public_report(sample_internal_report())
-        self.assertEqual(public["schema_version"], "1.1")
+        self.assertEqual(public["schema_version"], "1.2")
         self.assertEqual(public["timechain"]["ring"], 42)
         self.assertEqual(public["timechain"]["cognitive_ring"], 43)
         self.assertEqual(public["timechain"]["cognition"]["status"], "complete")
@@ -241,6 +252,14 @@ class PublicReportTests(unittest.TestCase):
         self.assertEqual(public["holders"]["count_source"], "Blockscout")
         self.assertEqual(public["holders"]["largest_holder_pct"], 8.2)
         self.assertEqual(public["holders"]["top10_holder_pct"], 24.5)
+        self.assertEqual(
+            public["entity_graph"]["network"], "robinhood"
+        )
+        self.assertEqual(len(public["entity_graph"]["graph_hash"]), 64)
+        self.assertEqual(
+            public["entity_graph"]["summary"]["scoring_scope"],
+            "evidence_only",
+        )
 
     def test_public_schema_exposes_solana_slot_boundary(self):
         report = sample_internal_report()

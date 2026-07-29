@@ -23,6 +23,7 @@ from typing import Any, Iterable
 
 BENCHMARK_SCHEMA_VERSION = "1.0"
 CASEBANK_SCHEMA_VERSION = "1.0"
+SUPPORTED_PUBLIC_REPORT_SCHEMAS = {"1.1", "1.2"}
 MIN_BENIGN_OBSERVATION_SECONDS = 7 * 24 * 60 * 60
 NETWORKS = {"robinhood", "solana"}
 LABELS = {"adverse_security", "benign", "infrastructure_failure"}
@@ -374,9 +375,12 @@ def build_observation_from_report(
     report = wrapper.get("result") or document
     if not isinstance(report, dict):
         raise BenchmarkValidationError("report document must be a JSON object")
-    if str(report.get("schema_version") or "") != "1.1":
+    if str(report.get("schema_version") or "") not in (
+        SUPPORTED_PUBLIC_REPORT_SCHEMAS
+    ):
         raise BenchmarkValidationError(
-            "capture requires a Chainseer public report with schema_version 1.1"
+            "capture requires a supported Chainseer public report schema: "
+            + ", ".join(sorted(SUPPORTED_PUBLIC_REPORT_SCHEMAS))
         )
     if split not in SPLITS:
         raise BenchmarkValidationError(

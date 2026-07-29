@@ -21,6 +21,11 @@ from typing import Any
 
 import requests
 
+from chainseer_entity_graph import (
+    build_solana_entity_graph,
+    verify_entity_graph,
+)
+
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
 BASE58_INDEX = {char: index for index, char in enumerate(BASE58_ALPHABET)}
@@ -571,6 +576,12 @@ class SolanaPublicAnalyzer:
         cognition = agent.cognitive_loop.prepare(report)
         analysis = report["analysis"]
         poq = report["poq_scores"]
+        entity_graph = (report.get("data") or {}).get("entity_graph") or {}
+        sealed_entity_graph = {
+            "graph_hash": entity_graph.get("graph_hash"),
+            "summary": entity_graph.get("summary") or {},
+            "signals": entity_graph.get("signals") or [],
+        }
         safe_context = {
             "network": "solana",
             "mint": report["token_address"],
@@ -589,6 +600,7 @@ class SolanaPublicAnalyzer:
                 ),
             },
             "coverage": report.get("coverage") or {},
+            "entity_graph": sealed_entity_graph,
         }
         candidate = (
             f"Solana mint {report['token_address']} assessed as "
@@ -607,6 +619,7 @@ class SolanaPublicAnalyzer:
                 _canonical_json(report.get("provenance") or {}),
                 _canonical_json(analysis.get("component_scores") or {}),
                 _canonical_json(report.get("coverage") or {}),
+                _canonical_json(sealed_entity_graph),
             ],
             extra_payload={
                 "network": "solana",
@@ -614,6 +627,7 @@ class SolanaPublicAnalyzer:
                 "slot_anchor": (report.get("provenance") or {}).get("block_pin"),
                 "analysis": safe_context["analysis"],
                 "coverage": report.get("coverage") or {},
+                "entity_graph": sealed_entity_graph,
                 "cognition": cognition,
                 "live_execution_enabled": False,
             },
@@ -1201,5 +1215,21 @@ class SolanaPublicAnalyzer:
             ),
             "poq_scores": poq_scores,
         }
+        report["data"]["entity_graph"] = build_solana_entity_graph(
+            mint,
+            report["data"],
+            slot_anchor=slot_anchor or account_slot,
+            facts=facts,
+        )
+        graph_ok, graph_reason = verify_entity_graph(
+            report["data"]["entity_graph"]
+        )
+        if not graph_ok:
+            raise RuntimeError(
+                f"Entity evidence graph verification failed: {graph_reason}"
+            )
+        report["analysis"]["entity_insider_summary"] = (
+            report["data"]["entity_graph"]["summary"]
+        )
         self._seal_report(report)
         return report

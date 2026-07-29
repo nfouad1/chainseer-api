@@ -17,6 +17,9 @@ ledgers under `/data/benchmark` on its persistent disk, uses
 `RENDER_GIT_COMMIT` as the immutable analyzer version, and deterministically
 keeps each token in one train/validation/test split. Cache hits are not captured
 again. Job responses and `/health/ready` report capture success or degradation.
+Capture accepts historical public schema `1.1` and entity-graph-enabled schema
+`1.2`. The graph is covered by the public report hash, but graph v1 is
+evidence-only and does not create or alter benchmark outcome labels.
 
 Capture a completed public report immediately. Use an immutable analyzer
 version such as the deployed Git commit:

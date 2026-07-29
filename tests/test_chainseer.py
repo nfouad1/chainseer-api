@@ -100,6 +100,46 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             provenance_doc,
         )
 
+    def test_cognitive_input_receives_only_bounded_entity_graph_fields(self):
+        safe = json.loads(
+            chainseer.ChainseerCognitiveLoop._safe_input(
+                {
+                    "token_address": "0x" + "1" * 40,
+                    "chain_id": 4663,
+                    "analysis": {"risk_level": "High"},
+                    "provenance": {"block_pin": 100, "fact_count": 2},
+                    "data": {
+                        "entity_graph": {
+                            "graph_hash": "a" * 64,
+                            "summary": {
+                                "insider_risk_level": "High",
+                                "coverage": "measured",
+                            },
+                            "signals": [
+                                {
+                                    "code": "direct_liquidity_control",
+                                    "reason": "provider text must stay excluded",
+                                }
+                            ],
+                            "nodes": [
+                                {
+                                    "address": "0x" + "b" * 40,
+                                    "label": "provider-controlled label",
+                                }
+                            ],
+                        }
+                    },
+                }
+            )
+        )
+        self.assertEqual(safe["entity_graph_hash"], "a" * 64)
+        self.assertEqual(safe["insider_risk_level"], "High")
+        self.assertEqual(
+            safe["entity_signal_codes"], ["direct_liquidity_control"]
+        )
+        self.assertNotIn("provider text", str(safe))
+        self.assertNotIn("provider-controlled label", str(safe))
+
     @staticmethod
     def investor_fixture():
         return {
