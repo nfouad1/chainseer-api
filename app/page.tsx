@@ -3,6 +3,8 @@
 import { FormEvent, useState } from "react";
 
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+type Network = "robinhood" | "solana";
 
 type PublicReport = {
   schema_version: string;
@@ -11,7 +13,7 @@ type PublicReport = {
     name?: string;
     symbol?: string;
     chain: string;
-    chain_id?: number;
+    chain_id?: number | string;
     explorer_url?: string;
   };
   decision: {
@@ -46,6 +48,9 @@ type PublicReport = {
   evidence: {
     fact_count: number;
     block_pin?: number;
+    anchor_type?: "block_pin" | "confirmed_slot_anchor" | string;
+    anchor_caveat?: string;
+    infrastructure_indeterminate?: string[];
     ledger_hash?: string;
     facts: Array<{
       id?: string;
@@ -70,7 +75,7 @@ type PublicReport = {
 type ScanState = "idle" | "submitting" | "analyzing" | "succeeded" | "failed";
 
 const factorNames: Record<string, string> = {
-  security: "Contract security",
+  security: "Token controls",
   honeypot_safety: "Honeypot safety",
   liquidity: "Liquidity health",
   lp_lock: "LP lock",
@@ -124,6 +129,8 @@ function LiveReport({ report }: { report: PublicReport }) {
     }));
   const hardStops = report.decision.hard_stops || [];
   const risk = (report.decision.risk_level || "Unknown").toLowerCase();
+  const isSlotAnchor = report.evidence.anchor_type === "confirmed_slot_anchor";
+  const anchorLabel = isSlotAnchor ? "Slot anchor" : "Block pin";
 
   return (
     <section className="live-report" id="live-report" aria-live="polite">
@@ -138,6 +145,7 @@ function LiveReport({ report }: { report: PublicReport }) {
             {report.token.symbol ? ` (${report.token.symbol})` : ""}
           </h2>
           <p className="live-address">{report.token.address}</p>
+          <p className="live-chain">{report.token.chain}</p>
         </div>
         <div className={`live-risk risk-${risk}`}>
           <span>{report.decision.action || "REVIEW"}</span>
@@ -172,7 +180,13 @@ function LiveReport({ report }: { report: PublicReport }) {
         <article>
           <span>Evidence</span>
           <strong>{report.evidence.fact_count} facts</strong>
-          <p>Block {report.evidence.block_pin?.toLocaleString() || "unknown"}</p>
+          <p>
+            {isSlotAnchor ? "Slot" : "Block"}{" "}
+            {report.evidence.block_pin?.toLocaleString() || "unknown"}
+            {(report.evidence.infrastructure_indeterminate?.length || 0) > 0
+              ? ` · ${report.evidence.infrastructure_indeterminate?.length} source indeterminate`
+              : ""}
+          </p>
         </article>
       </div>
 
@@ -225,11 +239,14 @@ function LiveReport({ report }: { report: PublicReport }) {
             <div><dt>Timechain Ring</dt><dd>{report.timechain.ring ?? "—"}</dd></div>
             <div><dt>Ring hash</dt><dd>{report.timechain.ring_hash?.slice(0, 20) || "—"}…</dd></div>
             <div><dt>Ledger hash</dt><dd>{report.evidence.ledger_hash?.slice(0, 20) || "—"}…</dd></div>
-            <div><dt>Block pin</dt><dd>{report.evidence.block_pin?.toLocaleString() || "—"}</dd></div>
+            <div><dt>{anchorLabel}</dt><dd>{report.evidence.block_pin?.toLocaleString() || "—"}</dd></div>
           </dl>
+          {report.evidence.anchor_caveat && (
+            <p className="anchor-caveat">{report.evidence.anchor_caveat}</p>
+          )}
           {report.token.explorer_url && (
             <a href={report.token.explorer_url} target="_blank" rel="noreferrer">
-              Open contract explorer ↗
+              Open token explorer ↗
             </a>
           )}
         </div>
@@ -303,6 +320,7 @@ const evidence = [
 ];
 
 export default function Home() {
+  const [network, setNetwork] = useState<Network>("robinhood");
   const [address, setAddress] = useState("");
   const [notice, setNotice] = useState("");
   const [scanState, setScanState] = useState<ScanState>("idle");
@@ -313,8 +331,16 @@ export default function Home() {
     event.preventDefault();
     const normalizedAddress = address.trim();
 
-    if (!ADDRESS_RE.test(normalizedAddress)) {
-      setNotice("Enter a valid 42-character EVM contract address.");
+    const validAddress =
+      network === "robinhood"
+        ? ADDRESS_RE.test(normalizedAddress)
+        : SOLANA_ADDRESS_RE.test(normalizedAddress);
+    if (!validAddress) {
+      setNotice(
+        network === "robinhood"
+          ? "Enter a valid 42-character EVM contract address."
+          : "Enter a valid Solana SPL mint address.",
+      );
       setScanState("failed");
       return;
     }
@@ -322,14 +348,14 @@ export default function Home() {
     setScanState("submitting");
     setLiveReport(null);
     setShowExample(false);
-    setNotice("Submitting the contract to the serialized analysis queue…");
+    setNotice("Submitting the token to the serialized analysis queue…");
 
     try {
       const submission = await fetch("/api/analyses", {
         method: "POST",
         cache: "no-store",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: normalizedAddress }),
+        body: JSON.stringify({ address: normalizedAddress, network }),
       });
       const submissionBody = await submission.json().catch(() => null);
       if (!submission.ok) {
@@ -349,7 +375,9 @@ export default function Home() {
       setNotice(
         submissionBody.cached
           ? "Loading the recent sealed result…"
-          : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
+          : network === "solana"
+            ? "Analyzing SPL mint controls, markets, holders, Jupiter routes, and provenance…"
+            : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
       );
 
       for (let attempt = 0; attempt < 150; attempt += 1) {
@@ -428,7 +456,7 @@ export default function Home() {
               <small>PoQ-verified analysis</small>
             </span>
           </a>
-          <a className="header-cta" href="#scanner">Scan contract</a>
+          <a className="header-cta" href="#scanner">Scan token</a>
         </div>
       </header>
 
@@ -439,7 +467,7 @@ export default function Home() {
           On-chain intelligence · Powered by Cypher Tempre Timechain
         </div>
         <h1>
-          Know the contract
+          Know the token
           <br />
           <span>before it knows your wallet.</span>
         </h1>
@@ -449,14 +477,30 @@ export default function Home() {
         </p>
 
         <form className="scanner" id="scanner" onSubmit={submitScan}>
-          <div className="network-select" aria-label="Selected network">
+          <div className="network-select">
             <span className="network-glyph">◆</span>
-            <span>
-              <strong>Robinhood Chain</strong>
-              <small>Base · coming soon</small>
-            </span>
+            <label className="sr-only" htmlFor="analysis-network">
+              Analysis network
+            </label>
+            <select
+              id="analysis-network"
+              value={network}
+              onChange={(event) => {
+                setNetwork(event.target.value as Network);
+                setAddress("");
+                setNotice("");
+                setLiveReport(null);
+                setScanState("idle");
+              }}
+            >
+              <option value="robinhood">Robinhood Chain</option>
+              <option value="solana">Solana</option>
+            </select>
+            <small>{network === "solana" ? "SPL · live" : "EVM · live"}</small>
           </div>
-          <label className="sr-only" htmlFor="contract-address">Contract address</label>
+          <label className="sr-only" htmlFor="contract-address">
+            {network === "solana" ? "SPL mint address" : "Contract address"}
+          </label>
           <input
             id="contract-address"
             value={address}
@@ -464,7 +508,11 @@ export default function Home() {
               setAddress(event.target.value);
               setNotice("");
             }}
-            placeholder="Paste a contract address 0x..."
+            placeholder={
+              network === "solana"
+                ? "Paste a Solana mint address..."
+                : "Paste a contract address 0x..."
+            }
             autoComplete="off"
             spellCheck={false}
           />
@@ -477,7 +525,7 @@ export default function Home() {
         <div className="scanner-meta">
           <span>No wallet connection</span>
           <span>No signature</span>
-          <span>Evidence pinned to block</span>
+          <span>Evidence anchored to block or slot</span>
           <button type="button" onClick={loadExample}>Open demo report →</button>
         </div>
         {notice && <p className="scan-notice" role="status">{notice}</p>}
@@ -486,7 +534,7 @@ export default function Home() {
       <section className="signal-strip" aria-label="Chainseer capabilities">
         <div><strong>12</strong><span>risk dimensions</span></div>
         <div><strong>6</strong><span>hard-stop gates</span></div>
-        <div><strong>Block-pinned</strong><span>market evidence</span></div>
+        <div><strong>Block / slot</strong><span>anchored evidence</span></div>
         <div><strong>Timechain</strong><span>tamper-evident memory</span></div>
       </section>
 
@@ -613,7 +661,7 @@ export default function Home() {
           </p>
         </div>
         <div className="steps">
-          <article><span>01</span><h3>Observe</h3><p>Collect contract, liquidity, holder, deployer, and market signals.</p></article>
+          <article><span>01</span><h3>Observe</h3><p>Collect token controls, liquidity, holder, execution, and market signals.</p></article>
           <article><span>02</span><h3>Challenge</h3><p>Run hard-stop gates and test conflicting evidence before scoring.</p></article>
           <article><span>03</span><h3>Explain</h3><p>Translate the result into an investor-friendly action and watchlist.</p></article>
           <article><span>04</span><h3>Remember</h3><p>Seal evidence and compare later outcomes without rewriting history.</p></article>
@@ -686,7 +734,7 @@ export default function Home() {
           <span className="eyebrow">Built for decisions, not hype</span>
           <h2>Read the chain. Verify the claim.</h2>
         </div>
-        <a href="#scanner">Scan a contract</a>
+        <a href="#scanner">Scan a token</a>
       </section>
 
       <footer>

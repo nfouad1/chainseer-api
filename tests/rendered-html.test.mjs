@@ -33,6 +33,7 @@ test("server-renders the Chainseer product page", async () => {
   const html = await response.text();
   assert.match(html, /<title>Chainseer/);
   assert.match(html, /Robinhood Chain/);
+  assert.match(html, /Solana/);
   assert.match(html, /Timechain-sealed/);
   assert.match(html, /Powered by Cypher Tempre/);
   assert.doesNotMatch(html, /Private beta/i);
@@ -92,6 +93,8 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.doesNotMatch(page, /0x407470F8D77d12417A6cfaC5940c2f8B5F4E8a27/);
   assert.doesNotMatch(page, /ring_000751/);
   assert.match(apiRoute, /CHAINSEER_API_TOKEN/);
+  assert.match(apiRoute, /validSolanaMint/);
+  assert.match(apiRoute, /JSON\.stringify\(\{ address, network \}\)/);
   assert.doesNotMatch(page, /CHAINSEER_API_TOKEN|NEXT_PUBLIC_CHAINSEER/);
   assert.match(packageJson, /"name": "chainseer-web"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

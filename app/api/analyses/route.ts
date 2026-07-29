@@ -1,8 +1,27 @@
 import { NextRequest, NextResponse } from "next/server";
 
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
+const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
+const BASE58_ALPHABET =
+  "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz";
 const JOB_RE = /^[a-f0-9]{32}$/;
 const MAX_REQUEST_BYTES = 2_048;
+
+function validSolanaMint(value: string) {
+  if (!SOLANA_ADDRESS_RE.test(value)) return false;
+  let number = 0n;
+  for (const character of value) {
+    const index = BASE58_ALPHABET.indexOf(character);
+    if (index < 0) return false;
+    number = number * 58n + BigInt(index);
+  }
+  let byteLength = 0;
+  for (let remaining = number; remaining > 0n; remaining >>= 8n) {
+    byteLength += 1;
+  }
+  const leadingZeroes = value.length - value.replace(/^1+/, "").length;
+  return leadingZeroes + byteLength === 32;
+}
 
 function configuration() {
   const baseUrl = process.env.CHAINSEER_API_URL?.replace(/\/+$/, "");
@@ -131,13 +150,27 @@ export async function POST(request: NextRequest) {
     typeof payload.address === "string"
       ? payload.address.trim()
       : "";
+  const network =
+    typeof payload === "object" &&
+    payload !== null &&
+    "network" in payload &&
+    payload.network === "solana"
+      ? "solana"
+      : "robinhood";
 
-  if (!ADDRESS_RE.test(address)) {
+  const validAddress =
+    network === "solana"
+      ? validSolanaMint(address)
+      : ADDRESS_RE.test(address);
+  if (!validAddress) {
     return NextResponse.json(
       {
         error: {
           code: "invalid_address",
-          message: "Enter a valid 42-character EVM contract address.",
+          message:
+            network === "solana"
+              ? "Enter a valid Solana SPL mint address."
+              : "Enter a valid 42-character EVM contract address.",
         },
       },
       { status: 422 },
@@ -148,7 +181,7 @@ export async function POST(request: NextRequest) {
   const identity = token ? await clientIdentity(request, token) : undefined;
   return proxy("/v1/analyses", {
     method: "POST",
-    body: JSON.stringify({ address }),
+    body: JSON.stringify({ address, network }),
   }, identity);
 }
 
