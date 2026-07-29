@@ -91,6 +91,10 @@ test("keeps secrets server-side and removes the starter preview", async () => {
 
   assert.match(page, /\/api\/analyses/);
   assert.match(page, /className="chain-switch"/);
+  assert.match(page, /live-market-grid/);
+  assert.match(page, />Holders</);
+  assert.match(page, /market_cap_kind/);
+  assert.match(page, /FDV estimate/);
   assert.match(page, /data-network=\{network\}/);
   assert.match(page, /aria-pressed=\{network === "solana"\}/);
   assert.doesNotMatch(page, /<select/);

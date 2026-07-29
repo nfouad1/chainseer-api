@@ -41,9 +41,24 @@ type PublicReport = {
   market: {
     price_usd?: number | string | null;
     market_cap_usd?: number | string | null;
+    market_cap_kind?: "reported_market_cap" | "fdv_proxy" | "unavailable" | string;
+    market_cap_source?: string | null;
+    fdv_usd?: number | string | null;
     liquidity_usd?: number | string | null;
     volume_24h_usd?: number | string | null;
     age?: string | null;
+  };
+  holders: {
+    count?: number | null;
+    count_status?: "reported" | "unavailable" | string;
+    count_source?: string | null;
+    sample_size?: number;
+    sample_kind?: string | null;
+    largest_holder_pct?: number | null;
+    top10_holder_pct?: number | null;
+    concentration_basis?: string | null;
+    pool_and_program_vaults_excluded?: boolean | null;
+    caveat?: string;
   };
   evidence: {
     fact_count: number;
@@ -119,6 +134,17 @@ function formatMoney(value: number | string | null | undefined) {
   }).format(amount);
 }
 
+function formatCount(value: number | null | undefined) {
+  const numericValue = Number(value);
+  if (value === null || value === undefined || !Number.isFinite(numericValue) || numericValue <= 0) {
+    return "Unavailable";
+  }
+  return new Intl.NumberFormat("en-US", {
+    notation: numericValue >= 10_000 ? "compact" : "standard",
+    maximumFractionDigits: 1,
+  }).format(numericValue);
+}
+
 function LiveReport({ report }: { report: PublicReport }) {
   const factorEntries = Object.entries(report.factors)
     .filter(([key, value]) => key !== "legitimacy" && Number.isFinite(value))
@@ -131,6 +157,26 @@ function LiveReport({ report }: { report: PublicReport }) {
   const risk = (report.decision.risk_level || "Unknown").toLowerCase();
   const isSlotAnchor = report.evidence.anchor_type === "confirmed_slot_anchor";
   const anchorLabel = isSlotAnchor ? "Slot anchor" : "Block pin";
+  const marketCapKind = report.market.market_cap_kind || "unavailable";
+  const marketCapValue = marketCapKind === "unavailable"
+    ? report.market.fdv_usd
+    : report.market.market_cap_usd;
+  const marketCapLabel = marketCapKind === "fdv_proxy"
+    ? "FDV estimate"
+    : marketCapKind === "unavailable" && report.market.fdv_usd
+      ? "Fully diluted value"
+      : "Market cap";
+  const holderCount = report.holders?.count;
+  const holderValue = holderCount
+    ? formatCount(holderCount)
+    : report.holders?.sample_size
+      ? `${report.holders.sample_size} sampled`
+      : "Unavailable";
+  const holderDetail = holderCount
+    ? `${report.holders.count_source || "Provider"} reported`
+    : report.holders?.sample_size
+      ? "Largest accounts only"
+      : "No reliable count returned";
 
   return (
     <section className="live-report" id="live-report" aria-live="polite">
@@ -154,6 +200,33 @@ function LiveReport({ report }: { report: PublicReport }) {
         </div>
       </div>
 
+      <div className="live-market-grid" aria-label="Token market and holder snapshot">
+        <article>
+          <span>{marketCapLabel}</span>
+          <strong>{formatMoney(marketCapValue)}</strong>
+          <p>
+            {marketCapKind === "fdv_proxy"
+              ? "Circulating market cap was unavailable"
+              : report.market.market_cap_source || "Market source unavailable"}
+          </p>
+        </article>
+        <article title={report.holders?.caveat}>
+          <span>Holders</span>
+          <strong>{holderValue}</strong>
+          <p>{holderDetail}</p>
+        </article>
+        <article>
+          <span>Liquidity</span>
+          <strong>{formatMoney(report.market.liquidity_usd)}</strong>
+          <p>Observed across reported markets</p>
+        </article>
+        <article>
+          <span>24h volume</span>
+          <strong>{formatMoney(report.market.volume_24h_usd)}</strong>
+          <p>{report.market.age || "Market age unknown"}</p>
+        </article>
+      </div>
+
       <div className="live-summary-grid">
         <article>
           <span>Confidence</span>
@@ -170,11 +243,13 @@ function LiveReport({ report }: { report: PublicReport }) {
           </p>
         </article>
         <article>
-          <span>Market snapshot</span>
-          <strong>{formatMoney(report.market.liquidity_usd)} liquidity</strong>
+          <span>Trading snapshot</span>
+          <strong>{formatMoney(report.market.price_usd)} price</strong>
           <p>
             {formatMoney(report.market.volume_24h_usd)} volume ·{" "}
-            {report.market.age || "Age unknown"}
+            {report.holders?.largest_holder_pct != null
+              ? `Largest observed holder ${Number(report.holders.largest_holder_pct).toFixed(1)}%`
+              : report.market.age || "Market age unknown"}
           </p>
         </article>
         <article>
