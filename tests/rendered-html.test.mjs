@@ -107,11 +107,17 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, /analysis-disclosure-trigger/);
   assert.match(page, /data-network=\{network\}/);
   assert.match(page, /aria-pressed=\{network === "solana"\}/);
+  assert.match(page, /aria-pressed=\{network === "base"\}/);
   assert.doesNotMatch(page, /<select/);
   assert.match(styles, /\.theme-solana/);
   assert.match(styles, /#9945ff/i);
   assert.match(styles, /#14f195/i);
   assert.match(styles, /\.theme-robinhood/);
+  assert.match(styles, /\.theme-base/);
+  assert.match(styles, /#0052ff/i);
+  assert.match(page, /<strong>Base<\/strong>/);
+  assert.match(apiRoute, /requestedNetwork === "base"/);
+  assert.match(watchRoute, /network !== "base"/);
   assert.match(styles, /\.entity-graph/);
   assert.match(styles, /\.graph-link\.link-provider_attested/);
   assert.match(styles, /\.entity-inspector/);

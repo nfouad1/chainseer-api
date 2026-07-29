@@ -150,13 +150,19 @@ export async function POST(request: NextRequest) {
     typeof payload.address === "string"
       ? payload.address.trim()
       : "";
-  const network =
+  const requestedNetwork =
     typeof payload === "object" &&
     payload !== null &&
     "network" in payload &&
-    payload.network === "solana"
-      ? "solana"
+    typeof payload.network === "string"
+      ? payload.network
       : "robinhood";
+  const network =
+    requestedNetwork === "solana"
+      ? "solana"
+      : requestedNetwork === "base"
+        ? "base"
+        : "robinhood";
 
   const validAddress =
     network === "solana"

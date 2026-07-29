@@ -4,7 +4,7 @@ import { FormEvent, useEffect, useState } from "react";
 
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
-type Network = "robinhood" | "solana";
+type Network = "robinhood" | "base" | "solana";
 
 type EntityGraphNode = {
   id: string;
@@ -174,6 +174,15 @@ type CriticalAlert = {
 
 const MONITOR_STORAGE_KEY = "chainseer-critical-monitors-v1";
 const MAX_DEVICE_MONITORS = 10;
+
+function reportNetwork(chain: string): Network {
+  const normalized = chain.toLowerCase();
+  if (normalized.includes("solana")) return "solana";
+  if (normalized === "base" || normalized.includes("base mainnet")) {
+    return "base";
+  }
+  return "robinhood";
+}
 
 const factorNames: Record<string, string> = {
   security: "Token controls",
@@ -807,7 +816,9 @@ export default function Home() {
               (item): item is TokenMonitor =>
                 item &&
                 typeof item === "object" &&
-                (item.network === "robinhood" || item.network === "solana") &&
+                (item.network === "robinhood" ||
+                  item.network === "base" ||
+                  item.network === "solana") &&
                 typeof item.address === "string" &&
                 typeof item.key === "string" &&
                 typeof item.cursor === "string",
@@ -921,7 +932,7 @@ export default function Home() {
   }, [monitors, monitorsLoaded]);
 
   const liveMonitorKey = liveReport
-    ? `${liveReport.token.chain.toLowerCase().includes("solana") ? "solana" : "robinhood"}:${liveReport.token.address.toLowerCase()}`
+    ? `${reportNetwork(liveReport.token.chain)}:${liveReport.token.address.toLowerCase()}`
     : "";
   const liveIsMonitored = monitors.some(
     (monitor) => monitor.key === liveMonitorKey,
@@ -929,19 +940,15 @@ export default function Home() {
 
   async function toggleLiveMonitor() {
     if (!liveReport || monitorBusy) return;
-    const reportNetwork: Network = liveReport.token.chain
-      .toLowerCase()
-      .includes("solana")
-      ? "solana"
-      : "robinhood";
+    const activeNetwork = reportNetwork(liveReport.token.chain);
     const reportAddress = liveReport.token.address;
-    const key = `${reportNetwork}:${reportAddress.toLowerCase()}`;
+    const key = `${activeNetwork}:${reportAddress.toLowerCase()}`;
     setMonitorBusy(true);
     setMonitorNotice("");
     try {
       if (monitors.some((monitor) => monitor.key === key)) {
         const query = new URLSearchParams({
-          network: reportNetwork,
+          network: activeNetwork,
           address: reportAddress,
         });
         const response = await fetch(`/api/watch?${query.toString()}`, {
@@ -968,7 +975,7 @@ export default function Home() {
         cache: "no-store",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
-          network: reportNetwork,
+          network: activeNetwork,
           address: reportAddress,
         }),
       });
@@ -990,7 +997,7 @@ export default function Home() {
         ...current,
         {
           key,
-          network: reportNetwork,
+          network: activeNetwork,
           address: reportAddress,
           label:
             liveReport.token.symbol ||
@@ -1016,14 +1023,14 @@ export default function Home() {
     const normalizedAddress = address.trim();
 
     const validAddress =
-      network === "robinhood"
-        ? ADDRESS_RE.test(normalizedAddress)
-        : SOLANA_ADDRESS_RE.test(normalizedAddress);
+      network === "solana"
+        ? SOLANA_ADDRESS_RE.test(normalizedAddress)
+        : ADDRESS_RE.test(normalizedAddress);
     if (!validAddress) {
       setNotice(
-        network === "robinhood"
-          ? "Enter a valid 42-character EVM contract address."
-          : "Enter a valid Solana SPL mint address.",
+        network === "solana"
+          ? "Enter a valid Solana SPL mint address."
+          : "Enter a valid 42-character EVM contract address.",
       );
       setScanState("failed");
       return;
@@ -1061,7 +1068,9 @@ export default function Home() {
           ? "Loading the recent sealed result…"
           : network === "solana"
             ? "Analyzing SPL mint controls, markets, holders, Jupiter routes, and provenance…"
-            : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
+            : network === "base"
+              ? "Analyzing Base contract, liquidity, holders, deployer history, and provenance…"
+              : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
       );
 
       for (let attempt = 0; attempt < 150; attempt += 1) {
@@ -1183,6 +1192,21 @@ export default function Home() {
               <span className="chain-icon robinhood-icon" aria-hidden="true">◆</span>
               <span className="chain-option-copy">
                 <strong>Robinhood Chain</strong>
+                <small>EVM · block-pinned</small>
+              </span>
+              <span className="chain-live">Live</span>
+            </button>
+            <button
+              type="button"
+              className={`chain-option base-option ${
+                network === "base" ? "selected" : ""
+              }`}
+              aria-pressed={network === "base"}
+              onClick={() => selectNetwork("base")}
+            >
+              <span className="chain-icon base-icon" aria-hidden="true">B</span>
+              <span className="chain-option-copy">
+                <strong>Base</strong>
                 <small>EVM · block-pinned</small>
               </span>
               <span className="chain-live">Live</span>

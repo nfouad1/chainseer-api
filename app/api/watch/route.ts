@@ -53,7 +53,11 @@ async function clientIdentity(request: NextRequest, token: string) {
 }
 
 function validate(network: string, address: string) {
-  if (network !== "robinhood" && network !== "solana") return false;
+  if (
+    network !== "robinhood" &&
+    network !== "base" &&
+    network !== "solana"
+  ) return false;
   return network === "solana"
     ? validSolanaMint(address)
     : ADDRESS_RE.test(address);
@@ -138,10 +142,16 @@ export async function POST(request: NextRequest) {
     );
   }
   const payload = body && typeof body === "object" ? body : {};
-  const network =
-    "network" in payload && payload.network === "solana"
-      ? "solana"
+  const requestedNetwork =
+    "network" in payload && typeof payload.network === "string"
+      ? payload.network
       : "robinhood";
+  const network =
+    requestedNetwork === "solana"
+      ? "solana"
+      : requestedNetwork === "base"
+        ? "base"
+        : "robinhood";
   const address =
     "address" in payload && typeof payload.address === "string"
       ? payload.address.trim()
