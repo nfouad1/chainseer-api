@@ -184,6 +184,23 @@ class FakeSolanaAgent:
         return report
 
 
+class FakeBaseAgent(FakeAgent):
+    network_key = "base"
+
+    def analyze_token(self, address, full_report=False):
+        report = super().analyze_token(address, full_report=full_report)
+        report["chain_id"] = 8453
+        report["chain"] = "base"
+        report["chain_name"] = "Base"
+        report["data"]["entity_graph"] = build_robinhood_entity_graph(
+            address,
+            {},
+            block_pin=12345,
+            network="base",
+        )
+        return report
+
+
 class AnalyzeRequestTests(unittest.TestCase):
     def test_accepts_valid_address(self):
         request = AnalyzeRequest(address=TOKEN)
@@ -200,6 +217,12 @@ class AnalyzeRequestTests(unittest.TestCase):
         )
         self.assertEqual(request.network, "solana")
         self.assertEqual(request.address, SOLANA_MINT)
+
+    def test_accepts_valid_base_contract(self):
+        address = "0x" + "A" * 40
+        request = AnalyzeRequest(network="base", address=address)
+        self.assertEqual(request.network, "base")
+        self.assertEqual(request.address, address)
 
     def test_rejects_invalid_solana_mint(self):
         with self.assertRaises(ValidationError):
@@ -510,7 +533,7 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(len(status["subscriptions"]), 2)
                 self.assertEqual(
                     status["subscription_counts"],
-                    {"robinhood": 1, "solana": 1},
+                    {"robinhood": 1, "base": 0, "solana": 1},
                 )
                 self.assertTrue(service.watch_unsubscribe(TOKEN))
                 self.assertTrue(
@@ -553,6 +576,40 @@ class ServiceTests(unittest.TestCase):
                     f"robinhood:{SOLANA_MINT}",
                     service.cache,
                 )
+            finally:
+                service.stop()
+
+    def test_worker_routes_base_and_keeps_network_cache_separate(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            robinhood = FakeAgent()
+            base = FakeBaseAgent()
+            service._agent = robinhood
+            service._base_agent = base
+            service.start()
+            try:
+                accepted = service.submit(TOKEN.upper(), "base")
+                deadline = time.time() + 3
+                job = service.get(accepted.job_id)
+                while job and job.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    job = service.get(accepted.job_id)
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "succeeded")
+                self.assertEqual(job.result["token"]["chain"], "Base")
+                self.assertEqual(job.result["token"]["chain_id"], 8453)
+                self.assertEqual(
+                    job.result["entity_graph"]["network"], "base"
+                )
+                self.assertEqual(base.calls, 1)
+                self.assertEqual(robinhood.calls, 0)
+
+                cached = service.submit(TOKEN, "base")
+                self.assertTrue(cached.cached)
+                self.assertEqual(base.calls, 1)
+                self.assertIn(f"base:{TOKEN}", service.cache)
+                self.assertNotIn(f"robinhood:{TOKEN}", service.cache)
             finally:
                 service.stop()
 

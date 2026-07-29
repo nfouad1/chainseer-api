@@ -538,10 +538,14 @@ class SingleWriterLease:
 class WatchStore:
     """Atomic watcher state plus append-only alert history."""
 
-    def __init__(self, root: str | Path):
+    def __init__(self, root: str | Path, network: str = "robinhood"):
+        if network not in {"robinhood", "base"}:
+            raise ValueError("unsupported EVM watcher network")
         self.root = Path(root)
-        self.state_path = self.root / "watcher_state.json"
-        self.alert_path = self.root / "watcher_alerts.jsonl"
+        self.network = network
+        prefix = "" if network == "robinhood" else f"{network}_"
+        self.state_path = self.root / f"{prefix}watcher_state.json"
+        self.alert_path = self.root / f"{prefix}watcher_alerts.jsonl"
 
     def load(self) -> dict[str, Any]:
         if not self.state_path.exists():
@@ -606,7 +610,7 @@ class WatchStore:
         value = state["subscriptions"].setdefault(
             key,
             {
-                "network": "robinhood",
+                "network": self.network,
                 "token_address": token,
                 "created_at": utc_now_iso(),
                 "manual_subscription": subscriber is None,
@@ -1850,12 +1854,18 @@ class ChainseerWatcher:
         control_root: str | Path | None = None,
         config: WatchConfig | None = None,
         clock: Callable[[], float] = time.time,
+        network: str | None = None,
     ):
         self.agent = agent
+        self.network = network or getattr(
+            agent, "network_key", "robinhood"
+        )
+        if self.network not in {"robinhood", "base"}:
+            raise ValueError("unsupported EVM watcher network")
         self.config = config or WatchConfig()
         self.clock = clock
         root = Path(control_root or agent.chain_root) / "controls"
-        self.store = WatchStore(root)
+        self.store = WatchStore(root, self.network)
         self.outcomes = OutcomeCollector()
         self.calibration = CalibrationEngine(root)
 
@@ -2060,6 +2070,7 @@ class ChainseerWatcher:
                     if canonical.get("hash") != subscription["last_processed_hash"]:
                         alert = {
                             "schema_version": CONTROL_SCHEMA_VERSION,
+                            "network": self.network,
                             "type": "reorg",
                             "reason": "confirmed_block_hash_changed",
                             "token_address": token,
@@ -2189,6 +2200,7 @@ class ChainseerWatcher:
                         )
                         alert = {
                             "schema_version": CONTROL_SCHEMA_VERSION,
+                            "network": self.network,
                             "type": "state_change",
                             "reason": ",".join(reasons),
                             "token_address": token,

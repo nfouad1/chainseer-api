@@ -369,6 +369,7 @@ class ChainseerInfrastructureTests(unittest.TestCase):
     def test_dex_analysis_ignores_pairs_from_other_chains(self):
         robinhood_pair = {
             "chainId": "robinhood",
+            "baseToken": {"address": "0x" + "a" * 40},
             "pairAddress": "0x" + "2" * 64,
             "labels": ["v4"],
             "liquidity": {"usd": 10_000},
@@ -376,6 +377,7 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         }
         foreign_pair = {
             "chainId": "base",
+            "baseToken": {"address": "0x" + "a" * 40},
             "pairAddress": "0x" + "1" * 40,
             "labels": ["v2"],
             "liquidity": {"usd": 1_000_000},
@@ -401,6 +403,46 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertEqual(result["primary_price_usd"], 0.25)
         self.assertEqual(result["total_liquidity_usd"], 10_000)
         self.assertEqual(result["discarded_foreign_pair_count"], 1)
+
+    def test_dex_analysis_ignores_pairs_where_target_is_quote_asset(self):
+        token = "0x" + "a" * 40
+        reversed_pair = {
+            "chainId": "robinhood",
+            "pairAddress": "0x" + "1" * 40,
+            "baseToken": {"address": "0x" + "b" * 40},
+            "quoteToken": {"address": token},
+            "labels": ["v2"],
+            "liquidity": {"usd": 1_000_000},
+            "priceUsd": "99",
+        }
+        correctly_oriented = {
+            "chainId": "robinhood",
+            "pairAddress": "0x" + "2" * 64,
+            "baseToken": {"address": token},
+            "quoteToken": {"address": chainseer.WETH_ADDRESS},
+            "labels": ["v4"],
+            "liquidity": {"usd": 10_000},
+            "priceUsd": "0.25",
+        }
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.rpc = FailOnLPTokenRPC()
+        result = agent._analyze_dex_pairs(
+            token,
+            {
+                "dexscreener": {
+                    "pairs": [reversed_pair, correctly_oriented],
+                },
+                "goplus_security": {},
+            },
+        )
+        self.assertEqual(
+            result["primary_pair_address"],
+            correctly_oriented["pairAddress"],
+        )
+        self.assertEqual(result["primary_price_usd"], 0.25)
+        self.assertEqual(
+            result["discarded_quote_or_unbound_pair_count"], 1
+        )
 
     def test_holder_analysis_excludes_only_verified_amm_and_uses_supply(self):
         pool = "0x" + "a" * 40

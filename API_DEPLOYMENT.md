@@ -25,7 +25,8 @@ design.
    - disk: 5 GB mounted at `/data`
 4. When prompted for `CHAINSEER_API_TOKEN`, generate a random value of at least
    32 characters and store it in a password manager. Never commit it.
-5. Set `CHAINSEER_SOLANA_RPC_URL` to a dedicated HTTPS Solana RPC endpoint
+5. Set `CHAINSEER_BASE_RPC_URL` and `CHAINSEER_SOLANA_RPC_URL` to dedicated
+   HTTPS RPC endpoints
    before sustained public use. The Blueprint's public mainnet endpoint is
    suitable for a bounded smoke test but can rate-limit production traffic.
    `JUPITER_API_KEY` is optional; set it in Render when authenticated Jupiter

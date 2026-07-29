@@ -1,7 +1,7 @@
 # Chainseer
 
 Chainseer is an evidence-first on-chain risk analysis system for **Robinhood
-Chain tokens** and **Solana SPL mints**. It combines deterministic blockchain
+Chain tokens**, **Base contracts**, and **Solana SPL mints**. It combines deterministic blockchain
 and market checks with a tamper-evident Cypher Tempre Timechain, then presents
 the result as an investor-oriented risk report with explicit hard stops,
 unknowns, confidence, and provenance.
@@ -12,7 +12,7 @@ broadcast path.
 
 ## What Chainseer provides
 
-- Robinhood Chain and Solana analysis through one authenticated API
+- Robinhood Chain, Base, and Solana analysis through one authenticated API
 - network-specific evidence collection instead of pretending both chains have
   identical security models
 - investor-readable risk level, action, legitimacy score, confidence, market
@@ -22,7 +22,8 @@ broadcast path.
 - a non-bypassable Timechain cognitive loop with executable senses,
   modalities, covenant screening, Proof of Qualia (PoQ), and sealed analysis
   history
-- confirmed-block monitoring and drift alerts for Robinhood Chain contracts
+- isolated confirmed-block monitoring and drift alerts for Robinhood Chain
+  and Base contracts
 - one-time pre-trade authorization artifacts with block freshness and
   executable-route guardrails—without signing or executing a trade
 - append-only outcome collection and tighten-only calibration proposals
@@ -73,6 +74,22 @@ The composite model uses 12 bounded factors: security, honeypot safety,
 liquidity, LP custody, holder distribution, volume, maturity, creator risk,
 wash trading, deployer history, sentiment, and trend. A separate hard-stop
 layer prevents a weighted average from hiding a loss-of-capital condition.
+
+## Base analysis
+
+Base uses the same production EVM evidence and scoring core as Robinhood Chain,
+but every analyzer instance has an immutable Base profile: chain ID `8453`,
+Base RPC, Base Blockscout, Base DexScreener markets, GoPlus chain scope, Base
+WETH, explorer links, cache namespace, benchmark cohort, and watcher files.
+This keeps scores comparable without allowing one network's data or protocol
+assumptions to leak into another.
+
+Base reports cover the full EVM factor set above. Protocol-specific evidence
+fails closed when it cannot be verified on Base; unknown liquidity custody is
+reported as `custody_unverified`, never silently converted into locked or
+creator-withdrawable liquidity. The default public Base RPC is rate-limited,
+so production operators should set `CHAINSEER_BASE_RPC_URL` to a dedicated
+HTTPS endpoint.
 
 ## Solana analysis
 
@@ -144,7 +161,7 @@ cannot silently change deterministic scoring policy.
 
 ## Monitoring and pre-trade controls
 
-`chainseer_controls.py` extends both network analyzers with:
+`chainseer_controls.py` extends all network analyzers with:
 
 - confirmed-block watching for owner, proxy, transfer, LP-burn, holder, and
   outcome changes
@@ -176,7 +193,7 @@ Chainseer includes a time-separated benchmark designed to measure what the
 analyzer knew **before** an outcome occurred.
 
 Production automatically captures one immutable observation for every fresh
-successful Robinhood or Solana analysis. Cache hits are not duplicated.
+successful Robinhood, Base, or Solana analysis. Cache hits are not duplicated.
 Observations are:
 
 - pinned to the exact deployed Git commit
@@ -216,6 +233,13 @@ curl -X POST "http://127.0.0.1:8000/v1/analyses" \
 curl -X POST "http://127.0.0.1:8000/v1/analyses" \
   -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
   -H "Content-Type: application/json" \
+  -d '{"network":"base","address":"0xYourBaseTokenAddress"}'
+```
+
+```bash
+curl -X POST "http://127.0.0.1:8000/v1/analyses" \
+  -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
+  -H "Content-Type: application/json" \
   -d '{"network":"solana","address":"YourSolanaMint"}'
 ```
 
@@ -232,7 +256,7 @@ curl "http://127.0.0.1:8000/v1/analyses/JOB_ID" \
 | --- | --- | --- |
 | `GET` | `/health/live` | Process liveness |
 | `GET` | `/health/ready` | Worker, watcher, network, and benchmark readiness |
-| `POST` | `/v1/analyses` | Submit a Robinhood or Solana analysis |
+| `POST` | `/v1/analyses` | Submit a Robinhood, Base, or Solana analysis |
 | `GET` | `/v1/analyses/{job_id}` | Retrieve job state and public report |
 | `GET` | `/v1/watch` | Inspect the authenticated client's watch state |
 | `POST` | `/v1/watch` | Add an idempotent, client-aware watch subscription |
@@ -267,6 +291,7 @@ Run the API locally:
 ```bash
 export CHAINSEER_SKILL_DIR="/path/to/cypher-tempre-self-model"
 export CHAINSEER_API_TOKEN="replace-with-a-long-random-development-token"
+export CHAINSEER_BASE_RPC_URL="https://your-base-rpc.example"
 export CHAINSEER_SOLANA_RPC_URL="https://your-solana-rpc.example"
 python -X utf8 chainseer_api.py
 ```
@@ -295,7 +320,8 @@ Deployment, secrets, backups, health checks, and domain setup are covered in
 
 | File | Responsibility |
 | --- | --- |
-| [`chainseer.py`](chainseer.py) | Robinhood Chain analyzer and report model |
+| [`chainseer.py`](chainseer.py) | Network-configurable production EVM analyzer and report model |
+| [`chainseer_base_public.py`](chainseer_base_public.py) | Isolated first-class Base adapter |
 | [`chainseer_solana_public.py`](chainseer_solana_public.py) | Conservative Solana analyzer |
 | [`chainseer_api.py`](chainseer_api.py) | Authenticated FastAPI service, queue, cache, watcher integration, and production benchmark capture |
 | [`chainseer_controls.py`](chainseer_controls.py) | Monitoring, outcomes, calibration, MEV checks, and TradePermit boundary |

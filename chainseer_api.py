@@ -35,6 +35,7 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import JSONResponse
 
 from chainseer import Chainseer
+from chainseer_base_public import BasePublicAnalyzer
 from chainseer_benchmark import (
     append_observation,
     build_observation_from_report,
@@ -56,12 +57,13 @@ from chainseer_solana_public import (
 
 LOGGER = logging.getLogger("chainseer.api")
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
-SUPPORTED_NETWORKS = {"robinhood", "solana"}
+SUPPORTED_NETWORKS = {"robinhood", "base", "solana"}
+EVM_NETWORKS = {"robinhood", "base"}
 
 
 def deterministic_benchmark_split(network: str, address: str) -> str:
     """Keep every observation for one token in the same leakage-safe split."""
-    normalized = address.lower() if network == "robinhood" else address
+    normalized = address.lower() if network in EVM_NETWORKS else address
     digest = hashlib.sha256(
         f"chainseer-benchmark-v1:{network}:{normalized}".encode("utf-8")
     ).digest()
@@ -175,6 +177,12 @@ class Settings:
             "CHAINSEER_SHUTDOWN_GRACE_SECONDS", 180, 10, 900
         )
     )
+    base_rpc_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BASE_RPC_URL",
+            "https://mainnet.base.org",
+        )
+    )
     solana_rpc_url: str = field(
         default_factory=lambda: os.environ.get(
             "CHAINSEER_SOLANA_RPC_URL",
@@ -229,6 +237,12 @@ class Settings:
             "solana_public_analysis",
         ).strip()
     )
+    benchmark_base_cohort: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BENCHMARK_BASE_COHORT",
+            "base_public_analysis",
+        ).strip()
+    )
 
     def validate(self) -> None:
         if self.environment not in {"development", "test", "production"}:
@@ -238,6 +252,11 @@ class Settings:
         rpc = urlparse(self.rpc_url)
         if rpc.scheme not in {"http", "https"} or not rpc.hostname:
             raise RuntimeError("CHAINSEER_RPC_URL must be an HTTP(S) URL")
+        base_rpc = urlparse(self.base_rpc_url)
+        if base_rpc.scheme not in {"http", "https"} or not base_rpc.hostname:
+            raise RuntimeError(
+                "CHAINSEER_BASE_RPC_URL must be an HTTP(S) URL"
+            )
         solana_rpc = urlparse(self.solana_rpc_url)
         if (
             solana_rpc.scheme not in {"http", "https"}
@@ -270,6 +289,10 @@ class Settings:
             if rpc.scheme != "https":
                 raise RuntimeError(
                     "CHAINSEER_RPC_URL must use HTTPS in production"
+                )
+            if base_rpc.scheme != "https":
+                raise RuntimeError(
+                    "CHAINSEER_BASE_RPC_URL must use HTTPS in production"
                 )
             if solana_rpc.scheme != "https":
                 raise RuntimeError(
@@ -314,6 +337,10 @@ class Settings:
                 raise RuntimeError(
                     "CHAINSEER_BENCHMARK_SOLANA_COHORT is required"
                 )
+            if not self.benchmark_base_cohort:
+                raise RuntimeError(
+                    "CHAINSEER_BENCHMARK_BASE_COHORT is required"
+                )
             benchmark_path = Path(self.benchmark_root).resolve()
             chain_path = Path(self.chain_root).resolve()
             try:
@@ -328,7 +355,7 @@ class Settings:
 
 
 class AnalyzeRequest(BaseModel):
-    network: str = Field(default="robinhood", min_length=6, max_length=16)
+    network: str = Field(default="robinhood", min_length=4, max_length=16)
     address: str = Field(min_length=32, max_length=44)
 
     @field_validator("network")
@@ -342,7 +369,7 @@ class AnalyzeRequest(BaseModel):
     @model_validator(mode="after")
     def validate_address_for_network(self):
         self.address = self.address.strip()
-        if self.network == "robinhood":
+        if self.network in EVM_NETWORKS:
             if not ADDRESS_RE.fullmatch(self.address):
                 raise ValueError("invalid EVM contract address")
         else:
@@ -351,7 +378,7 @@ class AnalyzeRequest(BaseModel):
 
 
 class WatchRequest(BaseModel):
-    network: str = Field(default="robinhood", min_length=6, max_length=16)
+    network: str = Field(default="robinhood", min_length=4, max_length=16)
     address: str = Field(min_length=32, max_length=44)
 
     @field_validator("network")
@@ -365,7 +392,7 @@ class WatchRequest(BaseModel):
     @model_validator(mode="after")
     def validate_address_for_network(self):
         self.address = self.address.strip()
-        if self.network == "robinhood":
+        if self.network in EVM_NETWORKS:
             if not ADDRESS_RE.fullmatch(self.address):
                 raise ValueError("invalid EVM contract address")
         else:
@@ -479,11 +506,11 @@ class BenchmarkCaptureRecorder:
     ) -> dict[str, Any]:
         if not self.enabled:
             return {"status": "disabled"}
-        cohort = (
-            self.settings.benchmark_solana_cohort
-            if job.network == "solana"
-            else self.settings.benchmark_robinhood_cohort
-        )
+        cohort = {
+            "robinhood": self.settings.benchmark_robinhood_cohort,
+            "base": self.settings.benchmark_base_cohort,
+            "solana": self.settings.benchmark_solana_cohort,
+        }[job.network]
         split = deterministic_benchmark_split(job.network, job.address)
         latency_ms = max(
             0.0,
@@ -577,15 +604,21 @@ class AnalysisService:
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
         self._agent: Chainseer | None = None
+        self._base_agent: BasePublicAnalyzer | None = None
         self._solana_agent: SolanaPublicAnalyzer | None = None
         self._stopping = threading.Event()
         self._ready = threading.Event()
         self._watch_lock = threading.Lock()
         self._watcher: ChainseerWatcher | None = None
+        self._base_watcher: ChainseerWatcher | None = None
         self._solana_watcher: SolanaEventWatcher | None = None
         self._watcher_status: dict[str, Any] = {
             "enabled": settings.watcher_enabled,
-            "last_cycle": {"robinhood": None, "solana": None},
+            "last_cycle": {
+                "robinhood": None,
+                "base": None,
+                "solana": None,
+            },
             "last_error": None,
         }
         self._benchmark = BenchmarkCaptureRecorder(settings)
@@ -605,6 +638,11 @@ class AnalysisService:
                 timechain_agent=self._agent,
                 jupiter_api_key=self.settings.jupiter_api_key or None,
             )
+        if self._base_agent is None and isinstance(self._agent, Chainseer):
+            self._base_agent = BasePublicAnalyzer(
+                self.settings.base_rpc_url,
+                timechain_agent=self._agent,
+            )
         if self._watcher is None:
             self._watcher = ChainseerWatcher(
                 self._agent,
@@ -622,6 +660,16 @@ class AnalysisService:
                 config=SolanaWatchConfig(
                     poll_seconds=self.settings.watcher_interval_seconds,
                 ),
+            )
+        if self._base_watcher is None and self._base_agent is not None:
+            self._base_watcher = ChainseerWatcher(
+                self._base_agent,
+                control_root=self.settings.chain_root,
+                config=WatchConfig(
+                    poll_seconds=self.settings.watcher_interval_seconds,
+                    confirmations=self.settings.watcher_confirmations,
+                ),
+                network="base",
             )
         self._worker = threading.Thread(
             target=self._run,
@@ -657,7 +705,7 @@ class AnalysisService:
         self, address: str, network: str = "robinhood"
     ) -> JobAccepted:
         normalized_address = (
-            address.lower() if network == "robinhood" else address
+            address.lower() if network in EVM_NETWORKS else address
         )
         normalized = f"{network}:{normalized_address}"
         now = time.time()
@@ -720,6 +768,11 @@ class AnalysisService:
                 if self._watcher is not None
                 else {"subscriptions": {}}
             )
+            base_state = (
+                self._base_watcher.store.load()
+                if self._base_watcher is not None
+                else {"subscriptions": {}}
+            )
             solana_state = (
                 self._solana_watcher.store.load()
                 if self._solana_watcher is not None
@@ -742,12 +795,20 @@ class AnalysisService:
                 subscriptions.append(
                     self._solana_watcher.store.public_subscription(value)
                 )
+            for value in base_state.get("subscriptions", {}).values():
+                if subscriber and subscriber not in (
+                    value.get("subscribers") or []
+                ):
+                    continue
+                subscriptions.append(
+                    self._base_watcher.store.public_subscription(value)
+                )
             network_counts = {
                 network: sum(
                     item.get("network") == network
                     for item in subscriptions
                 )
-                for network in ("robinhood", "solana")
+                for network in ("robinhood", "base", "solana")
             }
             return {
                 **self._watcher_status,
@@ -772,6 +833,13 @@ class AnalysisService:
                     address, subscriber
                 )
                 return self._solana_watcher.store.public_subscription(value)
+            if network == "base":
+                if self._base_watcher is None:
+                    raise RuntimeError("Base watcher is not initialized")
+                value = self._base_watcher.store.subscribe(
+                    address, subscriber
+                )
+                return self._base_watcher.store.public_subscription(value)
             if self._watcher is None:
                 raise RuntimeError("watcher is not initialized")
             value = self._watcher.store.subscribe(address, subscriber)
@@ -790,6 +858,12 @@ class AnalysisService:
                 return self._solana_watcher.store.unsubscribe(
                     address, subscriber
                 )
+            if network == "base":
+                if self._base_watcher is None:
+                    raise RuntimeError("Base watcher is not initialized")
+                return self._base_watcher.store.unsubscribe(
+                    address, subscriber
+                )
             if self._watcher is None:
                 raise RuntimeError("watcher is not initialized")
             return self._watcher.store.unsubscribe(address, subscriber)
@@ -804,11 +878,11 @@ class AnalysisService:
         limit: int = 50,
     ) -> list[dict[str, Any]]:
         with self._watch_lock:
-            watcher = (
-                self._solana_watcher
-                if network == "solana"
-                else self._watcher
-            )
+            watcher = {
+                "robinhood": self._watcher,
+                "base": self._base_watcher,
+                "solana": self._solana_watcher,
+            }.get(network)
             if watcher is None:
                 raise RuntimeError(f"{network} watcher is not initialized")
             if not watcher.store.is_subscribed(address, subscriber):
@@ -825,12 +899,14 @@ class AnalysisService:
             return
         summaries: dict[str, Any] = {
             "robinhood": None,
+            "base": None,
             "solana": None,
         }
         errors: dict[str, Any] = {}
         with self._watch_lock:
             for network, watcher in (
                 ("robinhood", self._watcher),
+                ("base", self._base_watcher),
                 ("solana", self._solana_watcher),
             ):
                 if watcher is None:
@@ -905,6 +981,14 @@ class AnalysisService:
                             "analysis worker has no Solana analyzer"
                         )
                     report = self._solana_agent.analyze_token(job.address)
+                elif job.network == "base":
+                    if self._base_agent is None:
+                        raise RuntimeError(
+                            "analysis worker has no Base analyzer"
+                        )
+                    report = self._base_agent.analyze_token(
+                        job.address, full_report=False
+                    )
                 else:
                     report = self._agent.analyze_token(
                         job.address, full_report=False
@@ -925,7 +1009,7 @@ class AnalysisService:
                     if self.settings.cache_ttl_seconds:
                         cache_address = (
                             job.address.lower()
-                            if job.network == "robinhood"
+                            if job.network in EVM_NETWORKS
                             else job.address
                         )
                         self.cache[f"{job.network}:{cache_address}"] = (
@@ -963,7 +1047,7 @@ class AnalysisService:
                             f"{job.network}:"
                             + (
                                 job.address.lower()
-                                if job.network == "robinhood"
+                                if job.network in EVM_NETWORKS
                                 else job.address
                             )
                         ),
@@ -1442,7 +1526,8 @@ def ready() -> dict[str, Any]:
         "environment": SETTINGS.environment,
         "watcher_enabled": SETTINGS.watcher_enabled,
         "watcher_last_error": SERVICE.watch_status().get("last_error"),
-        "networks": ["robinhood", "solana"],
+        "networks": ["robinhood", "base", "solana"],
+        "base_rpc_configured": bool(SETTINGS.base_rpc_url),
         "solana_rpc_configured": bool(SETTINGS.solana_rpc_url),
         "benchmark_capture": SERVICE.benchmark_status(),
     }

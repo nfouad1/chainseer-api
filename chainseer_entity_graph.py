@@ -71,7 +71,7 @@ def _normalize_identifier(network: str, identifier: Any) -> str | None:
     value = str(identifier or "").strip()
     if not value or len(value) > 128:
         return None
-    if network == "robinhood":
+    if network in {"robinhood", "base"}:
         if not EVM_ADDRESS_RE.fullmatch(value):
             return None
         value = value.lower()
@@ -338,9 +338,12 @@ def build_robinhood_entity_graph(
     *,
     block_pin: int | None = None,
     claim_evidence: dict[str, Any] | None = None,
+    network: str = "robinhood",
 ) -> dict[str, Any]:
+    if network not in {"robinhood", "base"}:
+        raise ValueError("unsupported EVM entity graph network")
     graph = _Graph(
-        "robinhood",
+        network,
         token_address,
         anchor_type="block_pin",
         anchor_value=block_pin,
@@ -373,7 +376,7 @@ def build_robinhood_entity_graph(
     if not EVM_TX_HASH_RE.fullmatch(creation_tx_hash):
         creation_tx_hash = ""
     for source_name, address in creators_by_source.items():
-        normalized = _normalize_identifier("robinhood", address)
+        normalized = _normalize_identifier(network, address)
         if normalized:
             normalized_creators[source_name] = normalized
             roles = ["deployer"] if source_name == "blockscout" else [
@@ -469,7 +472,7 @@ def build_robinhood_entity_graph(
         )
 
     owner = _normalize_identifier(
-        "robinhood", goplus.get("owner_address")
+        network, goplus.get("owner_address")
     )
     if owner:
         owner_id = graph.add_node(
@@ -593,7 +596,7 @@ def build_robinhood_entity_graph(
     for rank, item in enumerate((holders.get("holders") or [])[:20], 1):
         if not isinstance(item, dict):
             continue
-        address = _normalize_identifier("robinhood", item.get("address"))
+        address = _normalize_identifier(network, item.get("address"))
         if not address:
             continue
         is_market = address in verified_amm

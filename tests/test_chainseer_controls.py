@@ -405,6 +405,17 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             self.assertEqual(first["created_at"], second["created_at"])
             self.assertEqual(len(store.load()["subscriptions"]), 1)
 
+    def test_base_watch_store_is_network_and_file_isolated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            robinhood = controls.WatchStore(temp_dir)
+            base = controls.WatchStore(temp_dir, "base")
+            value = base.subscribe(TOKEN)
+            self.assertEqual(value["network"], "base")
+            self.assertEqual(robinhood.load()["subscriptions"], {})
+            self.assertIn(TOKEN.lower(), base.load()["subscriptions"])
+            self.assertNotEqual(robinhood.state_path, base.state_path)
+            self.assertNotEqual(robinhood.alert_path, base.alert_path)
+
     def test_watch_store_isolates_subscribers_and_returns_public_critical_feed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = controls.WatchStore(temp_dir)
