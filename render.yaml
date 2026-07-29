@@ -46,6 +46,14 @@ services:
         value: "15"
       - key: CHAINSEER_WATCHER_CONFIRMATIONS
         value: "2"
+      - key: CHAINSEER_BENCHMARK_CAPTURE_ENABLED
+        value: "1"
+      - key: CHAINSEER_BENCHMARK_ROOT
+        value: /data/benchmark
+      - key: CHAINSEER_BENCHMARK_ROBINHOOD_COHORT
+        value: robinhood_public_analysis
+      - key: CHAINSEER_BENCHMARK_SOLANA_COHORT
+        value: solana_public_analysis
       - key: CT_AUTOGROW
         value: "1"
       - key: CT_PROMOTE_AT

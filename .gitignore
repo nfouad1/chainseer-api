@@ -9,6 +9,7 @@ __pycache__/
 venv/
 
 chainseer_chain/
+benchmark_data/
 base_learning/
 base_prototype/
 chainseer_report_*.json

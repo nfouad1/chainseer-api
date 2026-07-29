@@ -35,6 +35,12 @@ from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import JSONResponse
 
 from chainseer import Chainseer
+from chainseer_benchmark import (
+    append_observation,
+    build_observation_from_report,
+    case_bank_status,
+    load_jsonl,
+)
 from chainseer_controls import ChainseerWatcher, WatchConfig
 from chainseer_solana_public import (
     SolanaMintError,
@@ -45,6 +51,20 @@ from chainseer_solana_public import (
 LOGGER = logging.getLogger("chainseer.api")
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 SUPPORTED_NETWORKS = {"robinhood", "solana"}
+
+
+def deterministic_benchmark_split(network: str, address: str) -> str:
+    """Keep every observation for one token in the same leakage-safe split."""
+    normalized = address.lower() if network == "robinhood" else address
+    digest = hashlib.sha256(
+        f"chainseer-benchmark-v1:{network}:{normalized}".encode("utf-8")
+    ).digest()
+    bucket = int.from_bytes(digest[:4], "big") % 100
+    if bucket < 60:
+        return "train"
+    if bucket < 80:
+        return "validation"
+    return "test"
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -173,6 +193,36 @@ class Settings:
             "CHAINSEER_WATCHER_CONFIRMATIONS", 2, 0, 100
         )
     )
+    benchmark_capture_enabled: bool = field(
+        default_factory=lambda: _env_bool(
+            "CHAINSEER_BENCHMARK_CAPTURE_ENABLED", False
+        )
+    )
+    benchmark_root: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BENCHMARK_ROOT",
+            str(Path(__file__).resolve().parent / "benchmark_data"),
+        )
+    )
+    benchmark_analyzer_version: str = field(
+        default_factory=lambda: (
+            os.environ.get("CHAINSEER_BENCHMARK_ANALYZER_VERSION", "").strip()
+            or os.environ.get("RENDER_GIT_COMMIT", "").strip()
+            or "local-unversioned"
+        )
+    )
+    benchmark_robinhood_cohort: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BENCHMARK_ROBINHOOD_COHORT",
+            "robinhood_public_analysis",
+        ).strip()
+    )
+    benchmark_solana_cohort: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BENCHMARK_SOLANA_COHORT",
+            "solana_public_analysis",
+        ).strip()
+    )
 
     def validate(self) -> None:
         if self.environment not in {"development", "test", "production"}:
@@ -239,6 +289,36 @@ class Settings:
                 raise RuntimeError(
                     "Wildcard or empty trusted hosts are forbidden in production"
                 )
+            if self.benchmark_capture_enabled:
+                if not Path(self.benchmark_root).is_absolute():
+                    raise RuntimeError(
+                        "CHAINSEER_BENCHMARK_ROOT must be absolute in production"
+                    )
+                if self.benchmark_analyzer_version == "local-unversioned":
+                    raise RuntimeError(
+                        "Benchmark capture requires RENDER_GIT_COMMIT or "
+                        "CHAINSEER_BENCHMARK_ANALYZER_VERSION in production"
+                    )
+        if self.benchmark_capture_enabled:
+            if not self.benchmark_robinhood_cohort:
+                raise RuntimeError(
+                    "CHAINSEER_BENCHMARK_ROBINHOOD_COHORT is required"
+                )
+            if not self.benchmark_solana_cohort:
+                raise RuntimeError(
+                    "CHAINSEER_BENCHMARK_SOLANA_COHORT is required"
+                )
+            benchmark_path = Path(self.benchmark_root).resolve()
+            chain_path = Path(self.chain_root).resolve()
+            try:
+                benchmark_path.relative_to(chain_path)
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError(
+                    "CHAINSEER_BENCHMARK_ROOT must not be inside "
+                    "CHAINSEER_CHAIN_ROOT"
+                )
 
 
 class AnalyzeRequest(BaseModel):
@@ -292,6 +372,7 @@ class Job:
     started_at: float | None = None
     finished_at: float | None = None
     result: dict[str, Any] | None = None
+    benchmark_capture: dict[str, Any] | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -305,6 +386,7 @@ class Job:
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
             "result": self.result,
+            "benchmark_capture": self.benchmark_capture,
             "error": (
                 {
                     "code": self.error_code,
@@ -320,6 +402,130 @@ def _iso(value: float | None) -> str | None:
     if value is None:
         return None
     return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+
+class BenchmarkCaptureRecorder:
+    """Append fresh analysis predictions to the durable benchmark ledger."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.enabled = settings.benchmark_capture_enabled
+        self.root = Path(settings.benchmark_root)
+        self.observations_path = self.root / "observations-v1.jsonl"
+        self.outcomes_path = self.root / "outcomes-v1.jsonl"
+        self._lock = threading.Lock()
+        self._summary: dict[str, Any] = {
+            "enabled": self.enabled,
+            "state": "disabled" if not self.enabled else "initializing",
+            "last_capture_at": None,
+            "last_error": None,
+        }
+        if self.enabled:
+            self._initialize()
+
+    def _initialize(self) -> None:
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self._refresh_summary()
+        except Exception as exc:
+            LOGGER.exception("Benchmark capture storage initialization failed")
+            self._summary = {
+                "enabled": True,
+                "state": "degraded",
+                "last_capture_at": None,
+                "last_error": {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "code": "benchmark_storage_unavailable",
+                    "error_type": type(exc).__name__,
+                },
+            }
+
+    def _refresh_summary(self) -> None:
+        ledger = case_bank_status(
+            load_jsonl(self.observations_path),
+            load_jsonl(self.outcomes_path),
+        )
+        self._summary = {
+            "enabled": True,
+            "state": "ready",
+            "last_capture_at": self._summary.get("last_capture_at"),
+            "last_error": None,
+            **ledger,
+        }
+
+    def capture(
+        self,
+        job: Job,
+        public_report: dict[str, Any],
+        *,
+        captured_at: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            return {"status": "disabled"}
+        cohort = (
+            self.settings.benchmark_solana_cohort
+            if job.network == "solana"
+            else self.settings.benchmark_robinhood_cohort
+        )
+        split = deterministic_benchmark_split(job.network, job.address)
+        latency_ms = max(
+            0.0,
+            (time.time() - (job.started_at or time.time())) * 1000,
+        )
+        try:
+            with self._lock:
+                observation = build_observation_from_report(
+                    public_report,
+                    cohort=cohort,
+                    split=split,
+                    analyzer="chainseer",
+                    analyzer_version=(
+                        self.settings.benchmark_analyzer_version
+                    ),
+                    latency_ms=latency_ms,
+                    captured_at=captured_at,
+                )
+                append_observation(
+                    self.observations_path,
+                    observation,
+                )
+                captured_timestamp = datetime.now(timezone.utc).isoformat()
+                self._summary["last_capture_at"] = captured_timestamp
+                self._refresh_summary()
+            return {
+                "status": "captured",
+                "case_id": observation["case_id"],
+                "observation_hash": observation["observation_hash"],
+                "split": observation["split"],
+                "cohort": observation["cohort"],
+                "analyzer_version": observation["analyzer_version"],
+            }
+        except Exception as exc:
+            # Benchmark telemetry is intentionally non-critical: an unforeseen
+            # recorder defect must never turn a valid analysis into a failed job.
+            LOGGER.exception(
+                "Benchmark observation capture failed",
+                extra={"job_id": job.id, "network": job.network},
+            )
+            with self._lock:
+                self._summary = {
+                    **self._summary,
+                    "enabled": True,
+                    "state": "degraded",
+                    "last_error": {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "code": "benchmark_capture_failed",
+                        "error_type": type(exc).__name__,
+                    },
+                }
+            return {
+                "status": "failed",
+                "error": "benchmark_capture_failed",
+            }
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return json.loads(json.dumps(self._summary))
 
 
 class SlidingWindowRateLimiter:
@@ -364,6 +570,7 @@ class AnalysisService:
             "last_cycle": None,
             "last_error": None,
         }
+        self._benchmark = BenchmarkCaptureRecorder(settings)
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -439,6 +646,9 @@ class AnalysisService:
                     started_at=now,
                     finished_at=now,
                     result=cached[1],
+                    benchmark_capture={
+                        "status": "cache_hit_not_recaptured"
+                    },
                 )
                 self.jobs[job.id] = job
                 return JobAccepted(
@@ -484,6 +694,9 @@ class AnalysisService:
                 **self._watcher_status,
                 "subscriptions": list(state.get("subscriptions", {}).values()),
             }
+
+    def benchmark_status(self) -> dict[str, Any]:
+        return self._benchmark.status()
 
     def watch_subscribe(self, address: str) -> dict[str, Any]:
         if self._watcher is None:
@@ -580,8 +793,13 @@ class AnalysisService:
                         "analysis_rejected", str(report["error"])
                     )
                 public_report = build_public_report(report)
+                benchmark_capture = self._benchmark.capture(
+                    job,
+                    public_report,
+                )
                 with self._lock:
                     job.result = public_report
+                    job.benchmark_capture = benchmark_capture
                     job.status = "succeeded"
                     if self.settings.cache_ttl_seconds:
                         cache_address = (
@@ -1092,6 +1310,7 @@ def ready() -> dict[str, Any]:
         "watcher_last_error": SERVICE.watch_status().get("last_error"),
         "networks": ["robinhood", "solana"],
         "solana_rpc_configured": bool(SETTINGS.solana_rpc_url),
+        "benchmark_capture": SERVICE.benchmark_status(),
     }
 
 

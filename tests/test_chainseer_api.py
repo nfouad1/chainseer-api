@@ -14,7 +14,9 @@ from chainseer_api import (
     SlidingWindowRateLimiter,
     _server_port,
     build_public_report,
+    deterministic_benchmark_split,
 )
+from chainseer_benchmark import load_jsonl
 
 
 TOKEN = "0x" + "a" * 40
@@ -350,9 +352,55 @@ class SettingsTests(unittest.TestCase):
             )
             settings.validate()
 
+    def test_production_benchmark_capture_requires_versioned_absolute_storage(self):
+        with patch.dict(
+            "os.environ",
+            {"CHAINSEER_ALLOWED_HOSTS": "api.usechainseer.com"},
+            clear=False,
+        ):
+            settings = Settings(
+                environment="production",
+                api_token="a-secure-production-token-with-40-characters",
+                rpc_url="https://rpc.mainnet.chain.robinhood.com",
+                chain_root=str(Path.cwd().resolve() / "chainseer_chain"),
+                allowed_origins=("https://usechainseer.com",),
+                allowed_hosts=("api.usechainseer.com",),
+                benchmark_capture_enabled=True,
+                benchmark_root=str(Path.cwd().resolve() / "benchmark_data"),
+                benchmark_analyzer_version="local-unversioned",
+            )
+            with self.assertRaises(RuntimeError):
+                settings.validate()
+
+    def test_benchmark_split_is_stable_per_token(self):
+        first = deterministic_benchmark_split("robinhood", TOKEN)
+        second = deterministic_benchmark_split(
+            "robinhood",
+            TOKEN.upper(),
+        )
+        self.assertEqual(first, second)
+        self.assertIn(first, {"train", "validation", "test"})
+
+    def test_render_commit_is_default_benchmark_analyzer_version(self):
+        with patch.dict(
+            "os.environ",
+            {"RENDER_GIT_COMMIT": "abc123def456"},
+            clear=True,
+        ):
+            self.assertEqual(
+                Settings().benchmark_analyzer_version,
+                "abc123def456",
+            )
+
 
 class ServiceTests(unittest.TestCase):
-    def settings(self, root):
+    def settings(
+        self,
+        root,
+        *,
+        benchmark_root=None,
+        benchmark_capture_enabled=False,
+    ):
         return Settings(
             environment="test",
             api_token="",
@@ -362,6 +410,12 @@ class ServiceTests(unittest.TestCase):
             cache_ttl_seconds=300,
             rate_limit_per_minute=6,
             shutdown_grace_seconds=10,
+            benchmark_capture_enabled=benchmark_capture_enabled,
+            benchmark_root=(
+                benchmark_root
+                or str(Path(root).resolve().parent / "benchmark_data")
+            ),
+            benchmark_analyzer_version="test-commit",
         )
 
     def test_worker_returns_and_caches_structured_result(self):
@@ -455,6 +509,104 @@ class ServiceTests(unittest.TestCase):
                 self.assertNotIn(
                     f"robinhood:{SOLANA_MINT}",
                     service.cache,
+                )
+            finally:
+                service.stop()
+
+    def test_fresh_analysis_is_captured_once_and_cache_hit_is_not(self):
+        with tempfile.TemporaryDirectory() as root:
+            chain_root = str(Path(root) / "chain")
+            benchmark_root = str(Path(root) / "benchmark")
+            service = AnalysisService(
+                self.settings(
+                    chain_root,
+                    benchmark_root=benchmark_root,
+                    benchmark_capture_enabled=True,
+                )
+            )
+            fake = FakeAgent()
+            service._agent = fake
+            service.start()
+            try:
+                accepted = service.submit(TOKEN)
+                deadline = time.time() + 3
+                job = service.get(accepted.job_id)
+                while job and job.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    job = service.get(accepted.job_id)
+                self.assertEqual(job.status, "succeeded")
+                self.assertEqual(
+                    job.benchmark_capture["status"],
+                    "captured",
+                )
+                self.assertEqual(
+                    job.benchmark_capture["analyzer_version"],
+                    "test-commit",
+                )
+                observations = load_jsonl(
+                    Path(benchmark_root) / "observations-v1.jsonl"
+                )
+                self.assertEqual(len(observations), 1)
+                self.assertEqual(
+                    service.benchmark_status()["observations"],
+                    1,
+                )
+                self.assertNotIn(
+                    TOKEN,
+                    str(service.benchmark_status()),
+                )
+
+                cached = service.submit(TOKEN)
+                cached_job = service.get(cached.job_id)
+                self.assertTrue(cached.cached)
+                self.assertEqual(
+                    cached_job.benchmark_capture["status"],
+                    "cache_hit_not_recaptured",
+                )
+                self.assertEqual(
+                    len(
+                        load_jsonl(
+                            Path(benchmark_root)
+                            / "observations-v1.jsonl"
+                        )
+                    ),
+                    1,
+                )
+            finally:
+                service.stop()
+
+    def test_capture_storage_failure_does_not_discard_analysis(self):
+        with tempfile.TemporaryDirectory() as root:
+            chain_root = str(Path(root) / "chain")
+            unavailable = Path(root) / "not-a-directory"
+            unavailable.write_text("occupied", encoding="utf-8")
+            service = AnalysisService(
+                self.settings(
+                    chain_root,
+                    benchmark_root=str(unavailable),
+                    benchmark_capture_enabled=True,
+                )
+            )
+            service._agent = FakeAgent()
+            service.start()
+            try:
+                accepted = service.submit(TOKEN)
+                deadline = time.time() + 3
+                job = service.get(accepted.job_id)
+                while job and job.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    job = service.get(accepted.job_id)
+                self.assertEqual(job.status, "succeeded")
+                self.assertIsNotNone(job.result)
+                self.assertEqual(
+                    job.benchmark_capture["status"],
+                    "failed",
+                )
+                self.assertEqual(
+                    service.benchmark_status()["state"],
+                    "degraded",
                 )
             finally:
                 service.stop()

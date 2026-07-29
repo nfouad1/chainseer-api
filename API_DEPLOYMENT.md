@@ -31,7 +31,7 @@ design.
    `JUPITER_API_KEY` is optional; set it in Render when authenticated Jupiter
    capacity is available.
 6. Deploy and wait for `/health/ready` to return HTTP 200 and list both
-   `robinhood` and `solana`.
+   `robinhood` and `solana`. Confirm `benchmark_capture.state=ready`.
 7. Copy the public `https://<service>.onrender.com` URL.
 8. Store that URL as `CHAINSEER_API_URL` in the Chainseer Sites environment.
 9. Store the same API token as the secret `CHAINSEER_API_TOKEN` in Sites.
@@ -47,6 +47,28 @@ confirmations. Watch subscriptions are authenticated:
 These endpoints only manage monitoring. The production API has no private-key,
 transaction-signing, or broadcast capability.
 
+## Automatic benchmark capture
+
+The Blueprint enables benchmark capture under `/data/benchmark`, which is on
+the same persistent disk as the production Timechain but outside its root.
+Every fresh successful analysis appends one immutable prediction observation.
+Cache hits are not captured again.
+
+The analyzer version comes from Render's runtime `RENDER_GIT_COMMIT`, so each
+observation is tied to the exact deployed source revision. Token addresses are
+assigned deterministically to `train` (60%), `validation` (20%), or `test`
+(20%); every observation for the same token stays in the same split.
+
+The API job response exposes `benchmark_capture` with the case ID, observation
+hash, split, cohort, and analyzer version. `/health/ready` exposes aggregate
+capture state and ledger hashes without exposing scanned token addresses.
+Storage or validation failures set capture state to `degraded` but do not
+discard an otherwise successful analysis.
+
+Automatic capture does not assign outcomes. Reviewers append those later with
+the `chainseer_benchmark.py label` command described in `BENCHMARK.md`. Back up
+`/data/benchmark` together with `/data/chainseer_chain`.
+
 ## Timechain durability
 
 The container image pins Cypher Tempre to a specific source commit. The image
@@ -58,7 +80,7 @@ epoch-mismatched registry fails startup instead of being silently repaired.
 
 Before each release:
 
-1. Download a backup of `/data/chainseer_chain`.
+1. Download backups of `/data/chainseer_chain` and `/data/benchmark`.
 2. Run `timechain.py verify` against the backup.
 3. Deploy one instance.
 4. Confirm `/health/ready`.
@@ -66,6 +88,8 @@ Before each release:
 6. Confirm the public result contains `timechain.cognition.status=complete`
    and a `timechain.cognitive_ring`.
 7. Confirm `/health/ready` reports the watcher enabled and no watcher error.
+8. Confirm benchmark capture is `ready` and a fresh known-contract scan
+   increments its observation count exactly once.
 
 ## Domain
 

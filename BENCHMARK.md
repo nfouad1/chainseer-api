@@ -11,6 +11,13 @@ The source of truth is two append-only ledgers:
 - prediction observations, captured before any outcome is known
 - later outcome observations, each with an evidence reference and reviewer
 
+In production, the API captures every fresh successful analysis automatically
+when `CHAINSEER_BENCHMARK_CAPTURE_ENABLED=1`. The Render Blueprint stores the
+ledgers under `/data/benchmark` on its persistent disk, uses
+`RENDER_GIT_COMMIT` as the immutable analyzer version, and deterministically
+keeps each token in one train/validation/test split. Cache hits are not captured
+again. Job responses and `/health/ready` report capture success or degradation.
+
 Capture a completed public report immediately. Use an immutable analyzer
 version such as the deployed Git commit:
 
