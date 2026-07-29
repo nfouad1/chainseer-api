@@ -38,7 +38,12 @@ jobs:
             >> "$GITHUB_ENV"
 
       - name: Compile
-        run: python -X utf8 -m py_compile chainseer.py chainseer_controls.py chainseer_api.py
+        run: >-
+          python -X utf8 -m py_compile
+          chainseer.py
+          chainseer_controls.py
+          chainseer_solana_public.py
+          chainseer_api.py
 
       - name: Unit tests
         run: python -X utf8 -m unittest discover -s tests -v

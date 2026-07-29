@@ -31,14 +31,20 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import JSONResponse
 
 from chainseer import Chainseer
 from chainseer_controls import ChainseerWatcher, WatchConfig
+from chainseer_solana_public import (
+    SolanaMintError,
+    SolanaPublicAnalyzer,
+    validate_solana_mint,
+)
 
 LOGGER = logging.getLogger("chainseer.api")
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+SUPPORTED_NETWORKS = {"robinhood", "solana"}
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -143,6 +149,15 @@ class Settings:
             "CHAINSEER_SHUTDOWN_GRACE_SECONDS", 180, 10, 900
         )
     )
+    solana_rpc_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_SOLANA_RPC_URL",
+            "https://api.mainnet-beta.solana.com",
+        )
+    )
+    jupiter_api_key: str = field(
+        default_factory=lambda: os.environ.get("JUPITER_API_KEY", "")
+    )
     watcher_enabled: bool = field(
         default_factory=lambda: _env_bool(
             "CHAINSEER_WATCHER_ENABLED", False
@@ -167,6 +182,14 @@ class Settings:
         rpc = urlparse(self.rpc_url)
         if rpc.scheme not in {"http", "https"} or not rpc.hostname:
             raise RuntimeError("CHAINSEER_RPC_URL must be an HTTP(S) URL")
+        solana_rpc = urlparse(self.solana_rpc_url)
+        if (
+            solana_rpc.scheme not in {"http", "https"}
+            or not solana_rpc.hostname
+        ):
+            raise RuntimeError(
+                "CHAINSEER_SOLANA_RPC_URL must be an HTTP(S) URL"
+            )
         for origin in self.allowed_origins:
             parsed = urlparse(origin)
             if (
@@ -192,6 +215,10 @@ class Settings:
                 raise RuntimeError(
                     "CHAINSEER_RPC_URL must use HTTPS in production"
                 )
+            if solana_rpc.scheme != "https":
+                raise RuntimeError(
+                    "CHAINSEER_SOLANA_RPC_URL must use HTTPS in production"
+                )
             if not Path(self.chain_root).is_absolute():
                 raise RuntimeError(
                     "CHAINSEER_CHAIN_ROOT must be absolute in production"
@@ -215,15 +242,26 @@ class Settings:
 
 
 class AnalyzeRequest(BaseModel):
-    address: str = Field(min_length=42, max_length=42)
+    network: str = Field(default="robinhood", min_length=6, max_length=16)
+    address: str = Field(min_length=32, max_length=44)
 
-    @field_validator("address")
+    @field_validator("network")
     @classmethod
-    def validate_address(cls, value: str) -> str:
-        value = value.strip()
-        if not ADDRESS_RE.fullmatch(value):
-            raise ValueError("invalid EVM contract address")
-        return value
+    def validate_network(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in SUPPORTED_NETWORKS:
+            raise ValueError("unsupported analysis network")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_address_for_network(self):
+        self.address = self.address.strip()
+        if self.network == "robinhood":
+            if not ADDRESS_RE.fullmatch(self.address):
+                raise ValueError("invalid EVM contract address")
+        else:
+            validate_solana_mint(self.address)
+        return self
 
 
 class WatchRequest(BaseModel):
@@ -248,6 +286,7 @@ class JobAccepted(BaseModel):
 class Job:
     id: str
     address: str
+    network: str = "robinhood"
     status: str = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
@@ -260,6 +299,7 @@ class Job:
         return {
             "job_id": self.id,
             "address": self.address,
+            "network": self.network,
             "status": self.status,
             "created_at": _iso(self.created_at),
             "started_at": _iso(self.started_at),
@@ -314,6 +354,7 @@ class AnalysisService:
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
         self._agent: Chainseer | None = None
+        self._solana_agent: SolanaPublicAnalyzer | None = None
         self._stopping = threading.Event()
         self._ready = threading.Event()
         self._watch_lock = threading.Lock()
@@ -332,6 +373,12 @@ class AnalysisService:
             self._agent = Chainseer(
                 rpc_url=self.settings.rpc_url,
                 chain_root=self.settings.chain_root,
+            )
+        if self._solana_agent is None:
+            self._solana_agent = SolanaPublicAnalyzer(
+                self.settings.solana_rpc_url,
+                timechain_agent=self._agent,
+                jupiter_api_key=self.settings.jupiter_api_key or None,
             )
         if self._watcher is None:
             self._watcher = ChainseerWatcher(
@@ -372,8 +419,13 @@ class AnalysisService:
             and not self._stopping.is_set()
         )
 
-    def submit(self, address: str) -> JobAccepted:
-        normalized = address.lower()
+    def submit(
+        self, address: str, network: str = "robinhood"
+    ) -> JobAccepted:
+        normalized_address = (
+            address.lower() if network == "robinhood" else address
+        )
+        normalized = f"{network}:{normalized_address}"
         now = time.time()
         with self._lock:
             self._prune(now)
@@ -382,6 +434,7 @@ class AnalysisService:
                 job = Job(
                     id=uuid.uuid4().hex,
                     address=address,
+                    network=network,
                     status="succeeded",
                     started_at=now,
                     finished_at=now,
@@ -405,7 +458,11 @@ class AnalysisService:
             if self.work.full():
                 raise QueueFullError
 
-            job = Job(id=uuid.uuid4().hex, address=address)
+            job = Job(
+                id=uuid.uuid4().hex,
+                address=address,
+                network=network,
+            )
             self.jobs[job.id] = job
             self.active_by_address[normalized] = job.id
             self.work.put_nowait(job.id)
@@ -508,9 +565,16 @@ class AnalysisService:
             try:
                 if self._agent is None:
                     raise RuntimeError("analysis worker has no Chainseer agent")
-                report = self._agent.analyze_token(
-                    job.address, full_report=False
-                )
+                if job.network == "solana":
+                    if self._solana_agent is None:
+                        raise RuntimeError(
+                            "analysis worker has no Solana analyzer"
+                        )
+                    report = self._solana_agent.analyze_token(job.address)
+                else:
+                    report = self._agent.analyze_token(
+                        job.address, full_report=False
+                    )
                 if report.get("error"):
                     raise PublicAnalysisError(
                         "analysis_rejected", str(report["error"])
@@ -520,12 +584,22 @@ class AnalysisService:
                     job.result = public_report
                     job.status = "succeeded"
                     if self.settings.cache_ttl_seconds:
-                        self.cache[job.address.lower()] = (
+                        cache_address = (
+                            job.address.lower()
+                            if job.network == "robinhood"
+                            else job.address
+                        )
+                        self.cache[f"{job.network}:{cache_address}"] = (
                             time.time()
                             + self.settings.cache_ttl_seconds,
                             public_report,
                         )
             except PublicAnalysisError as exc:
+                with self._lock:
+                    job.status = "failed"
+                    job.error_code = exc.code
+                    job.error_message = exc.message
+            except SolanaMintError as exc:
                 with self._lock:
                     job.status = "failed"
                     job.error_code = exc.code
@@ -546,7 +620,15 @@ class AnalysisService:
                 with self._lock:
                     job.finished_at = time.time()
                     self.active_by_address.pop(
-                        job.address.lower(), None
+                        (
+                            f"{job.network}:"
+                            + (
+                                job.address.lower()
+                                if job.network == "robinhood"
+                                else job.address
+                            )
+                        ),
+                        None,
                     )
                 self.work.task_done()
             if (
@@ -688,7 +770,7 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
             "address": report.get("token_address"),
             "name": report.get("token_name") or basic.get("name"),
             "symbol": report.get("token_symbol") or basic.get("symbol"),
-            "chain": "Robinhood Chain",
+            "chain": report.get("chain_name") or "Robinhood Chain",
             "chain_id": report.get("chain_id"),
             "explorer_url": report.get("explorer_url"),
         },
@@ -761,6 +843,11 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         "evidence": {
             "fact_count": provenance.get("fact_count", 0),
             "block_pin": provenance.get("block_pin"),
+            "anchor_type": provenance.get("anchor_type", "block_pin"),
+            "anchor_caveat": provenance.get("anchor_caveat"),
+            "infrastructure_indeterminate": (
+                report.get("infrastructure_indeterminate") or []
+            ),
             "ledger_hash": ledger_hash,
             "facts": public_facts,
         },
@@ -912,6 +999,8 @@ def ready() -> dict[str, Any]:
         "environment": SETTINGS.environment,
         "watcher_enabled": SETTINGS.watcher_enabled,
         "watcher_last_error": SERVICE.watch_status().get("last_error"),
+        "networks": ["robinhood", "solana"],
+        "solana_rpc_configured": bool(SETTINGS.solana_rpc_url),
     }
 
 
@@ -929,7 +1018,7 @@ def create_analysis(payload: AnalyzeRequest, request: Request) -> JobAccepted:
             headers={"Retry-After": "60"},
         )
     try:
-        return SERVICE.submit(payload.address)
+        return SERVICE.submit(payload.address, payload.network)
     except QueueFullError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

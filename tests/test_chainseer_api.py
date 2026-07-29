@@ -18,6 +18,7 @@ from chainseer_api import (
 
 
 TOKEN = "0x" + "a" * 40
+SOLANA_MINT = "So11111111111111111111111111111111111111112"
 
 
 def sample_internal_report():
@@ -125,6 +126,7 @@ def sample_internal_report():
                 }
             ],
         },
+        "infrastructure_indeterminate": [],
     }
 
 
@@ -139,6 +141,23 @@ class FakeAgent:
         return report
 
 
+class FakeSolanaAgent:
+    def __init__(self):
+        self.calls = 0
+
+    def analyze_token(self, address):
+        self.calls += 1
+        report = sample_internal_report()
+        report["token_address"] = address
+        report["token_name"] = "Wrapped SOL"
+        report["token_symbol"] = "SOL"
+        report["chain_name"] = "Solana"
+        report["chain_id"] = "mainnet-beta"
+        report["provenance"]["anchor_type"] = "confirmed_slot_anchor"
+        report["provenance"]["anchor_caveat"] = "Confirmed slot anchor."
+        return report
+
+
 class AnalyzeRequestTests(unittest.TestCase):
     def test_accepts_valid_address(self):
         request = AnalyzeRequest(address=TOKEN)
@@ -147,6 +166,24 @@ class AnalyzeRequestTests(unittest.TestCase):
     def test_rejects_invalid_address(self):
         with self.assertRaises(ValidationError):
             AnalyzeRequest(address="not-an-address")
+
+    def test_accepts_valid_solana_mint(self):
+        request = AnalyzeRequest(
+            network="solana",
+            address=SOLANA_MINT,
+        )
+        self.assertEqual(request.network, "solana")
+        self.assertEqual(request.address, SOLANA_MINT)
+
+    def test_rejects_invalid_solana_mint(self):
+        with self.assertRaises(ValidationError):
+            AnalyzeRequest(network="solana", address="2" * 32)
+
+    def test_network_address_types_do_not_cross(self):
+        with self.assertRaises(ValidationError):
+            AnalyzeRequest(network="robinhood", address=SOLANA_MINT)
+        with self.assertRaises(ValidationError):
+            AnalyzeRequest(network="solana", address=TOKEN)
 
 
 class PublicReportTests(unittest.TestCase):
@@ -176,6 +213,28 @@ class PublicReportTests(unittest.TestCase):
         )
         self.assertNotIn(
             "flow_records", public["extended_evidence"]["cross_chain"]
+        )
+        self.assertEqual(
+            public["evidence"]["infrastructure_indeterminate"],
+            [],
+        )
+
+    def test_public_schema_exposes_solana_slot_boundary(self):
+        report = sample_internal_report()
+        report["chain_name"] = "Solana"
+        report["chain_id"] = "mainnet-beta"
+        report["provenance"]["anchor_type"] = "confirmed_slot_anchor"
+        report["provenance"]["anchor_caveat"] = "Confirmed slot anchor."
+        public = build_public_report(report)
+        self.assertEqual(public["token"]["chain"], "Solana")
+        self.assertEqual(public["token"]["chain_id"], "mainnet-beta")
+        self.assertEqual(
+            public["evidence"]["anchor_type"],
+            "confirmed_slot_anchor",
+        )
+        self.assertEqual(
+            public["evidence"]["anchor_caveat"],
+            "Confirmed slot anchor.",
         )
 
 
@@ -305,6 +364,40 @@ class ServiceTests(unittest.TestCase):
                 self.assertTrue(service.watch_unsubscribe(TOKEN))
                 self.assertEqual(
                     service.watch_status()["subscriptions"], []
+                )
+            finally:
+                service.stop()
+
+    def test_worker_routes_solana_and_keeps_network_cache_separate(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            evm = FakeAgent()
+            solana = FakeSolanaAgent()
+            service._agent = evm
+            service._solana_agent = solana
+            service.start()
+            try:
+                accepted = service.submit(SOLANA_MINT, "solana")
+                deadline = time.time() + 3
+                job = service.get(accepted.job_id)
+                while job and job.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    job = service.get(accepted.job_id)
+                self.assertIsNotNone(job)
+                self.assertEqual(job.status, "succeeded")
+                self.assertEqual(job.network, "solana")
+                self.assertEqual(job.result["token"]["chain"], "Solana")
+                self.assertEqual(solana.calls, 1)
+                self.assertEqual(evm.calls, 0)
+
+                cached = service.submit(SOLANA_MINT, "solana")
+                self.assertTrue(cached.cached)
+                self.assertEqual(solana.calls, 1)
+                self.assertIn(f"solana:{SOLANA_MINT}", service.cache)
+                self.assertNotIn(
+                    f"robinhood:{SOLANA_MINT}",
+                    service.cache,
                 )
             finally:
                 service.stop()
