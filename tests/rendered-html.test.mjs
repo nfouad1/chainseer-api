@@ -95,6 +95,11 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, />Holders</);
   assert.match(page, /market_cap_kind/);
   assert.match(page, /FDV estimate/);
+  assert.match(page, /entity_graph/);
+  assert.match(page, /EntityEvidenceGraph/);
+  assert.match(page, /Entity &amp; insider evidence/);
+  assert.match(page, /Provider-attested/);
+  assert.match(page, /graph_hash/);
   assert.match(page, /data-network=\{network\}/);
   assert.match(page, /aria-pressed=\{network === "solana"\}/);
   assert.doesNotMatch(page, /<select/);
@@ -102,6 +107,9 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(styles, /#9945ff/i);
   assert.match(styles, /#14f195/i);
   assert.match(styles, /\.theme-robinhood/);
+  assert.match(styles, /\.entity-graph/);
+  assert.match(styles, /\.graph-link\.link-provider_attested/);
+  assert.match(styles, /\.entity-inspector/);
   assert.match(page, /SAMPLE DATA · NOT LIVE/);
   assert.match(page, /nothing was sealed/);
   assert.match(page, /setShowExample\(false\)/);

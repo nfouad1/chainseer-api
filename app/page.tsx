@@ -6,6 +6,61 @@ const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
 type Network = "robinhood" | "solana";
 
+type EntityGraphNode = {
+  id: string;
+  type: string;
+  address: string;
+  label?: string;
+  roles: string[];
+  attributes: Record<string, string | number | boolean | null>;
+};
+
+type EntityGraphEdge = {
+  id: string;
+  source: string;
+  target: string;
+  relationship: string;
+  evidence_status: string;
+  confidence: string;
+  evidence_refs: string[];
+  attributes: Record<string, string | number | boolean | null>;
+};
+
+type EntityGraphSignal = {
+  id: string;
+  code: string;
+  severity: string;
+  reason: string;
+  entity_ids: string[];
+  evidence_refs: string[];
+  confidence: string;
+};
+
+type EntityGraph = {
+  schema_version: string;
+  network: string;
+  root_entity_id: string;
+  anchor: Record<string, string | number | boolean | null>;
+  summary: {
+    entity_count: number;
+    relationship_count: number;
+    privileged_entity_count: number;
+    confirmed_relationship_count: number;
+    provider_attested_relationship_count: number;
+    signal_count: number;
+    high_or_critical_signal_count: number;
+    insider_risk_level: string;
+    coverage: string;
+    scoring_scope: string;
+    changes_legitimacy_score: boolean;
+  };
+  nodes: EntityGraphNode[];
+  edges: EntityGraphEdge[];
+  signals: EntityGraphSignal[];
+  limitations: string[];
+  graph_hash: string;
+};
+
 type PublicReport = {
   schema_version: string;
   token: {
@@ -83,6 +138,7 @@ type PublicReport = {
     decision?: string;
     scores: Record<string, number>;
   };
+  entity_graph?: EntityGraph;
   analyzed_at?: string;
   disclaimer: string;
 };
@@ -143,6 +199,255 @@ function formatCount(value: number | null | undefined) {
     notation: numericValue >= 10_000 ? "compact" : "standard",
     maximumFractionDigits: 1,
   }).format(numericValue);
+}
+
+const privilegedRoles = new Set([
+  "deployer",
+  "contract_owner",
+  "liquidity_controller",
+  "mint_authority",
+  "freeze_authority",
+]);
+const confirmedStatuses = new Set(["onchain_confirmed", "cross_source_confirmed"]);
+type GraphFilter = "all" | "confirmed" | "attested";
+
+function titleCase(value: string) {
+  return value.replaceAll("_", " ").replace(/\b\w/g, (letter) => letter.toUpperCase());
+}
+
+function shortAddress(value: string) {
+  if (!value) return "Address unavailable";
+  return value.length > 20 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
+}
+
+function nodePriority(node: EntityGraphNode, graph: EntityGraph) {
+  let score = 0;
+  if (node.id === graph.root_entity_id) score += 1000;
+  if (graph.signals.some((signal) => signal.entity_ids.includes(node.id))) score += 500;
+  if (node.roles.some((role) => privilegedRoles.has(role))) score += 300;
+  if (["primary_market", "proxy", "implementation"].some((role) => node.roles.includes(role))) {
+    score += 180;
+  }
+  const holderRank = Number(node.attributes?.rank);
+  if (Number.isFinite(holderRank) && holderRank > 0) score += Math.max(0, 120 - holderRank);
+  return score;
+}
+
+function EntityEvidenceGraph({ graph }: { graph?: EntityGraph }) {
+  const [filter, setFilter] = useState<GraphFilter>("all");
+  const [selectedId, setSelectedId] = useState(graph?.root_entity_id || "");
+
+  if (!graph?.graph_hash || !graph.nodes?.length) {
+    return (
+      <section className="entity-graph entity-graph-empty" aria-label="Entity evidence graph">
+        <div>
+          <span className="panel-index">03</span>
+          <h3>Entity &amp; insider evidence</h3>
+        </div>
+        <p>
+          Entity graph unavailable for this report. Run a fresh analysis after the graph rollout
+          to map privileged actors and evidence-backed relationships.
+        </p>
+      </section>
+    );
+  }
+
+  const visibleNodes = [...graph.nodes]
+    .sort((left, right) => nodePriority(right, graph) - nodePriority(left, graph))
+    .slice(0, 16);
+  const visibleIds = new Set(visibleNodes.map((node) => node.id));
+  const visibleEdges = graph.edges.filter((edge) => {
+    if (!visibleIds.has(edge.source) || !visibleIds.has(edge.target)) return false;
+    if (filter === "confirmed") return confirmedStatuses.has(edge.evidence_status);
+    if (filter === "attested") return edge.evidence_status === "provider_attested";
+    return true;
+  });
+  const selectedNode =
+    graph.nodes.find((node) => node.id === selectedId) ||
+    graph.nodes.find((node) => node.id === graph.root_entity_id) ||
+    visibleNodes[0];
+  const selectedEdges = graph.edges
+    .filter((edge) => edge.source === selectedNode.id || edge.target === selectedNode.id)
+    .slice(0, 8);
+  const selectedSignals = graph.signals.filter((signal) =>
+    signal.entity_ids.includes(selectedNode.id),
+  );
+  const signalEntityIds = new Set(graph.signals.flatMap((signal) => signal.entity_ids));
+  const root = visibleNodes.find((node) => node.id === graph.root_entity_id) || visibleNodes[0];
+  const orbitingNodes = visibleNodes.filter((node) => node.id !== root.id);
+  const positions = new Map<string, { x: number; y: number }>([[root.id, { x: 500, y: 280 }]]);
+  orbitingNodes.forEach((node, index) => {
+    const angle = -Math.PI / 2 + (Math.PI * 2 * index) / Math.max(orbitingNodes.length, 1);
+    const wideOrbit = index % 2 === 0;
+    positions.set(node.id, {
+      x: 500 + Math.cos(angle) * (wideOrbit ? 375 : 285),
+      y: 280 + Math.sin(angle) * (wideOrbit ? 205 : 165),
+    });
+  });
+  const hiddenCount = Math.max(0, graph.nodes.length - visibleNodes.length);
+  const attributeEntries = Object.entries(selectedNode.attributes || {})
+    .filter(([, value]) => value !== null && value !== "")
+    .slice(0, 6);
+
+  return (
+    <section className="entity-graph" aria-labelledby="entity-graph-title">
+      <div className="entity-graph-head">
+        <div>
+          <span className="panel-index">03</span>
+          <p className="entity-kicker">Evidence-linked ownership and control</p>
+          <h3 id="entity-graph-title">Entity &amp; insider evidence</h3>
+        </div>
+        <div className={`insider-risk risk-${graph.summary.insider_risk_level.toLowerCase()}`}>
+          <span>Insider risk</span>
+          <strong>{graph.summary.insider_risk_level}</strong>
+          <small>{graph.summary.coverage} coverage</small>
+        </div>
+      </div>
+
+      <div className="entity-graph-summary" aria-label="Entity graph summary">
+        <article><span>Entities</span><strong>{graph.summary.entity_count}</strong></article>
+        <article><span>Privileged</span><strong>{graph.summary.privileged_entity_count}</strong></article>
+        <article><span>Confirmed links</span><strong>{graph.summary.confirmed_relationship_count}</strong></article>
+        <article><span>High / critical signals</span><strong>{graph.summary.high_or_critical_signal_count}</strong></article>
+      </div>
+
+      <div className="entity-graph-toolbar">
+        <div className="graph-filters" aria-label="Relationship evidence filter">
+          {([
+            ["all", "All evidence"],
+            ["confirmed", "Confirmed"],
+            ["attested", "Provider-attested"],
+          ] as Array<[GraphFilter, string]>).map(([value, label]) => (
+            <button
+              type="button"
+              key={value}
+              className={filter === value ? "active" : ""}
+              aria-pressed={filter === value}
+              onClick={() => setFilter(value)}
+            >
+              {label}
+            </button>
+          ))}
+        </div>
+        <div className="graph-legend" aria-label="Evidence legend">
+          <span className="legend-onchain">Onchain</span>
+          <span className="legend-cross">Cross-source</span>
+          <span className="legend-attested">Attested</span>
+        </div>
+      </div>
+
+      <div className="entity-graph-layout">
+        <div className="entity-graph-stage">
+          <svg viewBox="0 0 1000 560" role="img" aria-label="Interactive entity relationship graph">
+            <g aria-hidden="true">
+              {visibleEdges.map((edge) => {
+                const source = positions.get(edge.source);
+                const target = positions.get(edge.target);
+                if (!source || !target) return null;
+                const connected = edge.source === selectedNode.id || edge.target === selectedNode.id;
+                return (
+                  <line
+                    key={edge.id}
+                    x1={source.x}
+                    y1={source.y}
+                    x2={target.x}
+                    y2={target.y}
+                    className={`graph-link link-${edge.evidence_status}${connected ? " selected" : ""}`}
+                  />
+                );
+              })}
+            </g>
+            {visibleNodes.map((node) => {
+              const position = positions.get(node.id) || { x: 500, y: 280 };
+              const isSelected = node.id === selectedNode.id;
+              const isRoot = node.id === root.id;
+              const hasSignal = signalEntityIds.has(node.id);
+              const label = (node.label || titleCase(node.type)).slice(0, 20);
+              return (
+                <g
+                  key={node.id}
+                  transform={`translate(${position.x} ${position.y})`}
+                  className={`graph-node${isSelected ? " selected" : ""}${isRoot ? " root" : ""}${hasSignal ? " signal" : ""}`}
+                  role="button"
+                  tabIndex={0}
+                  aria-label={`${label}, ${shortAddress(node.address)}`}
+                  aria-pressed={isSelected}
+                  onClick={() => setSelectedId(node.id)}
+                  onKeyDown={(event) => {
+                    if (event.key === "Enter" || event.key === " ") {
+                      event.preventDefault();
+                      setSelectedId(node.id);
+                    }
+                  }}
+                >
+                  <rect x="-66" y="-29" width="132" height="58" rx="4" />
+                  <text className="graph-node-label" textAnchor="middle" y="-4">{label}</text>
+                  <text className="graph-node-address" textAnchor="middle" y="13">
+                    {shortAddress(node.address)}
+                  </text>
+                </g>
+              );
+            })}
+          </svg>
+          <p className="graph-stage-note">
+            Showing {visibleNodes.length} priority entities
+            {hiddenCount ? ` · ${hiddenCount} lower-priority entities collapsed` : ""}
+          </p>
+        </div>
+
+        <aside className="entity-inspector" aria-live="polite">
+          <span className="inspector-type">{titleCase(selectedNode.type)}</span>
+          <h4>{selectedNode.label || shortAddress(selectedNode.address)}</h4>
+          <code title={selectedNode.address}>{selectedNode.address}</code>
+
+          <div className="role-list">
+            {(selectedNode.roles.length ? selectedNode.roles : ["observed_entity"]).map((role) => (
+              <span key={role}>{titleCase(role)}</span>
+            ))}
+          </div>
+
+          {selectedSignals.length > 0 && (
+            <div className="inspector-block signal-block">
+              <strong>Related signals</strong>
+              {selectedSignals.map((signal) => (
+                <article key={signal.id}>
+                  <span>{signal.severity} · {titleCase(signal.code)}</span>
+                  <p>{signal.reason}</p>
+                </article>
+              ))}
+            </div>
+          )}
+
+          <div className="inspector-block">
+            <strong>Relationships</strong>
+            {selectedEdges.length ? (
+              <ul>
+                {selectedEdges.map((edge) => (
+                  <li key={edge.id}>
+                    <span>{titleCase(edge.relationship)}</span>
+                    <small>{titleCase(edge.evidence_status)} · {edge.confidence}</small>
+                  </li>
+                ))}
+              </ul>
+            ) : <p>No mapped relationship for this entity.</p>}
+          </div>
+
+          {attributeEntries.length > 0 && (
+            <dl className="inspector-attributes">
+              {attributeEntries.map(([key, value]) => (
+                <div key={key}><dt>{titleCase(key)}</dt><dd>{String(value)}</dd></div>
+              ))}
+            </dl>
+          )}
+        </aside>
+      </div>
+
+      <div className="entity-graph-foot">
+        <p>{graph.limitations[0] || "Relationships are limited to the evidence collected for this analysis."}</p>
+        <code title={graph.graph_hash}>Graph hash {graph.graph_hash.slice(0, 18)}…</code>
+      </div>
+    </section>
+  );
 }
 
 function LiveReport({ report }: { report: PublicReport }) {
@@ -281,6 +586,8 @@ function LiveReport({ report }: { report: PublicReport }) {
           ))}
         </div>
       )}
+
+      <EntityEvidenceGraph graph={report.entity_graph} />
 
       <div className="live-detail-grid">
         <div className="live-factors">
