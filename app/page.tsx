@@ -240,14 +240,20 @@ function EntityEvidenceGraph({ graph }: { graph?: EntityGraph }) {
   if (!graph?.graph_hash || !graph.nodes?.length) {
     return (
       <section className="entity-graph entity-graph-empty" aria-label="Entity evidence graph">
-        <div>
-          <span className="panel-index">03</span>
-          <h3>Entity &amp; insider evidence</h3>
-        </div>
-        <p>
-          Entity graph unavailable for this report. Run a fresh analysis after the graph rollout
-          to map privileged actors and evidence-backed relationships.
-        </p>
+        <details className="analysis-disclosure">
+          <summary className="analysis-disclosure-trigger">
+            <div>
+              <span className="panel-index">03</span>
+              <h3>Entity &amp; insider evidence</h3>
+            </div>
+          </summary>
+          <div className="analysis-disclosure-body">
+            <p>
+              Entity graph unavailable for this report. Run a fresh analysis after the graph
+              rollout to map privileged actors and evidence-backed relationships.
+            </p>
+          </div>
+        </details>
       </section>
     );
   }
@@ -291,27 +297,29 @@ function EntityEvidenceGraph({ graph }: { graph?: EntityGraph }) {
 
   return (
     <section className="entity-graph" aria-labelledby="entity-graph-title">
-      <div className="entity-graph-head">
-        <div>
-          <span className="panel-index">03</span>
-          <p className="entity-kicker">Evidence-linked ownership and control</p>
-          <h3 id="entity-graph-title">Entity &amp; insider evidence</h3>
-        </div>
-        <div className={`insider-risk risk-${graph.summary.insider_risk_level.toLowerCase()}`}>
-          <span>Insider risk</span>
-          <strong>{graph.summary.insider_risk_level}</strong>
-          <small>{graph.summary.coverage} coverage</small>
-        </div>
-      </div>
+      <details className="analysis-disclosure">
+        <summary className="entity-graph-head analysis-disclosure-trigger">
+          <div>
+            <span className="panel-index">03</span>
+            <p className="entity-kicker">Evidence-linked ownership and control</p>
+            <h3 id="entity-graph-title">Entity &amp; insider evidence</h3>
+          </div>
+          <div className={`insider-risk risk-${graph.summary.insider_risk_level.toLowerCase()}`}>
+            <span>Insider risk</span>
+            <strong>{graph.summary.insider_risk_level}</strong>
+            <small>{graph.summary.coverage} coverage</small>
+          </div>
+        </summary>
 
-      <div className="entity-graph-summary" aria-label="Entity graph summary">
-        <article><span>Entities</span><strong>{graph.summary.entity_count}</strong></article>
-        <article><span>Privileged</span><strong>{graph.summary.privileged_entity_count}</strong></article>
-        <article><span>Confirmed links</span><strong>{graph.summary.confirmed_relationship_count}</strong></article>
-        <article><span>High / critical signals</span><strong>{graph.summary.high_or_critical_signal_count}</strong></article>
-      </div>
+        <div className="analysis-disclosure-body">
+          <div className="entity-graph-summary" aria-label="Entity graph summary">
+            <article><span>Entities</span><strong>{graph.summary.entity_count}</strong></article>
+            <article><span>Privileged</span><strong>{graph.summary.privileged_entity_count}</strong></article>
+            <article><span>Confirmed links</span><strong>{graph.summary.confirmed_relationship_count}</strong></article>
+            <article><span>High / critical signals</span><strong>{graph.summary.high_or_critical_signal_count}</strong></article>
+          </div>
 
-      <div className="entity-graph-toolbar">
+          <div className="entity-graph-toolbar">
         <div className="graph-filters" aria-label="Relationship evidence filter">
           {([
             ["all", "All evidence"],
@@ -334,9 +342,9 @@ function EntityEvidenceGraph({ graph }: { graph?: EntityGraph }) {
           <span className="legend-cross">Cross-source</span>
           <span className="legend-attested">Attested</span>
         </div>
-      </div>
+          </div>
 
-      <div className="entity-graph-layout">
+          <div className="entity-graph-layout">
         <div className="entity-graph-stage">
           <svg viewBox="0 0 1000 560" role="img" aria-label="Interactive entity relationship graph">
             <g aria-hidden="true">
@@ -440,12 +448,14 @@ function EntityEvidenceGraph({ graph }: { graph?: EntityGraph }) {
             </dl>
           )}
         </aside>
-      </div>
+          </div>
 
-      <div className="entity-graph-foot">
-        <p>{graph.limitations[0] || "Relationships are limited to the evidence collected for this analysis."}</p>
-        <code title={graph.graph_hash}>Graph hash {graph.graph_hash.slice(0, 18)}…</code>
-      </div>
+          <div className="entity-graph-foot">
+            <p>{graph.limitations[0] || "Relationships are limited to the evidence collected for this analysis."}</p>
+            <code title={graph.graph_hash}>Graph hash {graph.graph_hash.slice(0, 18)}…</code>
+          </div>
+        </div>
+      </details>
     </section>
   );
 }
@@ -590,48 +600,52 @@ function LiveReport({ report }: { report: PublicReport }) {
       <EntityEvidenceGraph graph={report.entity_graph} />
 
       <div className="live-detail-grid">
-        <div className="live-factors">
-          <div className="panel-head">
+        <details className="live-factors analysis-disclosure">
+          <summary className="panel-head analysis-disclosure-trigger">
             <div><span className="panel-index">01</span><h3>Risk dimensions</h3></div>
             <span>Higher is safer</span>
-          </div>
-          <div className="factor-grid">
-            {factorEntries.map((factor) => (
-              <div className="factor" key={factor.key}>
-                <div className="factor-label">
-                  <span>{factor.label}</span><strong>{factor.score}</strong>
+          </summary>
+          <div className="analysis-disclosure-body">
+            <div className="factor-grid">
+              {factorEntries.map((factor) => (
+                <div className="factor" key={factor.key}>
+                  <div className="factor-label">
+                    <span>{factor.label}</span><strong>{factor.score}</strong>
+                  </div>
+                  <div className="bar">
+                    <span
+                      className={factor.score >= 70 ? "good" : "warn"}
+                      style={{ width: `${factor.score}%` }}
+                    />
+                  </div>
                 </div>
-                <div className="bar">
-                  <span
-                    className={factor.score >= 70 ? "good" : "warn"}
-                    style={{ width: `${factor.score}%` }}
-                  />
-                </div>
-              </div>
-            ))}
+              ))}
+            </div>
           </div>
-        </div>
+        </details>
 
-        <div className="live-evidence">
-          <div className="panel-head">
+        <details className="live-evidence analysis-disclosure">
+          <summary className="panel-head analysis-disclosure-trigger">
             <div><span className="panel-index">02</span><h3>Verification</h3></div>
             <div className="verified-seal"><span>◆</span> {report.timechain.decision || "SEALED"}</div>
+          </summary>
+          <div className="analysis-disclosure-body">
+            <dl>
+              <div><dt>Timechain Ring</dt><dd>{report.timechain.ring ?? "—"}</dd></div>
+              <div><dt>Ring hash</dt><dd>{report.timechain.ring_hash?.slice(0, 20) || "—"}…</dd></div>
+              <div><dt>Ledger hash</dt><dd>{report.evidence.ledger_hash?.slice(0, 20) || "—"}…</dd></div>
+              <div><dt>{anchorLabel}</dt><dd>{report.evidence.block_pin?.toLocaleString() || "—"}</dd></div>
+            </dl>
+            {report.evidence.anchor_caveat && (
+              <p className="anchor-caveat">{report.evidence.anchor_caveat}</p>
+            )}
+            {report.token.explorer_url && (
+              <a href={report.token.explorer_url} target="_blank" rel="noreferrer">
+                Open token explorer ↗
+              </a>
+            )}
           </div>
-          <dl>
-            <div><dt>Timechain Ring</dt><dd>{report.timechain.ring ?? "—"}</dd></div>
-            <div><dt>Ring hash</dt><dd>{report.timechain.ring_hash?.slice(0, 20) || "—"}…</dd></div>
-            <div><dt>Ledger hash</dt><dd>{report.evidence.ledger_hash?.slice(0, 20) || "—"}…</dd></div>
-            <div><dt>{anchorLabel}</dt><dd>{report.evidence.block_pin?.toLocaleString() || "—"}</dd></div>
-          </dl>
-          {report.evidence.anchor_caveat && (
-            <p className="anchor-caveat">{report.evidence.anchor_caveat}</p>
-          )}
-          {report.token.explorer_url && (
-            <a href={report.token.explorer_url} target="_blank" rel="noreferrer">
-              Open token explorer ↗
-            </a>
-          )}
-        </div>
+        </details>
       </div>
 
       <div className="live-flags">

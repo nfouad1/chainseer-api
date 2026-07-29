@@ -100,6 +100,10 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, /Entity &amp; insider evidence/);
   assert.match(page, /Provider-attested/);
   assert.match(page, /graph_hash/);
+  assert.match(page, /<details className="live-factors analysis-disclosure">/);
+  assert.match(page, /<details className="live-evidence analysis-disclosure">/);
+  assert.match(page, /<details className="analysis-disclosure">/);
+  assert.match(page, /analysis-disclosure-trigger/);
   assert.match(page, /data-network=\{network\}/);
   assert.match(page, /aria-pressed=\{network === "solana"\}/);
   assert.doesNotMatch(page, /<select/);
@@ -110,6 +114,8 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(styles, /\.entity-graph/);
   assert.match(styles, /\.graph-link\.link-provider_attested/);
   assert.match(styles, /\.entity-inspector/);
+  assert.match(styles, /\.analysis-disclosure\[open\]/);
+  assert.match(styles, /\.analysis-disclosure-trigger::after/);
   assert.match(page, /SAMPLE DATA · NOT LIVE/);
   assert.match(page, /nothing was sealed/);
   assert.match(page, /setShowExample\(false\)/);
