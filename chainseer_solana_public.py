@@ -799,6 +799,7 @@ class SolanaPublicAnalyzer:
             ((pair or {}).get("volume") or {}).get("h24"), None
         )
         market_cap = _safe_float((pair or {}).get("marketCap"), None)
+        fdv = _safe_float((pair or {}).get("fdv"), None)
         created_ms = _safe_int((pair or {}).get("pairCreatedAt"), 0)
         market_age_seconds = (
             max(0, int(time.time() - created_ms / 1000))
@@ -1086,6 +1087,13 @@ class SolanaPublicAnalyzer:
                 "dex_pairs": {
                     "primary_price_usd": price_usd,
                     "market_cap": market_cap,
+                    "market_cap_kind": (
+                        "reported_market_cap"
+                        if market_cap is not None and market_cap > 0
+                        else "unavailable"
+                    ),
+                    "market_cap_source": "DexScreener",
+                    "fdv": fdv,
                     "total_liquidity_usd": liquidity_usd,
                     "total_volume_24h": volume_24h,
                     "token_age_label": self._age_label(market_age_seconds),

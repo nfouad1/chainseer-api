@@ -78,5 +78,10 @@ integration, backups, and domain configuration.
 See [`CHAINSEER_CONTROLS.md`](CHAINSEER_CONTROLS.md) for watcher, calibration,
 TradePermit, MEV, social/KOL, and cross-chain adapter operation.
 
+See [`BENCHMARK.md`](BENCHMARK.md) for the versioned, time-separated benchmark
+schema and deterministic evaluation workflow. Benchmark v1 keeps token outcomes
+separate from infrastructure failures and emits hashes suitable for Timechain
+sealing after PoQ review.
+
 Never commit API tokens, environment files, local Timechain rings, learning
 databases, or analysis reports.

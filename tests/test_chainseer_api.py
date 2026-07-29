@@ -56,6 +56,12 @@ def sample_internal_report():
             "confidence": "6/8 sources",
             "recommendation": "Keep on a watchlist.",
             "hard_stop_overrides": [],
+            "holder_assessment": {
+                "holder_count": 1_250,
+                "source": "Blockscout",
+                "largest_non_amm_holder_pct": 8.2,
+                "concentration_source": "Blockscout holders / pinned total supply",
+            },
             "component_scores": {
                 "security": 90,
                 "liquidity": 70,
@@ -108,6 +114,12 @@ def sample_internal_report():
                 "locked": False,
                 "withdrawal_verified": False,
                 "hard_stop_eligible": False,
+            },
+            "blockscout_holders": {
+                "holders": [{"address": TOKEN, "balance_parsed": 10}],
+                "adj_top_1_pct": 8.2,
+                "adj_top_10_pct": 24.5,
+                "concentration_basis": "total_supply",
             },
         },
         "provenance": {
@@ -189,7 +201,7 @@ class AnalyzeRequestTests(unittest.TestCase):
 class PublicReportTests(unittest.TestCase):
     def test_public_schema_omits_raw_queries(self):
         public = build_public_report(sample_internal_report())
-        self.assertEqual(public["schema_version"], "1.0")
+        self.assertEqual(public["schema_version"], "1.1")
         self.assertEqual(public["timechain"]["ring"], 42)
         self.assertEqual(public["timechain"]["cognitive_ring"], 43)
         self.assertEqual(public["timechain"]["cognition"]["status"], "complete")
@@ -218,6 +230,15 @@ class PublicReportTests(unittest.TestCase):
             public["evidence"]["infrastructure_indeterminate"],
             [],
         )
+        self.assertEqual(public["market"]["market_cap_usd"], 1_000_000)
+        self.assertEqual(
+            public["market"]["market_cap_kind"],
+            "reported_market_cap",
+        )
+        self.assertEqual(public["holders"]["count"], 1_250)
+        self.assertEqual(public["holders"]["count_source"], "Blockscout")
+        self.assertEqual(public["holders"]["largest_holder_pct"], 8.2)
+        self.assertEqual(public["holders"]["top10_holder_pct"], 24.5)
 
     def test_public_schema_exposes_solana_slot_boundary(self):
         report = sample_internal_report()
@@ -225,6 +246,17 @@ class PublicReportTests(unittest.TestCase):
         report["chain_id"] = "mainnet-beta"
         report["provenance"]["anchor_type"] = "confirmed_slot_anchor"
         report["provenance"]["anchor_caveat"] = "Confirmed slot anchor."
+        report["analysis"]["holder_assessment"] = None
+        report["data"].pop("blockscout_holders")
+        report["data"]["basic_info"]["jupiter_holder_count"] = 420
+        report["data"]["holder_concentration"] = {
+            "largest_accounts": [{"token_account": SOLANA_MINT}],
+            "top1_total_supply_pct": 9.5,
+            "top10_total_supply_pct": 31.0,
+            "method": "getTokenLargestAccounts_plus_owner_resolution",
+            "pool_and_program_vaults_excluded": False,
+            "caveat": "Largest accounts may include program vaults.",
+        }
         public = build_public_report(report)
         self.assertEqual(public["token"]["chain"], "Solana")
         self.assertEqual(public["token"]["chain_id"], "mainnet-beta")
@@ -236,6 +268,31 @@ class PublicReportTests(unittest.TestCase):
             public["evidence"]["anchor_caveat"],
             "Confirmed slot anchor.",
         )
+        self.assertEqual(public["holders"]["count"], 420)
+        self.assertEqual(public["holders"]["count_source"], "Jupiter")
+        self.assertEqual(public["holders"]["sample_size"], 1)
+        self.assertFalse(
+            public["holders"]["pool_and_program_vaults_excluded"]
+        )
+
+    def test_public_schema_does_not_mislabel_holder_sample_as_count(self):
+        report = sample_internal_report()
+        report["chain_name"] = "Solana"
+        report["analysis"]["holder_assessment"] = None
+        report["data"].pop("blockscout_holders")
+        report["data"]["holder_concentration"] = {
+            "largest_accounts": [
+                {"token_account": f"account-{index}"}
+                for index in range(20)
+            ],
+            "top1_total_supply_pct": 12.0,
+            "method": "getTokenLargestAccounts_plus_owner_resolution",
+        }
+        public = build_public_report(report)
+        self.assertIsNone(public["holders"]["count"])
+        self.assertEqual(public["holders"]["count_status"], "unavailable")
+        self.assertEqual(public["holders"]["sample_size"], 20)
+        self.assertIn("exact holder count was unavailable", public["holders"]["caveat"])
 
 
 class RateLimiterTests(unittest.TestCase):

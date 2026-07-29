@@ -1518,8 +1518,22 @@ class Chainseer:
         result["total_volume_24h"] = total_volume_24h
         result["primary_price_usd"] = _safe_float(primary.get("priceUsd"))
         result["primary_liquidity_usd"] = _safe_float(primary.get("liquidity", {}).get("usd"))
-        result["market_cap"] = _safe_float(primary.get("marketCap") or primary.get("fdv"))
-        result["fdv"] = _safe_float(primary.get("fdv"))
+        reported_market_cap = _safe_float(primary.get("marketCap"))
+        fdv = _safe_float(primary.get("fdv"))
+        if reported_market_cap > 0:
+            result["market_cap"] = reported_market_cap
+            result["market_cap_kind"] = "reported_market_cap"
+        elif fdv > 0:
+            # DexScreener does not always provide circulating market cap. Keep
+            # the fallback useful without presenting fully diluted valuation
+            # as a measured circulating market cap.
+            result["market_cap"] = fdv
+            result["market_cap_kind"] = "fdv_proxy"
+        else:
+            result["market_cap"] = None
+            result["market_cap_kind"] = "unavailable"
+        result["market_cap_source"] = "DexScreener"
+        result["fdv"] = fdv if fdv > 0 else None
 
         # Transaction counts (from best pair)
         txns = primary.get("txns", {})

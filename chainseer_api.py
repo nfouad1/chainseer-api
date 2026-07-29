@@ -729,6 +729,12 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
     data = report.get("data") or {}
     basic = data.get("basic_info") or {}
     dex = data.get("dex_pairs") or {}
+    holder_assessment = analysis.get("holder_assessment") or {}
+    holder_evidence = (
+        data.get("holder_concentration")
+        or data.get("blockscout_holders")
+        or {}
+    )
     liquidity_custody = data.get("lp_lock") or {}
     extended = analysis.get("extended_evidence") or {}
     social_attention = extended.get("social_attention") or {}
@@ -764,8 +770,59 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         ).encode("utf-8")
     ).hexdigest()
 
+    raw_holder_count = holder_assessment.get("holder_count")
+    holder_count_source = holder_assessment.get("source")
+    if raw_holder_count in (None, "", 0, "0"):
+        raw_holder_count = basic.get("jupiter_holder_count")
+        if raw_holder_count not in (None, "", 0, "0"):
+            holder_count_source = "Jupiter"
+    try:
+        holder_count = int(raw_holder_count)
+    except (TypeError, ValueError, OverflowError):
+        holder_count = None
+    if holder_count is not None and holder_count <= 0:
+        holder_count = None
+
+    largest_accounts = holder_evidence.get("largest_accounts") or []
+    top_holders = holder_evidence.get("holders") or []
+    holder_sample_size = len(largest_accounts or top_holders)
+    largest_holder_pct = holder_assessment.get(
+        "largest_non_amm_holder_pct"
+    )
+    if largest_holder_pct is None:
+        largest_holder_pct = holder_evidence.get("adj_top_1_pct")
+    if largest_holder_pct is None:
+        largest_holder_pct = holder_evidence.get(
+            "top1_total_supply_pct"
+        )
+    top10_holder_pct = holder_evidence.get("adj_top_10_pct")
+    if top10_holder_pct is None:
+        top10_holder_pct = holder_evidence.get(
+            "top10_total_supply_pct"
+        )
+    is_solana = (
+        str(report.get("chain_name") or "").strip().lower() == "solana"
+    )
+    if holder_count is not None:
+        holder_caveat = (
+            f"Holder count was reported by {holder_count_source or 'an upstream provider'} "
+            "at analysis time."
+        )
+    elif holder_sample_size:
+        holder_caveat = (
+            f"An exact holder count was unavailable. Chainseer observed the "
+            f"{holder_sample_size} largest "
+            f"{'token accounts' if is_solana else 'holder records'} only."
+        )
+    else:
+        holder_caveat = "Holder-count evidence was unavailable."
+    if holder_evidence.get("caveat"):
+        holder_caveat = (
+            f"{holder_caveat} {holder_evidence['caveat']}"
+        )
+
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.1",
         "token": {
             "address": report.get("token_address"),
             "name": report.get("token_name") or basic.get("name"),
@@ -794,9 +851,43 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         "market": {
             "price_usd": dex.get("primary_price_usd"),
             "market_cap_usd": dex.get("market_cap"),
+            "market_cap_kind": dex.get(
+                "market_cap_kind",
+                (
+                    "reported_market_cap"
+                    if dex.get("market_cap") not in (None, "", 0, "0")
+                    else "unavailable"
+                ),
+            ),
+            "market_cap_source": dex.get("market_cap_source"),
+            "fdv_usd": dex.get("fdv"),
             "liquidity_usd": dex.get("total_liquidity_usd"),
             "volume_24h_usd": dex.get("total_volume_24h"),
             "age": dex.get("token_age_label"),
+        },
+        "holders": {
+            "count": holder_count,
+            "count_status": (
+                "reported" if holder_count is not None else "unavailable"
+            ),
+            "count_source": holder_count_source,
+            "sample_size": holder_sample_size,
+            "sample_kind": (
+                "largest_token_accounts"
+                if is_solana and holder_sample_size
+                else "top_holder_records" if holder_sample_size else None
+            ),
+            "largest_holder_pct": largest_holder_pct,
+            "top10_holder_pct": top10_holder_pct,
+            "concentration_basis": (
+                holder_assessment.get("concentration_source")
+                or holder_evidence.get("concentration_basis")
+                or holder_evidence.get("method")
+            ),
+            "pool_and_program_vaults_excluded": holder_evidence.get(
+                "pool_and_program_vaults_excluded"
+            ),
+            "caveat": holder_caveat,
         },
         "liquidity_custody": {
             "state": liquidity_custody.get(
