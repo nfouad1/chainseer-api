@@ -82,9 +82,10 @@ test("publishes robots and sitemap metadata", async () => {
 });
 
 test("keeps secrets server-side and removes the starter preview", async () => {
-  const [page, apiRoute, styles, packageJson] = await Promise.all([
+  const [page, apiRoute, watchRoute, styles, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/analyses/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/watch/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
@@ -119,11 +120,18 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, /SAMPLE DATA · NOT LIVE/);
   assert.match(page, /nothing was sealed/);
   assert.match(page, /setShowExample\(false\)/);
+  assert.match(page, /Monitor critical events/);
+  assert.match(page, /chainseer-critical-monitors-v1/);
+  assert.match(page, /window\.Notification/);
   assert.doesNotMatch(page, /0x407470F8D77d12417A6cfaC5940c2f8B5F4E8a27/);
   assert.doesNotMatch(page, /ring_000751/);
   assert.match(apiRoute, /CHAINSEER_API_TOKEN/);
   assert.match(apiRoute, /validSolanaMint/);
   assert.match(apiRoute, /JSON\.stringify\(\{ address, network \}\)/);
+  assert.match(watchRoute, /CHAINSEER_API_TOKEN/);
+  assert.match(watchRoute, /chainseer_monitor_device/);
+  assert.match(watchRoute, /httpOnly: true/);
+  assert.match(watchRoute, /\/v1\/watch\/alerts/);
   assert.doesNotMatch(page, /CHAINSEER_API_TOKEN|NEXT_PUBLIC_CHAINSEER/);
   assert.match(packageJson, /"name": "chainseer-web"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

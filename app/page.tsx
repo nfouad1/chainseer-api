@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useState } from "react";
+import { FormEvent, useEffect, useState } from "react";
 
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -144,6 +144,36 @@ type PublicReport = {
 };
 
 type ScanState = "idle" | "submitting" | "analyzing" | "succeeded" | "failed";
+
+type TokenMonitor = {
+  key: string;
+  network: Network;
+  address: string;
+  label: string;
+  cursor: string;
+};
+
+type CriticalAlert = {
+  alert_hash: string;
+  network: Network;
+  token_address: string;
+  severity: "critical";
+  categories: string[];
+  title: string;
+  message: string;
+  anchor?: number;
+  anchor_type?: string;
+  observed_at: string;
+  new_hard_stops?: string[];
+  timechain?: {
+    ring?: number;
+    ring_hash?: string;
+    decision?: string;
+  };
+};
+
+const MONITOR_STORAGE_KEY = "chainseer-critical-monitors-v1";
+const MAX_DEVICE_MONITORS = 10;
 
 const factorNames: Record<string, string> = {
   security: "Token controls",
@@ -460,7 +490,17 @@ function EntityEvidenceGraph({ graph }: { graph?: EntityGraph }) {
   );
 }
 
-function LiveReport({ report }: { report: PublicReport }) {
+function LiveReport({
+  report,
+  isMonitoring,
+  monitorBusy,
+  onToggleMonitor,
+}: {
+  report: PublicReport;
+  isMonitoring: boolean;
+  monitorBusy: boolean;
+  onToggleMonitor: () => void;
+}) {
   const factorEntries = Object.entries(report.factors)
     .filter(([key, value]) => key !== "legitimacy" && Number.isFinite(value))
     .map(([key, value]) => ({
@@ -583,6 +623,33 @@ function LiveReport({ report }: { report: PublicReport }) {
       <div className="live-recommendation">
         <span>Investor interpretation</span>
         <p>{report.decision.recommendation || "Review the evidence before making a decision."}</p>
+      </div>
+
+      <div className={`critical-monitor ${isMonitoring ? "monitor-active" : ""}`}>
+        <div>
+          <span>Critical state monitor</span>
+          <strong>
+            {isMonitoring
+              ? "Watching liquidity, authority, upgrades, and sellability"
+              : "Get alerted when a critical token state changes"}
+          </strong>
+          <p>
+            Confirmed events are checked near real time while this site is open.
+            Delivery follows watcher cadence and cannot be guaranteed before a transaction.
+          </p>
+        </div>
+        <button
+          type="button"
+          onClick={onToggleMonitor}
+          disabled={monitorBusy}
+          aria-pressed={isMonitoring}
+        >
+          {monitorBusy
+            ? "Updating…"
+            : isMonitoring
+              ? "Stop monitoring"
+              : "Monitor critical events"}
+        </button>
       </div>
 
       {hardStops.length > 0 && (
@@ -722,6 +789,227 @@ export default function Home() {
   const [scanState, setScanState] = useState<ScanState>("idle");
   const [liveReport, setLiveReport] = useState<PublicReport | null>(null);
   const [showExample, setShowExample] = useState(false);
+  const [monitors, setMonitors] = useState<TokenMonitor[]>([]);
+  const [monitorsLoaded, setMonitorsLoaded] = useState(false);
+  const [criticalAlerts, setCriticalAlerts] = useState<CriticalAlert[]>([]);
+  const [monitorBusy, setMonitorBusy] = useState(false);
+  const [monitorNotice, setMonitorNotice] = useState("");
+
+  useEffect(() => {
+    try {
+      const stored = JSON.parse(
+        window.localStorage.getItem(MONITOR_STORAGE_KEY) || "[]",
+      );
+      if (Array.isArray(stored)) {
+        setMonitors(
+          stored
+            .filter(
+              (item): item is TokenMonitor =>
+                item &&
+                typeof item === "object" &&
+                (item.network === "robinhood" || item.network === "solana") &&
+                typeof item.address === "string" &&
+                typeof item.key === "string" &&
+                typeof item.cursor === "string",
+            )
+            .slice(0, MAX_DEVICE_MONITORS),
+        );
+      }
+    } catch {
+      window.localStorage.removeItem(MONITOR_STORAGE_KEY);
+    } finally {
+      setMonitorsLoaded(true);
+    }
+  }, []);
+
+  useEffect(() => {
+    if (!monitorsLoaded) return;
+    window.localStorage.setItem(
+      MONITOR_STORAGE_KEY,
+      JSON.stringify(monitors),
+    );
+  }, [monitors, monitorsLoaded]);
+
+  useEffect(() => {
+    if (!monitorsLoaded || monitors.length === 0) return;
+    let active = true;
+    let inFlight = false;
+
+    async function pollAlerts(resubscribe: boolean) {
+      if (inFlight) return;
+      inFlight = true;
+      try {
+        const nextCursors = new Map<string, string>();
+        const incoming: CriticalAlert[] = [];
+        for (const monitor of monitors) {
+          if (resubscribe) {
+            await fetch("/api/watch", {
+              method: "POST",
+              cache: "no-store",
+              headers: { "Content-Type": "application/json" },
+              body: JSON.stringify({
+                network: monitor.network,
+                address: monitor.address,
+              }),
+            });
+          }
+          const query = new URLSearchParams({
+            network: monitor.network,
+            address: monitor.address,
+          });
+          if (monitor.cursor) query.set("after", monitor.cursor);
+          const response = await fetch(`/api/watch?${query.toString()}`, {
+            cache: "no-store",
+          });
+          if (!response.ok) continue;
+          const body = await response.json().catch(() => null);
+          if (Array.isArray(body?.alerts)) {
+            incoming.push(...(body.alerts as CriticalAlert[]));
+          }
+          if (typeof body?.cursor === "string" && body.cursor) {
+            nextCursors.set(monitor.key, body.cursor);
+          }
+        }
+        if (!active) return;
+        if (nextCursors.size) {
+          setMonitors((current) => {
+            let changed = false;
+            const next = current.map((monitor) => {
+              const cursor = nextCursors.get(monitor.key) || monitor.cursor;
+              if (cursor === monitor.cursor) return monitor;
+              changed = true;
+              return { ...monitor, cursor };
+            });
+            return changed ? next : current;
+          });
+        }
+        if (incoming.length) {
+          setCriticalAlerts((current) => {
+            const byHash = new Map(
+              [...incoming, ...current].map((alert) => [
+                alert.alert_hash,
+                alert,
+              ]),
+            );
+            return Array.from(byHash.values())
+              .sort((a, b) => b.observed_at.localeCompare(a.observed_at))
+              .slice(0, 20);
+          });
+          if (
+            "Notification" in window &&
+            window.Notification.permission === "granted"
+          ) {
+            for (const alert of incoming.slice(0, 3)) {
+              new window.Notification(alert.title, {
+                body: alert.message,
+                tag: alert.alert_hash,
+              });
+            }
+          }
+        }
+      } finally {
+        inFlight = false;
+      }
+    }
+
+    void pollAlerts(true);
+    const timer = window.setInterval(() => void pollAlerts(false), 5_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, [monitors, monitorsLoaded]);
+
+  const liveMonitorKey = liveReport
+    ? `${liveReport.token.chain.toLowerCase().includes("solana") ? "solana" : "robinhood"}:${liveReport.token.address.toLowerCase()}`
+    : "";
+  const liveIsMonitored = monitors.some(
+    (monitor) => monitor.key === liveMonitorKey,
+  );
+
+  async function toggleLiveMonitor() {
+    if (!liveReport || monitorBusy) return;
+    const reportNetwork: Network = liveReport.token.chain
+      .toLowerCase()
+      .includes("solana")
+      ? "solana"
+      : "robinhood";
+    const reportAddress = liveReport.token.address;
+    const key = `${reportNetwork}:${reportAddress.toLowerCase()}`;
+    setMonitorBusy(true);
+    setMonitorNotice("");
+    try {
+      if (monitors.some((monitor) => monitor.key === key)) {
+        const query = new URLSearchParams({
+          network: reportNetwork,
+          address: reportAddress,
+        });
+        const response = await fetch(`/api/watch?${query.toString()}`, {
+          method: "DELETE",
+          cache: "no-store",
+        });
+        if (!response.ok) {
+          const body = await response.json().catch(() => null);
+          throw new Error(errorMessage(body, "Monitoring could not be stopped."));
+        }
+        setMonitors((current) =>
+          current.filter((monitor) => monitor.key !== key),
+        );
+        setMonitorNotice("Critical monitoring stopped for this token.");
+        return;
+      }
+      if (monitors.length >= MAX_DEVICE_MONITORS) {
+        throw new Error(
+          `This device can monitor up to ${MAX_DEVICE_MONITORS} tokens.`,
+        );
+      }
+      const response = await fetch("/api/watch", {
+        method: "POST",
+        cache: "no-store",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          network: reportNetwork,
+          address: reportAddress,
+        }),
+      });
+      const body = await response.json().catch(() => null);
+      if (!response.ok) {
+        throw new Error(errorMessage(body, "Monitoring could not be started."));
+      }
+      if (
+        "Notification" in window &&
+        window.Notification.permission === "default"
+      ) {
+        await window.Notification.requestPermission();
+      }
+      const cursor =
+        typeof body?.subscription?.created_at === "string"
+          ? body.subscription.created_at
+          : new Date().toISOString();
+      setMonitors((current) => [
+        ...current,
+        {
+          key,
+          network: reportNetwork,
+          address: reportAddress,
+          label:
+            liveReport.token.symbol ||
+            liveReport.token.name ||
+            reportAddress.slice(0, 10),
+          cursor,
+        },
+      ]);
+      setMonitorNotice(
+        "Critical monitoring is active. Keep Chainseer open for in-page and browser notifications.",
+      );
+    } catch (error) {
+      setMonitorNotice(
+        error instanceof Error ? error.message : "Monitoring could not be updated.",
+      );
+    } finally {
+      setMonitorBusy(false);
+    }
+  }
 
   async function submitScan(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
@@ -959,7 +1247,49 @@ export default function Home() {
         <div><strong>Timechain</strong><span>tamper-evident memory</span></div>
       </section>
 
-      {liveReport && <LiveReport report={liveReport} />}
+      {monitorNotice && (
+        <p className="monitor-notice" role="status">{monitorNotice}</p>
+      )}
+
+      {criticalAlerts.length > 0 && (
+        <section className="critical-alert-feed" aria-live="assertive">
+          <div className="critical-alert-feed-head">
+            <div>
+              <span>Critical alerts</span>
+              <strong>Confirmed token state changes</strong>
+            </div>
+            <button type="button" onClick={() => setCriticalAlerts([])}>
+              Clear
+            </button>
+          </div>
+          {criticalAlerts.map((alert) => (
+            <article key={alert.alert_hash}>
+              <div>
+                <span>{alert.categories.join(" · ") || "critical"}</span>
+                <strong>{alert.title}</strong>
+                <p>{alert.message}</p>
+              </div>
+              <small>
+                {new Date(alert.observed_at).toLocaleTimeString()} ·{" "}
+                {alert.anchor_type === "confirmed_slot" ? "slot" : "block"}{" "}
+                {alert.anchor?.toLocaleString() || "confirmed"}
+                {alert.timechain?.ring != null
+                  ? ` · ring ${alert.timechain.ring}`
+                  : ""}
+              </small>
+            </article>
+          ))}
+        </section>
+      )}
+
+      {liveReport && (
+        <LiveReport
+          report={liveReport}
+          isMonitoring={liveIsMonitored}
+          monitorBusy={monitorBusy}
+          onToggleMonitor={toggleLiveMonitor}
+        />
+      )}
 
       <section className="report-shell" id="report">
         <div className="section-heading">

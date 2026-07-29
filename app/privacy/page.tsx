@@ -13,7 +13,7 @@ export default function PrivacyPage() {
       <Link className="policy-back" href="/">← Back to Chainseer</Link>
       <div className="eyebrow">Privacy notice</div>
       <h1>Public-chain analysis, minimal private data.</h1>
-      <p className="policy-updated">Effective July 23, 2026</p>
+      <p className="policy-updated">Effective July 29, 2026</p>
 
       <div className="policy-body">
         <section>
@@ -33,6 +33,17 @@ export default function PrivacyPage() {
             network address is not written into a Chainseer Timechain Ring.
             Hosting providers may still process network metadata under their
             own policies.
+          </p>
+        </section>
+        <section>
+          <h2>Critical monitoring</h2>
+          <p>
+            If you enable monitoring, the browser stores the public token
+            addresses and alert cursors on your device. An essential,
+            HTTP-only device cookie separates your subscriptions from other
+            visitors; the API receives only its one-way keyed identifier.
+            Browser notifications require your permission and are delivered
+            only while the Chainseer site is open in this release.
           </p>
         </section>
         <section>

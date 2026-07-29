@@ -13,7 +13,7 @@ export default function TermsPage() {
       <Link className="policy-back" href="/">← Back to Chainseer</Link>
       <div className="eyebrow">Terms of use</div>
       <h1>Evidence helps. It does not remove risk.</h1>
-      <p className="policy-updated">Effective July 23, 2026</p>
+      <p className="policy-updated">Effective July 29, 2026</p>
 
       <div className="policy-body">
         <section>
@@ -31,6 +31,16 @@ export default function TermsPage() {
             does not prove that a token is safe. Contracts can change, external
             data can be incomplete, providers can disagree, and previously
             unseen attacks can occur. Digital assets can lose all value.
+          </p>
+        </section>
+        <section>
+          <h2>Alert limitations</h2>
+          <p>
+            Critical monitoring is a best-effort confirmed-state service.
+            Provider latency, confirmation rules, network outages, browser
+            suspension, and event ordering can delay or prevent an alert.
+            An alert is not guaranteed to arrive before a transaction and is
+            not a substitute for a fresh pre-trade check.
           </p>
         </section>
         <section>
