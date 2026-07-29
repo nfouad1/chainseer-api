@@ -90,6 +90,9 @@ Before each release:
 7. Confirm `/health/ready` reports the watcher enabled and no watcher error.
 8. Confirm benchmark capture is `ready` and a fresh known-contract scan
    increments its observation count exactly once.
+9. Confirm the public result contains `entity_graph.graph_hash`, the graph
+   anchor matches the analysis block/slot boundary, and graph summary
+   `changes_legitimacy_score=false`.
 
 ## Domain
 

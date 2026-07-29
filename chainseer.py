@@ -23,6 +23,7 @@ v7.1 features:
   - Timelock contract verification (Unicrypt, TeamFinance, PinkLock, TrustSwap)
   - Historical trend analysis from Timechain rings
   - Holder enrichment (EOA vs contract, scam flags, proxy detection)
+  - Entity and insider evidence graph with explicit inference boundaries
   - Deployer rug history via Blockscout flags + GoPlus cross-reference
   - DexScreener boosts as sentiment signal
   - Confirmed-block state-change watcher with drift alerts
@@ -69,6 +70,11 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
         pass
 
 import requests
+
+from chainseer_entity_graph import (
+    build_robinhood_entity_graph,
+    verify_entity_graph,
+)
 
 CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
@@ -293,6 +299,8 @@ class ChainseerCognitiveLoop:
         source = data.get("source_code") or {}
         dex = data.get("dex_pairs") or {}
         liquidity_custody = data.get("lp_lock") or {}
+        entity_graph = data.get("entity_graph") or {}
+        graph_summary = entity_graph.get("summary") or {}
         safe = {
             "task": "on-chain token risk analysis",
             "chain_id": report.get("chain_id"),
@@ -318,6 +326,14 @@ class ChainseerCognitiveLoop:
             "liquidity_usd": dex.get("total_liquidity_usd"),
             "primary_amm_version": dex.get("primary_amm_version"),
             "liquidity_custody_state": liquidity_custody.get("state"),
+            "entity_graph_hash": entity_graph.get("graph_hash"),
+            "insider_risk_level": graph_summary.get("insider_risk_level"),
+            "entity_graph_coverage": graph_summary.get("coverage"),
+            "entity_signal_codes": sorted(
+                str(item.get("code"))[:80]
+                for item in (entity_graph.get("signals") or [])
+                if isinstance(item, dict) and item.get("code")
+            ),
         }
         return json.dumps(safe, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -1413,6 +1429,17 @@ class Chainseer:
         )
 
         # ── Phase 8: Analysis + scoring ────────────────────────────────────
+        data["entity_graph"] = build_robinhood_entity_graph(
+            token,
+            data,
+            block_pin=pin_block,
+            claim_evidence=claim_evidence,
+        )
+        graph_ok, graph_reason = verify_entity_graph(data["entity_graph"])
+        if not graph_ok:
+            raise RuntimeError(
+                f"Entity evidence graph verification failed: {graph_reason}"
+            )
         print(" Running analysis...")
         analysis = self._analyze(data)
 
@@ -3211,6 +3238,9 @@ class Chainseer:
             "confidence": confidence_label,
             "confidence_grade": confidence_grade,
             "confidence_limiters": major_unknowns,
+            "entity_insider_summary": (
+                (data.get("entity_graph") or {}).get("summary") or {}
+            ),
             "extended_evidence": {
                 "social_attention": data.get("social_attention", {}),
                 "cross_chain": data.get("cross_chain", {}),
@@ -3259,13 +3289,14 @@ class Chainseer:
         for key in ["goplus_security", "dexscreener", "basic_info", "contract_audit",
                     "dex_pairs", "transfer_activity", "lp_lock", "tax_estimate",
                     "deployer", "blockscout_holders", "wash_trading", "blockscout_address",
-                    "trend", "social_attention", "cross_chain", "mev_exposure"]:
+                    "trend", "social_attention", "cross_chain", "mev_exposure",
+                    "entity_graph"]:
             d = data.get(key, {})
             if d and not d.get("error") and (isinstance(d, dict) and len(d) > 0):
                 sources_filled += 1
             elif isinstance(d, list) and len(d) > 0:
                 sources_filled += 1
-        depth_ratio = sources_filled / 16
+        depth_ratio = sources_filled / 17
         scores["depth"] = int(100 + depth_ratio * 120)
 
         # Honest uncertainty and traceable evidence are the covenant-facing signals.
@@ -3279,6 +3310,12 @@ class Chainseer:
         cognition = self.cognitive_loop.prepare(report)
         poq = report.get("poq_scores", {})
         analysis = report["analysis"]
+        entity_graph = (report.get("data") or {}).get("entity_graph") or {}
+        sealed_entity_graph = {
+            "graph_hash": entity_graph.get("graph_hash"),
+            "summary": entity_graph.get("summary") or {},
+            "signals": entity_graph.get("signals") or [],
+        }
         candidate = (
             f"Token {report['token_address']} assessed as {analysis['risk_level']} risk "
             f"with legitimacy score {analysis['legitimacy_score']}/100. "
@@ -3292,6 +3329,7 @@ class Chainseer:
                 "analysis": report.get("analysis", {}),
                 "provenance": report.get("provenance", {}),
                 "claim_evidence": report.get("claim_evidence", {}),
+                "entity_graph": sealed_entity_graph,
             }, sort_keys=True, default=str)
         )
         verdict, ring = self.poq_module.gate_and_seal(
@@ -3313,6 +3351,7 @@ class Chainseer:
                 json.dumps(report.get("analysis", {}), sort_keys=True, default=str),
                 json.dumps(report.get("provenance", {}), sort_keys=True, default=str),
                 json.dumps(report.get("claim_evidence", {}), sort_keys=True, default=str),
+                json.dumps(sealed_entity_graph, sort_keys=True, default=str),
             ],
             extra_payload={
                 "token_address": report["token_address"],
@@ -3333,6 +3372,7 @@ class Chainseer:
                 "block_pin": report["provenance"]["block_pin"],
                 "provenance": report["provenance"],
                 "claim_evidence": report.get("claim_evidence", {}),
+                "entity_graph": sealed_entity_graph,
                 "uncertain_components": report["analysis"].get("uncertain_components", {}),
                 "cognitive_loop": cognition,
             },

@@ -206,6 +206,21 @@ class SolanaPublicAnalyzerTests(unittest.TestCase):
                 "pool_and_program_vaults_excluded"
             ]
         )
+        graph = report["data"]["entity_graph"]
+        self.assertEqual(graph["network"], "solana")
+        self.assertEqual(graph["anchor"]["value"], 321)
+        self.assertEqual(
+            graph["summary"]["scoring_scope"], "evidence_only"
+        )
+        self.assertFalse(
+            graph["summary"]["changes_legitimacy_score"]
+        )
+        self.assertTrue(
+            any(
+                edge["relationship"] == "controls_token_account"
+                for edge in graph["edges"]
+            )
+        )
         self.assertIn(
             "creator_risk",
             report["analysis"]["uncertain_components"],

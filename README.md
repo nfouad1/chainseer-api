@@ -97,6 +97,31 @@ that limitation instead of presenting it as certain holder ownership.
 Provider/RPC failure is classified as **infrastructure indeterminate**, not as
 negative token evidence.
 
+## Entity and insider evidence graph
+
+Every analysis now projects its verified and provider-attested entities into a
+deterministic graph. It connects the analyzed asset to deployers, reported
+owners, proxy implementations, primary markets, LP withdrawal controllers, top
+holders, Solana authorities, token accounts, and resolved account owners.
+
+Each relationship carries an evidence status, confidence, fact references, and
+bounded attributes. Chainseer surfaces exact-address role overlaps, privileged
+supply concentration, direct liquidity control, serial deployers, scam-flagged
+entities, provider disagreement, proxy holders, and Solana authority/account
+overlaps.
+
+The graph is deliberately conservative:
+
+- ordinary large holders are not labelled insiders without a privileged link
+- shared funding and behavioral wallet clusters remain unmeasured
+- Solana AMM/program vaults remain unresolved until independently identified
+- graph v1 is evidence-only and does not silently change the legitimacy score
+
+The canonical graph hash, summary, and signals are included in Timechain
+sealing. The authenticated API returns the bounded nodes and edges for future
+visualization. See [`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) for the schema,
+relationship semantics, signal definitions, and limitations.
+
 ## Timechain cognitive provenance
 
 Every completed analysis passes through the Cypher Tempre self-model:
@@ -264,8 +289,10 @@ Deployment, secrets, backups, health checks, and domain setup are covered in
 | [`chainseer_api.py`](chainseer_api.py) | Authenticated FastAPI service, queue, cache, watcher integration, and production benchmark capture |
 | [`chainseer_controls.py`](chainseer_controls.py) | Monitoring, outcomes, calibration, MEV checks, and TradePermit boundary |
 | [`chainseer_benchmark.py`](chainseer_benchmark.py) | Immutable case bank and deterministic benchmark evaluator |
+| [`chainseer_entity_graph.py`](chainseer_entity_graph.py) | Deterministic entity relationships, insider-exposure signals, and graph verification |
 | [`CHAINSEER_CONTROLS.md`](CHAINSEER_CONTROLS.md) | Monitoring and pre-trade control operations |
 | [`BENCHMARK.md`](BENCHMARK.md) | Benchmark schema, workflow, metrics, and caveats |
+| [`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) | Entity graph schema, evidence semantics, signals, and inference limits |
 | [`API_DEPLOYMENT.md`](API_DEPLOYMENT.md) | Render deployment and production operations |
 | [`render.yaml`](render.yaml) | Render Blueprint |
 | [`Dockerfile.api`](Dockerfile.api) | Reproducible API container |

@@ -958,6 +958,7 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
     social_attention = extended.get("social_attention") or {}
     cross_chain = extended.get("cross_chain") or {}
     mev_exposure = extended.get("mev_exposure") or {}
+    entity_graph = data.get("entity_graph") or {}
     provenance = report.get("provenance") or {}
     evidence_facts = provenance.get("facts") or []
     public_facts = [
@@ -1040,7 +1041,7 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         )
 
     return {
-        "schema_version": "1.1",
+        "schema_version": "1.2",
         "token": {
             "address": report.get("token_address"),
             "name": report.get("token_name") or basic.get("name"),
@@ -1106,6 +1107,18 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
                 "pool_and_program_vaults_excluded"
             ),
             "caveat": holder_caveat,
+        },
+        "entity_graph": {
+            "schema_version": entity_graph.get("schema_version"),
+            "network": entity_graph.get("network"),
+            "root_entity_id": entity_graph.get("root_entity_id"),
+            "anchor": entity_graph.get("anchor") or {},
+            "summary": entity_graph.get("summary") or {},
+            "nodes": (entity_graph.get("nodes") or [])[:50],
+            "edges": (entity_graph.get("edges") or [])[:100],
+            "signals": (entity_graph.get("signals") or [])[:30],
+            "limitations": entity_graph.get("limitations") or [],
+            "graph_hash": entity_graph.get("graph_hash"),
         },
         "liquidity_custody": {
             "state": liquidity_custody.get(
