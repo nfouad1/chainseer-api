@@ -154,6 +154,11 @@ cannot silently change deterministic scoring policy.
   transition detection
 - event-triggered Solana rescans with noisy activity debounced and a periodic
   reconciliation scan to recover from missed provider events
+- Timechain-sealed critical alerts for liquidity removal or custody
+  deterioration, privileged-authority changes, proxy implementation upgrades,
+  and newly unsafe sellability, tax, or Jupiter route conditions
+- a subscriber-isolated, cursor-based critical-alert feed; subscriber
+  identities are one-way hashes and raw watcher state is not exposed
 - outcome checks at 1 hour, 6 hours, 24 hours, 7 days, and 30 days
 - calibration proposals that can only tighten the adopted pre-trade policy
 - short-lived, one-time `TradePermit` artifacts bound to the current block,
@@ -229,9 +234,10 @@ curl "http://127.0.0.1:8000/v1/analyses/JOB_ID" \
 | `GET` | `/health/ready` | Worker, watcher, network, and benchmark readiness |
 | `POST` | `/v1/analyses` | Submit a Robinhood or Solana analysis |
 | `GET` | `/v1/analyses/{job_id}` | Retrieve job state and public report |
-| `GET` | `/v1/watch` | Inspect Robinhood Chain and Solana watch state |
-| `POST` | `/v1/watch` | Add a network-aware watch subscription |
-| `DELETE` | `/v1/watch/{address}` | Remove a watch subscription |
+| `GET` | `/v1/watch` | Inspect the authenticated client's watch state |
+| `POST` | `/v1/watch` | Add an idempotent, client-aware watch subscription |
+| `GET` | `/v1/watch/alerts` | Read bounded critical alerts after an ISO cursor |
+| `DELETE` | `/v1/watch/{address}` | Remove only the authenticated client's subscription |
 
 ## Run locally
 

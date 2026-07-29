@@ -39,6 +39,7 @@ class FakeRPC:
         self.owner = "0x" + "4" * 40
         self.context = None
         self.ledger = None
+        self.logs = []
 
     def unbind_context(self):
         self.context = None
@@ -59,8 +60,8 @@ class FakeRPC:
     def erc20_total_supply(self, _token, block=None):
         return 1_000_000
 
-    def get_logs(self, *_args, **_kwargs):
-        return []
+    def get_logs(self, *_args, **kwargs):
+        return list(self.logs) if kwargs.get("address") == TOKEN else []
 
 
 class FakeAgent:
@@ -80,6 +81,7 @@ class FakeAgent:
         self.chain_id = 4663
         self.chain_root = "."
         self.scan_count = 0
+        self.sell_tax = "0"
 
     def analyze_token(self, token, full_report=False, block_pin=None):
         self.scan_count += 1
@@ -121,7 +123,10 @@ class FakeAgent:
                     "primary_liquidity_usd": 100_000,
                 },
                 "lp_lock": {"state": "protocol_secured"},
-                "goplus_security": {"buy_tax": "0", "sell_tax": "0"},
+                "goplus_security": {
+                    "buy_tax": "0",
+                    "sell_tax": self.sell_tax,
+                },
             },
         }
 
@@ -400,6 +405,49 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             self.assertEqual(first["created_at"], second["created_at"])
             self.assertEqual(len(store.load()["subscriptions"]), 1)
 
+    def test_watch_store_isolates_subscribers_and_returns_public_critical_feed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = controls.WatchStore(temp_dir)
+            subscriber_a = "a" * 64
+            subscriber_b = "b" * 64
+            store.subscribe(TOKEN, subscriber_a)
+            store.subscribe(TOKEN, subscriber_b)
+            self.assertTrue(store.is_subscribed(TOKEN, subscriber_a))
+            self.assertTrue(store.unsubscribe(TOKEN, subscriber_a))
+            self.assertFalse(store.is_subscribed(TOKEN, subscriber_a))
+            self.assertTrue(store.is_subscribed(TOKEN, subscriber_b))
+
+            alert = {
+                "schema_version": controls.CONTROL_SCHEMA_VERSION,
+                "network": "robinhood",
+                "token_address": TOKEN,
+                "block": 100,
+                "observed_at": "2026-07-29T20:00:00+00:00",
+                "critical_events": [
+                    controls._critical_event(
+                        "sellability",
+                        "sell_restriction_detected",
+                        "A sell restriction was detected.",
+                    )
+                ],
+                "analysis_ring": 12,
+                "analysis_ring_hash": "analysis-hash",
+                "timechain": {"ring": 13, "ring_hash": "watch-hash"},
+            }
+            alert["alert_hash"] = controls.canonical_hash(alert)
+            store.append_alert(alert)
+            feed = store.read_alerts(TOKEN)
+            self.assertEqual(len(feed), 1)
+            self.assertEqual(feed[0]["categories"], ["sellability"])
+            self.assertNotIn("events", feed[0])
+            self.assertEqual(
+                store.read_alerts(
+                    TOKEN,
+                    after="2026-07-29T20:00:00+00:00",
+                ),
+                [],
+            )
+
     def test_outcomes_keep_market_and_security_dimensions_separate(self):
         baseline = {
             "price_usd": 1.0,
@@ -453,7 +501,38 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             ).splitlines()
             alert = json.loads(alerts[-1])
             self.assertEqual(alert["type"], "state_change")
+            self.assertEqual(
+                alert["critical_events"][0]["category"],
+                "authority",
+            )
             self.assertIsNotNone(alert["timechain"]["ring"])
+
+    def test_custom_contract_activity_detects_sell_tax_increase(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = FakeAgent()
+            agent.chain_root = temp_dir
+            watcher = controls.ChainseerWatcher(
+                agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(TOKEN)
+            watcher.run_once()
+
+            agent.rpc.head = 103
+            agent.sell_tax = "0.20"
+            agent.rpc.logs = [
+                {
+                    "topics": ["0x" + "9" * 64],
+                    "blockNumber": "0x65",
+                    "transactionHash": "0x" + "8" * 64,
+                    "logIndex": "0x0",
+                }
+            ]
+            result = watcher.run_once()
+            self.assertEqual(result["rescans"], 1)
+            feed = watcher.store.read_alerts(TOKEN)
+            self.assertEqual(feed[-1]["categories"], ["sellability"])
+            self.assertIn("20.0%", feed[-1]["message"])
 
     def test_solana_watcher_rescans_on_confirmed_authority_change(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -495,6 +574,10 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             )
             self.assertEqual(alert["network"], "solana")
             self.assertIn("mint_authority_changed", alert["reason"])
+            self.assertEqual(
+                alert["critical_events"][0]["category"],
+                "authority",
+            )
             self.assertEqual(
                 alert["timechain"]["decision"],
                 "SEAL",
@@ -558,6 +641,32 @@ class WatcherAndOutcomeTests(unittest.TestCase):
                 subscription["quick_snapshot"][
                     "top10_total_supply_pct"
                 ]
+            )
+
+    def test_solana_liquidity_removal_is_a_critical_event(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(SOLANA_MINT)
+            watcher.run_once()
+            analyzer.rpc.slot = 101
+            analyzer.dexscreener.liquidity = 60_000
+            result = watcher.run_once()
+            self.assertEqual(result["alerts"], 1)
+            alert = json.loads(
+                watcher.store.alert_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()[-1]
+            )
+            self.assertIn("liquidity_removed", alert["reason"])
+            self.assertEqual(
+                alert["critical_events"][0]["category"],
+                "liquidity",
             )
 
 

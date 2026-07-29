@@ -17,6 +17,7 @@ import secrets
 import socket
 import threading
 import time
+from collections import deque
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -401,6 +402,7 @@ class WatchConfig:
     confirmations: int = 2
     poll_seconds: float = 3.0
     holder_rescan_blocks: int = 12
+    sellability_rescan_blocks: int = 5
     max_rescan_blocks: int = 120
     score_alert_delta: float = 5.0
     outcome_baseline_interval_seconds: int = 24 * 3600
@@ -417,7 +419,11 @@ class WatchConfig:
             raise ValueError("confirmations cannot be negative")
         if self.poll_seconds <= 0:
             raise ValueError("poll_seconds must be positive")
-        if self.holder_rescan_blocks < 1 or self.max_rescan_blocks < 1:
+        if (
+            self.holder_rescan_blocks < 1
+            or self.sellability_rescan_blocks < 1
+            or self.max_rescan_blocks < 1
+        ):
             raise ValueError("rescan block intervals must be positive")
         if self.outcome_baseline_interval_seconds < 3600:
             raise ValueError("outcome baseline interval must be at least one hour")
@@ -430,6 +436,7 @@ class SolanaWatchConfig:
     poll_seconds: float = 3.0
     signature_limit: int = 25
     minimum_rescan_slots: int = 8
+    sellability_probe_slots: int = 75
     max_reconcile_slots: int = 900
     liquidity_delta_bps: int = 1_500
     price_delta_bps: int = 2_500
@@ -441,7 +448,11 @@ class SolanaWatchConfig:
             raise ValueError("poll_seconds must be positive")
         if not 1 <= self.signature_limit <= 1_000:
             raise ValueError("signature_limit must be between 1 and 1000")
-        if self.minimum_rescan_slots < 1 or self.max_reconcile_slots < 1:
+        if (
+            self.minimum_rescan_slots < 1
+            or self.sellability_probe_slots < 1
+            or self.max_reconcile_slots < 1
+        ):
             raise ValueError("Solana rescan slot intervals must be positive")
         if self.minimum_rescan_slots > self.max_reconcile_slots:
             raise ValueError(
@@ -555,16 +566,51 @@ class WatchStore:
         with self.alert_path.open("a", encoding="utf-8") as handle:
             handle.write(canonical_json(alert) + "\n")
 
-    def subscribe(self, token: str) -> dict[str, Any]:
+    @staticmethod
+    def _subscriber(value: str | None) -> str | None:
+        if value is None:
+            return None
+        normalized = value.strip().lower()
+        if not re.fullmatch(r"[a-f0-9]{64}", normalized):
+            raise ValueError("invalid watcher subscriber identity")
+        return normalized
+
+    @staticmethod
+    def public_subscription(value: dict[str, Any]) -> dict[str, Any]:
+        return {
+            "network": value.get("network", "robinhood"),
+            "token_address": value.get("token_address"),
+            "created_at": value.get("created_at"),
+            "subscriber_count": len(value.get("subscribers") or []),
+            "manual_subscription": bool(
+                value.get("manual_subscription", True)
+            ),
+            "last_processed_block": value.get("last_processed_block"),
+            "last_observed_slot": value.get("last_observed_slot"),
+            "last_full_scan_block": value.get("last_full_scan_block"),
+            "last_full_scan_slot": value.get("last_full_scan_slot"),
+            "latest_analysis": value.get("latest_analysis"),
+            "last_error": value.get("last_error"),
+        }
+
+    def subscribe(
+        self,
+        token: str,
+        subscriber: str | None = None,
+    ) -> dict[str, Any]:
         if not ADDRESS_RE.fullmatch(token):
             raise ValueError("invalid token address")
+        subscriber = self._subscriber(subscriber)
         state = self.load()
         key = token.lower()
-        state["subscriptions"].setdefault(
+        value = state["subscriptions"].setdefault(
             key,
             {
+                "network": "robinhood",
                 "token_address": token,
                 "created_at": utc_now_iso(),
+                "manual_subscription": subscriber is None,
+                "subscribers": [],
                 "last_processed_block": None,
                 "last_processed_hash": None,
                 "last_full_scan_block": None,
@@ -574,15 +620,75 @@ class WatchStore:
                 "completed_outcomes": [],
             },
         )
+        value.setdefault("manual_subscription", subscriber is None)
+        value.setdefault("subscribers", [])
+        if subscriber and subscriber not in value["subscribers"]:
+            value["subscribers"].append(subscriber)
+            value["subscribers"] = value["subscribers"][-1_000:]
+        elif subscriber is None:
+            value["manual_subscription"] = True
         self.save(state)
-        return state["subscriptions"][key]
+        return value
 
-    def unsubscribe(self, token: str) -> bool:
+    def is_subscribed(self, token: str, subscriber: str) -> bool:
+        subscriber = self._subscriber(subscriber)
+        value = self.load()["subscriptions"].get(token.lower()) or {}
+        return bool(subscriber in (value.get("subscribers") or []))
+
+    def unsubscribe(
+        self,
+        token: str,
+        subscriber: str | None = None,
+    ) -> bool:
+        subscriber = self._subscriber(subscriber)
         state = self.load()
-        removed = state["subscriptions"].pop(token.lower(), None) is not None
+        key = token.lower()
+        value = state["subscriptions"].get(key)
+        if value is None:
+            return False
+        if subscriber is None:
+            state["subscriptions"].pop(key, None)
+            removed = True
+        else:
+            subscribers = value.setdefault("subscribers", [])
+            removed = subscriber in subscribers
+            if removed:
+                subscribers.remove(subscriber)
+            if not subscribers and not value.get("manual_subscription", True):
+                state["subscriptions"].pop(key, None)
         if removed:
             self.save(state)
         return removed
+
+    def read_alerts(
+        self,
+        token: str,
+        *,
+        after: str | None = None,
+        limit: int = 50,
+        critical_only: bool = True,
+    ) -> list[dict[str, Any]]:
+        if not self.alert_path.exists():
+            return []
+        results: list[dict[str, Any]] = []
+        with self.alert_path.open("r", encoding="utf-8") as handle:
+            lines = deque(handle, maxlen=2_000)
+        for line in lines:
+            try:
+                alert = json.loads(line)
+            except (TypeError, ValueError):
+                continue
+            alert_token = str(alert.get("token_address") or "")
+            if alert_token.lower() != token.lower():
+                continue
+            observed_at = str(alert.get("observed_at") or "")
+            if after and observed_at <= after:
+                continue
+            critical_events = alert.get("critical_events") or []
+            if critical_only and not critical_events:
+                continue
+            results.append(_public_alert(alert))
+        return results[-max(1, min(int(limit), 100)):]
 
 
 class SolanaWatchStore(WatchStore):
@@ -593,16 +699,23 @@ class SolanaWatchStore(WatchStore):
         self.state_path = self.root / "solana_watcher_state.json"
         self.alert_path = self.root / "solana_watcher_alerts.jsonl"
 
-    def subscribe(self, mint: str) -> dict[str, Any]:
+    def subscribe(
+        self,
+        mint: str,
+        subscriber: str | None = None,
+    ) -> dict[str, Any]:
         if not _is_solana_pubkey(mint):
             raise ValueError("invalid Solana mint address")
+        subscriber = self._subscriber(subscriber)
         state = self.load()
-        state["subscriptions"].setdefault(
+        value = state["subscriptions"].setdefault(
             mint,
             {
                 "network": "solana",
                 "token_address": mint,
                 "created_at": utc_now_iso(),
+                "manual_subscription": subscriber is None,
+                "subscribers": [],
                 "last_observed_slot": None,
                 "last_full_scan_slot": None,
                 "last_signature": None,
@@ -613,12 +726,41 @@ class SolanaWatchStore(WatchStore):
                 "analyses": [],
             },
         )
+        value.setdefault("manual_subscription", subscriber is None)
+        value.setdefault("subscribers", [])
+        if subscriber and subscriber not in value["subscribers"]:
+            value["subscribers"].append(subscriber)
+            value["subscribers"] = value["subscribers"][-1_000:]
+        elif subscriber is None:
+            value["manual_subscription"] = True
         self.save(state)
-        return state["subscriptions"][mint]
+        return value
 
-    def unsubscribe(self, mint: str) -> bool:
+    def is_subscribed(self, mint: str, subscriber: str) -> bool:
+        subscriber = self._subscriber(subscriber)
+        value = self.load()["subscriptions"].get(mint) or {}
+        return bool(subscriber in (value.get("subscribers") or []))
+
+    def unsubscribe(
+        self,
+        mint: str,
+        subscriber: str | None = None,
+    ) -> bool:
+        subscriber = self._subscriber(subscriber)
         state = self.load()
-        removed = state["subscriptions"].pop(mint, None) is not None
+        value = state["subscriptions"].get(mint)
+        if value is None:
+            return False
+        if subscriber is None:
+            state["subscriptions"].pop(mint, None)
+            removed = True
+        else:
+            subscribers = value.setdefault("subscribers", [])
+            removed = subscriber in subscribers
+            if removed:
+                subscribers.remove(subscriber)
+            if not subscribers and not value.get("manual_subscription", True):
+                state["subscriptions"].pop(mint, None)
         if removed:
             self.save(state)
         return removed
@@ -629,8 +771,20 @@ def _analysis_view(report: dict[str, Any]) -> dict[str, Any]:
     analysis = report.get("analysis") or {}
     dex = data.get("dex_pairs") or {}
     contract = data.get("contract_audit") or {}
+    source = data.get("source_code") or {}
     custody = data.get("lp_lock") or {}
     tax = data.get("goplus_security") or {}
+    implementations = source.get("implementations") or []
+    implementation_identity = sorted(
+        str(
+            item.get("address")
+            or item.get("implementation_address")
+            or item.get("name")
+            or ""
+        ).lower()
+        for item in implementations
+        if isinstance(item, dict)
+    )
     return {
         "analysis_ring": report.get("analysis_ring"),
         "analysis_ring_hash": report.get("analysis_ring_hash"),
@@ -649,9 +803,19 @@ def _analysis_view(report: dict[str, Any]) -> dict[str, Any]:
             (analysis.get("holder_assessment") or {}).get("holder_count")
         ),
         "owner": contract.get("owner"),
+        "bytecode_hash": contract.get("bytecode_hash"),
+        "proxy_type": source.get("proxy_type"),
+        "implementation_hash": (
+            canonical_hash(implementation_identity)
+            if implementation_identity
+            else None
+        ),
+        "implementation_verified": source.get("implementation_verified"),
         "custody_state": custody.get("state"),
         "buy_tax": tax.get("buy_tax"),
         "sell_tax": tax.get("sell_tax"),
+        "buy_tax_pct": _safe_float(tax.get("buy_tax")) * 100,
+        "sell_tax_pct": _safe_float(tax.get("sell_tax")) * 100,
         "pair_address": dex.get("primary_pair_address"),
         "extended_evidence": analysis.get("extended_evidence") or {},
     }
@@ -668,9 +832,15 @@ def _diff_views(before: dict[str, Any] | None, after: dict[str, Any]) -> dict[st
         "liquidity_usd",
         "holder_count",
         "owner",
+        "bytecode_hash",
+        "proxy_type",
+        "implementation_hash",
+        "implementation_verified",
         "custody_state",
         "buy_tax",
         "sell_tax",
+        "buy_tax_pct",
+        "sell_tax_pct",
         "pair_address",
     )
     changes = {
@@ -720,6 +890,269 @@ def _solana_analysis_view(report: dict[str, Any]) -> dict[str, Any]:
         "roundtrip_retention_pct": execution.get(
             "roundtrip_retention_pct"
         ),
+    }
+
+
+def _critical_event(
+    category: str,
+    code: str,
+    message: str,
+    *,
+    before: Any = None,
+    after: Any = None,
+    evidence: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    value = {
+        "category": category,
+        "code": code,
+        "message": message,
+        "before": before,
+        "after": after,
+        "evidence": evidence or {},
+    }
+    value["event_hash"] = canonical_hash(value)
+    return value
+
+
+def _evm_critical_events(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    observed_events: dict[str, Any],
+    new_stops: list[str],
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    event_types = {
+        str(item.get("event_type"))
+        for item in observed_events.get("critical_events") or []
+        if isinstance(item, dict)
+    }
+    if (
+        before.get("pair_address")
+        and not after.get("pair_address")
+    ):
+        findings.append(
+            _critical_event(
+                "liquidity",
+                "primary_liquidity_market_disappeared",
+                "The previously observed primary liquidity market disappeared.",
+                before=before.get("pair_address"),
+                after=None,
+            )
+        )
+    old_liquidity = _safe_float(before.get("liquidity_usd"), 0.0)
+    new_liquidity = _safe_float(after.get("liquidity_usd"), 0.0)
+    if old_liquidity > 0:
+        removed_pct = 100 * max(0.0, old_liquidity - new_liquidity) / old_liquidity
+        if removed_pct >= 30:
+            findings.append(
+                _critical_event(
+                    "liquidity",
+                    "liquidity_removed",
+                    f"Observed liquidity fell by {removed_pct:.1f}%.",
+                    before=before.get("liquidity_usd"),
+                    after=after.get("liquidity_usd"),
+                    evidence={"removed_pct": round(removed_pct, 2)},
+                )
+            )
+    unsafe_custody = {
+        "creator_withdrawable",
+        "withdrawal_verified",
+        "unlocked",
+    }
+    if (
+        after.get("custody_state") in unsafe_custody
+        and before.get("custody_state") != after.get("custody_state")
+    ) or "UNLOCKED_LP" in new_stops:
+        findings.append(
+            _critical_event(
+                "liquidity",
+                "liquidity_custody_deteriorated",
+                "Liquidity custody changed to a creator-withdrawable or unlocked state.",
+                before=before.get("custody_state"),
+                after=after.get("custody_state"),
+            )
+        )
+
+    if (
+        before.get("owner") != after.get("owner")
+        or "ownership_transferred" in event_types
+        or "admin_changed" in event_types
+    ):
+        findings.append(
+            _critical_event(
+                "authority",
+                "privileged_authority_changed",
+                "Contract ownership or proxy administration changed.",
+                before=before.get("owner"),
+                after=after.get("owner"),
+                evidence={"event_types": sorted(event_types)},
+            )
+        )
+
+    implementation_changed = (
+        before.get("implementation_hash")
+        and before.get("implementation_hash") != after.get("implementation_hash")
+    )
+    bytecode_changed = (
+        before.get("bytecode_hash")
+        and before.get("bytecode_hash") != after.get("bytecode_hash")
+    )
+    if (
+        implementation_changed
+        or bytecode_changed
+        or "implementation_upgraded" in event_types
+        or "UNVERIFIED_PROXY" in new_stops
+    ):
+        findings.append(
+            _critical_event(
+                "upgrade",
+                "contract_implementation_changed",
+                "Proxy implementation or deployed bytecode changed.",
+                before={
+                    "implementation_hash": before.get("implementation_hash"),
+                    "bytecode_hash": before.get("bytecode_hash"),
+                },
+                after={
+                    "implementation_hash": after.get("implementation_hash"),
+                    "bytecode_hash": after.get("bytecode_hash"),
+                },
+                evidence={"event_types": sorted(event_types)},
+            )
+        )
+
+    sellability_stops = {"HONEYPOT", "SELL_RESTRICTED"}
+    new_sellability_stops = sorted(sellability_stops.intersection(new_stops))
+    old_sell_tax = _safe_float(before.get("sell_tax_pct"), 0.0)
+    new_sell_tax = _safe_float(after.get("sell_tax_pct"), 0.0)
+    tax_crossed = new_sell_tax > 10 and (
+        old_sell_tax <= 10 or new_sell_tax - old_sell_tax >= 10
+    )
+    if new_sellability_stops or tax_crossed:
+        findings.append(
+            _critical_event(
+                "sellability",
+                (
+                    "sell_restriction_detected"
+                    if new_sellability_stops
+                    else "sell_tax_increased"
+                ),
+                (
+                    "A new honeypot or sell-restriction hard stop was detected."
+                    if new_sellability_stops
+                    else f"Observed sell tax increased to {new_sell_tax:.1f}%."
+                ),
+                before={"sell_tax_pct": old_sell_tax},
+                after={
+                    "sell_tax_pct": new_sell_tax,
+                    "new_hard_stops": new_sellability_stops,
+                },
+            )
+        )
+    return list({item["event_hash"]: item for item in findings}.values())
+
+
+def _solana_critical_events(
+    before: dict[str, Any],
+    after: dict[str, Any],
+    observed_events: list[dict[str, Any]],
+    new_stops: list[str],
+) -> list[dict[str, Any]]:
+    findings: list[dict[str, Any]] = []
+    for event in observed_events:
+        event_type = str(event.get("event_type") or "")
+        if event_type in {
+            "mint_authority_changed",
+            "freeze_authority_changed",
+            "owner_program_changed",
+            "token_extensions_changed",
+        }:
+            findings.append(
+                _critical_event(
+                    "authority",
+                    event_type,
+                    "A Solana mint authority, owner program, or token extension changed.",
+                    before=event.get("before"),
+                    after=event.get("after"),
+                    evidence={"source_event_hash": event.get("event_hash")},
+                )
+            )
+        elif event_type in {"market_disappeared", "primary_market_changed"}:
+            findings.append(
+                _critical_event(
+                    "liquidity",
+                    event_type,
+                    "The primary Solana liquidity market disappeared or changed.",
+                    before=event.get("before"),
+                    after=event.get("after"),
+                    evidence={"source_event_hash": event.get("event_hash")},
+                )
+            )
+        elif event_type == "liquidity_removed":
+            findings.append(
+                _critical_event(
+                    "liquidity",
+                    event_type,
+                    "Observed Solana liquidity fell by at least 30%.",
+                    before=event.get("before"),
+                    after=event.get("after"),
+                    evidence=event.get("evidence") or {},
+                )
+            )
+    sellability_stops = {
+        "jupiter_roundtrip_retention_low",
+        "jupiter_buy_price_impact_high",
+    }
+    new_sellability_stops = sorted(sellability_stops.intersection(new_stops))
+    old_retention = _safe_float(before.get("roundtrip_retention_pct"), 100.0)
+    new_retention = _safe_float(after.get("roundtrip_retention_pct"), 100.0)
+    if new_sellability_stops or (
+        old_retention >= 72 and new_retention < 72
+    ):
+        findings.append(
+            _critical_event(
+                "sellability",
+                "jupiter_sellability_deteriorated",
+                "Jupiter route evidence now indicates unsafe sellability or price impact.",
+                before={"roundtrip_retention_pct": old_retention},
+                after={
+                    "roundtrip_retention_pct": new_retention,
+                    "new_hard_stops": new_sellability_stops,
+                },
+            )
+        )
+    return list({item["event_hash"]: item for item in findings}.values())
+
+
+def _public_alert(alert: dict[str, Any]) -> dict[str, Any]:
+    critical_events = alert.get("critical_events") or []
+    categories = list(
+        dict.fromkeys(
+            str(item.get("category"))
+            for item in critical_events
+            if isinstance(item, dict) and item.get("category")
+        )
+    )
+    primary = critical_events[0] if critical_events else {}
+    network = str(alert.get("network") or "robinhood")
+    anchor = alert.get("slot") if network == "solana" else alert.get("block")
+    title_category = categories[0].title() if categories else "Critical"
+    return {
+        "schema_version": CONTROL_SCHEMA_VERSION,
+        "alert_hash": alert.get("alert_hash") or canonical_hash(alert),
+        "network": network,
+        "token_address": alert.get("token_address"),
+        "severity": "critical",
+        "categories": categories,
+        "title": f"Critical {title_category} alert",
+        "message": primary.get("message") or "A critical token state changed.",
+        "critical_events": critical_events,
+        "anchor": anchor,
+        "anchor_type": "confirmed_slot" if network == "solana" else "confirmed_block",
+        "observed_at": alert.get("observed_at"),
+        "new_hard_stops": alert.get("new_hard_stops") or [],
+        "analysis_ring": alert.get("analysis_ring"),
+        "analysis_ring_hash": alert.get("analysis_ring_hash"),
+        "timechain": alert.get("timechain"),
     }
 
 
@@ -1478,24 +1911,37 @@ class ChainseerWatcher:
         to_block: int,
     ) -> dict[str, Any]:
         self._unbind()
-        critical = self.agent.rpc.get_logs(
+        token_logs = self.agent.rpc.get_logs(
             from_block,
             to_block,
             address=token,
-            topics=[
-                [
-                    OWNERSHIP_TRANSFERRED_TOPIC,
-                    UPGRADED_TOPIC,
-                    ADMIN_CHANGED_TOPIC,
-                ]
-            ],
         )
-        transfers = self.agent.rpc.get_logs(
-            from_block,
-            to_block,
-            address=token,
-            topics=[TRANSFER_TOPIC],
-        )
+        token_logs = [
+            item for item in (token_logs or []) if isinstance(item, dict)
+        ]
+        critical_topics = {
+            OWNERSHIP_TRANSFERRED_TOPIC,
+            UPGRADED_TOPIC,
+            ADMIN_CHANGED_TOPIC,
+        }
+        critical = [
+            item
+            for item in token_logs
+            if str((item.get("topics") or [""])[0]).lower()
+            in critical_topics
+        ]
+        transfers = [
+            item
+            for item in token_logs
+            if str((item.get("topics") or [""])[0]).lower()
+            == TRANSFER_TOPIC
+        ]
+        contract_activity = [
+            item
+            for item in token_logs
+            if str((item.get("topics") or [""])[0]).lower()
+            not in critical_topics | {TRANSFER_TOPIC}
+        ]
         lp_burns = []
         if pair and ADDRESS_RE.fullmatch(pair):
             lp_burns = self.agent.rpc.get_logs(
@@ -1508,12 +1954,37 @@ class ChainseerWatcher:
                     [_topic_address(ZERO_ADDRESS), _topic_address(DEAD_ADDRESS)],
                 ],
             )
+        event_names = {
+            OWNERSHIP_TRANSFERRED_TOPIC: "ownership_transferred",
+            UPGRADED_TOPIC: "implementation_upgraded",
+            ADMIN_CHANGED_TOPIC: "admin_changed",
+        }
+        critical_events = []
+        for item in (critical or [])[:50]:
+            if not isinstance(item, dict):
+                continue
+            topics = item.get("topics") or []
+            topic0 = str(topics[0]).lower() if topics else ""
+            critical_events.append(
+                {
+                    "event_type": event_names.get(topic0, "privileged_event"),
+                    "block": item.get("blockNumber"),
+                    "transaction_hash": item.get("transactionHash"),
+                    "log_index": item.get("logIndex"),
+                    "event_hash": canonical_hash(item),
+                }
+            )
         return {
             "critical_count": len(critical or []),
+            "critical_events": critical_events,
             "transfer_count": len(transfers or []),
+            "contract_activity_count": len(contract_activity),
             "lp_burn_count": len(lp_burns or []),
             "critical_log_hash": canonical_hash(critical or []),
             "transfer_log_hash": canonical_hash(transfers or []),
+            "contract_activity_log_hash": canonical_hash(
+                contract_activity
+            ),
             "lp_burn_log_hash": canonical_hash(lp_burns or []),
         }
 
@@ -1626,6 +2097,8 @@ class ChainseerWatcher:
                     reasons.append("initial_baseline")
                 if events["critical_count"] or events["lp_burn_count"]:
                     reasons.append("critical_event")
+                if events["contract_activity_count"]:
+                    reasons.append("contract_activity_sellability_probe")
                 if fingerprint_changed:
                     reasons.append("critical_fingerprint_changed")
                 if (
@@ -1633,10 +2106,13 @@ class ChainseerWatcher:
                     and (
                         last_full is None
                         or safe_block - int(last_full)
-                        >= self.config.holder_rescan_blocks
+                        >= min(
+                            self.config.holder_rescan_blocks,
+                            self.config.sellability_rescan_blocks,
+                        )
                     )
                 ):
-                    reasons.append("holder_transfer_threshold_window")
+                    reasons.append("activity_sellability_probe")
                 if (
                     last_full is None
                     or safe_block - int(last_full)
@@ -1705,6 +2181,12 @@ class ChainseerWatcher:
                         baselines.append(current)
                         subscription["analyses"] = baselines[-200:]
                     if material:
+                        critical_events = _evm_critical_events(
+                            latest,
+                            current,
+                            events,
+                            new_stops,
+                        )
                         alert = {
                             "schema_version": CONTROL_SCHEMA_VERSION,
                             "type": "state_change",
@@ -1715,9 +2197,11 @@ class ChainseerWatcher:
                             "events": events,
                             "drift": drift,
                             "new_hard_stops": new_stops,
+                            "critical_events": critical_events,
                             "analysis_ring": report.get("analysis_ring"),
                             "analysis_ring_hash": report.get("analysis_ring_hash"),
                         }
+                        alert["alert_hash"] = canonical_hash(alert)
                         alert["timechain"] = self._seal_transition(alert)
                         self.store.append_alert(alert)
                         summary["alerts"] += 1
@@ -1760,6 +2244,7 @@ class SolanaEventWatcher:
         "supply_changed",
         "market_disappeared",
         "primary_market_changed",
+        "liquidity_removed",
     }
 
     def __init__(
@@ -2060,7 +2545,31 @@ class SolanaEventWatcher:
             old_market.get("liquidity_usd"),
             new_market.get("liquidity_usd"),
         )
+        liquidity_removed_bps = None
+        old_liquidity = _safe_float(old_market.get("liquidity_usd"), 0.0)
+        new_liquidity = _safe_float(new_market.get("liquidity_usd"), 0.0)
+        if old_liquidity > 0 and new_liquidity < old_liquidity:
+            liquidity_removed_bps = (
+                (old_liquidity - new_liquidity) / old_liquidity * 10_000
+            )
         if (
+            old_pair == new_pair
+            and liquidity_removed_bps is not None
+            and liquidity_removed_bps >= 3_000
+        ):
+            events.append(
+                self._event(
+                    "liquidity_removed",
+                    severity="critical",
+                    before=old_market.get("liquidity_usd"),
+                    after=new_market.get("liquidity_usd"),
+                    triggers_rescan=True,
+                    evidence={
+                        "removed_bps": round(liquidity_removed_bps, 2)
+                    },
+                )
+            )
+        elif (
             old_pair == new_pair
             and liquidity_delta is not None
             and liquidity_delta >= self.config.liquidity_delta_bps
@@ -2282,9 +2791,18 @@ class SolanaEventWatcher:
                     or head_slot - int(last_full)
                     >= self.config.minimum_rescan_slots
                 )
+                activity_probe_due = (
+                    bool(new_signatures)
+                    and (
+                        last_full is None
+                        or head_slot - int(last_full)
+                        >= self.config.sellability_probe_slots
+                    )
+                )
                 should_rescan = (
                     not latest
                     or reconcile_due
+                    or activity_probe_due
                     or (bool(pending) and (critical_pending or cooldown_clear))
                 )
 
@@ -2335,6 +2853,12 @@ class SolanaEventWatcher:
                             ],
                             "drift": drift,
                             "new_hard_stops": new_stops,
+                            "critical_events": _solana_critical_events(
+                                latest,
+                                current,
+                                pending,
+                                new_stops,
+                            ),
                             "analysis_ring": report.get("analysis_ring"),
                             "analysis_ring_hash": report.get(
                                 "analysis_ring_hash"

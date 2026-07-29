@@ -28,6 +28,9 @@ method. A TradePermit is an authorization artifact, not a transaction.
   Authority, program, supply, extension, or market-identity changes bypass the
   debounce. A periodic confirmed-state reconciliation catches missed provider
   events.
+- Confirmed activity also schedules bounded sellability probes. It does not
+  alert by itself: notification requires post-rescan evidence of a critical
+  liquidity, authority, upgrade, or sellability deterioration.
 - Optional holder, market, and signature-provider failures are recorded as
   `infrastructure_indeterminate` and retain the last confirmed observation;
   they never become a fabricated token state change. Mint-account and supply
@@ -68,6 +71,32 @@ Each material alert carries the confirmed slot, compact event evidence, the
 fresh analysis ring, a content hash, and a `solana_watch_transition` Timechain
 ring. The watcher remains observation-only: it cannot sign or broadcast a
 transaction.
+
+### Critical alert feed
+
+The public feed returns only critical state changes for a token:
+
+- `liquidity`: primary market disappearance/change, at least 30% observed
+  liquidity removal, or EVM liquidity custody deterioration;
+- `authority`: ownership, proxy-admin, mint/freeze authority, owner-program,
+  or risky token-extension changes;
+- `upgrade`: EVM implementation, bytecode, or unverified-proxy changes;
+- `sellability`: a new honeypot/sell restriction, a material sell-tax
+  increase, or unsafe Jupiter round-trip/price-impact evidence.
+
+Price movement, routine transfers/signatures, and small holder rotations do
+not generate critical notifications. Infrastructure failure remains
+`infrastructure_indeterminate`, not token evidence.
+
+```bash
+curl "https://api.usechainseer.com/v1/watch/alerts?network=solana&address=YourSolanaMint&after=2026-07-29T20%3A00%3A00Z" \
+  -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
+  -H "X-Chainseer-Client: $CLIENT_ID_HASH"
+```
+
+The feed is cursor-based, capped at 100 alerts per request, filters by token
+and authenticated subscriber, and exposes the analysis and Timechain ring
+proofs without exposing raw subscription state.
 
 The standalone CLI below continues to manage Robinhood Chain subscriptions.
 

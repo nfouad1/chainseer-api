@@ -710,7 +710,10 @@ class AnalysisService:
             self._prune(time.time())
             return self.jobs.get(job_id)
 
-    def watch_status(self) -> dict[str, Any]:
+    def watch_status(
+        self,
+        subscriber: str | None = None,
+    ) -> dict[str, Any]:
         with self._watch_lock:
             robinhood_state = (
                 self._watcher.store.load()
@@ -722,28 +725,34 @@ class AnalysisService:
                 if self._solana_watcher is not None
                 else {"subscriptions": {}}
             )
-            subscriptions = [
-                {"network": "robinhood", **value}
-                for value in robinhood_state.get(
-                    "subscriptions", {}
-                ).values()
-            ] + [
-                {"network": "solana", **value}
-                for value in solana_state.get(
-                    "subscriptions", {}
-                ).values()
-            ]
+            subscriptions = []
+            for value in robinhood_state.get("subscriptions", {}).values():
+                if subscriber and subscriber not in (
+                    value.get("subscribers") or []
+                ):
+                    continue
+                subscriptions.append(
+                    self._watcher.store.public_subscription(value)
+                )
+            for value in solana_state.get("subscriptions", {}).values():
+                if subscriber and subscriber not in (
+                    value.get("subscribers") or []
+                ):
+                    continue
+                subscriptions.append(
+                    self._solana_watcher.store.public_subscription(value)
+                )
+            network_counts = {
+                network: sum(
+                    item.get("network") == network
+                    for item in subscriptions
+                )
+                for network in ("robinhood", "solana")
+            }
             return {
                 **self._watcher_status,
                 "subscriptions": subscriptions,
-                "subscription_counts": {
-                    "robinhood": len(
-                        robinhood_state.get("subscriptions", {})
-                    ),
-                    "solana": len(
-                        solana_state.get("subscriptions", {})
-                    ),
-                },
+                "subscription_counts": network_counts,
             }
 
     def benchmark_status(self) -> dict[str, Any]:
@@ -753,29 +762,63 @@ class AnalysisService:
         self,
         address: str,
         network: str = "robinhood",
+        subscriber: str | None = None,
     ) -> dict[str, Any]:
         with self._watch_lock:
             if network == "solana":
                 if self._solana_watcher is None:
                     raise RuntimeError("Solana watcher is not initialized")
-                return self._solana_watcher.store.subscribe(address)
+                value = self._solana_watcher.store.subscribe(
+                    address, subscriber
+                )
+                return self._solana_watcher.store.public_subscription(value)
             if self._watcher is None:
                 raise RuntimeError("watcher is not initialized")
-            return self._watcher.store.subscribe(address)
+            value = self._watcher.store.subscribe(address, subscriber)
+            return self._watcher.store.public_subscription(value)
 
     def watch_unsubscribe(
         self,
         address: str,
         network: str = "robinhood",
+        subscriber: str | None = None,
     ) -> bool:
         with self._watch_lock:
             if network == "solana":
                 if self._solana_watcher is None:
                     raise RuntimeError("Solana watcher is not initialized")
-                return self._solana_watcher.store.unsubscribe(address)
+                return self._solana_watcher.store.unsubscribe(
+                    address, subscriber
+                )
             if self._watcher is None:
                 raise RuntimeError("watcher is not initialized")
-            return self._watcher.store.unsubscribe(address)
+            return self._watcher.store.unsubscribe(address, subscriber)
+
+    def watch_alerts(
+        self,
+        address: str,
+        network: str,
+        subscriber: str,
+        *,
+        after: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self._watch_lock:
+            watcher = (
+                self._solana_watcher
+                if network == "solana"
+                else self._watcher
+            )
+            if watcher is None:
+                raise RuntimeError(f"{network} watcher is not initialized")
+            if not watcher.store.is_subscribed(address, subscriber):
+                raise KeyError("watch subscription not found")
+            return watcher.store.read_alerts(
+                address,
+                after=after,
+                limit=limit,
+                critical_only=True,
+            )
 
     def _run_watcher_cycle(self) -> None:
         if not self.settings.watcher_enabled:
@@ -1451,21 +1494,82 @@ def get_analysis(job_id: str) -> dict[str, Any]:
     "/v1/watch",
     dependencies=[Depends(require_api_token)],
 )
-def get_watch_status() -> dict[str, Any]:
-    return SERVICE.watch_status()
+def get_watch_status(request: Request) -> dict[str, Any]:
+    return SERVICE.watch_status(request_identity(request))
 
 
 @app.post(
     "/v1/watch",
     dependencies=[Depends(require_api_token)],
 )
-def create_watch(payload: WatchRequest) -> dict[str, Any]:
+def create_watch(payload: WatchRequest, request: Request) -> dict[str, Any]:
+    identity = request_identity(request)
     return {
         "enabled": SETTINGS.watcher_enabled,
         "subscription": SERVICE.watch_subscribe(
             payload.address,
             payload.network,
+            identity,
         ),
+    }
+
+
+@app.get(
+    "/v1/watch/alerts",
+    dependencies=[Depends(require_api_token)],
+)
+def get_watch_alerts(
+    request: Request,
+    network: str,
+    address: str,
+    after: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    normalized_network = network.strip().lower()
+    if normalized_network not in SUPPORTED_NETWORKS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="unsupported watch network",
+        )
+    try:
+        WatchRequest(network=normalized_network, address=address)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="invalid watch address",
+        ) from exc
+    if after:
+        try:
+            datetime.fromisoformat(after.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="invalid alert cursor",
+            ) from exc
+    if not 1 <= limit <= 100:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="alert limit must be between 1 and 100",
+        )
+    try:
+        alerts = SERVICE.watch_alerts(
+            address,
+            normalized_network,
+            request_identity(request),
+            after=after,
+            limit=limit,
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="watch subscription not found",
+        ) from exc
+    cursor = alerts[-1]["observed_at"] if alerts else after
+    return {
+        "network": normalized_network,
+        "address": address,
+        "alerts": alerts,
+        "cursor": cursor,
     }
 
 
@@ -1473,8 +1577,21 @@ def create_watch(payload: WatchRequest) -> dict[str, Any]:
     "/v1/watch/{address}",
     dependencies=[Depends(require_api_token)],
 )
-def delete_watch(address: str) -> dict[str, Any]:
-    network = "solana" if not ADDRESS_RE.fullmatch(address) else "robinhood"
+def delete_watch(
+    address: str,
+    request: Request,
+    network: str | None = None,
+) -> dict[str, Any]:
+    network = (
+        network.strip().lower()
+        if network
+        else ("solana" if not ADDRESS_RE.fullmatch(address) else "robinhood")
+    )
+    if network not in SUPPORTED_NETWORKS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="watch subscription not found",
+        )
     if network == "solana":
         try:
             validate_solana_mint(address)
@@ -1489,7 +1606,11 @@ def delete_watch(address: str) -> dict[str, Any]:
             detail="watch subscription not found",
         )
     return {
-        "removed": SERVICE.watch_unsubscribe(address, network),
+        "removed": SERVICE.watch_unsubscribe(
+            address,
+            network,
+            request_identity(request),
+        ),
         "address": address,
         "network": network,
     }
