@@ -571,6 +571,10 @@ class BenchmarkCaptureRecorder:
         with self._lock:
             return json.loads(json.dumps(self._summary))
 
+    def health_status(self) -> dict[str, Any]:
+        """Return the latest immutable-enough snapshot without blocking probes."""
+        return dict(self._summary)
+
 
 class SlidingWindowRateLimiter:
     def __init__(self, limit: int, window_seconds: int = 60):
@@ -818,6 +822,14 @@ class AnalysisService:
 
     def benchmark_status(self) -> dict[str, Any]:
         return self._benchmark.status()
+
+    def health_status(self) -> dict[str, Any]:
+        """Return cached worker health without loading watcher state from disk."""
+        watcher_status = self._watcher_status
+        return {
+            "watcher_last_error": watcher_status.get("last_error"),
+            "benchmark_capture": self._benchmark.health_status(),
+        }
 
     def watch_subscribe(
         self,
@@ -1520,16 +1532,17 @@ def ready() -> dict[str, Any]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="analysis worker is not ready",
         )
+    health = SERVICE.health_status()
     return {
         "status": "ready",
         "queue_depth": SERVICE.work.qsize(),
         "environment": SETTINGS.environment,
         "watcher_enabled": SETTINGS.watcher_enabled,
-        "watcher_last_error": SERVICE.watch_status().get("last_error"),
+        "watcher_last_error": health["watcher_last_error"],
         "networks": ["robinhood", "base", "solana"],
         "base_rpc_configured": bool(SETTINGS.base_rpc_url),
         "solana_rpc_configured": bool(SETTINGS.solana_rpc_url),
-        "benchmark_capture": SERVICE.benchmark_status(),
+        "benchmark_capture": health["benchmark_capture"],
     }
 
 

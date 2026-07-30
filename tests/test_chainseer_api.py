@@ -545,6 +545,27 @@ class ServiceTests(unittest.TestCase):
             finally:
                 service.stop()
 
+    def test_health_status_does_not_wait_for_watcher_or_benchmark_locks(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            service._watcher_status = {
+                "enabled": True,
+                "last_cycle": {"robinhood": None, "base": None, "solana": None},
+                "last_error": {"base": {"message": "temporary"}},
+            }
+            service._watch_lock.acquire()
+            service._benchmark._lock.acquire()
+            try:
+                health = service.health_status()
+            finally:
+                service._benchmark._lock.release()
+                service._watch_lock.release()
+            self.assertEqual(
+                health["watcher_last_error"],
+                {"base": {"message": "temporary"}},
+            )
+            self.assertFalse(health["benchmark_capture"]["enabled"])
+
     def test_worker_routes_solana_and_keeps_network_cache_separate(self):
         with tempfile.TemporaryDirectory() as root:
             service = AnalysisService(self.settings(root))
