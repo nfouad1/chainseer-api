@@ -33,8 +33,9 @@ RUN python -m zipfile -e /tmp/cypher-tempre.zip /tmp/cypher-tempre \
     && test -f /opt/cypher-tempre-self-model/registry/senses.json \
     && test -f /opt/cypher-tempre-self-model/registry/modalities.json
 
-COPY chainseer.py chainseer_controls.py chainseer_solana_public.py \
-    chainseer_benchmark.py chainseer_entity_graph.py chainseer_api.py ./
+COPY chainseer.py chainseer_controls.py chainseer_base_public.py \
+    chainseer_solana_public.py chainseer_benchmark.py \
+    chainseer_entity_graph.py chainseer_api.py ./
 
 RUN useradd --create-home --uid 10001 chainseer \
     && mkdir -p /data/chainseer_chain \
