@@ -108,6 +108,8 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, /data-network=\{network\}/);
   assert.match(page, /aria-pressed=\{network === "solana"\}/);
   assert.match(page, /aria-pressed=\{network === "base"\}/);
+  assert.match(page, /networkLabel\(alert\.network\)/);
+  assert.match(page, /shortAddress\(alert\.token_address\)/);
   assert.doesNotMatch(page, /<select/);
   assert.match(styles, /\.theme-solana/);
   assert.match(styles, /#9945ff/i);

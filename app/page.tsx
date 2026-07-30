@@ -184,6 +184,12 @@ function reportNetwork(chain: string): Network {
   return "robinhood";
 }
 
+function networkLabel(network: Network) {
+  if (network === "robinhood") return "Robinhood Chain";
+  if (network === "base") return "Base";
+  return "Solana";
+}
+
 const factorNames: Record<string, string> = {
   security: "Token controls",
   honeypot_safety: "Honeypot safety",
@@ -912,7 +918,7 @@ export default function Home() {
           ) {
             for (const alert of incoming.slice(0, 3)) {
               new window.Notification(alert.title, {
-                body: alert.message,
+                body: `${networkLabel(alert.network)} ${shortAddress(alert.token_address)}: ${alert.message}`,
                 tag: alert.alert_hash,
               });
             }
@@ -1289,7 +1295,11 @@ export default function Home() {
           {criticalAlerts.map((alert) => (
             <article key={alert.alert_hash}>
               <div>
-                <span>{alert.categories.join(" · ") || "critical"}</span>
+                <span>
+                  {networkLabel(alert.network)} ·{" "}
+                  {shortAddress(alert.token_address)} ·{" "}
+                  {alert.categories.join(" · ") || "critical"}
+                </span>
                 <strong>{alert.title}</strong>
                 <p>{alert.message}</p>
               </div>
