@@ -183,6 +183,8 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             "blockscout_holders": {
                 "blockscout_available": True,
                 "adj_top_1_pct": 82.5,
+                "concentration_complete": True,
+                "concentration_hard_stop_eligible": True,
                 "holder_count": 20,
             },
             "wash_trading": {"available": True, "wash_score": 0, "wash_risk": "Low"},
@@ -470,6 +472,14 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         ]
         agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
         agent.ledger = None
+        live_balances = {
+            pool: 330,
+            eoa: 40,
+            eip7702: 20,
+        }
+        agent.rpc = types.SimpleNamespace(
+            erc20_balance_of=lambda token, address: live_balances[address]
+        )
 
         with patch(
             "chainseer._fetch_blockscout_holders",
@@ -486,8 +496,12 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertEqual(result["pair_contracts_excluded"], [pool])
         self.assertIn(eip7702, result["unclassified_contract_holders"])
         self.assertEqual(result["eip7702_count"], 1)
-        self.assertEqual(result["concentration_basis"], "total_supply")
+        self.assertEqual(
+            result["concentration_basis"],
+            "pinned_rpc_balances_over_pinned_total_supply",
+        )
         self.assertTrue(result["concentration_complete"])
+        self.assertTrue(result["concentration_hard_stop_eligible"])
         self.assertEqual(result["top_1_pct"], 33.0)
         self.assertEqual(result["adj_top_1_pct"], 4.0)
 
@@ -509,6 +523,12 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         ]
         agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
         agent.ledger = None
+        agent.rpc = types.SimpleNamespace(
+            erc20_balance_of=lambda token, address: {
+                contract_holder: 600,
+                "0x" + "b" * 40: 100,
+            }[address]
+        )
 
         with patch(
             "chainseer._fetch_blockscout_holders",
@@ -525,6 +545,102 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             contract_holder, result["unclassified_contract_holders"]
         )
         self.assertEqual(result["adj_top_1_pct"], 60.0)
+
+    def test_stale_explorer_whale_is_replaced_by_pinned_rpc_balance(self):
+        stale_fpair = "0x14aaf47d53939f5dec532ab9269b3a41d0d6373f"
+        actual_whale = "0x39eea2575309535a42575f108a0ab66e6de960e5"
+        active_pool = "0xbba541973fb01d4525ddbdd6162bc203425cffc6"
+        unit = 10**18
+        supply = 1_000_000_000 * unit
+        indexed_holders = [
+            {
+                "address": stale_fpair,
+                "is_contract": True,
+                "balance_raw": str(875_374_467 * unit),
+                "address_info": {"name": "FPair"},
+            },
+            {
+                "address": active_pool,
+                "is_contract": True,
+                "balance_raw": str(58_561_436 * unit),
+                "address_info": {"name": "UniswapV2Pair"},
+            },
+        ]
+        live_balances = {
+            stale_fpair: unit - 1,
+            actual_whale: 147_602_652 * unit,
+            active_pool: 64_891_820 * unit,
+        }
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.ledger = None
+        agent.rpc = types.SimpleNamespace(
+            erc20_balance_of=lambda token, address: live_balances[address]
+        )
+
+        with patch(
+            "chainseer._fetch_blockscout_holders",
+            return_value=indexed_holders,
+        ):
+            result = agent._analyze_holders_blockscout(
+                "0x08df470d41c11ba5cb60242747d76c65ca52c94c",
+                verified_amm_addresses=[active_pool],
+                total_supply_raw=supply,
+                goplus_holders=[
+                    {
+                        "address": actual_whale,
+                        "is_contract": 1,
+                    }
+                ],
+            )
+
+        self.assertTrue(result["stale_index_detected"])
+        self.assertEqual(result["material_indexed_balance_mismatch_count"], 2)
+        self.assertIn(
+            stale_fpair,
+            {
+                item["address"]
+                for item in result["material_indexed_balance_mismatches"]
+            },
+        )
+        self.assertEqual(result["holders"][0]["address"], actual_whale)
+        self.assertAlmostEqual(result["adj_top_1_pct"], 14.76, places=2)
+        self.assertTrue(result["concentration_hard_stop_eligible"])
+
+        data = self.investor_fixture()
+        data["blockscout_holders"] = result
+        data["lp_lock"] = {
+            "state": "protocol_managed",
+            "locked": True,
+            "withdrawal_verified": False,
+            "hard_stop_eligible": False,
+            "amm_version": "v2",
+            "method": "Synthetic safe-custody fixture",
+        }
+        analysis = agent._analyze(data)
+        self.assertNotIn(
+            "EXTREME_CONCENTRATION",
+            {item["code"] for item in analysis["hard_stop_overrides"]},
+        )
+
+    def test_unvalidated_concentration_cannot_trigger_hard_stop(self):
+        data = self.investor_fixture()
+        data["blockscout_holders"].update({
+            "concentration_complete": False,
+            "concentration_hard_stop_eligible": False,
+            "rpc_balance_validation_attempted": True,
+        })
+        data["lp_lock"]["hard_stop_eligible"] = False
+
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        analysis = agent._analyze(data)
+
+        self.assertNotIn(
+            "EXTREME_CONCENTRATION",
+            {item["code"] for item in analysis["hard_stop_overrides"]},
+        )
+        self.assertIn(
+            "holder_concentration", analysis["uncertain_components"]
+        )
 
     def test_holder_base_score_is_age_aware_and_sybil_capped(self):
         young = chainseer._holder_base_score(669, 9)

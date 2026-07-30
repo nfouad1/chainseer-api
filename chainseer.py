@@ -1546,6 +1546,7 @@ class Chainseer:
                 "verified_amm_addresses", []
             ),
             total_supply_raw=data["basic_info"].get("total_supply_raw"),
+            goplus_holders=data["goplus_security"].get("holders", []),
         )
         data["wash_trading"] = self._detect_wash_trading(token, latest_block)
         claim_evidence["activity_and_holders"] = self.ledger.fact_ids_since(checkpoint)
@@ -1893,28 +1894,142 @@ class Chainseer:
         *,
         verified_amm_addresses=None,
         total_supply_raw=None,
+        goplus_holders=None,
     ) -> dict:
-        """Fetch and classify top holders using explicit market evidence.
+        """Discover holder candidates, then validate balances at the block pin.
+
+        Blockscout and GoPlus are candidate-discovery sources, not balance
+        authorities: explorer indexes can lag or retain stale holder rows.
+        Every candidate balance must therefore be re-read through
+        ``balanceOf`` on the request's pinned RPC context before concentration
+        can affect scoring or trigger a hard stop.
 
         Only holder addresses independently identified as same-network AMM
         markets are excluded. Other contracts, including EIP-7702 accounts,
-        remain economic holders. Concentration uses total token supply when it
-        is available; a top-20 sample is never silently labelled as supply.
+        remain economic holders.
         """
-        holders = _fetch_blockscout_holders(
+        indexed_holders = _fetch_blockscout_holders(
             token,
             limit=20,
             ledger=self.ledger,
             blockscout_base=self.network.blockscout_base,
         )
-        if not holders:
+        if not indexed_holders and not goplus_holders:
             return {"holders": [], "blockscout_available": False}
 
+        supply_raw = _safe_int(total_supply_raw)
         verified_amm = {
             str(address).lower()
             for address in (verified_amm_addresses or [])
             if ADDRESS_RE.fullmatch(str(address or ""))
         }
+
+        # Build a bounded candidate union. Blockscout contributes richer
+        # address metadata; GoPlus provides an independent ordering when an
+        # explorer holder index is stale. Neither provider's balance is trusted.
+        candidates = {}
+        for source_holder in indexed_holders:
+            holder = dict(source_holder)
+            address = str(holder.get("address") or "").lower()
+            if not ADDRESS_RE.fullmatch(address):
+                continue
+            holder["address"] = address
+            holder["candidate_sources"] = ["blockscout"]
+            holder["indexed_balance_raw"] = _safe_int(
+                holder.get("balance_raw", "0")
+            )
+            candidates[address] = holder
+
+        for source_holder in list(goplus_holders or [])[:20]:
+            address = str(
+                source_holder.get("address")
+                or source_holder.get("holder_address")
+                or ""
+            ).lower()
+            if not ADDRESS_RE.fullmatch(address):
+                continue
+            if address in candidates:
+                candidates[address]["candidate_sources"].append("goplus")
+                continue
+            candidates[address] = {
+                "address": address,
+                "is_contract": bool(_safe_int(source_holder.get("is_contract"))),
+                "address_info": {},
+                "candidate_sources": ["goplus"],
+                "indexed_balance_raw": None,
+            }
+
+        holders = list(candidates.values())
+        if not holders:
+            return {
+                "holders": [],
+                "blockscout_available": bool(indexed_holders),
+            }
+
+        balance_reader = getattr(getattr(self, "rpc", None), "erc20_balance_of", None)
+        rpc_validation_attempted = callable(balance_reader)
+        validation_errors = []
+        material_mismatches = []
+        validated_count = 0
+        material_floor = max(1, supply_raw // 10_000) if supply_raw > 0 else 1
+
+        for holder in holders:
+            indexed_balance = holder.get("indexed_balance_raw")
+            if rpc_validation_attempted:
+                try:
+                    live_balance = _safe_int(
+                        balance_reader(token, holder["address"])
+                    )
+                    holder["balance_raw"] = str(live_balance)
+                    holder["balance_parsed"] = live_balance
+                    holder["balance_source"] = "pinned_rpc_balanceOf"
+                    holder["balance_live_validated"] = True
+                    validated_count += 1
+                    if indexed_balance is not None:
+                        delta = abs(live_balance - indexed_balance)
+                        relative_floor = max(
+                            live_balance, indexed_balance, 1
+                        ) // 100
+                        if delta > max(material_floor, relative_floor):
+                            material_mismatches.append({
+                                "address": holder["address"],
+                                "indexed_balance_raw": indexed_balance,
+                                "pinned_balance_raw": live_balance,
+                            })
+                except Exception as exc:
+                    holder["balance_parsed"] = 0
+                    holder["balance_source"] = "pinned_rpc_validation_failed"
+                    holder["balance_live_validated"] = False
+                    validation_errors.append({
+                        "address": holder["address"],
+                        "error": str(exc)[:240],
+                    })
+            else:
+                holder["balance_parsed"] = _safe_int(indexed_balance)
+                holder["balance_source"] = "explorer_index_unverified"
+                holder["balance_live_validated"] = False
+
+        # Provider ordering is advisory. Only the pinned balances determine
+        # which validated candidate is actually the largest holder.
+        holders.sort(
+            key=lambda holder: holder.get("balance_parsed", 0),
+            reverse=True,
+        )
+        indexed_total_raw = sum(
+            _safe_int(holder.get("indexed_balance_raw"))
+            for holder in holders
+            if holder.get("indexed_balance_raw") is not None
+        )
+        indexed_sample_exceeds_supply = (
+            supply_raw > 0 and indexed_total_raw > supply_raw
+        )
+        concentration_complete = (
+            supply_raw > 0
+            and rpc_validation_attempted
+            and validated_count == len(holders)
+            and not validation_errors
+        )
+
         # Compute concentration excluding only verified pair/AMM addresses.
         total_raw = 0
         excluded_amm = set()
@@ -1962,24 +2077,37 @@ class Chainseer:
             h["balance_parsed"] for h in holders
             if h.get("address", "").lower() not in excluded_amm
         )
-        supply_raw = _safe_int(total_supply_raw)
         concentration_denominator = supply_raw if supply_raw > 0 else total_raw
         concentration_basis = (
-            "total_supply" if supply_raw > 0 else "top_holders_sample"
+            "pinned_rpc_balances_over_pinned_total_supply"
+            if concentration_complete
+            else "candidate_balances_not_hard_stop_eligible"
         )
         result = {
             "holders": holders,
-            "blockscout_available": True,
+            "blockscout_available": bool(indexed_holders),
             "total_parsed": total_raw,
+            "indexed_total_parsed": indexed_total_raw,
             "non_pair_total": non_pair_total,
             "total_supply_raw": supply_raw or None,
             "concentration_denominator_raw": concentration_denominator,
             "concentration_basis": concentration_basis,
-            "concentration_complete": supply_raw > 0,
+            "concentration_complete": concentration_complete,
+            "concentration_hard_stop_eligible": concentration_complete,
+            "rpc_balance_validation_attempted": rpc_validation_attempted,
+            "rpc_balance_validated_count": validated_count,
+            "rpc_balance_candidate_count": len(holders),
+            "rpc_balance_validation_errors": validation_errors,
+            "material_indexed_balance_mismatches": material_mismatches,
+            "material_indexed_balance_mismatch_count": len(material_mismatches),
+            "indexed_sample_exceeds_supply": indexed_sample_exceeds_supply,
+            "stale_index_detected": bool(
+                material_mismatches or indexed_sample_exceeds_supply
+            ),
             "pair_contracts_excluded": sorted(excluded_amm),
             "verified_amm_addresses": sorted(verified_amm),
             "amm_verification_method": (
-                "DexScreener Robinhood pair + Blockscout contract"
+                "DexScreener same-network pair + holder contract metadata"
             ),
             "unclassified_contract_holders": unclassified_contracts,
             "eoa_holders_count": eoa_count,
@@ -1990,7 +2118,7 @@ class Chainseer:
             "eip7702_count": eip7702_count,
         }
 
-        if concentration_denominator > 0 and holders:
+        if concentration_complete and concentration_denominator > 0 and holders:
             # Raw concentration (includes pair contracts)
             result["top_1_pct"] = round(
                 holders[0].get("balance_parsed", 0)
@@ -2954,9 +3082,9 @@ class Chainseer:
 
         # Prefer total-supply concentration with only verified AMMs excluded.
         has_complete_blockscout_concentration = (
-            bs_holders.get("blockscout_available")
-            and bs_holders.get("adj_top_1_pct") is not None
-            and bs_holders.get("concentration_complete", True)
+            bs_holders.get("adj_top_1_pct") is not None
+            and bs_holders.get("concentration_complete", False)
+            and bs_holders.get("concentration_hard_stop_eligible", False)
         )
         if has_complete_blockscout_concentration:
             adj_top1 = bs_holders["adj_top_1_pct"]
@@ -2980,7 +3108,7 @@ class Chainseer:
                     f"Low non-AMM concentration: largest holder "
                     f"{adj_top1:.1f}% of supply"
                 )
-        else:
+        elif not bs_holders.get("rpc_balance_validation_attempted"):
             # GoPlus is a fallback only when supply-based Blockscout
             # concentration is unavailable. Ignore any independently verified
             # AMM address rather than treating the pool as a whale.
@@ -3023,6 +3151,11 @@ class Chainseer:
                     "Total supply denominator unavailable; top-holder sample "
                     "was not treated as a complete concentration measure"
                 )
+        else:
+            uncertain["holder_concentration"] = (
+                "Holder candidates could not all be validated with balanceOf "
+                "at the pinned block; concentration is not hard-stop eligible"
+            )
 
         # ── 5. Volume & activity (0-100) ─────────────────────────────────
         vol_24h = dex.get("total_volume_24h", 0)
@@ -3344,7 +3477,10 @@ class Chainseer:
             )
 
         top_holder_pct = _safe_float(bs_holders.get("adj_top_1_pct"))
-        if top_holder_pct >= 50:
+        if (
+            bs_holders.get("concentration_hard_stop_eligible") is True
+            and top_holder_pct >= 50
+        ):
             severity = "Critical" if top_holder_pct >= 80 else "High"
             hard_stop(
                 "EXTREME_CONCENTRATION", severity,
