@@ -31,8 +31,9 @@ design.
    suitable for a bounded smoke test but can rate-limit production traffic.
    `JUPITER_API_KEY` is optional; set it in Render when authenticated Jupiter
    capacity is available.
-6. Deploy and wait for `/health/ready` to return HTTP 200 and list both
-   `robinhood` and `solana`. Confirm `benchmark_capture.state=ready`.
+6. Deploy and wait for `/health/ready` to return HTTP 200 and list
+   `robinhood`, `base`, and `solana`. Confirm
+   `base_rpc_configured=true` and `benchmark_capture.state=ready`.
 7. Copy the public `https://<service>.onrender.com` URL.
 8. Store that URL as `CHAINSEER_API_URL` in the Chainseer Sites environment.
 9. Store the same API token as the secret `CHAINSEER_API_TOKEN` in Sites.

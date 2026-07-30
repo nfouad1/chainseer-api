@@ -21,7 +21,7 @@ services:
       - key: CHAINSEER_RPC_URL
         value: https://rpc.mainnet.chain.robinhood.com
       - key: CHAINSEER_BASE_RPC_URL
-        value: https://mainnet.base.org
+        sync: false
       - key: CHAINSEER_SOLANA_RPC_URL
         value: https://api.mainnet-beta.solana.com
       - key: CHAINSEER_CHAIN_ROOT
