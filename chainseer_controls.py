@@ -1502,6 +1502,29 @@ class CalibrationEngine:
             set(current.allowed_risk_levels)
         ):
             raise ValueError("calibration adoption cannot broaden allowed risks")
+        # propose() never touches these fields, but adopt() takes an
+        # arbitrary proposal file path (not something bound to propose()'s
+        # own output), so a hand-edited proposal must still be rejected if it
+        # loosens any dimension TradePermitGuard relies on for freshness or
+        # data-quality, not just the two fields checked above.
+        if proposed.max_false_negative_rate > current.max_false_negative_rate:
+            raise ValueError(
+                "calibration adoption cannot raise max_false_negative_rate"
+            )
+        if proposed.min_outcomes < current.min_outcomes:
+            raise ValueError("calibration adoption cannot lower min_outcomes")
+        if proposed.max_permit_block_drift > current.max_permit_block_drift:
+            raise ValueError(
+                "calibration adoption cannot raise max_permit_block_drift"
+            )
+        if proposed.max_quote_age_blocks > current.max_quote_age_blocks:
+            raise ValueError(
+                "calibration adoption cannot raise max_quote_age_blocks"
+            )
+        if proposed.permit_ttl_seconds > current.permit_ttl_seconds:
+            raise ValueError(
+                "calibration adoption cannot raise permit_ttl_seconds"
+            )
         metrics = proposal.get("metrics") or {}
         if _safe_int(metrics.get("sample_size")) < current.min_outcomes:
             raise ValueError("calibration adoption lacks the required outcomes")
@@ -1763,6 +1786,15 @@ class TradePermitGuard:
             permit.get("max_block_drift")
         ):
             reasons.append("permit block drift exceeded")
+        # A stored ring_hash field is only meaningful if the chain it lives in
+        # is actually intact: without this, an attacker able to write
+        # rings.jsonl could append one fabricated trade_permit ring with any
+        # self-consistent hash and pass every check below. Recomputing and
+        # walking the whole chain is the same cost as tc.load() below plus a
+        # hash per ring, and this guard is not on the analysis hot path.
+        chain_ok, _chain_report = self.agent.tc.verify()
+        if not chain_ok:
+            reasons.append("timechain integrity check failed")
         rings = self.agent.tc.load()
         ring = next(
             (
@@ -1775,6 +1807,9 @@ class TradePermitGuard:
         )
         if ring is None:
             reasons.append("permit ring unavailable")
+        elif not chain_ok:
+            pass  # already refused above; an unverified chain cannot be
+            # trusted to confirm this ring's hash or its binding to the permit
         elif ring.get("ring_hash") != permit.get("permit_ring_hash"):
             reasons.append("permit ring hash mismatch")
         elif (ring.get("payload") or {}).get("permit_hash") != permit.get(
@@ -2077,6 +2112,7 @@ class ChainseerWatcher:
                             "block": int(last),
                             "observed_at": utc_now_iso(now),
                         }
+                        alert["timechain"] = self._seal_transition(alert)
                         self.store.append_alert(alert)
                         summary["alerts"] += 1
                         subscription["last_processed_block"] = max(

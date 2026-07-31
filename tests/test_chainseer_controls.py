@@ -20,6 +20,9 @@ class FakeTimechain:
     def load(self):
         return list(self.rings)
 
+    def verify(self):
+        return True, ["ok"]
+
 
 class FakePoQ:
     def gate_and_seal(self, tc, _candidate, **kwargs):
@@ -518,6 +521,42 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             )
             self.assertIsNotNone(alert["timechain"]["ring"])
 
+    def test_watcher_seals_reorg_alert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = FakeAgent()
+            agent.chain_root = temp_dir
+            watcher = controls.ChainseerWatcher(
+                agent,
+                control_root=temp_dir,
+                config=controls.WatchConfig(
+                    confirmations=2,
+                    holder_rescan_blocks=12,
+                    max_rescan_blocks=120,
+                    score_alert_delta=5,
+                ),
+            )
+            watcher.store.subscribe(TOKEN)
+            first = watcher.run_once()
+            self.assertEqual(first["alerts"], 0)
+
+            # Simulate a confirmed-block hash change without advancing the
+            # head, so run_once takes the reorg branch rather than the
+            # regular rescan branch.
+            state = watcher.store.load()
+            key = next(iter(state["subscriptions"]))
+            state["subscriptions"][key]["last_processed_hash"] = "stale-hash"
+            watcher.store.save(state)
+
+            second = watcher.run_once()
+            self.assertEqual(second["alerts"], 1)
+            alerts = watcher.store.alert_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            alert = json.loads(alerts[-1])
+            self.assertEqual(alert["type"], "reorg")
+            self.assertIsNotNone(alert["timechain"])
+            self.assertIsNotNone(alert["timechain"]["ring"])
+
     def test_custom_contract_activity_detects_sell_tax_increase(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             agent = FakeAgent()
@@ -722,6 +761,53 @@ class CalibrationTests(unittest.TestCase):
             proposal = engine.propose([self.outcome_ring(1, True)])
             self.assertEqual(proposal["status"], "insufficient_data")
             self.assertFalse(engine.policy_path.exists())
+
+    def _hand_edited_proposal(self, **overrides):
+        # adopt() takes an arbitrary proposal file path, not something bound
+        # to propose()'s own output, so a real attack/misconfiguration looks
+        # like this: a "proposed" status with a hand-edited proposed_policy
+        # rather than anything propose() itself would ever emit.
+        current = controls.CalibrationPolicy()
+        from dataclasses import asdict
+
+        proposed = asdict(current)
+        proposed.update(overrides)
+        return {
+            "status": "proposed",
+            "current_policy": asdict(current),
+            "proposed_policy": proposed,
+            "metrics": {"sample_size": current.min_outcomes},
+        }
+
+    def test_adopt_rejects_loosened_false_negative_rate(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(max_false_negative_rate=0.5)
+        with self.assertRaisesRegex(ValueError, "max_false_negative_rate"):
+            engine.adopt(proposal, agent=None)
+
+    def test_adopt_rejects_lowered_min_outcomes(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(min_outcomes=1)
+        with self.assertRaisesRegex(ValueError, "min_outcomes"):
+            engine.adopt(proposal, agent=None)
+
+    def test_adopt_rejects_widened_permit_block_drift(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(max_permit_block_drift=50)
+        with self.assertRaisesRegex(ValueError, "max_permit_block_drift"):
+            engine.adopt(proposal, agent=None)
+
+    def test_adopt_rejects_widened_quote_age(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(max_quote_age_blocks=50)
+        with self.assertRaisesRegex(ValueError, "max_quote_age_blocks"):
+            engine.adopt(proposal, agent=None)
+
+    def test_adopt_rejects_lengthened_permit_ttl(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(permit_ttl_seconds=300)
+        with self.assertRaisesRegex(ValueError, "permit_ttl_seconds"):
+            engine.adopt(proposal, agent=None)
 
 
 class TradePermitTests(unittest.TestCase):
