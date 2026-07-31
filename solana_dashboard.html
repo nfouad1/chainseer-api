@@ -130,6 +130,13 @@
     .meter-track { height:5px; margin-top:11px; border-radius:999px; overflow:hidden; background:#1b1d2b; }
     .meter-fill { height:100%; border-radius:inherit; background:linear-gradient(90deg,var(--purple-2),var(--cyan)); }
     .callout { margin-top:15px; padding:13px 14px; border:1px solid rgba(255,202,106,.16); border-radius:11px; background:rgba(255,202,106,.035); color:var(--muted); font-size:11px; line-height:1.55; }
+    .verdict { margin-bottom:18px; }
+    .verdict-reasons { list-style:none; margin:12px 0 0; padding:0; display:flex; flex-wrap:wrap; gap:8px; }
+    .verdict-reasons li { padding:6px 10px; border:1px solid rgba(255,255,255,.06); border-radius:8px; background:#0b0d15; color:var(--muted); font:10px var(--mono); }
+    details.disclosure { margin-top:14px; }
+    details.disclosure > summary { cursor:pointer; color:var(--muted); font:9px var(--mono); letter-spacing:.06em; text-transform:uppercase; padding:8px 0; }
+    details.disclosure > summary:hover { color:var(--ink); }
+    details.disclosure[open] > summary { margin-bottom:6px; }
     .promotion-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:9px; }
     .gate { padding:12px; border:1px solid rgba(255,255,255,.06); border-radius:10px; background:#0b0d15; }
     .gate-top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
@@ -270,6 +277,16 @@
       </div>
     </header>
 
+    <section class="panel verdict" id="verdict-banner" aria-label="Top-line status">
+      <div class="panel-head">
+        <div>
+          <span class="status" id="verdict-status"><span class="dot" id="verdict-dot"></span><span id="verdict-label">CHECKING</span></span>
+          <h2 id="verdict-headline" style="margin-top:8px">Loading learner status…</h2>
+        </div>
+      </div>
+      <ul id="verdict-reasons" class="verdict-reasons"></ul>
+    </section>
+
     <section class="hero">
       <article class="hero-main">
         <div class="eyebrow">Solana launch intelligence · paper-only boundary</div>
@@ -377,29 +394,32 @@
         <div><h2>Concentration calibration</h2><div class="sub">Descriptive distribution of observed tokens · does NOT validate or auto-tune the threshold</div></div>
         <span class="status"><span class="dot" id="calibration-dot"></span><span id="calibration-status">—</span></span>
       </div>
-      <div class="infra-grid" style="grid-template-columns:repeat(3,1fr)">
-        <div class="infra"><div class="infra-name">Top-1 holder · median</div><div class="infra-value" id="cal-top1-median">—</div><div class="infra-note" id="cal-top1-range">—</div></div>
-        <div class="infra"><div class="infra-name">Top-10 holders · median</div><div class="infra-value" id="cal-top10-median">—</div><div class="infra-note" id="cal-top10-range">—</div></div>
-        <div class="infra"><div class="infra-name">Joint gate admit rate</div><div class="infra-value" id="cal-joint">—</div><div class="infra-note">concentration AND retention at active policy</div></div>
-      </div>
-      <div class="quality-grid" style="grid-template-columns:repeat(3,1fr);margin-top:13px">
-        <div class="meter">
-          <div class="meter-head"><span>Top-1 threshold sensitivity</span><strong id="cal-top1-active">—</strong></div>
-          <div class="meter-track"><div class="meter-fill" id="cal-top1-meter"></div></div>
-          <div class="infra-note" id="cal-top1-grid" style="margin-top:8px">—</div>
+      <details class="disclosure">
+        <summary>Show distribution &amp; sensitivity detail</summary>
+        <div class="infra-grid" style="grid-template-columns:repeat(3,1fr)">
+          <div class="infra"><div class="infra-name">Top-1 holder · median</div><div class="infra-value" id="cal-top1-median">—</div><div class="infra-note" id="cal-top1-range">—</div></div>
+          <div class="infra"><div class="infra-name">Top-10 holders · median</div><div class="infra-value" id="cal-top10-median">—</div><div class="infra-note" id="cal-top10-range">—</div></div>
+          <div class="infra"><div class="infra-name">Joint gate admit rate</div><div class="infra-value" id="cal-joint">—</div><div class="infra-note">concentration AND retention at active policy</div></div>
         </div>
-        <div class="meter">
-          <div class="meter-head"><span>Top-10 threshold sensitivity</span><strong id="cal-top10-active">—</strong></div>
-          <div class="meter-track"><div class="meter-fill" id="cal-top10-meter"></div></div>
-          <div class="infra-note" id="cal-top10-grid" style="margin-top:8px">—</div>
+        <div class="quality-grid" style="grid-template-columns:repeat(3,1fr);margin-top:13px">
+          <div class="meter">
+            <div class="meter-head"><span>Top-1 threshold sensitivity</span><strong id="cal-top1-active">—</strong></div>
+            <div class="meter-track"><div class="meter-fill" id="cal-top1-meter"></div></div>
+            <div class="infra-note" id="cal-top1-grid" style="margin-top:8px">—</div>
+          </div>
+          <div class="meter">
+            <div class="meter-head"><span>Top-10 threshold sensitivity</span><strong id="cal-top10-active">—</strong></div>
+            <div class="meter-track"><div class="meter-fill" id="cal-top10-meter"></div></div>
+            <div class="infra-note" id="cal-top10-grid" style="margin-top:8px">—</div>
+          </div>
+          <div class="meter">
+            <div class="meter-head"><span>Roundtrip retention sensitivity</span><strong id="cal-ret-active">—</strong></div>
+            <div class="meter-track"><div class="meter-fill" id="cal-ret-meter"></div></div>
+            <div class="infra-note" id="cal-ret-grid" style="margin-top:8px">—</div>
+          </div>
         </div>
-        <div class="meter">
-          <div class="meter-head"><span>Roundtrip retention sensitivity</span><strong id="cal-ret-active">—</strong></div>
-          <div class="meter-track"><div class="meter-fill" id="cal-ret-meter"></div></div>
-          <div class="infra-note" id="cal-ret-grid" style="margin-top:8px">—</div>
-        </div>
-      </div>
-      <div class="callout" id="calibration-callout">Calibration characterizes the distribution; threshold validation requires realized outcomes that are not yet collected.</div>
+        <div class="callout" id="calibration-callout">Calibration characterizes the distribution; threshold validation requires realized outcomes that are not yet collected.</div>
+      </details>
     </section>
 
     <section class="panel" style="margin-bottom:18px">
@@ -838,7 +858,53 @@
       </div>`).join("");
     }
 
+    function renderVerdict(data) {
+      const states=data.evidence_states || {};
+      const safe=Number(states.complete_safe||0), unsafe=Number(states.complete_unsafe||0),
+            pend=Number(states.distribution_pending||0), ind=Number(states.infrastructure_indeterminate||0);
+      const total=safe+unsafe+pend+ind;
+      const indRate = total ? ind/total*100 : 0;
+      const schedule=data.schedule || {}, scheduler=data.scheduler || {};
+      const schedulerFailed = schedule.installed && scheduler.status === "failed";
+      const schedulerRunning = schedule.installed && schedule.enabled !== false && scheduler.status !== "failed";
+      const promotion = data.promotion || {};
+      const reasons = [];
+      let level, headline;
+
+      if (!total) {
+        level="warning";
+        headline="No data yet — run learn-once to populate the observatory.";
+      } else if (schedulerFailed) {
+        level="negative";
+        headline="Attention needed — the scheduled learner is in a failed state.";
+        reasons.push(`scheduler: ${esc(String(scheduler.status||"failed"))}`);
+      } else if (indRate >= 30) {
+        level="negative";
+        headline=`Attention needed — ${indRate.toFixed(1)}% of evidence is infrastructure-indeterminate.`;
+        reasons.push("RPC/Jupiter coverage is degraded, not token risk");
+      } else if (indRate >= 10) {
+        level="warning";
+        headline=`Learning, but noisy — ${indRate.toFixed(1)}% of evidence is infrastructure-indeterminate.`;
+      } else {
+        level="positive";
+        headline=`Learning normally — ${num(total)} analyses, ${indRate.toFixed(1)}% infrastructure-indeterminate.`;
+      }
+      reasons.push(schedulerRunning ? `scheduler running${schedule.interval_minutes?` · every ${num(schedule.interval_minutes)}m`:""}` : "scheduler not running");
+      reasons.push(`${num(data.shadow?.open)} open / ${num(data.shadow?.closed)} closed shadow positions`);
+      const promoStatus = String(promotion.status||"").toUpperCase();
+      reasons.push(promoStatus === "PROMOTABLE_FOR_REVIEW"
+        ? "promotable for manual review"
+        : `not yet promotable${(promotion.blockers||[]).length ? ` (${promotion.blockers.length} blocker${promotion.blockers.length===1?"":"s"})` : ""}`);
+
+      $("verdict-headline").textContent=headline;
+      $("verdict-label").textContent=level.toUpperCase();
+      $("verdict-label").parentElement.className=`status ${level}`;
+      setDot("verdict-dot", level==="positive" ? true : level==="negative" ? false : null);
+      $("verdict-reasons").innerHTML=reasons.map(r=>`<li>${esc(r)}</li>`).join("");
+    }
+
     function render(data) {
+      renderVerdict(data);
       const schedule=data.schedule || {}, scheduler=data.scheduler || {};
       const enabled=schedule.installed && schedule.enabled !== false;
       const schedulerState=enabled ? String(scheduler.status || "scheduled").toUpperCase() : (schedule.installed ? "STOPPED" : "NOT INSTALLED");

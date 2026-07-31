@@ -111,57 +111,22 @@ class ReflectionCheckpointPending(RuntimeError):
     """The learner is paused until a sealed reflection is acknowledged."""
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
+import functools
 
+from chainseer_core import (
+    utc_now as _utc_now,
+    canonical_json as _canonical_json_impl,
+    safe_float as _safe_float,
+    safe_int as _safe_int,
+    atomic_json_write as _atomic_json,
+    read_json as _read_json,
+)
 
-def _canonical_json(value) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-
-
-def _atomic_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=False),
-        encoding="utf-8",
-    )
-    for attempt in range(6):
-        try:
-            temporary.replace(path)
-            return
-        except PermissionError:
-            # Windows readers can briefly prevent replacing the destination.
-            # The dashboard is read-only and releases the handle immediately,
-            # so bounded retry preserves atomicity without weakening the
-            # learner's single-writer boundary.
-            if attempt == 5:
-                raise
-            time.sleep(0.05 * (2**attempt))
-
-
-def _read_json(path: Path, default):
-    if not path.exists():
-        return default
-    try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, ValueError):
-        return default
-
-
-def _safe_int(value, default=0) -> int:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
-def _safe_float(value, default=0.0) -> float:
-    try:
-        result = float(value)
-        return result if math.isfinite(result) else default
-    except (TypeError, ValueError):
-        return default
+# This adapter's original _canonical_json used ensure_ascii=False with no
+# `default=str` fallback (stricter: raises on a non-JSON-serializable value).
+# Bind chainseer_core.canonical_json to reproduce that exact behavior so
+# historical event_hash values in solana_chain/ keep re-verifying.
+_canonical_json = functools.partial(_canonical_json_impl, ensure_ascii=False, default=None)
 
 
 def _timestamp(value: str | None) -> float | None:

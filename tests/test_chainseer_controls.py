@@ -19,6 +19,9 @@ class FakeTimechain:
     def load(self):
         return list(self.rings)
 
+    def verify(self):
+        return True, ["ok"]
+
 
 class FakePoQ:
     def gate_and_seal(self, tc, _candidate, **kwargs):
@@ -307,6 +310,42 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             self.assertEqual(alert["type"], "state_change")
             self.assertIsNotNone(alert["timechain"]["ring"])
 
+    def test_watcher_seals_reorg_alert(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = FakeAgent()
+            agent.chain_root = temp_dir
+            watcher = controls.ChainseerWatcher(
+                agent,
+                control_root=temp_dir,
+                config=controls.WatchConfig(
+                    confirmations=2,
+                    holder_rescan_blocks=12,
+                    max_rescan_blocks=120,
+                    score_alert_delta=5,
+                ),
+            )
+            watcher.store.subscribe(TOKEN)
+            first = watcher.run_once()
+            self.assertEqual(first["alerts"], 0)
+
+            # Simulate a confirmed-block hash change without advancing the
+            # head, so run_once takes the reorg branch rather than the
+            # regular rescan branch.
+            state = watcher.store.load()
+            key = next(iter(state["subscriptions"]))
+            state["subscriptions"][key]["last_processed_hash"] = "stale-hash"
+            watcher.store.save(state)
+
+            second = watcher.run_once()
+            self.assertEqual(second["alerts"], 1)
+            alerts = watcher.store.alert_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            alert = json.loads(alerts[-1])
+            self.assertEqual(alert["type"], "reorg")
+            self.assertIsNotNone(alert["timechain"])
+            self.assertIsNotNone(alert["timechain"]["ring"])
+
 
 class CalibrationTests(unittest.TestCase):
     @staticmethod
@@ -349,6 +388,137 @@ class CalibrationTests(unittest.TestCase):
             proposal = engine.propose([self.outcome_ring(1, True)])
             self.assertEqual(proposal["status"], "insufficient_data")
             self.assertFalse(engine.policy_path.exists())
+
+    def _hand_edited_proposal(self, **overrides):
+        # adopt() takes an arbitrary proposal file path, not something bound
+        # to propose()'s own output, so a real attack/misconfiguration looks
+        # like this: a "proposed" status with a hand-edited proposed_policy
+        # rather than anything propose() itself would ever emit.
+        current = controls.CalibrationPolicy()
+        from dataclasses import asdict
+
+        proposed = asdict(current)
+        proposed.update(overrides)
+        return {
+            "status": "proposed",
+            "current_policy": asdict(current),
+            "proposed_policy": proposed,
+            "metrics": {"sample_size": current.min_outcomes},
+        }
+
+    def test_adopt_rejects_loosened_false_negative_rate(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(max_false_negative_rate=0.5)
+        with self.assertRaisesRegex(ValueError, "max_false_negative_rate"):
+            engine.adopt(proposal, agent=None)
+
+    def test_adopt_rejects_lowered_min_outcomes(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(min_outcomes=1)
+        with self.assertRaisesRegex(ValueError, "min_outcomes"):
+            engine.adopt(proposal, agent=None)
+
+    def test_adopt_rejects_widened_permit_block_drift(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(max_permit_block_drift=50)
+        with self.assertRaisesRegex(ValueError, "max_permit_block_drift"):
+            engine.adopt(proposal, agent=None)
+
+    def test_adopt_rejects_widened_quote_age(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(max_quote_age_blocks=50)
+        with self.assertRaisesRegex(ValueError, "max_quote_age_blocks"):
+            engine.adopt(proposal, agent=None)
+
+    def test_adopt_rejects_lengthened_permit_ttl(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        proposal = self._hand_edited_proposal(permit_ttl_seconds=300)
+        with self.assertRaisesRegex(ValueError, "permit_ttl_seconds"):
+            engine.adopt(proposal, agent=None)
+
+    @staticmethod
+    def scored_outcome_ring(index, *, score, adverse):
+        return {
+            "index": index,
+            "ring_type": "analysis_outcome",
+            "payload": {
+                "analysis_ring": index + 100,
+                "calibration": {
+                    "original_risk_level": "Low",
+                    "original_legitimacy_score": score,
+                    "adverse_security_event": adverse,
+                },
+                "other_outcomes": {"horizon_seconds": 3600},
+                "market_outcomes": {"price_return_pct": -10 if adverse else 5},
+            },
+        }
+
+    def test_reliability_curve_is_empty_with_no_scored_outcomes(self):
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        report = engine.reliability_curve([], bins=10)
+        self.assertEqual(report["sample_size"], 0)
+        self.assertIsNone(report["brier_score"])
+        self.assertEqual(len(report["bins"]), 10)
+
+    def test_reliability_curve_perfect_calibration_scores_zero_brier(self):
+        # Every score-100 token stays safe; every score-0 token is adverse --
+        # a perfectly calibrated agent at the extremes, so Brier should be
+        # exactly 0 and every populated bin's calibration_gap_pct should be
+        # ~0.
+        rings = [
+            self.scored_outcome_ring(i, score=100, adverse=False) for i in range(10)
+        ] + [
+            self.scored_outcome_ring(100 + i, score=0, adverse=True) for i in range(10)
+        ]
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        report = engine.reliability_curve(rings, bins=10)
+        self.assertEqual(report["sample_size"], 20)
+        self.assertAlmostEqual(report["brier_score"], 0.0, places=3)
+        for bucket in report["bins"]:
+            if bucket["sample_size"]:
+                self.assertAlmostEqual(bucket["calibration_gap_pct"], 0.0, places=1)
+
+    def test_reliability_curve_overconfident_scores_show_positive_gap(self):
+        # Every token scores 95 (agent claims near-certain safety) but half
+        # turn out adverse -- overconfidence, so the bin's calibration_gap_pct
+        # should be large and positive (predicted safety >> observed safety),
+        # and skill_vs_naive_baseline should not show meaningful skill.
+        rings = [
+            self.scored_outcome_ring(i, score=95, adverse=(i % 2 == 0))
+            for i in range(20)
+        ]
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        report = engine.reliability_curve(rings, bins=10)
+        self.assertEqual(report["sample_size"], 20)
+        populated = [b for b in report["bins"] if b["sample_size"]]
+        self.assertEqual(len(populated), 1)
+        self.assertGreater(populated[0]["calibration_gap_pct"], 30)
+        self.assertLessEqual(report["skill_vs_naive_baseline"], 0.0)
+
+    def test_reliability_curve_dedupes_by_latest_horizon_like_summarize(self):
+        # Two outcome rings for the same analysis_ring at different horizons;
+        # only the later horizon should be counted, matching summarize()'s
+        # existing dedup contract.
+        early = self.scored_outcome_ring(1, score=90, adverse=False)
+        early["payload"]["analysis_ring"] = 500
+        early["payload"]["other_outcomes"]["horizon_seconds"] = 3600
+        late = self.scored_outcome_ring(2, score=90, adverse=True)
+        late["payload"]["analysis_ring"] = 500
+        late["payload"]["other_outcomes"]["horizon_seconds"] = 86400
+        engine = controls.CalibrationEngine(tempfile.mkdtemp())
+        report = engine.reliability_curve([early, late], bins=10)
+        self.assertEqual(report["sample_size"], 1)
+        populated = [b for b in report["bins"] if b["sample_size"]]
+        self.assertEqual(populated[0]["adverse_count"], 1)
+
+    def test_reliability_report_persists_to_disk(self):
+        rings = [self.scored_outcome_ring(i, score=80, adverse=False) for i in range(5)]
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = controls.CalibrationEngine(temp_dir)
+            report = engine.reliability_report(rings, bins=5)
+            self.assertTrue(engine.reliability_path.exists())
+            on_disk = json.loads(engine.reliability_path.read_text(encoding="utf-8"))
+            self.assertEqual(on_disk["sample_size"], report["sample_size"])
 
 
 class TradePermitTests(unittest.TestCase):

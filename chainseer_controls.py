@@ -22,6 +22,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+import chainseer_alerts
+
 
 CONTROL_SCHEMA_VERSION = "1.0"
 PERMIT_VERSION = "1.0"
@@ -727,6 +729,7 @@ class CalibrationEngine:
         self.root = Path(root)
         self.policy_path = self.root / "calibration_policy.json"
         self.proposal_path = self.root / "calibration_proposal.json"
+        self.reliability_path = self.root / "calibration_reliability.json"
 
     def policy(self) -> CalibrationPolicy:
         if not self.policy_path.exists():
@@ -736,13 +739,18 @@ class CalibrationEngine:
         )
 
     @staticmethod
-    def summarize(rings: list[dict[str, Any]]) -> dict[str, Any]:
+    def _latest_outcomes(rings: list[dict[str, Any]]) -> dict[int, dict[str, Any]]:
+        """Dedupe analysis_outcome rings to one per analysis_ring, keeping
+        whichever has the latest (largest) outcome horizon -- a later horizon
+        supersedes an earlier label for the same original analysis. Shared by
+        summarize() (confusion-matrix metrics) and reliability_curve()
+        (score-vs-outcome calibration) so both use identical outcome selection.
+        """
         outcomes = [
             ring
             for ring in rings
             if ring.get("ring_type") == "analysis_outcome"
         ]
-        # A later horizon supersedes an earlier label for the same analysis.
         latest: dict[int, dict[str, Any]] = {}
         for ring in outcomes:
             payload = ring.get("payload") or {}
@@ -762,7 +770,11 @@ class CalibrationEngine:
             )
             if previous is None or horizon >= previous_horizon:
                 latest[analysis_ring] = ring
+        return latest
 
+    @staticmethod
+    def summarize(rings: list[dict[str, Any]]) -> dict[str, Any]:
+        latest = CalibrationEngine._latest_outcomes(rings)
         tp = fp = tn = fn = 0
         market_returns = []
         for ring in latest.values():
@@ -805,6 +817,152 @@ class CalibrationEngine:
             "market_return_samples": len(market_returns),
             "security_and_market_labels_separated": True,
         }
+
+    @staticmethod
+    def reliability_curve(
+        rings: list[dict[str, Any]], *, bins: int = 10
+    ) -> dict[str, Any]:
+        """Bucket each analysis's predicted legitimacy_score against whether
+        an adverse security event was later observed, so a score of "80" can
+        be checked against what actually happened to the tokens that scored
+        near 80 -- not just whether the current policy's single threshold
+        looks right in aggregate (that's what summarize()/propose() already
+        do). This is a reliability diagram plus a Brier score, not a
+        replacement for the tighten-only confusion-matrix policy: it never
+        changes calibration_policy.json by itself.
+
+        Score -> "predicted probability the token stays safe" is score/100.
+        The event scored by Brier is the adverse outcome, so predicted
+        probability of THAT event is 1 - score/100. A well-calibrated agent's
+        bins should show observed_safe_rate close to mean_predicted_safe_pct
+        in every bin; a bin where the gap is large and sample_size is
+        non-trivial is where the agent is over- or under-confident.
+        """
+        latest = CalibrationEngine._latest_outcomes(rings)
+        samples: list[tuple[float, bool]] = []
+        for ring in latest.values():
+            payload = ring.get("payload") or {}
+            calibration = payload.get("calibration") or {}
+            score = calibration.get("original_legitimacy_score")
+            if score is None:
+                continue
+            score = _safe_float(score, -1.0)
+            if score < 0 or score > 100:
+                continue
+            adverse = bool(calibration.get("adverse_security_event"))
+            samples.append((score, adverse))
+
+        bins = max(1, int(bins))
+        width = 100.0 / bins
+        buckets: list[dict[str, Any]] = [
+            {
+                "bin_index": i,
+                "score_range": [round(i * width, 1), round((i + 1) * width, 1)],
+                "sample_size": 0,
+                "adverse_count": 0,
+                "mean_predicted_score": None,
+                "observed_safe_rate": None,
+                "mean_predicted_safe_pct": None,
+                "calibration_gap_pct": None,
+            }
+            for i in range(bins)
+        ]
+        for score, adverse in samples:
+            index = min(bins - 1, int(score // width))
+            bucket = buckets[index]
+            bucket["sample_size"] += 1
+            bucket["adverse_count"] += 1 if adverse else 0
+            bucket.setdefault("_score_sum", 0.0)
+            bucket["_score_sum"] += score
+
+        for bucket in buckets:
+            n = bucket.pop("sample_size")
+            score_sum = bucket.pop("_score_sum", 0.0)
+            adverse_count = bucket["adverse_count"]
+            bucket["sample_size"] = n
+            if n == 0:
+                continue
+            mean_score = score_sum / n
+            observed_safe_rate = 1.0 - (adverse_count / n)
+            bucket["mean_predicted_score"] = round(mean_score, 2)
+            bucket["observed_safe_rate"] = round(observed_safe_rate, 4)
+            bucket["mean_predicted_safe_pct"] = round(mean_score, 2)
+            bucket["calibration_gap_pct"] = round(
+                mean_score - (observed_safe_rate * 100), 2
+            )
+
+        total = len(samples)
+        if total == 0:
+            brier_score = None
+            baseline_brier_score = None
+            skill_vs_naive_baseline = None
+        else:
+            base_rate_adverse = sum(1 for _, adverse in samples if adverse) / total
+            brier_score = round(
+                sum(
+                    ((1.0 - score / 100.0) - (1.0 if adverse else 0.0)) ** 2
+                    for score, adverse in samples
+                )
+                / total,
+                4,
+            )
+            # A naive predictor that always outputs the observed base rate,
+            # for context: an agent whose Brier score is not meaningfully
+            # better than this baseline is not adding predictive skill, no
+            # matter how confident-looking its individual scores are.
+            baseline_brier_score = round(
+                sum(
+                    (base_rate_adverse - (1.0 if adverse else 0.0)) ** 2
+                    for _, adverse in samples
+                )
+                / total,
+                4,
+            )
+            skill_vs_naive_baseline = (
+                round(1.0 - (brier_score / baseline_brier_score), 4)
+                if baseline_brier_score
+                else None
+            )
+
+        largest_gap = max(
+            (b for b in buckets if b["sample_size"] > 0),
+            key=lambda b: abs(b["calibration_gap_pct"] or 0.0),
+            default=None,
+        )
+        return {
+            "schema_version": CONTROL_SCHEMA_VERSION,
+            "sample_size": total,
+            "bins": buckets,
+            "brier_score": brier_score,
+            "baseline_brier_score": baseline_brier_score,
+            "skill_vs_naive_baseline": skill_vs_naive_baseline,
+            "most_miscalibrated_bin": (
+                {
+                    "score_range": largest_gap["score_range"],
+                    "sample_size": largest_gap["sample_size"],
+                    "calibration_gap_pct": largest_gap["calibration_gap_pct"],
+                }
+                if largest_gap is not None
+                else None
+            ),
+            "interpretation": (
+                "brier_score: 0=perfect, 0.25=uninformative on a balanced "
+                "sample, 1=worst possible. skill_vs_naive_baseline: fraction "
+                "of the naive constant-prediction error this agent removes; "
+                "<=0 means the score is not adding predictive value over "
+                "just guessing the historical adverse-event rate. "
+                "calibration_gap_pct: mean_predicted_score minus "
+                "observed_safe_rate*100 per bin -- positive means "
+                "overconfident (score implies safer than reality), negative "
+                "means underconfident."
+            ),
+            "created_at": utc_now_iso(),
+        }
+
+    def reliability_report(self, rings: list[dict[str, Any]], *, bins: int = 10) -> dict[str, Any]:
+        report = self.reliability_curve(rings, bins=bins)
+        _atomic_write_json(self.reliability_path, report)
+        return report
 
     def propose(self, rings: list[dict[str, Any]]) -> dict[str, Any]:
         policy = self.policy()
@@ -868,6 +1026,29 @@ class CalibrationEngine:
             set(current.allowed_risk_levels)
         ):
             raise ValueError("calibration adoption cannot broaden allowed risks")
+        # propose() never touches these fields, but adopt() takes an
+        # arbitrary proposal file path (not something bound to propose()'s
+        # own output), so a hand-edited proposal must still be rejected if it
+        # loosens any dimension TradePermitGuard relies on for freshness or
+        # data-quality, not just the two fields checked above.
+        if proposed.max_false_negative_rate > current.max_false_negative_rate:
+            raise ValueError(
+                "calibration adoption cannot raise max_false_negative_rate"
+            )
+        if proposed.min_outcomes < current.min_outcomes:
+            raise ValueError("calibration adoption cannot lower min_outcomes")
+        if proposed.max_permit_block_drift > current.max_permit_block_drift:
+            raise ValueError(
+                "calibration adoption cannot raise max_permit_block_drift"
+            )
+        if proposed.max_quote_age_blocks > current.max_quote_age_blocks:
+            raise ValueError(
+                "calibration adoption cannot raise max_quote_age_blocks"
+            )
+        if proposed.permit_ttl_seconds > current.permit_ttl_seconds:
+            raise ValueError(
+                "calibration adoption cannot raise permit_ttl_seconds"
+            )
         metrics = proposal.get("metrics") or {}
         if _safe_int(metrics.get("sample_size")) < current.min_outcomes:
             raise ValueError("calibration adoption lacks the required outcomes")
@@ -1129,6 +1310,15 @@ class TradePermitGuard:
             permit.get("max_block_drift")
         ):
             reasons.append("permit block drift exceeded")
+        # A stored ring_hash field is only meaningful if the chain it lives in
+        # is actually intact: without this, an attacker able to write
+        # rings.jsonl could append one fabricated trade_permit ring with any
+        # self-consistent hash and pass every check below. Recomputing and
+        # walking the whole chain is the same cost as tc.load() below plus a
+        # hash per ring, and this guard is not on the analysis hot path.
+        chain_ok, _chain_report = self.agent.tc.verify()
+        if not chain_ok:
+            reasons.append("timechain integrity check failed")
         rings = self.agent.tc.load()
         ring = next(
             (
@@ -1141,6 +1331,9 @@ class TradePermitGuard:
         )
         if ring is None:
             reasons.append("permit ring unavailable")
+        elif not chain_ok:
+            pass  # already refused above; an unverified chain cannot be
+            # trusted to confirm this ring's hash or its binding to the permit
         elif ring.get("ring_hash") != permit.get("permit_ring_hash"):
             reasons.append("permit ring hash mismatch")
         elif (ring.get("payload") or {}).get("permit_hash") != permit.get(
@@ -1398,6 +1591,7 @@ class ChainseerWatcher:
                             "block": int(last),
                             "observed_at": utc_now_iso(now),
                         }
+                        alert["timechain"] = self._seal_transition(alert)
                         self.store.append_alert(alert)
                         summary["alerts"] += 1
                         subscription["last_processed_block"] = max(
@@ -1524,6 +1718,24 @@ class ChainseerWatcher:
                         alert["timechain"] = self._seal_transition(alert)
                         self.store.append_alert(alert)
                         summary["alerts"] += 1
+                        if new_stops:
+                            # Best-effort external push (Discord/Slack/Telegram/
+                            # generic webhook). No-ops unless
+                            # CHAINSEER_ALERT_WEBHOOK_URL is configured, and
+                            # never raises into the watcher loop -- see
+                            # chainseer_alerts.py for the fail-open contract.
+                            chainseer_alerts.send_alert(
+                                {
+                                    "summary": f"{token}: new hard stop(s) "
+                                    + ",".join(new_stops),
+                                    "hard_stops": new_stops,
+                                    "reason": alert["reason"],
+                                    "block": safe_block,
+                                },
+                                chain="robinhood",
+                                token_address=token,
+                                event_type="hard_stop",
+                            )
 
                 block_info = self._block(safe_block)
                 subscription["last_processed_block"] = safe_block
@@ -1586,6 +1798,8 @@ def main() -> None:
     )
     calibration_commands.add_parser("status")
     calibration_commands.add_parser("propose")
+    reliability = calibration_commands.add_parser("reliability")
+    reliability.add_argument("--bins", type=int, default=10)
     adopt = calibration_commands.add_parser("adopt")
     adopt.add_argument("proposal")
 
@@ -1640,12 +1854,18 @@ def main() -> None:
                 return
         elif args.command == "calibration":
             if args.calibration_command == "status":
+                rings = agent.tc.load()
                 result = {
                     "policy": asdict(watcher.calibration.policy()),
-                    "metrics": watcher.calibration.summarize(agent.tc.load()),
+                    "metrics": watcher.calibration.summarize(rings),
+                    "reliability": watcher.calibration.reliability_curve(rings),
                 }
             elif args.calibration_command == "propose":
                 result = watcher.calibration.propose(agent.tc.load())
+            elif args.calibration_command == "reliability":
+                result = watcher.calibration.reliability_report(
+                    agent.tc.load(), bins=args.bins
+                )
             else:
                 result = watcher.calibration.adopt(
                     _load_json_argument(args.proposal), agent

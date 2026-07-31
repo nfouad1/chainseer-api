@@ -118,37 +118,18 @@ PONS_FACTORY_BY_ADDRESS = {
 }
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _canonical_json(value) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _atomic_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, default=str), encoding="utf-8"
-    )
-    os.replace(temporary, path)
-
-
-def _read_json(path: Path, default):
-    try:
-        # Windows PowerShell 5.1's `-Encoding utf8` writes a BOM. utf-8-sig
-        # accepts those scheduler files and ordinary UTF-8 application files.
-        return json.loads(path.read_text(encoding="utf-8-sig"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default
-
-
-def _safe_float(value, default=0.0):
-    try:
-        return float(value)
-    except (TypeError, ValueError, OverflowError):
-        return default
+from chainseer_core import (
+    utc_now as _utc_now,
+    canonical_json as _canonical_json,
+    safe_float as _safe_float,
+    atomic_json_write as _atomic_json,
+    read_json as _read_json,
+)
+# _canonical_json/_atomic_json/_read_json/_safe_float/_utc_now moved to
+# chainseer_core.py (shared with chainseer_base.py / chainseer_solana.py).
+# _canonical_json here keeps its original ensure_ascii=True, default=str
+# behavior (chainseer_core's defaults) so historical event_hash values in this
+# adapter's ledger keep re-verifying. Do not add ensure_ascii=False here.
 
 
 def _percentile(values: Iterable[float], quantile: float) -> float | None:

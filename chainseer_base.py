@@ -83,19 +83,19 @@ SENTIENT_STATUS = 2
 ZERO_ADDRESS = "0x" + "0" * 40
 
 
-def _utc_now() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
-def _canonical_json(value) -> str:
-    return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
-
-
-def _safe_float(value, default=0.0) -> float:
-    try:
-        return float(value)
-    except (TypeError, ValueError):
-        return default
+from chainseer_core import (
+    utc_now as _utc_now,
+    canonical_json as _canonical_json,
+    safe_float as _safe_float,
+    safe_int as _safe_int,
+    atomic_json_write as _atomic_json,
+    read_json as _read_json,
+)
+# _canonical_json/_atomic_json/_read_json/_safe_float/_safe_int/_utc_now moved
+# to chainseer_core.py (shared with chainseer_solana.py / chainseer_pons.py).
+# _canonical_json here keeps its original ensure_ascii=True, default=str
+# behavior (chainseer_core's defaults) so historical event_hash values in this
+# adapter's ledger keep re-verifying. Do not add ensure_ascii=False here.
 
 
 def _timestamp_seconds(value) -> float | None:
@@ -109,29 +109,8 @@ def _timestamp_seconds(value) -> float | None:
         return None
 
 
-def _safe_int(value, default=0) -> int | None:
-    try:
-        return int(value)
-    except (TypeError, ValueError):
-        return default
-
-
 def _flag(value) -> bool:
     return str(value).strip().lower() in {"1", "true", "yes"}
-
-
-def _atomic_json(path: Path, value) -> None:
-    path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(json.dumps(value, indent=2, sort_keys=True), encoding="utf-8")
-    os.replace(temporary, path)
-
-
-def _read_json(path: Path, default=None):
-    try:
-        return json.loads(path.read_text(encoding="utf-8"))
-    except (FileNotFoundError, json.JSONDecodeError, OSError):
-        return default
 
 
 @dataclass(frozen=True)

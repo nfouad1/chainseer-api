@@ -104,6 +104,7 @@
     .stat-note { margin-top: 9px; color: var(--dim); font-size: 11px; }
     .positive { color: var(--mint) !important; }
     .negative { color: var(--red) !important; }
+    .warning { color: var(--amber) !important; }
     .neutral { color: var(--ink) !important; }
     .grid { display: grid; grid-template-columns: minmax(0,1.45fr) minmax(340px,.55fr); gap: 20px; margin-bottom: 20px; }
     .panel { padding: 24px; }
@@ -176,6 +177,13 @@
     .policy-name { font:10px var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .policy-metric { text-align:right; font:10px var(--mono); color:var(--muted); }
     .recommendation { margin-top:13px; padding:12px 13px; border-radius:10px; border:1px solid rgba(255,203,102,.16); background:rgba(255,203,102,.035); color:var(--muted); font-size:11px; line-height:1.5; }
+    .verdict { margin-bottom:20px; }
+    .verdict-reasons { list-style:none; margin:12px 0 0; padding:0; display:flex; flex-wrap:wrap; gap:8px; }
+    .verdict-reasons li { padding:6px 10px; border:1px solid rgba(255,255,255,.06); border-radius:8px; background:rgba(0,0,0,.15); color:var(--muted); font:10px var(--mono); }
+    details.disclosure { margin-top:14px; }
+    details.disclosure > summary { cursor:pointer; color:var(--muted); font:9px var(--mono); letter-spacing:.06em; text-transform:uppercase; padding:8px 0; }
+    details.disclosure > summary:hover { color:var(--ink); }
+    details.disclosure[open] > summary { margin-bottom:6px; }
     footer { display:flex; justify-content:space-between; gap:20px; padding-top:5px; color:var(--dim); font:10px/1.6 var(--mono); }
     @media (max-width: 1050px) {
       .hero, .grid { grid-template-columns:1fr; }
@@ -215,6 +223,16 @@
         <button class="refresh" id="refresh" type="button">↻ REFRESH</button>
       </div>
     </header>
+
+    <section class="panel verdict" id="verdict-banner" aria-label="Top-line status">
+      <div class="panel-head">
+        <div>
+          <span class="status" id="verdict-status"><span class="dot" id="verdict-dot"></span><span id="verdict-label">CHECKING</span></span>
+          <h2 id="verdict-headline" style="margin-top:8px">Loading learner status…</h2>
+        </div>
+      </div>
+      <ul id="verdict-reasons" class="verdict-reasons"></ul>
+    </section>
 
     <section class="hero">
       <article class="hero-main">
@@ -322,16 +340,19 @@
 
     <section class="panel" style="margin-bottom:20px">
       <div class="panel-head"><div><h2>Evidence & integrity path</h2><div class="sub">Each layer is checked independently on refresh</div></div><span class="status"><span class="dot" id="integrity-dot"></span><span id="integrity-label">CHECKING</span></span></div>
-      <div class="integrity">
-        <div class="node"><div class="node-top"><span class="node-name">Factory catalog</span><span class="dot" id="catalog-dot"></span></div><div class="node-value" id="catalog-node">—</div><div class="node-note">Canonical launch events</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Paper ledger</span><span class="dot" id="paper-dot"></span></div><div class="node-value" id="paper-events">—</div><div class="node-note" id="paper-report">Hash-linked events</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Shadow ledger</span><span class="dot" id="shadow-dot"></span></div><div class="node-value" id="shadow-events">—</div><div class="node-note" id="shadow-report">Hash-linked events</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Admission</span><span class="dot" id="admission-integrity-dot"></span></div><div class="node-value" id="admission-node">—</div><div class="node-note" id="admission-report">Quarantine state</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Policy lab</span><span class="dot" id="policy-integrity-dot"></span></div><div class="node-value" id="policy-node">—</div><div class="node-note" id="policy-report">Human-gated learner</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Managed paper</span><span class="dot" id="managed-integrity-dot"></span></div><div class="node-value" id="managed-node">—</div><div class="node-note" id="managed-report">Portfolio breakers</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Timechain</span><span class="dot" id="chain-dot"></span></div><div class="node-value" id="chain-node">—</div><div class="node-note" id="chain-report">Tamper-evident rings</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Faculties</span><span class="dot" id="faculty-dot"></span></div><div class="node-value" id="faculty-node">—</div><div class="node-note">Registry integrity</div></div>
-      </div>
+      <details class="disclosure">
+        <summary>Show all 8 integrity layers</summary>
+        <div class="integrity">
+          <div class="node"><div class="node-top"><span class="node-name">Factory catalog</span><span class="dot" id="catalog-dot"></span></div><div class="node-value" id="catalog-node">—</div><div class="node-note">Canonical launch events</div></div>
+          <div class="node"><div class="node-top"><span class="node-name">Paper ledger</span><span class="dot" id="paper-dot"></span></div><div class="node-value" id="paper-events">—</div><div class="node-note" id="paper-report">Hash-linked events</div></div>
+          <div class="node"><div class="node-top"><span class="node-name">Shadow ledger</span><span class="dot" id="shadow-dot"></span></div><div class="node-value" id="shadow-events">—</div><div class="node-note" id="shadow-report">Hash-linked events</div></div>
+          <div class="node"><div class="node-top"><span class="node-name">Admission</span><span class="dot" id="admission-integrity-dot"></span></div><div class="node-value" id="admission-node">—</div><div class="node-note" id="admission-report">Quarantine state</div></div>
+          <div class="node"><div class="node-top"><span class="node-name">Policy lab</span><span class="dot" id="policy-integrity-dot"></span></div><div class="node-value" id="policy-node">—</div><div class="node-note" id="policy-report">Human-gated learner</div></div>
+          <div class="node"><div class="node-top"><span class="node-name">Managed paper</span><span class="dot" id="managed-integrity-dot"></span></div><div class="node-value" id="managed-node">—</div><div class="node-note" id="managed-report">Portfolio breakers</div></div>
+          <div class="node"><div class="node-top"><span class="node-name">Timechain</span><span class="dot" id="chain-dot"></span></div><div class="node-value" id="chain-node">—</div><div class="node-note" id="chain-report">Tamper-evident rings</div></div>
+          <div class="node"><div class="node-top"><span class="node-name">Faculties</span><span class="dot" id="faculty-dot"></span></div><div class="node-value" id="faculty-node">—</div><div class="node-note">Registry integrity</div></div>
+        </div>
+      </details>
     </section>
 
     <section class="grid">
@@ -457,7 +478,44 @@
       setDot("managed-integrity-dot", String(integrity.managed_portfolio || "").toLowerCase().includes("verified"));
     }
 
+    function renderVerdict(data) {
+      const integrity=data.integrity || {};
+      const managed=data.managed_portfolio || {};
+      const admission=data.admission || {};
+      const shadow=data.shadow || {};
+      const schedule=data.schedule || {}; const scheduler=data.scheduler || {};
+      const learnerEnabled=schedule.installed && schedule.enabled !== false;
+      const reasons=[];
+      let level, headline;
+
+      if (integrity.ok === false) {
+        level="negative";
+        headline="Attention needed — an integrity check is failing (Timechain, ledger, or registry).";
+        reasons.push("run `verify` before trusting new state");
+      } else if (!schedule.installed) {
+        level="warning";
+        headline="Learner not installed — no scheduled discovery/admission cycle is running.";
+      } else if (!learnerEnabled) {
+        level="warning";
+        headline="Learner paused — install is present but the schedule is disabled.";
+      } else {
+        level="positive";
+        headline=`Learning normally — ${number(data.catalog_size)} launches indexed, all integrity checks pass.`;
+      }
+      reasons.push(learnerEnabled ? `learner every ${schedule.interval_minutes || "?"}m` : "learner not running");
+      reasons.push(`${number(admission.ready||0)} ready / ${number(admission.pending||0)} pending admission`);
+      reasons.push(`${number(shadow.open)} open / ${number(shadow.closed)} closed shadow positions`);
+      reasons.push(managed.allowed ? "managed paper entry armed" : `managed paper paused${(managed.blockers||[]).length ? ` (${managed.blockers.length} blocker${managed.blockers.length===1?"":"s"})` : ""}`);
+
+      $("verdict-headline").textContent=headline;
+      $("verdict-label").textContent=level.toUpperCase();
+      $("verdict-label").parentElement.className=`status ${level}`;
+      setDot("verdict-dot", level==="positive" ? true : level==="negative" ? false : null);
+      $("verdict-reasons").innerHTML=reasons.map(r=>`<li>${esc(r)}</li>`).join("");
+    }
+
     function render(data) {
+      renderVerdict(data);
       const shadow=data.shadow || {}; const integrity=data.integrity || {}; const chain=(integrity.timechain || {});
       const scheduler=data.scheduler || {}; const schedule=data.schedule || {}; const learning=data.learning || {};
       const guard=data.guard || {}; const guardSchedule=data.guard_schedule || {}; const guardScheduler=data.guard_scheduler || {};

@@ -11,13 +11,25 @@ from unittest.mock import patch
 
 # The desktop test runtime does not bundle requests. Provide only the import
 # surface needed by the mocked tests; production still requires real requests.
-if "requests" not in sys.modules:
+#
+# IMPORTANT: only install this stub if requests genuinely cannot be imported.
+# The previous guard (`if "requests" not in sys.modules`) was order-dependent:
+# in a combined test run (e.g. `python -m unittest discover`), whichever test
+# module happens to import first decides whether the REAL requests package or
+# this incomplete stub ends up cached in sys.modules for every other test
+# module in the same process -- including ones (like chainseer_alerts.py's
+# `requests.post`) that need the real library and don't mock it themselves.
+try:
+    import requests as _real_requests  # noqa: F401
+except ImportError:
     requests_stub = types.ModuleType("requests")
     requests_stub.Session = lambda: types.SimpleNamespace(headers={})
     requests_stub.get = lambda *args, **kwargs: None
+    requests_stub.post = lambda *args, **kwargs: None
     requests_stub.exceptions = types.SimpleNamespace(
         ConnectionError=ConnectionError,
         Timeout=TimeoutError,
+        RequestException=Exception,
     )
     sys.modules["requests"] = requests_stub
 

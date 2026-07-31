@@ -26,7 +26,7 @@ RUN python -m zipfile -e /tmp/cypher-tempre.zip /tmp/cypher-tempre \
     && test -f /opt/cypher-tempre-self-model/timechain.py \
     && test -f /opt/cypher-tempre-self-model/poq.py
 
-COPY chainseer.py chainseer_controls.py chainseer_api.py ./
+COPY chainseer.py chainseer_core.py chainseer_alerts.py chainseer_controls.py chainseer_api.py ./
 
 RUN useradd --create-home --uid 10001 chainseer \
     && mkdir -p /data/chainseer_chain \
