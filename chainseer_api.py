@@ -31,14 +31,48 @@ from urllib.parse import urlparse
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.middleware.trustedhost import TrustedHostMiddleware
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import JSONResponse
 
 from chainseer import Chainseer
-from chainseer_controls import ChainseerWatcher, WatchConfig
+from chainseer_base_public import BasePublicAnalyzer
+from chainseer_benchmark import (
+    append_observation,
+    build_observation_from_report,
+    case_bank_status,
+    load_jsonl,
+)
+from chainseer_controls import (
+    ChainseerWatcher,
+    SolanaEventWatcher,
+    SolanaWatchConfig,
+    WatchConfig,
+    credential_safe_error,
+)
+from chainseer_solana_public import (
+    SolanaMintError,
+    SolanaPublicAnalyzer,
+    validate_solana_mint,
+)
 
 LOGGER = logging.getLogger("chainseer.api")
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+SUPPORTED_NETWORKS = {"robinhood", "base", "solana"}
+EVM_NETWORKS = {"robinhood", "base"}
+
+
+def deterministic_benchmark_split(network: str, address: str) -> str:
+    """Keep every observation for one token in the same leakage-safe split."""
+    normalized = address.lower() if network in EVM_NETWORKS else address
+    digest = hashlib.sha256(
+        f"chainseer-benchmark-v1:{network}:{normalized}".encode("utf-8")
+    ).digest()
+    bucket = int.from_bytes(digest[:4], "big") % 100
+    if bucket < 60:
+        return "train"
+    if bucket < 80:
+        return "validation"
+    return "test"
 
 
 def _env_int(name: str, default: int, minimum: int, maximum: int) -> int:
@@ -143,6 +177,21 @@ class Settings:
             "CHAINSEER_SHUTDOWN_GRACE_SECONDS", 180, 10, 900
         )
     )
+    base_rpc_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BASE_RPC_URL",
+            "https://mainnet.base.org",
+        )
+    )
+    solana_rpc_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_SOLANA_RPC_URL",
+            "https://api.mainnet-beta.solana.com",
+        )
+    )
+    jupiter_api_key: str = field(
+        default_factory=lambda: os.environ.get("JUPITER_API_KEY", "")
+    )
     watcher_enabled: bool = field(
         default_factory=lambda: _env_bool(
             "CHAINSEER_WATCHER_ENABLED", False
@@ -158,6 +207,42 @@ class Settings:
             "CHAINSEER_WATCHER_CONFIRMATIONS", 2, 0, 100
         )
     )
+    benchmark_capture_enabled: bool = field(
+        default_factory=lambda: _env_bool(
+            "CHAINSEER_BENCHMARK_CAPTURE_ENABLED", False
+        )
+    )
+    benchmark_root: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BENCHMARK_ROOT",
+            str(Path(__file__).resolve().parent / "benchmark_data"),
+        )
+    )
+    benchmark_analyzer_version: str = field(
+        default_factory=lambda: (
+            os.environ.get("CHAINSEER_BENCHMARK_ANALYZER_VERSION", "").strip()
+            or os.environ.get("RENDER_GIT_COMMIT", "").strip()
+            or "local-unversioned"
+        )
+    )
+    benchmark_robinhood_cohort: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BENCHMARK_ROBINHOOD_COHORT",
+            "robinhood_public_analysis",
+        ).strip()
+    )
+    benchmark_solana_cohort: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BENCHMARK_SOLANA_COHORT",
+            "solana_public_analysis",
+        ).strip()
+    )
+    benchmark_base_cohort: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_BENCHMARK_BASE_COHORT",
+            "base_public_analysis",
+        ).strip()
+    )
 
     def validate(self) -> None:
         if self.environment not in {"development", "test", "production"}:
@@ -167,6 +252,19 @@ class Settings:
         rpc = urlparse(self.rpc_url)
         if rpc.scheme not in {"http", "https"} or not rpc.hostname:
             raise RuntimeError("CHAINSEER_RPC_URL must be an HTTP(S) URL")
+        base_rpc = urlparse(self.base_rpc_url)
+        if base_rpc.scheme not in {"http", "https"} or not base_rpc.hostname:
+            raise RuntimeError(
+                "CHAINSEER_BASE_RPC_URL must be an HTTP(S) URL"
+            )
+        solana_rpc = urlparse(self.solana_rpc_url)
+        if (
+            solana_rpc.scheme not in {"http", "https"}
+            or not solana_rpc.hostname
+        ):
+            raise RuntimeError(
+                "CHAINSEER_SOLANA_RPC_URL must be an HTTP(S) URL"
+            )
         for origin in self.allowed_origins:
             parsed = urlparse(origin)
             if (
@@ -192,6 +290,14 @@ class Settings:
                 raise RuntimeError(
                     "CHAINSEER_RPC_URL must use HTTPS in production"
                 )
+            if base_rpc.scheme != "https":
+                raise RuntimeError(
+                    "CHAINSEER_BASE_RPC_URL must use HTTPS in production"
+                )
+            if solana_rpc.scheme != "https":
+                raise RuntimeError(
+                    "CHAINSEER_SOLANA_RPC_URL must use HTTPS in production"
+                )
             if not Path(self.chain_root).is_absolute():
                 raise RuntimeError(
                     "CHAINSEER_CHAIN_ROOT must be absolute in production"
@@ -212,30 +318,86 @@ class Settings:
                 raise RuntimeError(
                     "Wildcard or empty trusted hosts are forbidden in production"
                 )
+            if self.benchmark_capture_enabled:
+                if not Path(self.benchmark_root).is_absolute():
+                    raise RuntimeError(
+                        "CHAINSEER_BENCHMARK_ROOT must be absolute in production"
+                    )
+                if self.benchmark_analyzer_version == "local-unversioned":
+                    raise RuntimeError(
+                        "Benchmark capture requires RENDER_GIT_COMMIT or "
+                        "CHAINSEER_BENCHMARK_ANALYZER_VERSION in production"
+                    )
+        if self.benchmark_capture_enabled:
+            if not self.benchmark_robinhood_cohort:
+                raise RuntimeError(
+                    "CHAINSEER_BENCHMARK_ROBINHOOD_COHORT is required"
+                )
+            if not self.benchmark_solana_cohort:
+                raise RuntimeError(
+                    "CHAINSEER_BENCHMARK_SOLANA_COHORT is required"
+                )
+            if not self.benchmark_base_cohort:
+                raise RuntimeError(
+                    "CHAINSEER_BENCHMARK_BASE_COHORT is required"
+                )
+            benchmark_path = Path(self.benchmark_root).resolve()
+            chain_path = Path(self.chain_root).resolve()
+            try:
+                benchmark_path.relative_to(chain_path)
+            except ValueError:
+                pass
+            else:
+                raise RuntimeError(
+                    "CHAINSEER_BENCHMARK_ROOT must not be inside "
+                    "CHAINSEER_CHAIN_ROOT"
+                )
 
 
 class AnalyzeRequest(BaseModel):
-    address: str = Field(min_length=42, max_length=42)
+    network: str = Field(default="robinhood", min_length=4, max_length=16)
+    address: str = Field(min_length=32, max_length=44)
 
-    @field_validator("address")
+    @field_validator("network")
     @classmethod
-    def validate_address(cls, value: str) -> str:
-        value = value.strip()
-        if not ADDRESS_RE.fullmatch(value):
-            raise ValueError("invalid EVM contract address")
-        return value
+    def validate_network(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in SUPPORTED_NETWORKS:
+            raise ValueError("unsupported analysis network")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_address_for_network(self):
+        self.address = self.address.strip()
+        if self.network in EVM_NETWORKS:
+            if not ADDRESS_RE.fullmatch(self.address):
+                raise ValueError("invalid EVM contract address")
+        else:
+            validate_solana_mint(self.address)
+        return self
 
 
 class WatchRequest(BaseModel):
-    address: str = Field(min_length=42, max_length=42)
+    network: str = Field(default="robinhood", min_length=4, max_length=16)
+    address: str = Field(min_length=32, max_length=44)
 
-    @field_validator("address")
+    @field_validator("network")
     @classmethod
-    def validate_address(cls, value: str) -> str:
-        value = value.strip()
-        if not ADDRESS_RE.fullmatch(value):
-            raise ValueError("invalid EVM contract address")
-        return value
+    def validate_network(cls, value: str) -> str:
+        normalized = value.strip().lower()
+        if normalized not in SUPPORTED_NETWORKS:
+            raise ValueError("unsupported watch network")
+        return normalized
+
+    @model_validator(mode="after")
+    def validate_address_for_network(self):
+        self.address = self.address.strip()
+        if self.network in EVM_NETWORKS:
+            if not ADDRESS_RE.fullmatch(self.address):
+                raise ValueError("invalid EVM contract address")
+        else:
+            validate_solana_mint(self.address)
+        return self
 
 
 class JobAccepted(BaseModel):
@@ -248,11 +410,13 @@ class JobAccepted(BaseModel):
 class Job:
     id: str
     address: str
+    network: str = "robinhood"
     status: str = "queued"
     created_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
     result: dict[str, Any] | None = None
+    benchmark_capture: dict[str, Any] | None = None
     error_code: str | None = None
     error_message: str | None = None
 
@@ -260,11 +424,13 @@ class Job:
         return {
             "job_id": self.id,
             "address": self.address,
+            "network": self.network,
             "status": self.status,
             "created_at": _iso(self.created_at),
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
             "result": self.result,
+            "benchmark_capture": self.benchmark_capture,
             "error": (
                 {
                     "code": self.error_code,
@@ -280,6 +446,134 @@ def _iso(value: float | None) -> str | None:
     if value is None:
         return None
     return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+
+class BenchmarkCaptureRecorder:
+    """Append fresh analysis predictions to the durable benchmark ledger."""
+
+    def __init__(self, settings: Settings):
+        self.settings = settings
+        self.enabled = settings.benchmark_capture_enabled
+        self.root = Path(settings.benchmark_root)
+        self.observations_path = self.root / "observations-v1.jsonl"
+        self.outcomes_path = self.root / "outcomes-v1.jsonl"
+        self._lock = threading.Lock()
+        self._summary: dict[str, Any] = {
+            "enabled": self.enabled,
+            "state": "disabled" if not self.enabled else "initializing",
+            "last_capture_at": None,
+            "last_error": None,
+        }
+        if self.enabled:
+            self._initialize()
+
+    def _initialize(self) -> None:
+        try:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self._refresh_summary()
+        except Exception as exc:
+            LOGGER.exception("Benchmark capture storage initialization failed")
+            self._summary = {
+                "enabled": True,
+                "state": "degraded",
+                "last_capture_at": None,
+                "last_error": {
+                    "at": datetime.now(timezone.utc).isoformat(),
+                    "code": "benchmark_storage_unavailable",
+                    "error_type": type(exc).__name__,
+                },
+            }
+
+    def _refresh_summary(self) -> None:
+        ledger = case_bank_status(
+            load_jsonl(self.observations_path),
+            load_jsonl(self.outcomes_path),
+        )
+        self._summary = {
+            "enabled": True,
+            "state": "ready",
+            "last_capture_at": self._summary.get("last_capture_at"),
+            "last_error": None,
+            **ledger,
+        }
+
+    def capture(
+        self,
+        job: Job,
+        public_report: dict[str, Any],
+        *,
+        captured_at: str | None = None,
+    ) -> dict[str, Any]:
+        if not self.enabled:
+            return {"status": "disabled"}
+        cohort = {
+            "robinhood": self.settings.benchmark_robinhood_cohort,
+            "base": self.settings.benchmark_base_cohort,
+            "solana": self.settings.benchmark_solana_cohort,
+        }[job.network]
+        split = deterministic_benchmark_split(job.network, job.address)
+        latency_ms = max(
+            0.0,
+            (time.time() - (job.started_at or time.time())) * 1000,
+        )
+        try:
+            with self._lock:
+                observation = build_observation_from_report(
+                    public_report,
+                    cohort=cohort,
+                    split=split,
+                    analyzer="chainseer",
+                    analyzer_version=(
+                        self.settings.benchmark_analyzer_version
+                    ),
+                    latency_ms=latency_ms,
+                    captured_at=captured_at,
+                )
+                append_observation(
+                    self.observations_path,
+                    observation,
+                )
+                captured_timestamp = datetime.now(timezone.utc).isoformat()
+                self._summary["last_capture_at"] = captured_timestamp
+                self._refresh_summary()
+            return {
+                "status": "captured",
+                "case_id": observation["case_id"],
+                "observation_hash": observation["observation_hash"],
+                "split": observation["split"],
+                "cohort": observation["cohort"],
+                "analyzer_version": observation["analyzer_version"],
+            }
+        except Exception as exc:
+            # Benchmark telemetry is intentionally non-critical: an unforeseen
+            # recorder defect must never turn a valid analysis into a failed job.
+            LOGGER.exception(
+                "Benchmark observation capture failed",
+                extra={"job_id": job.id, "network": job.network},
+            )
+            with self._lock:
+                self._summary = {
+                    **self._summary,
+                    "enabled": True,
+                    "state": "degraded",
+                    "last_error": {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "code": "benchmark_capture_failed",
+                        "error_type": type(exc).__name__,
+                    },
+                }
+            return {
+                "status": "failed",
+                "error": "benchmark_capture_failed",
+            }
+
+    def status(self) -> dict[str, Any]:
+        with self._lock:
+            return json.loads(json.dumps(self._summary))
+
+    def health_status(self) -> dict[str, Any]:
+        """Return the latest immutable-enough snapshot without blocking probes."""
+        return dict(self._summary)
 
 
 class SlidingWindowRateLimiter:
@@ -314,15 +608,24 @@ class AnalysisService:
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
         self._agent: Chainseer | None = None
+        self._base_agent: BasePublicAnalyzer | None = None
+        self._solana_agent: SolanaPublicAnalyzer | None = None
         self._stopping = threading.Event()
         self._ready = threading.Event()
         self._watch_lock = threading.Lock()
         self._watcher: ChainseerWatcher | None = None
+        self._base_watcher: ChainseerWatcher | None = None
+        self._solana_watcher: SolanaEventWatcher | None = None
         self._watcher_status: dict[str, Any] = {
             "enabled": settings.watcher_enabled,
-            "last_cycle": None,
+            "last_cycle": {
+                "robinhood": None,
+                "base": None,
+                "solana": None,
+            },
             "last_error": None,
         }
+        self._benchmark = BenchmarkCaptureRecorder(settings)
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -333,6 +636,17 @@ class AnalysisService:
                 rpc_url=self.settings.rpc_url,
                 chain_root=self.settings.chain_root,
             )
+        if self._solana_agent is None:
+            self._solana_agent = SolanaPublicAnalyzer(
+                self.settings.solana_rpc_url,
+                timechain_agent=self._agent,
+                jupiter_api_key=self.settings.jupiter_api_key or None,
+            )
+        if self._base_agent is None and isinstance(self._agent, Chainseer):
+            self._base_agent = BasePublicAnalyzer(
+                self.settings.base_rpc_url,
+                timechain_agent=self._agent,
+            )
         if self._watcher is None:
             self._watcher = ChainseerWatcher(
                 self._agent,
@@ -341,6 +655,25 @@ class AnalysisService:
                     poll_seconds=self.settings.watcher_interval_seconds,
                     confirmations=self.settings.watcher_confirmations,
                 ),
+            )
+        if self._solana_watcher is None:
+            self._solana_watcher = SolanaEventWatcher(
+                self._solana_agent,
+                timechain_agent=self._agent,
+                control_root=self.settings.chain_root,
+                config=SolanaWatchConfig(
+                    poll_seconds=self.settings.watcher_interval_seconds,
+                ),
+            )
+        if self._base_watcher is None and self._base_agent is not None:
+            self._base_watcher = ChainseerWatcher(
+                self._base_agent,
+                control_root=self.settings.chain_root,
+                config=WatchConfig(
+                    poll_seconds=self.settings.watcher_interval_seconds,
+                    confirmations=self.settings.watcher_confirmations,
+                ),
+                network="base",
             )
         self._worker = threading.Thread(
             target=self._run,
@@ -372,8 +705,13 @@ class AnalysisService:
             and not self._stopping.is_set()
         )
 
-    def submit(self, address: str) -> JobAccepted:
-        normalized = address.lower()
+    def submit(
+        self, address: str, network: str = "robinhood"
+    ) -> JobAccepted:
+        normalized_address = (
+            address.lower() if network in EVM_NETWORKS else address
+        )
+        normalized = f"{network}:{normalized_address}"
         now = time.time()
         with self._lock:
             self._prune(now)
@@ -382,10 +720,14 @@ class AnalysisService:
                 job = Job(
                     id=uuid.uuid4().hex,
                     address=address,
+                    network=network,
                     status="succeeded",
                     started_at=now,
                     finished_at=now,
                     result=cached[1],
+                    benchmark_capture={
+                        "status": "cache_hit_not_recaptured"
+                    },
                 )
                 self.jobs[job.id] = job
                 return JobAccepted(
@@ -405,7 +747,11 @@ class AnalysisService:
             if self.work.full():
                 raise QueueFullError
 
-            job = Job(id=uuid.uuid4().hex, address=address)
+            job = Job(
+                id=uuid.uuid4().hex,
+                address=address,
+                network=network,
+            )
             self.jobs[job.id] = job
             self.active_by_address[normalized] = job.id
             self.work.put_nowait(job.id)
@@ -416,51 +762,184 @@ class AnalysisService:
             self._prune(time.time())
             return self.jobs.get(job_id)
 
-    def watch_status(self) -> dict[str, Any]:
+    def watch_status(
+        self,
+        subscriber: str | None = None,
+    ) -> dict[str, Any]:
         with self._watch_lock:
-            state = (
+            robinhood_state = (
                 self._watcher.store.load()
                 if self._watcher is not None
                 else {"subscriptions": {}}
             )
+            base_state = (
+                self._base_watcher.store.load()
+                if self._base_watcher is not None
+                else {"subscriptions": {}}
+            )
+            solana_state = (
+                self._solana_watcher.store.load()
+                if self._solana_watcher is not None
+                else {"subscriptions": {}}
+            )
+            subscriptions = []
+            for value in robinhood_state.get("subscriptions", {}).values():
+                if subscriber and subscriber not in (
+                    value.get("subscribers") or []
+                ):
+                    continue
+                subscriptions.append(
+                    self._watcher.store.public_subscription(value)
+                )
+            for value in solana_state.get("subscriptions", {}).values():
+                if subscriber and subscriber not in (
+                    value.get("subscribers") or []
+                ):
+                    continue
+                subscriptions.append(
+                    self._solana_watcher.store.public_subscription(value)
+                )
+            for value in base_state.get("subscriptions", {}).values():
+                if subscriber and subscriber not in (
+                    value.get("subscribers") or []
+                ):
+                    continue
+                subscriptions.append(
+                    self._base_watcher.store.public_subscription(value)
+                )
+            network_counts = {
+                network: sum(
+                    item.get("network") == network
+                    for item in subscriptions
+                )
+                for network in ("robinhood", "base", "solana")
+            }
             return {
                 **self._watcher_status,
-                "subscriptions": list(state.get("subscriptions", {}).values()),
+                "subscriptions": subscriptions,
+                "subscription_counts": network_counts,
             }
 
-    def watch_subscribe(self, address: str) -> dict[str, Any]:
-        if self._watcher is None:
-            raise RuntimeError("watcher is not initialized")
-        with self._watch_lock:
-            return self._watcher.store.subscribe(address)
+    def benchmark_status(self) -> dict[str, Any]:
+        return self._benchmark.status()
 
-    def watch_unsubscribe(self, address: str) -> bool:
-        if self._watcher is None:
-            raise RuntimeError("watcher is not initialized")
+    def health_status(self) -> dict[str, Any]:
+        """Return cached worker health without loading watcher state from disk."""
+        watcher_status = self._watcher_status
+        return {
+            "watcher_last_error": watcher_status.get("last_error"),
+            "benchmark_capture": self._benchmark.health_status(),
+        }
+
+    def watch_subscribe(
+        self,
+        address: str,
+        network: str = "robinhood",
+        subscriber: str | None = None,
+    ) -> dict[str, Any]:
         with self._watch_lock:
-            return self._watcher.store.unsubscribe(address)
+            if network == "solana":
+                if self._solana_watcher is None:
+                    raise RuntimeError("Solana watcher is not initialized")
+                value = self._solana_watcher.store.subscribe(
+                    address, subscriber
+                )
+                return self._solana_watcher.store.public_subscription(value)
+            if network == "base":
+                if self._base_watcher is None:
+                    raise RuntimeError("Base watcher is not initialized")
+                value = self._base_watcher.store.subscribe(
+                    address, subscriber
+                )
+                return self._base_watcher.store.public_subscription(value)
+            if self._watcher is None:
+                raise RuntimeError("watcher is not initialized")
+            value = self._watcher.store.subscribe(address, subscriber)
+            return self._watcher.store.public_subscription(value)
+
+    def watch_unsubscribe(
+        self,
+        address: str,
+        network: str = "robinhood",
+        subscriber: str | None = None,
+    ) -> bool:
+        with self._watch_lock:
+            if network == "solana":
+                if self._solana_watcher is None:
+                    raise RuntimeError("Solana watcher is not initialized")
+                return self._solana_watcher.store.unsubscribe(
+                    address, subscriber
+                )
+            if network == "base":
+                if self._base_watcher is None:
+                    raise RuntimeError("Base watcher is not initialized")
+                return self._base_watcher.store.unsubscribe(
+                    address, subscriber
+                )
+            if self._watcher is None:
+                raise RuntimeError("watcher is not initialized")
+            return self._watcher.store.unsubscribe(address, subscriber)
+
+    def watch_alerts(
+        self,
+        address: str,
+        network: str,
+        subscriber: str,
+        *,
+        after: str | None = None,
+        limit: int = 50,
+    ) -> list[dict[str, Any]]:
+        with self._watch_lock:
+            watcher = {
+                "robinhood": self._watcher,
+                "base": self._base_watcher,
+                "solana": self._solana_watcher,
+            }.get(network)
+            if watcher is None:
+                raise RuntimeError(f"{network} watcher is not initialized")
+            if not watcher.store.is_subscribed(address, subscriber):
+                raise KeyError("watch subscription not found")
+            return watcher.store.read_alerts(
+                address,
+                after=after,
+                limit=limit,
+                critical_only=True,
+            )
 
     def _run_watcher_cycle(self) -> None:
-        if not self.settings.watcher_enabled or self._watcher is None:
+        if not self.settings.watcher_enabled:
             return
-        try:
-            with self._watch_lock:
-                summary = self._watcher.run_once()
-            self._watcher_status = {
-                "enabled": True,
-                "last_cycle": summary,
-                "last_error": None,
-            }
-        except Exception as exc:
-            LOGGER.exception("Watcher cycle failed")
-            self._watcher_status = {
-                "enabled": True,
-                "last_cycle": self._watcher_status.get("last_cycle"),
-                "last_error": {
-                    "at": datetime.now(timezone.utc).isoformat(),
-                    "message": str(exc),
-                },
-            }
+        summaries: dict[str, Any] = {
+            "robinhood": None,
+            "base": None,
+            "solana": None,
+        }
+        errors: dict[str, Any] = {}
+        with self._watch_lock:
+            for network, watcher in (
+                ("robinhood", self._watcher),
+                ("base", self._base_watcher),
+                ("solana", self._solana_watcher),
+            ):
+                if watcher is None:
+                    errors[network] = {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "message": f"{network} watcher is not initialized",
+                    }
+                    continue
+                try:
+                    summaries[network] = watcher.run_once()
+                except Exception as exc:
+                    LOGGER.exception("%s watcher cycle failed", network)
+                    errors[network] = {
+                        "at": datetime.now(timezone.utc).isoformat(),
+                        "message": credential_safe_error(exc),
+                    }
+        self._watcher_status = {
+            "enabled": True,
+            "last_cycle": summaries,
+            "last_error": errors or None,
+        }
 
     def _prune(self, now: float) -> None:
         cutoff = now - self.settings.result_ttl_seconds
@@ -508,24 +987,54 @@ class AnalysisService:
             try:
                 if self._agent is None:
                     raise RuntimeError("analysis worker has no Chainseer agent")
-                report = self._agent.analyze_token(
-                    job.address, full_report=False
-                )
+                if job.network == "solana":
+                    if self._solana_agent is None:
+                        raise RuntimeError(
+                            "analysis worker has no Solana analyzer"
+                        )
+                    report = self._solana_agent.analyze_token(job.address)
+                elif job.network == "base":
+                    if self._base_agent is None:
+                        raise RuntimeError(
+                            "analysis worker has no Base analyzer"
+                        )
+                    report = self._base_agent.analyze_token(
+                        job.address, full_report=False
+                    )
+                else:
+                    report = self._agent.analyze_token(
+                        job.address, full_report=False
+                    )
                 if report.get("error"):
                     raise PublicAnalysisError(
                         "analysis_rejected", str(report["error"])
                     )
                 public_report = build_public_report(report)
+                benchmark_capture = self._benchmark.capture(
+                    job,
+                    public_report,
+                )
                 with self._lock:
                     job.result = public_report
+                    job.benchmark_capture = benchmark_capture
                     job.status = "succeeded"
                     if self.settings.cache_ttl_seconds:
-                        self.cache[job.address.lower()] = (
+                        cache_address = (
+                            job.address.lower()
+                            if job.network in EVM_NETWORKS
+                            else job.address
+                        )
+                        self.cache[f"{job.network}:{cache_address}"] = (
                             time.time()
                             + self.settings.cache_ttl_seconds,
                             public_report,
                         )
             except PublicAnalysisError as exc:
+                with self._lock:
+                    job.status = "failed"
+                    job.error_code = exc.code
+                    job.error_message = exc.message
+            except SolanaMintError as exc:
                 with self._lock:
                     job.status = "failed"
                     job.error_code = exc.code
@@ -546,7 +1055,15 @@ class AnalysisService:
                 with self._lock:
                     job.finished_at = time.time()
                     self.active_by_address.pop(
-                        job.address.lower(), None
+                        (
+                            f"{job.network}:"
+                            + (
+                                job.address.lower()
+                                if job.network in EVM_NETWORKS
+                                else job.address
+                            )
+                        ),
+                        None,
                     )
                 self.work.task_done()
             if (
@@ -647,11 +1164,18 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
     data = report.get("data") or {}
     basic = data.get("basic_info") or {}
     dex = data.get("dex_pairs") or {}
+    holder_assessment = analysis.get("holder_assessment") or {}
+    holder_evidence = (
+        data.get("holder_concentration")
+        or data.get("blockscout_holders")
+        or {}
+    )
     liquidity_custody = data.get("lp_lock") or {}
     extended = analysis.get("extended_evidence") or {}
     social_attention = extended.get("social_attention") or {}
     cross_chain = extended.get("cross_chain") or {}
     mev_exposure = extended.get("mev_exposure") or {}
+    entity_graph = data.get("entity_graph") or {}
     provenance = report.get("provenance") or {}
     evidence_facts = provenance.get("facts") or []
     public_facts = [
@@ -682,13 +1206,64 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         ).encode("utf-8")
     ).hexdigest()
 
+    raw_holder_count = holder_assessment.get("holder_count")
+    holder_count_source = holder_assessment.get("source")
+    if raw_holder_count in (None, "", 0, "0"):
+        raw_holder_count = basic.get("jupiter_holder_count")
+        if raw_holder_count not in (None, "", 0, "0"):
+            holder_count_source = "Jupiter"
+    try:
+        holder_count = int(raw_holder_count)
+    except (TypeError, ValueError, OverflowError):
+        holder_count = None
+    if holder_count is not None and holder_count <= 0:
+        holder_count = None
+
+    largest_accounts = holder_evidence.get("largest_accounts") or []
+    top_holders = holder_evidence.get("holders") or []
+    holder_sample_size = len(largest_accounts or top_holders)
+    largest_holder_pct = holder_assessment.get(
+        "largest_non_amm_holder_pct"
+    )
+    if largest_holder_pct is None:
+        largest_holder_pct = holder_evidence.get("adj_top_1_pct")
+    if largest_holder_pct is None:
+        largest_holder_pct = holder_evidence.get(
+            "top1_total_supply_pct"
+        )
+    top10_holder_pct = holder_evidence.get("adj_top_10_pct")
+    if top10_holder_pct is None:
+        top10_holder_pct = holder_evidence.get(
+            "top10_total_supply_pct"
+        )
+    is_solana = (
+        str(report.get("chain_name") or "").strip().lower() == "solana"
+    )
+    if holder_count is not None:
+        holder_caveat = (
+            f"Holder count was reported by {holder_count_source or 'an upstream provider'} "
+            "at analysis time."
+        )
+    elif holder_sample_size:
+        holder_caveat = (
+            f"An exact holder count was unavailable. Chainseer observed the "
+            f"{holder_sample_size} largest "
+            f"{'token accounts' if is_solana else 'holder records'} only."
+        )
+    else:
+        holder_caveat = "Holder-count evidence was unavailable."
+    if holder_evidence.get("caveat"):
+        holder_caveat = (
+            f"{holder_caveat} {holder_evidence['caveat']}"
+        )
+
     return {
-        "schema_version": "1.0",
+        "schema_version": "1.2",
         "token": {
             "address": report.get("token_address"),
             "name": report.get("token_name") or basic.get("name"),
             "symbol": report.get("token_symbol") or basic.get("symbol"),
-            "chain": "Robinhood Chain",
+            "chain": report.get("chain_name") or "Robinhood Chain",
             "chain_id": report.get("chain_id"),
             "explorer_url": report.get("explorer_url"),
         },
@@ -712,9 +1287,55 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         "market": {
             "price_usd": dex.get("primary_price_usd"),
             "market_cap_usd": dex.get("market_cap"),
+            "market_cap_kind": dex.get(
+                "market_cap_kind",
+                (
+                    "reported_market_cap"
+                    if dex.get("market_cap") not in (None, "", 0, "0")
+                    else "unavailable"
+                ),
+            ),
+            "market_cap_source": dex.get("market_cap_source"),
+            "fdv_usd": dex.get("fdv"),
             "liquidity_usd": dex.get("total_liquidity_usd"),
             "volume_24h_usd": dex.get("total_volume_24h"),
             "age": dex.get("token_age_label"),
+        },
+        "holders": {
+            "count": holder_count,
+            "count_status": (
+                "reported" if holder_count is not None else "unavailable"
+            ),
+            "count_source": holder_count_source,
+            "sample_size": holder_sample_size,
+            "sample_kind": (
+                "largest_token_accounts"
+                if is_solana and holder_sample_size
+                else "top_holder_records" if holder_sample_size else None
+            ),
+            "largest_holder_pct": largest_holder_pct,
+            "top10_holder_pct": top10_holder_pct,
+            "concentration_basis": (
+                holder_assessment.get("concentration_source")
+                or holder_evidence.get("concentration_basis")
+                or holder_evidence.get("method")
+            ),
+            "pool_and_program_vaults_excluded": holder_evidence.get(
+                "pool_and_program_vaults_excluded"
+            ),
+            "caveat": holder_caveat,
+        },
+        "entity_graph": {
+            "schema_version": entity_graph.get("schema_version"),
+            "network": entity_graph.get("network"),
+            "root_entity_id": entity_graph.get("root_entity_id"),
+            "anchor": entity_graph.get("anchor") or {},
+            "summary": entity_graph.get("summary") or {},
+            "nodes": (entity_graph.get("nodes") or [])[:50],
+            "edges": (entity_graph.get("edges") or [])[:100],
+            "signals": (entity_graph.get("signals") or [])[:30],
+            "limitations": entity_graph.get("limitations") or [],
+            "graph_hash": entity_graph.get("graph_hash"),
         },
         "liquidity_custody": {
             "state": liquidity_custody.get(
@@ -761,6 +1382,11 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         "evidence": {
             "fact_count": provenance.get("fact_count", 0),
             "block_pin": provenance.get("block_pin"),
+            "anchor_type": provenance.get("anchor_type", "block_pin"),
+            "anchor_caveat": provenance.get("anchor_caveat"),
+            "infrastructure_indeterminate": (
+                report.get("infrastructure_indeterminate") or []
+            ),
             "ledger_hash": ledger_hash,
             "facts": public_facts,
         },
@@ -906,12 +1532,17 @@ def ready() -> dict[str, Any]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="analysis worker is not ready",
         )
+    health = SERVICE.health_status()
     return {
         "status": "ready",
         "queue_depth": SERVICE.work.qsize(),
         "environment": SETTINGS.environment,
         "watcher_enabled": SETTINGS.watcher_enabled,
-        "watcher_last_error": SERVICE.watch_status().get("last_error"),
+        "watcher_last_error": health["watcher_last_error"],
+        "networks": ["robinhood", "base", "solana"],
+        "base_rpc_configured": bool(SETTINGS.base_rpc_url),
+        "solana_rpc_configured": bool(SETTINGS.solana_rpc_url),
+        "benchmark_capture": health["benchmark_capture"],
     }
 
 
@@ -929,7 +1560,7 @@ def create_analysis(payload: AnalyzeRequest, request: Request) -> JobAccepted:
             headers={"Retry-After": "60"},
         )
     try:
-        return SERVICE.submit(payload.address)
+        return SERVICE.submit(payload.address, payload.network)
     except QueueFullError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -961,18 +1592,82 @@ def get_analysis(job_id: str) -> dict[str, Any]:
     "/v1/watch",
     dependencies=[Depends(require_api_token)],
 )
-def get_watch_status() -> dict[str, Any]:
-    return SERVICE.watch_status()
+def get_watch_status(request: Request) -> dict[str, Any]:
+    return SERVICE.watch_status(request_identity(request))
 
 
 @app.post(
     "/v1/watch",
     dependencies=[Depends(require_api_token)],
 )
-def create_watch(payload: WatchRequest) -> dict[str, Any]:
+def create_watch(payload: WatchRequest, request: Request) -> dict[str, Any]:
+    identity = request_identity(request)
     return {
         "enabled": SETTINGS.watcher_enabled,
-        "subscription": SERVICE.watch_subscribe(payload.address),
+        "subscription": SERVICE.watch_subscribe(
+            payload.address,
+            payload.network,
+            identity,
+        ),
+    }
+
+
+@app.get(
+    "/v1/watch/alerts",
+    dependencies=[Depends(require_api_token)],
+)
+def get_watch_alerts(
+    request: Request,
+    network: str,
+    address: str,
+    after: str | None = None,
+    limit: int = 50,
+) -> dict[str, Any]:
+    normalized_network = network.strip().lower()
+    if normalized_network not in SUPPORTED_NETWORKS:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="unsupported watch network",
+        )
+    try:
+        WatchRequest(network=normalized_network, address=address)
+    except ValueError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="invalid watch address",
+        ) from exc
+    if after:
+        try:
+            datetime.fromisoformat(after.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+                detail="invalid alert cursor",
+            ) from exc
+    if not 1 <= limit <= 100:
+        raise HTTPException(
+            status_code=status.HTTP_422_UNPROCESSABLE_ENTITY,
+            detail="alert limit must be between 1 and 100",
+        )
+    try:
+        alerts = SERVICE.watch_alerts(
+            address,
+            normalized_network,
+            request_identity(request),
+            after=after,
+            limit=limit,
+        )
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="watch subscription not found",
+        ) from exc
+    cursor = alerts[-1]["observed_at"] if alerts else after
+    return {
+        "network": normalized_network,
+        "address": address,
+        "alerts": alerts,
+        "cursor": cursor,
     }
 
 
@@ -980,15 +1675,42 @@ def create_watch(payload: WatchRequest) -> dict[str, Any]:
     "/v1/watch/{address}",
     dependencies=[Depends(require_api_token)],
 )
-def delete_watch(address: str) -> dict[str, Any]:
-    if not ADDRESS_RE.fullmatch(address):
+def delete_watch(
+    address: str,
+    request: Request,
+    network: str | None = None,
+) -> dict[str, Any]:
+    network = (
+        network.strip().lower()
+        if network
+        else ("solana" if not ADDRESS_RE.fullmatch(address) else "robinhood")
+    )
+    if network not in SUPPORTED_NETWORKS:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="watch subscription not found",
+        )
+    if network == "solana":
+        try:
+            validate_solana_mint(address)
+        except ValueError as exc:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="watch subscription not found",
+            ) from exc
+    elif not ADDRESS_RE.fullmatch(address):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="watch subscription not found",
         )
     return {
-        "removed": SERVICE.watch_unsubscribe(address),
+        "removed": SERVICE.watch_unsubscribe(
+            address,
+            network,
+            request_identity(request),
+        ),
         "address": address,
+        "network": network,
     }
 
 

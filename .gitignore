@@ -1,7 +1,12 @@
 # Python
 __pycache__/
 *.pyc
+*.py[cod]
 .pytest_cache/
+*.sqlite3
+*.sqlite3-*
+.venv/
+venv/
 
 # Secrets / env
 .env
@@ -12,6 +17,7 @@ __pycache__/
 # Runtime / generated state (chains, ledgers, learning data, logs, caches)
 chainseer_chain/
 chainseer_chain_archive_corrupted/
+benchmark_data/
 base_learning/
 base_prototype/
 base_prototype_smoke/
@@ -59,4 +65,6 @@ out/
 # OS
 .DS_Store
 Thumbs.db
+.idea/
+.vscode/
 chainseer_web/

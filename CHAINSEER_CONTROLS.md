@@ -1,7 +1,7 @@
 # Chainseer monitoring and execution controls
 
-`chainseer_controls.py` adds four deliberately separated capabilities to the
-Robinhood Chain analyzer:
+`chainseer_controls.py` adds deliberately separated monitoring and execution
+controls to the Robinhood Chain and Solana analyzers:
 
 1. confirmed-block monitoring and state-drift alerts;
 2. automated outcome collection with tighten-only calibration proposals;
@@ -19,6 +19,22 @@ method. A TradePermit is an authorization artifact, not a transaction.
 - The watcher scans ownership/upgrade, LP-burn, and token-transfer logs, then
   performs a full analysis only after a meaningful change, a holder refresh
   window, an outcome horizon, or the maximum refresh interval.
+- The Solana watcher incrementally indexes confirmed mint signatures and
+  compares compact snapshots of the token program, mint/freeze authorities,
+  extensions, supply, largest accounts, primary market, liquidity, and price.
+  Routine signatures and small account rotations remain observational; they
+  do not cause an expensive full analysis.
+- Material Solana changes trigger a full analysis after a short debounce.
+  Authority, program, supply, extension, or market-identity changes bypass the
+  debounce. A periodic confirmed-state reconciliation catches missed provider
+  events.
+- Confirmed activity also schedules bounded sellability probes. It does not
+  alert by itself: notification requires post-rescan evidence of a critical
+  liquidity, authority, upgrade, or sellability deterioration.
+- Optional holder, market, and signature-provider failures are recorded as
+  `infrastructure_indeterminate` and retain the last confirmed observation;
+  they never become a fabricated token state change. Mint-account and supply
+  failures remain fail-closed for that watcher cycle.
 - Reorgs are detected by comparing the previously processed block hash.
 - Analyses, watcher transitions, outcomes, calibration adoption, permit issue,
   and permit consumption are sealed into the Timechain.
@@ -34,6 +50,55 @@ method. A TradePermit is an authorization artifact, not a transaction.
   authorization, not the token legitimacy score.
 
 ## Watch tokens
+
+The authenticated production API accepts either network:
+
+```bash
+curl -X POST "https://api.usechainseer.com/v1/watch" \
+  -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"network":"solana","address":"YourSolanaMint"}'
+```
+
+Solana cursors and alerts are stored separately:
+
+```text
+chainseer_chain/controls/solana_watcher_state.json
+chainseer_chain/controls/solana_watcher_alerts.jsonl
+```
+
+Each material alert carries the confirmed slot, compact event evidence, the
+fresh analysis ring, a content hash, and a `solana_watch_transition` Timechain
+ring. The watcher remains observation-only: it cannot sign or broadcast a
+transaction.
+
+### Critical alert feed
+
+The public feed returns only critical state changes for a token:
+
+- `liquidity`: primary market disappearance/change, at least 30% observed
+  liquidity removal, or EVM liquidity custody deterioration;
+- `authority`: ownership, proxy-admin, mint/freeze authority, owner-program,
+  or risky token-extension changes;
+- `upgrade`: EVM implementation, bytecode, or unverified-proxy changes;
+- `sellability`: a new honeypot/sell restriction, a material sell-tax
+  increase, or unsafe Jupiter round-trip/price-impact evidence.
+
+Price movement, routine transfers/signatures, and small holder rotations do
+not generate critical notifications. Infrastructure failure remains
+`infrastructure_indeterminate`, not token evidence.
+
+```bash
+curl "https://api.usechainseer.com/v1/watch/alerts?network=solana&address=YourSolanaMint&after=2026-07-29T20%3A00%3A00Z" \
+  -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
+  -H "X-Chainseer-Client: $CLIENT_ID_HASH"
+```
+
+The feed is cursor-based, capped at 100 alerts per request, filters by token
+and authenticated subscriber, and exposes the analysis and Timechain ring
+proofs without exposing raw subscription state.
+
+The standalone CLI below continues to manage Robinhood Chain subscriptions.
 
 Global options must precede the command:
 

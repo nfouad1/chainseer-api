@@ -1,5 +1,5 @@
 """
-Chainseer -- On-Chain Intelligence Agent for Robinhood Chain
+Chainseer -- Evidence-backed On-Chain Intelligence Agent
 
 Integrates with:
   - Cypher Tempe Timechain for persistent, verifiable memory & trend analysis
@@ -23,6 +23,7 @@ v7.1 features:
   - Timelock contract verification (Unicrypt, TeamFinance, PinkLock, TrustSwap)
   - Historical trend analysis from Timechain rings
   - Holder enrichment (EOA vs contract, scam flags, proxy detection)
+  - Entity and insider evidence graph with explicit inference boundaries
   - Deployer rug history via Blockscout flags + GoPlus cross-reference
   - DexScreener boosts as sentiment signal
   - Confirmed-block state-change watcher with drift alerts
@@ -69,6 +70,11 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
         pass
 
 import requests
+
+from chainseer_entity_graph import (
+    build_robinhood_entity_graph,
+    verify_entity_graph,
+)
 
 CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
@@ -293,6 +299,8 @@ class ChainseerCognitiveLoop:
         source = data.get("source_code") or {}
         dex = data.get("dex_pairs") or {}
         liquidity_custody = data.get("lp_lock") or {}
+        entity_graph = data.get("entity_graph") or {}
+        graph_summary = entity_graph.get("summary") or {}
         safe = {
             "task": "on-chain token risk analysis",
             "chain_id": report.get("chain_id"),
@@ -318,6 +326,14 @@ class ChainseerCognitiveLoop:
             "liquidity_usd": dex.get("total_liquidity_usd"),
             "primary_amm_version": dex.get("primary_amm_version"),
             "liquidity_custody_state": liquidity_custody.get("state"),
+            "entity_graph_hash": entity_graph.get("graph_hash"),
+            "insider_risk_level": graph_summary.get("insider_risk_level"),
+            "entity_graph_coverage": graph_summary.get("coverage"),
+            "entity_signal_codes": sorted(
+                str(item.get("code"))[:80]
+                for item in (entity_graph.get("signals") or [])
+                if isinstance(item, dict) and item.get("code")
+            ),
         }
         return json.dumps(safe, sort_keys=True, separators=(",", ":"), default=str)
 
@@ -491,7 +507,7 @@ class ChainseerCognitiveLoop:
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
-# Robinhood Chain Constants
+# EVM network profiles
 # ═══════════════════════════════════════════════════════════════════════════════
 
 CHAIN_ID = 4663
@@ -510,6 +526,59 @@ UNISWAP_V2_ROUTER02 = "0x89e5db8b5aa49aa85ac63f691524311aeb649eba"
 UNISWAP_V3_FACTORY = "0x1f7d7550b1b028f7571e69a784071f0205fd2efa"
 UNISWAP_V3_SWAP_ROUTER02 = "0xcaf681a66d020601342297493863e78c959e5cb2"
 UNISWAP_V4_POOL_MANAGER = "0x8366a39cc670b4001a1121b8f6a443a643e40951"
+
+
+@dataclass(frozen=True)
+class EVMNetworkConfig:
+    """Immutable per-agent EVM evidence boundary.
+
+    Network identity is carried by each analyzer instance so concurrent API
+    jobs can never switch endpoints or attribute evidence to another chain.
+    Protocol addresses are optional: unsupported protocol-specific checks
+    remain explicitly unavailable instead of borrowing another network's
+    assumptions.
+    """
+
+    key: str
+    name: str
+    chain_id: int
+    rpc_url: str
+    explorer: str
+    dexscreener_chain_id: str
+    blockscout_base: str
+    wrapped_native: str
+    v2_factory: str | None = None
+
+    @property
+    def explorer_token(self) -> str:
+        return f"{self.explorer}/token/"
+
+
+ROBINHOOD_NETWORK = EVMNetworkConfig(
+    key="robinhood",
+    name="Robinhood Chain",
+    chain_id=CHAIN_ID,
+    rpc_url=RPC_URL,
+    explorer=EXPLORER,
+    dexscreener_chain_id=DEXSCREENER_CHAIN_ID,
+    blockscout_base=BLOCKSCOUT_BASE,
+    wrapped_native=WETH_ADDRESS,
+    v2_factory=UNISWAP_V2_FACTORY,
+)
+
+BASE_NETWORK = EVMNetworkConfig(
+    key="base",
+    name="Base",
+    chain_id=8453,
+    rpc_url="https://mainnet.base.org",
+    explorer="https://base.blockscout.com",
+    dexscreener_chain_id="base",
+    blockscout_base="https://base.blockscout.com/api/v2",
+    wrapped_native="0x4200000000000000000000000000000000000006",
+    # Uniswap V2 pair discovery is not currently used by the public analyzer.
+    # Leave it unconfigured rather than asserting an unverified deployment.
+    v2_factory=None,
+)
 
 # ERC-20 ABI selectors
 ABI_BALANCE_OF    = "0x70a08231"
@@ -717,7 +786,7 @@ class ProvenanceLedger:
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class RobinhoodRPC:
-    """Low-level JSON-RPC client for Robinhood Chain.
+    """Low-level EVM JSON-RPC client.
 
     When a ProvenanceLedger is attached, every call is recorded with its
     query spec and response hash.
@@ -780,6 +849,16 @@ class RobinhoodRPC:
             raise RPCError(f"Cannot connect to {self.rpc_url}", -1)
         except requests.exceptions.Timeout:
             raise RPCError(f"RPC request timed out after {self.timeout}s", -2)
+        except requests.exceptions.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            raise RPCError(
+                f"RPC HTTP response failed ({status or 'unknown status'})",
+                -(int(status) if status else 3),
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise RPCError(
+                f"RPC transport failed: {type(exc).__name__}", -3
+            ) from exc
 
     def get_block_number(self) -> int:
         result = self._call("eth_blockNumber")
@@ -858,13 +937,16 @@ class RobinhoodRPC:
     def pair_token1(self, pair_address: str) -> str:
         return _decode_address(self.call(pair_address, ABI_TOKEN1 + "0" * 56))
 
-    def factory_get_pair(self, token_a: str, token_b: str) -> str:
+    def factory_get_pair(
+        self, token_a: str, token_b: str, factory: str | None = None
+    ) -> str:
         """Find V2 pair via the factory. Returns zero address if none."""
+        factory = factory or UNISWAP_V2_FACTORY
         # getPair(address,address) selector: 0xe6a43905
         padded_a = token_a.lower().replace("0x", "").zfill(64)
         padded_b = token_b.lower().replace("0x", "").zfill(64)
         data = "0xe6a43905" + padded_a + padded_b
-        result = self.call(UNISWAP_V2_FACTORY, data)
+        result = self.call(factory, data)
         if not result or result == "0x" or len(result) < 66:
             return "0x" + "0" * 40
         return "0x" + result[26:]
@@ -1020,7 +1102,12 @@ def _http_get_json(url: str, *, params: dict = None, timeout: int = 15,
 # External API Clients
 # ═══════════════════════════════════════════════════════════════════════════════
 
-def _fetch_goplus_security(token_address: str, ledger: "ProvenanceLedger" = None) -> dict:
+def _fetch_goplus_security(
+    token_address: str,
+    ledger: "ProvenanceLedger" = None,
+    *,
+    chain_id: int = CHAIN_ID,
+) -> dict:
     """Fetch token security data from GoPlus API.
 
     GoPlus provides real buy/sell tax, honeypot detection, holder data,
@@ -1028,7 +1115,7 @@ def _fetch_goplus_security(token_address: str, ledger: "ProvenanceLedger" = None
     """
     try:
         data, _, _ = _http_get_json(
-            f"{GOPLUS_BASE}/token_security/{CHAIN_ID}",
+            f"{GOPLUS_BASE}/token_security/{chain_id}",
             params={"contract_addresses": token_address}, ledger=ledger)
         if data.get("code") != 1:
             return {}
@@ -1075,7 +1162,9 @@ def _amm_version(pair: dict) -> str:
     return "unknown"
 
 
-def _pick_primary_pair(dexscreener_data: dict) -> dict:
+def _pick_primary_pair(
+    dexscreener_data: dict, wrapped_native: str = WETH_ADDRESS
+) -> dict:
     """Select the highest-liquidity market, independent of AMM version."""
     pairs = dexscreener_data.get("pairs", [])
     if not pairs:
@@ -1086,16 +1175,21 @@ def _pick_primary_pair(dexscreener_data: dict) -> dict:
         key=lambda p: (
             _safe_float(p.get("liquidity", {}).get("usd")),
             p.get("quoteToken", {}).get("address", "").lower()
-            == WETH_ADDRESS.lower(),
+            == wrapped_native.lower(),
         ),
     )
 
 
-def _fetch_blockscout_address(token_address: str, ledger: "ProvenanceLedger" = None) -> dict:
+def _fetch_blockscout_address(
+    token_address: str,
+    ledger: "ProvenanceLedger" = None,
+    *,
+    blockscout_base: str = BLOCKSCOUT_BASE,
+) -> dict:
     """Fetch address info from Blockscout API: creator, creation tx, verification."""
     try:
         data, _, _ = _http_get_json(
-            f"{BLOCKSCOUT_BASE}/addresses/{token_address}", ledger=ledger)
+            f"{blockscout_base}/addresses/{token_address}", ledger=ledger)
         return {
             "creator_address": data.get("creator_address_hash", ""),
             "creation_tx_hash": data.get("creation_transaction_hash", ""),
@@ -1109,11 +1203,16 @@ def _fetch_blockscout_address(token_address: str, ledger: "ProvenanceLedger" = N
         return {}
 
 
-def _fetch_blockscout_token(token_address: str, ledger: "ProvenanceLedger" = None) -> dict:
+def _fetch_blockscout_token(
+    token_address: str,
+    ledger: "ProvenanceLedger" = None,
+    *,
+    blockscout_base: str = BLOCKSCOUT_BASE,
+) -> dict:
     """Fetch token info from Blockscout: holders count, price, volume."""
     try:
         data, _, _ = _http_get_json(
-            f"{BLOCKSCOUT_BASE}/tokens/{token_address}", ledger=ledger)
+            f"{blockscout_base}/tokens/{token_address}", ledger=ledger)
         return {
             "holders_count": data.get("holders_count", 0),
             "exchange_rate": data.get("exchange_rate"),
@@ -1126,11 +1225,13 @@ def _fetch_blockscout_token(token_address: str, ledger: "ProvenanceLedger" = Non
 
 
 def _fetch_blockscout_source(token_address: str,
-                             ledger: "ProvenanceLedger" = None) -> dict:
+                             ledger: "ProvenanceLedger" = None,
+                             *,
+                             blockscout_base: str = BLOCKSCOUT_BASE) -> dict:
     """Fetch verified source metadata, including proxy implementation details."""
     try:
         data, fact_id, cache_hit = _http_get_json(
-            f"{BLOCKSCOUT_BASE}/smart-contracts/{token_address}", ledger=ledger)
+            f"{blockscout_base}/smart-contracts/{token_address}", ledger=ledger)
         implementations = data.get("implementations") or []
         return {
             "available": True,
@@ -1155,11 +1256,13 @@ def _fetch_blockscout_source(token_address: str,
 
 
 def _fetch_blockscout_holders(token_address: str, limit: int = 20,
-                              ledger: "ProvenanceLedger" = None) -> list:
+                              ledger: "ProvenanceLedger" = None,
+                              *,
+                              blockscout_base: str = BLOCKSCOUT_BASE) -> list:
     """Fetch top token holders from Blockscout API."""
     try:
         data, _, _ = _http_get_json(
-            f"{BLOCKSCOUT_BASE}/tokens/{token_address}/holders", ledger=ledger)
+            f"{blockscout_base}/tokens/{token_address}/holders", ledger=ledger)
         items = data if isinstance(data, list) else data.get("items", [])
         holders = []
         for h in items[:limit]:
@@ -1186,7 +1289,12 @@ def _fetch_blockscout_holders(token_address: str, limit: int = 20,
         return []
 
 
-def _fetch_serial_deployer(deployer_address: str, ledger: "ProvenanceLedger" = None) -> dict:
+def _fetch_serial_deployer(
+    deployer_address: str,
+    ledger: "ProvenanceLedger" = None,
+    *,
+    blockscout_base: str = BLOCKSCOUT_BASE,
+) -> dict:
     """Check if deployer created other tokens and whether deployer is flagged."""
     result = {
         "deployer": deployer_address,
@@ -1201,7 +1309,11 @@ def _fetch_serial_deployer(deployer_address: str, ledger: "ProvenanceLedger" = N
         return result
 
     # Check the deployer's own Blockscout address for flags
-    deployer_info = _fetch_blockscout_address(deployer_address, ledger=ledger)
+    deployer_info = _fetch_blockscout_address(
+        deployer_address,
+        ledger=ledger,
+        blockscout_base=blockscout_base,
+    )
     result["deployer_is_scam"] = deployer_info.get("is_scam", False)
     result["deployer_reputation"] = deployer_info.get("reputation", "unknown")
     result["deployer_public_tags"] = deployer_info.get("public_tags", [])
@@ -1209,7 +1321,7 @@ def _fetch_serial_deployer(deployer_address: str, ledger: "ProvenanceLedger" = N
     try:
         # Use the 'created-contracts' endpoint for accurate count
         data, _, _ = _http_get_json(
-            f"{BLOCKSCOUT_BASE}/addresses/{deployer_address}/created-contracts",
+            f"{blockscout_base}/addresses/{deployer_address}/created-contracts",
             ledger=ledger)
         items = data if isinstance(data, list) else data.get("items", [])
         result["total_creations"] = len(items)
@@ -1225,38 +1337,58 @@ def _fetch_serial_deployer(deployer_address: str, ledger: "ProvenanceLedger" = N
 # ═══════════════════════════════════════════════════════════════════════════════
 
 class Chainseer:
-    """On-chain intelligence agent for Robinhood Chain."""
+    """Production EVM on-chain intelligence agent."""
+
+    # Safe defaults preserve compatibility for narrowly constructed test and
+    # diagnostic instances; normal agents always replace these in __init__.
+    network = ROBINHOOD_NETWORK
+    network_key = ROBINHOOD_NETWORK.key
 
     def __init__(
         self,
-        rpc_url: str = RPC_URL,
+        rpc_url: str | None = None,
         chain_root: str = None,
         cross_chain_provider=None,
         social_kol_provider=None,
+        *,
+        network: EVMNetworkConfig | None = None,
+        timechain_agent=None,
     ):
-        self.rpc_url = rpc_url
+        self.network = network or ROBINHOOD_NETWORK
+        self.network_key = self.network.key
+        self.rpc_url = rpc_url or self.network.rpc_url
         # Provenance ledger — created per-analysis in analyze_token()
         self.ledger = None
-        self.rpc = RobinhoodRPC(rpc_url)
-        self.chain_id = CHAIN_ID
-        self.explorer = EXPLORER
+        self.rpc = RobinhoodRPC(self.rpc_url)
+        self.chain_id = self.network.chain_id
+        self.explorer = self.network.explorer
         self.cross_chain_provider = cross_chain_provider
         self.social_kol_provider = social_kol_provider
 
         # Initialize Timechain
         skill_dir = _get_skill_dir()
-        tc_module = _load_timechain_module(skill_dir)
-        self.poq_module = _load_skill_module(skill_dir, "poq")
+        self.chain_root = (
+            chain_root
+            or getattr(timechain_agent, "chain_root", None)
+            or os.path.join(os.path.dirname(__file__), "chainseer_chain")
+        )
+        if timechain_agent is not None:
+            self.poq_module = timechain_agent.poq_module
+            self.tc = timechain_agent.tc
+            self.cognitive_loop = timechain_agent.cognitive_loop
+        else:
+            tc_module = _load_timechain_module(skill_dir)
+            self.poq_module = _load_skill_module(skill_dir, "poq")
+            _bootstrap_faculty_registry(self.chain_root, skill_dir)
+            self.tc = tc_module.Timechain(root=self.chain_root)
 
-        self.chain_root = chain_root or os.path.join(os.path.dirname(__file__), "chainseer_chain")
-        _bootstrap_faculty_registry(self.chain_root, skill_dir)
-        self.tc = tc_module.Timechain(root=self.chain_root)
-
-        if self.tc.height() == 0:
-            self.tc.genesis(name="Chainseer")
-            print(f"  New Timechain initialized at {self.chain_root}")
-        self.cognitive_loop = ChainseerCognitiveLoop(self.chain_root, skill_dir)
-        self.cognitive_loop.seal_bootstrap_epoch()
+            if self.tc.height() == 0:
+                self.tc.genesis(name="Chainseer")
+                print(f"  New Timechain initialized at {self.chain_root}")
+            self.cognitive_loop = ChainseerCognitiveLoop(
+                self.chain_root, skill_dir
+            )
+            self.cognitive_loop.seal_bootstrap_epoch()
         ok, verify_report = self.tc.verify()
         if not ok:
             raise RuntimeError(f"Timechain integrity verification failed: {verify_report}")
@@ -1264,7 +1396,7 @@ class Chainseer:
 
         print(
             f" Chainseer v{CHAINSEER_VERSION} -- "
-            "Robinhood Chain On-Chain Intelligence"
+            f"{self.network.name} On-Chain Intelligence"
         )
         print(f" Chain ID: {self.chain_id} | RPC: {self.rpc_url}")
         print(f" Timechain root: {self.chain_root}")
@@ -1296,7 +1428,7 @@ class Chainseer:
         if not ADDRESS_RE.fullmatch(token):
             return {"error": "Invalid token address", "address": token}
         print(f" TOKEN ANALYSIS: {token}")
-        print(f" Explorer: {EXPLORER_TOKEN}{token}")
+        print(f" Explorer: {self.network.explorer_token}{token}")
         print(f" Time: {datetime.now(timezone.utc).isoformat()}")
         print()
 
@@ -1333,11 +1465,27 @@ class Chainseer:
         print(" Phase 1/8: External APIs (GoPlus + DexScreener + Blockscout)...")
         checkpoint = self.ledger.checkpoint()
         data = {}
-        data["goplus_security"] = _fetch_goplus_security(token, ledger=self.ledger)
+        data["goplus_security"] = _fetch_goplus_security(
+            token,
+            ledger=self.ledger,
+            chain_id=self.chain_id,
+        )
         data["dexscreener"] = _fetch_dexscreener_token(token, ledger=self.ledger)
-        data["blockscout_address"] = _fetch_blockscout_address(token, ledger=self.ledger)
-        data["blockscout_token"] = _fetch_blockscout_token(token, ledger=self.ledger)
-        data["source_code"] = _fetch_blockscout_source(token, ledger=self.ledger)
+        data["blockscout_address"] = _fetch_blockscout_address(
+            token,
+            ledger=self.ledger,
+            blockscout_base=self.network.blockscout_base,
+        )
+        data["blockscout_token"] = _fetch_blockscout_token(
+            token,
+            ledger=self.ledger,
+            blockscout_base=self.network.blockscout_base,
+        )
+        data["source_code"] = _fetch_blockscout_source(
+            token,
+            ledger=self.ledger,
+            blockscout_base=self.network.blockscout_base,
+        )
         for key, provider in (
             ("cross_chain_flow_records", self.cross_chain_provider),
             ("social_kol_records", self.social_kol_provider),
@@ -1398,7 +1546,6 @@ class Chainseer:
                 "verified_amm_addresses", []
             ),
             total_supply_raw=data["basic_info"].get("total_supply_raw"),
-            goplus_holders=data["goplus_security"].get("holders", []),
         )
         data["wash_trading"] = self._detect_wash_trading(token, latest_block)
         claim_evidence["activity_and_holders"] = self.ledger.fact_ids_since(checkpoint)
@@ -1409,11 +1556,23 @@ class Chainseer:
 
         data.update(
             build_extended_evidence(
-                data, primary_chain_id=DEXSCREENER_CHAIN_ID
+                data, primary_chain_id=self.network.dexscreener_chain_id
             )
         )
 
         # ── Phase 8: Analysis + scoring ────────────────────────────────────
+        data["entity_graph"] = build_robinhood_entity_graph(
+            token,
+            data,
+            block_pin=pin_block,
+            claim_evidence=claim_evidence,
+            network=self.network_key,
+        )
+        graph_ok, graph_reason = verify_entity_graph(data["entity_graph"])
+        if not graph_ok:
+            raise RuntimeError(
+                f"Entity evidence graph verification failed: {graph_reason}"
+            )
         print(" Running analysis...")
         analysis = self._analyze(data)
 
@@ -1423,10 +1582,11 @@ class Chainseer:
             "token_name": data["basic_info"].get("name"),
             "token_symbol": data["basic_info"].get("symbol"),
             "chain_id": self.chain_id,
-            "chain": "robinhood",
+            "chain": self.network_key,
+            "chain_name": self.network.name,
             "analysis_version": CHAINSEER_VERSION,
             "timestamp": datetime.now(timezone.utc).isoformat(),
-            "explorer_url": f"{EXPLORER_TOKEN}{token}",
+            "explorer_url": f"{self.network.explorer_token}{token}",
             "data": data,
             "analysis": analysis,
             "provenance": self.ledger.to_dict(),
@@ -1489,20 +1649,37 @@ class Chainseer:
         dexscreener = data.get("dexscreener", {})
         goplus = data.get("goplus_security", {})
         all_pairs = dexscreener.get("pairs", [])
-        pairs = [
+        same_chain_pairs = [
             pair for pair in all_pairs
-            if str(pair.get("chainId", "")).lower() == DEXSCREENER_CHAIN_ID
+            if str(pair.get("chainId", "")).lower()
+            == self.network.dexscreener_chain_id
         ]
-        primary = _pick_primary_pair({"pairs": pairs})
+        token_lower = token.lower()
+        pairs = [
+            pair
+            for pair in same_chain_pairs
+            if str(
+                (pair.get("baseToken") or {}).get("address") or ""
+            ).lower()
+            == token_lower
+        ]
+        primary = _pick_primary_pair(
+            {"pairs": pairs}, self.network.wrapped_native
+        )
 
         result = {
             "pair_count": len(pairs),
-            "discarded_foreign_pair_count": len(all_pairs) - len(pairs),
+            "discarded_foreign_pair_count": (
+                len(all_pairs) - len(same_chain_pairs)
+            ),
+            "discarded_quote_or_unbound_pair_count": (
+                len(same_chain_pairs) - len(pairs)
+            ),
             "primary_pair_address": primary.get("pairAddress"),
             "primary_dex": primary.get("dexId"),
             "primary_labels": primary.get("labels", []),
             "primary_amm_version": _amm_version(primary),
-            # Only addresses supplied by a Robinhood-chain DEX market record
+            # Only addresses supplied by this network's DEX market record
             # are eligible for structural AMM exclusion in holder analysis.
             # V4 pool ids are 32-byte identifiers, not holder addresses.
             "verified_amm_addresses": sorted({
@@ -1519,8 +1696,22 @@ class Chainseer:
         result["total_volume_24h"] = total_volume_24h
         result["primary_price_usd"] = _safe_float(primary.get("priceUsd"))
         result["primary_liquidity_usd"] = _safe_float(primary.get("liquidity", {}).get("usd"))
-        result["market_cap"] = _safe_float(primary.get("marketCap") or primary.get("fdv"))
-        result["fdv"] = _safe_float(primary.get("fdv"))
+        reported_market_cap = _safe_float(primary.get("marketCap"))
+        fdv = _safe_float(primary.get("fdv"))
+        if reported_market_cap > 0:
+            result["market_cap"] = reported_market_cap
+            result["market_cap_kind"] = "reported_market_cap"
+        elif fdv > 0:
+            # DexScreener does not always provide circulating market cap. Keep
+            # the fallback useful without presenting fully diluted valuation
+            # as a measured circulating market cap.
+            result["market_cap"] = fdv
+            result["market_cap_kind"] = "fdv_proxy"
+        else:
+            result["market_cap"] = None
+            result["market_cap_kind"] = "unavailable"
+        result["market_cap_source"] = "DexScreener"
+        result["fdv"] = fdv if fdv > 0 else None
 
         # Transaction counts (from best pair)
         txns = primary.get("txns", {})
@@ -1584,10 +1775,10 @@ class Chainseer:
                     "reserve1_raw": reserves["reserve1"],
                 }
                 # Determine which reserve is ETH (quote) vs token (base)
-                if t1.lower() == WETH_ADDRESS.lower():
+                if t1.lower() == self.network.wrapped_native.lower():
                     result["on_chain_reserves"]["reserve_eth"] = reserves["reserve1"] / 1e18
                     result["on_chain_reserves"]["reserve_tokens_raw"] = reserves["reserve0"]
-                elif t0.lower() == WETH_ADDRESS.lower():
+                elif t0.lower() == self.network.wrapped_native.lower():
                     result["on_chain_reserves"]["reserve_eth"] = reserves["reserve0"] / 1e18
                     result["on_chain_reserves"]["reserve_tokens_raw"] = reserves["reserve1"]
             except Exception:
@@ -1661,8 +1852,16 @@ class Chainseer:
 
     def _analyze_deployer_and_creation(self, token: str) -> dict:
         """Fetch deployer address, creation tx, and serial deployer history from Blockscout."""
-        addr_info = _fetch_blockscout_address(token, ledger=self.ledger)
-        token_info = _fetch_blockscout_token(token, ledger=self.ledger)
+        addr_info = _fetch_blockscout_address(
+            token,
+            ledger=self.ledger,
+            blockscout_base=self.network.blockscout_base,
+        )
+        token_info = _fetch_blockscout_token(
+            token,
+            ledger=self.ledger,
+            blockscout_base=self.network.blockscout_base,
+        )
 
         creator = addr_info.get("creator_address", "")
         creation_tx = addr_info.get("creation_tx_hash", "")
@@ -1677,7 +1876,11 @@ class Chainseer:
 
         # Serial deployer check
         if creator:
-            serial = _fetch_serial_deployer(creator, ledger=self.ledger)
+            serial = _fetch_serial_deployer(
+                creator,
+                ledger=self.ledger,
+                blockscout_base=self.network.blockscout_base,
+            )
             result["serial_deployer"] = serial
             result["is_serial_deployer"] = serial.get("is_serial_deployer", False)
             result["total_deployer_creations"] = serial.get("total_creations", 0)
@@ -1690,134 +1893,28 @@ class Chainseer:
         *,
         verified_amm_addresses=None,
         total_supply_raw=None,
-        goplus_holders=None,
     ) -> dict:
-        """Discover holder candidates, then validate balances at the block pin.
+        """Fetch and classify top holders using explicit market evidence.
 
-        Blockscout and GoPlus are candidate-discovery sources, not balance
-        authorities: explorer indexes can lag or retain stale holder rows.
-        Every candidate balance must therefore be re-read through
-        ``balanceOf`` on the request's pinned RPC context before concentration
-        can affect scoring or trigger a hard stop.
-
-        Only holder addresses independently identified as Robinhood-chain AMM
+        Only holder addresses independently identified as same-network AMM
         markets are excluded. Other contracts, including EIP-7702 accounts,
-        remain economic holders.
+        remain economic holders. Concentration uses total token supply when it
+        is available; a top-20 sample is never silently labelled as supply.
         """
-        indexed_holders = _fetch_blockscout_holders(
-            token, limit=20, ledger=self.ledger
+        holders = _fetch_blockscout_holders(
+            token,
+            limit=20,
+            ledger=self.ledger,
+            blockscout_base=self.network.blockscout_base,
         )
-        if not indexed_holders and not goplus_holders:
+        if not holders:
             return {"holders": [], "blockscout_available": False}
 
-        supply_raw = _safe_int(total_supply_raw)
         verified_amm = {
             str(address).lower()
             for address in (verified_amm_addresses or [])
             if ADDRESS_RE.fullmatch(str(address or ""))
         }
-
-        candidates = {}
-        for source_holder in indexed_holders:
-            holder = dict(source_holder)
-            address = str(holder.get("address") or "").lower()
-            if not ADDRESS_RE.fullmatch(address):
-                continue
-            holder["address"] = address
-            holder["candidate_sources"] = ["blockscout"]
-            holder["indexed_balance_raw"] = _safe_int(
-                holder.get("balance_raw", "0")
-            )
-            candidates[address] = holder
-
-        for source_holder in list(goplus_holders or [])[:20]:
-            address = str(
-                source_holder.get("address")
-                or source_holder.get("holder_address")
-                or ""
-            ).lower()
-            if not ADDRESS_RE.fullmatch(address):
-                continue
-            if address in candidates:
-                candidates[address]["candidate_sources"].append("goplus")
-                continue
-            candidates[address] = {
-                "address": address,
-                "is_contract": bool(_safe_int(source_holder.get("is_contract"))),
-                "address_info": {},
-                "candidate_sources": ["goplus"],
-                "indexed_balance_raw": None,
-            }
-
-        holders = list(candidates.values())
-        if not holders:
-            return {
-                "holders": [],
-                "blockscout_available": bool(indexed_holders),
-            }
-
-        balance_reader = getattr(getattr(self, "rpc", None), "erc20_balance_of", None)
-        rpc_validation_attempted = callable(balance_reader)
-        validation_errors = []
-        material_mismatches = []
-        validated_count = 0
-        material_floor = max(1, supply_raw // 10_000) if supply_raw > 0 else 1
-
-        for holder in holders:
-            indexed_balance = holder.get("indexed_balance_raw")
-            if rpc_validation_attempted:
-                try:
-                    live_balance = _safe_int(
-                        balance_reader(token, holder["address"])
-                    )
-                    holder["balance_raw"] = str(live_balance)
-                    holder["balance_parsed"] = live_balance
-                    holder["balance_source"] = "pinned_rpc_balanceOf"
-                    holder["balance_live_validated"] = True
-                    validated_count += 1
-                    if indexed_balance is not None:
-                        delta = abs(live_balance - indexed_balance)
-                        relative_floor = max(
-                            live_balance, indexed_balance, 1
-                        ) // 100
-                        if delta > max(material_floor, relative_floor):
-                            material_mismatches.append({
-                                "address": holder["address"],
-                                "indexed_balance_raw": indexed_balance,
-                                "pinned_balance_raw": live_balance,
-                            })
-                except Exception as exc:
-                    holder["balance_parsed"] = 0
-                    holder["balance_source"] = "pinned_rpc_validation_failed"
-                    holder["balance_live_validated"] = False
-                    validation_errors.append({
-                        "address": holder["address"],
-                        "error": str(exc)[:240],
-                    })
-            else:
-                holder["balance_parsed"] = _safe_int(indexed_balance)
-                holder["balance_source"] = "explorer_index_unverified"
-                holder["balance_live_validated"] = False
-
-        holders.sort(
-            key=lambda holder: holder.get("balance_parsed", 0),
-            reverse=True,
-        )
-        indexed_total_raw = sum(
-            _safe_int(holder.get("indexed_balance_raw"))
-            for holder in holders
-            if holder.get("indexed_balance_raw") is not None
-        )
-        indexed_sample_exceeds_supply = (
-            supply_raw > 0 and indexed_total_raw > supply_raw
-        )
-        concentration_complete = (
-            supply_raw > 0
-            and rpc_validation_attempted
-            and validated_count == len(holders)
-            and not validation_errors
-        )
-
         # Compute concentration excluding only verified pair/AMM addresses.
         total_raw = 0
         excluded_amm = set()
@@ -1836,7 +1933,7 @@ class Chainseer:
             addr = h.get("address", "").lower()
             addr_info = h.get("address_info", {})
 
-            # Dual-source identity: the address must be a Robinhood-chain
+            # Dual-source identity: the address must be a same-network
             # market in DexScreener and a contract in Blockscout.
             if addr in verified_amm and h.get("is_contract"):
                 excluded_amm.add(addr)
@@ -1865,37 +1962,24 @@ class Chainseer:
             h["balance_parsed"] for h in holders
             if h.get("address", "").lower() not in excluded_amm
         )
+        supply_raw = _safe_int(total_supply_raw)
         concentration_denominator = supply_raw if supply_raw > 0 else total_raw
         concentration_basis = (
-            "pinned_rpc_balances_over_pinned_total_supply"
-            if concentration_complete
-            else "candidate_balances_not_hard_stop_eligible"
+            "total_supply" if supply_raw > 0 else "top_holders_sample"
         )
         result = {
             "holders": holders,
-            "blockscout_available": bool(indexed_holders),
+            "blockscout_available": True,
             "total_parsed": total_raw,
-            "indexed_total_parsed": indexed_total_raw,
             "non_pair_total": non_pair_total,
             "total_supply_raw": supply_raw or None,
             "concentration_denominator_raw": concentration_denominator,
             "concentration_basis": concentration_basis,
-            "concentration_complete": concentration_complete,
-            "concentration_hard_stop_eligible": concentration_complete,
-            "rpc_balance_validation_attempted": rpc_validation_attempted,
-            "rpc_balance_validated_count": validated_count,
-            "rpc_balance_candidate_count": len(holders),
-            "rpc_balance_validation_errors": validation_errors,
-            "material_indexed_balance_mismatches": material_mismatches,
-            "material_indexed_balance_mismatch_count": len(material_mismatches),
-            "indexed_sample_exceeds_supply": indexed_sample_exceeds_supply,
-            "stale_index_detected": bool(
-                material_mismatches or indexed_sample_exceeds_supply
-            ),
+            "concentration_complete": supply_raw > 0,
             "pair_contracts_excluded": sorted(excluded_amm),
             "verified_amm_addresses": sorted(verified_amm),
             "amm_verification_method": (
-                "DexScreener Robinhood pair + holder contract metadata"
+                "DexScreener Robinhood pair + Blockscout contract"
             ),
             "unclassified_contract_holders": unclassified_contracts,
             "eoa_holders_count": eoa_count,
@@ -1906,7 +1990,7 @@ class Chainseer:
             "eip7702_count": eip7702_count,
         }
 
-        if concentration_complete and concentration_denominator > 0 and holders:
+        if concentration_denominator > 0 and holders:
             # Raw concentration (includes pair contracts)
             result["top_1_pct"] = round(
                 holders[0].get("balance_parsed", 0)
@@ -2047,7 +2131,10 @@ class Chainseer:
 
                 # Find the top LP holder via Blockscout
                 lp_holders = _fetch_blockscout_holders(
-                    pair_addr, limit=5, ledger=getattr(self, "ledger", None)
+                    pair_addr,
+                    limit=5,
+                    ledger=getattr(self, "ledger", None),
+                    blockscout_base=self.network.blockscout_base,
                 )
                 for h in lp_holders:
                     addr = h.get("address", "")
@@ -2201,7 +2288,10 @@ class Chainseer:
             "verified as burned or timelocked; remaining custody is unverified"
         )
         holders = _fetch_blockscout_holders(
-            pair_addr, limit=5, ledger=getattr(self, "ledger", None)
+            pair_addr,
+            limit=5,
+            ledger=getattr(self, "ledger", None),
+            blockscout_base=self.network.blockscout_base,
         )
         normalized_creator = str(creator_address or "").lower()
         if normalized_creator:
@@ -2376,7 +2466,10 @@ class Chainseer:
 
             # Get basic_info from the data dict is not available here directly,
             # but we can compute using priceUsd and priceNative from DexScreener
-            primary_pair = _pick_primary_pair({"pairs": [dex_data.get("primary_pair_raw", {})]})
+            primary_pair = _pick_primary_pair(
+                {"pairs": [dex_data.get("primary_pair_raw", {})]},
+                self.network.wrapped_native,
+            )
             if not primary_pair:
                 primary_pair = {}
 
@@ -2748,7 +2841,7 @@ class Chainseer:
             if gp_open_source is True:
                 flags["yellow"].append(
                     "GoPlus reports open source, but Blockscout does not "
-                    "verify this Robinhood Chain contract"
+                    f"verify this {self.network.name} contract"
                 )
                 uncertain["source_verification"] = (
                     "Verification providers disagree; the chain-specific "
@@ -2861,9 +2954,9 @@ class Chainseer:
 
         # Prefer total-supply concentration with only verified AMMs excluded.
         has_complete_blockscout_concentration = (
-            bs_holders.get("adj_top_1_pct") is not None
-            and bs_holders.get("concentration_complete", False)
-            and bs_holders.get("concentration_hard_stop_eligible", False)
+            bs_holders.get("blockscout_available")
+            and bs_holders.get("adj_top_1_pct") is not None
+            and bs_holders.get("concentration_complete", True)
         )
         if has_complete_blockscout_concentration:
             adj_top1 = bs_holders["adj_top_1_pct"]
@@ -2887,7 +2980,7 @@ class Chainseer:
                     f"Low non-AMM concentration: largest holder "
                     f"{adj_top1:.1f}% of supply"
                 )
-        elif not bs_holders.get("rpc_balance_validation_attempted"):
+        else:
             # GoPlus is a fallback only when supply-based Blockscout
             # concentration is unavailable. Ignore any independently verified
             # AMM address rather than treating the pool as a whale.
@@ -2930,11 +3023,6 @@ class Chainseer:
                     "Total supply denominator unavailable; top-holder sample "
                     "was not treated as a complete concentration measure"
                 )
-        else:
-            uncertain["holder_concentration"] = (
-                "Holder candidates could not all be validated with balanceOf "
-                "at the pinned block; concentration is not hard-stop eligible"
-            )
 
         # ── 5. Volume & activity (0-100) ─────────────────────────────────
         vol_24h = dex.get("total_volume_24h", 0)
@@ -3256,10 +3344,7 @@ class Chainseer:
             )
 
         top_holder_pct = _safe_float(bs_holders.get("adj_top_1_pct"))
-        if (
-            bs_holders.get("concentration_hard_stop_eligible") is True
-            and top_holder_pct >= 50
-        ):
+        if top_holder_pct >= 50:
             severity = "Critical" if top_holder_pct >= 80 else "High"
             hard_stop(
                 "EXTREME_CONCENTRATION", severity,
@@ -3330,6 +3415,9 @@ class Chainseer:
             "confidence": confidence_label,
             "confidence_grade": confidence_grade,
             "confidence_limiters": major_unknowns,
+            "entity_insider_summary": (
+                (data.get("entity_graph") or {}).get("summary") or {}
+            ),
             "extended_evidence": {
                 "social_attention": data.get("social_attention", {}),
                 "cross_chain": data.get("cross_chain", {}),
@@ -3378,13 +3466,14 @@ class Chainseer:
         for key in ["goplus_security", "dexscreener", "basic_info", "contract_audit",
                     "dex_pairs", "transfer_activity", "lp_lock", "tax_estimate",
                     "deployer", "blockscout_holders", "wash_trading", "blockscout_address",
-                    "trend", "social_attention", "cross_chain", "mev_exposure"]:
+                    "trend", "social_attention", "cross_chain", "mev_exposure",
+                    "entity_graph"]:
             d = data.get(key, {})
             if d and not d.get("error") and (isinstance(d, dict) and len(d) > 0):
                 sources_filled += 1
             elif isinstance(d, list) and len(d) > 0:
                 sources_filled += 1
-        depth_ratio = sources_filled / 16
+        depth_ratio = sources_filled / 17
         scores["depth"] = int(100 + depth_ratio * 120)
 
         # Honest uncertainty and traceable evidence are the covenant-facing signals.
@@ -3398,6 +3487,12 @@ class Chainseer:
         cognition = self.cognitive_loop.prepare(report)
         poq = report.get("poq_scores", {})
         analysis = report["analysis"]
+        entity_graph = (report.get("data") or {}).get("entity_graph") or {}
+        sealed_entity_graph = {
+            "graph_hash": entity_graph.get("graph_hash"),
+            "summary": entity_graph.get("summary") or {},
+            "signals": entity_graph.get("signals") or [],
+        }
         candidate = (
             f"Token {report['token_address']} assessed as {analysis['risk_level']} risk "
             f"with legitimacy score {analysis['legitimacy_score']}/100. "
@@ -3411,6 +3506,7 @@ class Chainseer:
                 "analysis": report.get("analysis", {}),
                 "provenance": report.get("provenance", {}),
                 "claim_evidence": report.get("claim_evidence", {}),
+                "entity_graph": sealed_entity_graph,
             }, sort_keys=True, default=str)
         )
         verdict, ring = self.poq_module.gate_and_seal(
@@ -3432,6 +3528,7 @@ class Chainseer:
                 json.dumps(report.get("analysis", {}), sort_keys=True, default=str),
                 json.dumps(report.get("provenance", {}), sort_keys=True, default=str),
                 json.dumps(report.get("claim_evidence", {}), sort_keys=True, default=str),
+                json.dumps(sealed_entity_graph, sort_keys=True, default=str),
             ],
             extra_payload={
                 "token_address": report["token_address"],
@@ -3452,6 +3549,7 @@ class Chainseer:
                 "block_pin": report["provenance"]["block_pin"],
                 "provenance": report["provenance"],
                 "claim_evidence": report.get("claim_evidence", {}),
+                "entity_graph": sealed_entity_graph,
                 "uncertain_components": report["analysis"].get("uncertain_components", {}),
                 "cognitive_loop": cognition,
             },
@@ -3933,7 +4031,10 @@ class Chainseer:
             print(f" Deployer:")
             print(f"   Address: {deployer['creator_address']}")
             if deployer.get("creation_tx_hash"):
-                print(f"   Creation TX: {EXPLORER}/tx/{deployer['creation_tx_hash']}")
+                print(
+                    f"   Creation TX: {self.explorer}/tx/"
+                    f"{deployer['creation_tx_hash']}"
+                )
             if deployer.get("is_serial_deployer"):
                 print(f"   Serial deployer: YES ({deployer.get('total_deployer_creations')}+ contracts)")
             else:

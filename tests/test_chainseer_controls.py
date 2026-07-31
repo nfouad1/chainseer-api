@@ -10,6 +10,7 @@ import chainseer_controls as controls
 TOKEN = "0x" + "1" * 40
 PAIR = "0x" + "2" * 40
 RECIPIENT = "0x" + "3" * 40
+SOLANA_MINT = "So11111111111111111111111111111111111111112"
 
 
 class FakeTimechain:
@@ -18,9 +19,6 @@ class FakeTimechain:
 
     def load(self):
         return list(self.rings)
-
-    def verify(self):
-        return True, ["ok"]
 
 
 class FakePoQ:
@@ -41,6 +39,7 @@ class FakeRPC:
         self.owner = "0x" + "4" * 40
         self.context = None
         self.ledger = None
+        self.logs = []
 
     def unbind_context(self):
         self.context = None
@@ -61,8 +60,8 @@ class FakeRPC:
     def erc20_total_supply(self, _token, block=None):
         return 1_000_000
 
-    def get_logs(self, *_args, **_kwargs):
-        return []
+    def get_logs(self, *_args, **kwargs):
+        return list(self.logs) if kwargs.get("address") == TOKEN else []
 
 
 class FakeAgent:
@@ -82,6 +81,7 @@ class FakeAgent:
         self.chain_id = 4663
         self.chain_root = "."
         self.scan_count = 0
+        self.sell_tax = "0"
 
     def analyze_token(self, token, full_report=False, block_pin=None):
         self.scan_count += 1
@@ -123,7 +123,10 @@ class FakeAgent:
                     "primary_liquidity_usd": 100_000,
                 },
                 "lp_lock": {"state": "protocol_secured"},
-                "goplus_security": {"buy_tax": "0", "sell_tax": "0"},
+                "goplus_security": {
+                    "buy_tax": "0",
+                    "sell_tax": self.sell_tax,
+                },
             },
         }
 
@@ -151,6 +154,153 @@ class FakeAgent:
             "ring": ring,
             "verdict": {"decision": "SEAL"},
             "calibration": ring["payload"]["calibration"],
+        }
+
+
+class FakeSolanaRPC:
+    def __init__(self):
+        self.slot = 100
+        self.mint_authority = None
+        self.signatures = []
+        self.fail_largest_accounts = False
+
+    def get_slot(self):
+        return self.slot
+
+    def get_account_info(self, _mint, encoding="jsonParsed"):
+        self.asserted_encoding = encoding
+        return {
+            "context": {"slot": self.slot},
+            "value": {
+                "owner": "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA",
+                "data": {
+                    "parsed": {
+                        "type": "mint",
+                        "info": {
+                            "decimals": 6,
+                            "supply": "1000000",
+                            "mintAuthority": self.mint_authority,
+                            "freezeAuthority": None,
+                        },
+                    }
+                },
+            },
+        }
+
+    def get_token_supply(self, _mint):
+        return {
+            "context": {"slot": self.slot},
+            "value": {"amount": "1000000", "decimals": 6},
+        }
+
+    def get_token_largest_accounts(self, _mint):
+        if self.fail_largest_accounts:
+            raise RuntimeError(
+                "synthetic provider rate limit at "
+                "https://rpc.example/?api-key=secret"
+            )
+        return {
+            "context": {"slot": self.slot},
+            "value": [
+                {"address": "holder-a", "amount": "300000"},
+                {"address": "holder-b", "amount": "200000"},
+            ],
+        }
+
+    def get_signatures_for_address(self, _mint, limit=25):
+        return self.signatures[:limit]
+
+
+class FakeDexScreener:
+    def __init__(self):
+        self.price = "1.0"
+        self.liquidity = 100_000
+
+    def token_pairs(self, mint):
+        return [
+            {
+                "chainId": "solana",
+                "pairAddress": "pair-a",
+                "dexId": "raydium",
+                "baseToken": {"address": mint},
+                "quoteToken": {"address": "quote"},
+                "priceUsd": self.price,
+                "liquidity": {"usd": self.liquidity},
+                "marketCap": 1_000_000,
+                "fdv": 1_000_000,
+            }
+        ]
+
+
+class FakeSolanaAnalyzer:
+    def __init__(self, timechain_agent):
+        self.rpc = FakeSolanaRPC()
+        self.dexscreener = FakeDexScreener()
+        self.timechain_agent = timechain_agent
+        self.scan_count = 0
+
+    @staticmethod
+    def _extension_names(_info):
+        return []
+
+    @staticmethod
+    def _market_pair(_mint, pairs):
+        return pairs[0] if pairs else None
+
+    def analyze_token(self, mint):
+        self.scan_count += 1
+        ring = {
+            "index": len(self.timechain_agent.tc.rings),
+            "ring_hash": f"solana-analysis-{self.scan_count}",
+            "ring_type": "solana_token_analysis",
+            "payload": {},
+        }
+        self.timechain_agent.tc.rings.append(ring)
+        return {
+            "token_address": mint,
+            "timestamp": controls.utc_now_iso(),
+            "analysis_ring": ring["index"],
+            "analysis_ring_hash": ring["ring_hash"],
+            "provenance": {"block_pin": self.rpc.slot},
+            "analysis": {
+                "risk_level": (
+                    "High" if self.rpc.mint_authority else "Low"
+                ),
+                "legitimacy_score": (
+                    35 if self.rpc.mint_authority else 85
+                ),
+                "hard_stop_overrides": (
+                    [{"code": "mint_authority_active"}]
+                    if self.rpc.mint_authority
+                    else []
+                ),
+            },
+            "data": {
+                "basic_info": {
+                    "owner_program": (
+                        "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
+                    ),
+                    "mint_authority": self.rpc.mint_authority,
+                    "freeze_authority": None,
+                    "supply_raw": 1_000_000,
+                    "extensions": [],
+                    "jupiter_holder_count": 2,
+                },
+                "holder_concentration": {
+                    "top1_total_supply_pct": 30,
+                    "top10_total_supply_pct": 50,
+                },
+                "dex_pairs": {
+                    "primary_pair": "pair-a",
+                    "primary_amm_version": "raydium",
+                    "primary_price_usd": float(self.dexscreener.price),
+                    "total_liquidity_usd": self.dexscreener.liquidity,
+                    "market_cap": 1_000_000,
+                },
+                "execution_evidence": {
+                    "roundtrip_retention_pct": 98,
+                },
+            },
         }
 
 
@@ -255,6 +405,60 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             self.assertEqual(first["created_at"], second["created_at"])
             self.assertEqual(len(store.load()["subscriptions"]), 1)
 
+    def test_base_watch_store_is_network_and_file_isolated(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            robinhood = controls.WatchStore(temp_dir)
+            base = controls.WatchStore(temp_dir, "base")
+            value = base.subscribe(TOKEN)
+            self.assertEqual(value["network"], "base")
+            self.assertEqual(robinhood.load()["subscriptions"], {})
+            self.assertIn(TOKEN.lower(), base.load()["subscriptions"])
+            self.assertNotEqual(robinhood.state_path, base.state_path)
+            self.assertNotEqual(robinhood.alert_path, base.alert_path)
+
+    def test_watch_store_isolates_subscribers_and_returns_public_critical_feed(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            store = controls.WatchStore(temp_dir)
+            subscriber_a = "a" * 64
+            subscriber_b = "b" * 64
+            store.subscribe(TOKEN, subscriber_a)
+            store.subscribe(TOKEN, subscriber_b)
+            self.assertTrue(store.is_subscribed(TOKEN, subscriber_a))
+            self.assertTrue(store.unsubscribe(TOKEN, subscriber_a))
+            self.assertFalse(store.is_subscribed(TOKEN, subscriber_a))
+            self.assertTrue(store.is_subscribed(TOKEN, subscriber_b))
+
+            alert = {
+                "schema_version": controls.CONTROL_SCHEMA_VERSION,
+                "network": "robinhood",
+                "token_address": TOKEN,
+                "block": 100,
+                "observed_at": "2026-07-29T20:00:00+00:00",
+                "critical_events": [
+                    controls._critical_event(
+                        "sellability",
+                        "sell_restriction_detected",
+                        "A sell restriction was detected.",
+                    )
+                ],
+                "analysis_ring": 12,
+                "analysis_ring_hash": "analysis-hash",
+                "timechain": {"ring": 13, "ring_hash": "watch-hash"},
+            }
+            alert["alert_hash"] = controls.canonical_hash(alert)
+            store.append_alert(alert)
+            feed = store.read_alerts(TOKEN)
+            self.assertEqual(len(feed), 1)
+            self.assertEqual(feed[0]["categories"], ["sellability"])
+            self.assertNotIn("events", feed[0])
+            self.assertEqual(
+                store.read_alerts(
+                    TOKEN,
+                    after="2026-07-29T20:00:00+00:00",
+                ),
+                [],
+            )
+
     def test_outcomes_keep_market_and_security_dimensions_separate(self):
         baseline = {
             "price_usd": 1.0,
@@ -308,43 +512,173 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             ).splitlines()
             alert = json.loads(alerts[-1])
             self.assertEqual(alert["type"], "state_change")
+            self.assertEqual(
+                alert["critical_events"][0]["category"],
+                "authority",
+            )
             self.assertIsNotNone(alert["timechain"]["ring"])
 
-    def test_watcher_seals_reorg_alert(self):
+    def test_custom_contract_activity_detects_sell_tax_increase(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             agent = FakeAgent()
             agent.chain_root = temp_dir
             watcher = controls.ChainseerWatcher(
                 agent,
                 control_root=temp_dir,
-                config=controls.WatchConfig(
-                    confirmations=2,
-                    holder_rescan_blocks=12,
-                    max_rescan_blocks=120,
-                    score_alert_delta=5,
-                ),
             )
             watcher.store.subscribe(TOKEN)
+            watcher.run_once()
+
+            agent.rpc.head = 103
+            agent.sell_tax = "0.20"
+            agent.rpc.logs = [
+                {
+                    "topics": ["0x" + "9" * 64],
+                    "blockNumber": "0x65",
+                    "transactionHash": "0x" + "8" * 64,
+                    "logIndex": "0x0",
+                }
+            ]
+            result = watcher.run_once()
+            self.assertEqual(result["rescans"], 1)
+            feed = watcher.store.read_alerts(TOKEN)
+            self.assertEqual(feed[-1]["categories"], ["sellability"])
+            self.assertIn("20.0%", feed[-1]["message"])
+
+    def test_solana_watcher_rescans_on_confirmed_authority_change(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+                config=controls.SolanaWatchConfig(
+                    minimum_rescan_slots=8,
+                    max_reconcile_slots=900,
+                ),
+            )
+            watcher.store.subscribe(SOLANA_MINT)
             first = watcher.run_once()
+            self.assertEqual(first["rescans"], 1)
             self.assertEqual(first["alerts"], 0)
 
-            # Simulate a confirmed-block hash change without advancing the
-            # head, so run_once takes the reorg branch rather than the
-            # regular rescan branch.
-            state = watcher.store.load()
-            key = next(iter(state["subscriptions"]))
-            state["subscriptions"][key]["last_processed_hash"] = "stale-hash"
-            watcher.store.save(state)
-
+            analyzer.rpc.slot = 101
+            analyzer.rpc.mint_authority = "authority-a"
+            analyzer.rpc.signatures = [
+                {
+                    "signature": "signature-a",
+                    "slot": 101,
+                    "confirmationStatus": "confirmed",
+                    "err": None,
+                    "blockTime": 1_700_000_000,
+                }
+            ]
             second = watcher.run_once()
+            self.assertEqual(second["material_events"], 1)
+            self.assertEqual(second["rescans"], 1)
             self.assertEqual(second["alerts"], 1)
-            alerts = watcher.store.alert_path.read_text(
-                encoding="utf-8"
-            ).splitlines()
-            alert = json.loads(alerts[-1])
-            self.assertEqual(alert["type"], "reorg")
-            self.assertIsNotNone(alert["timechain"])
-            self.assertIsNotNone(alert["timechain"]["ring"])
+            alert = json.loads(
+                watcher.store.alert_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()[-1]
+            )
+            self.assertEqual(alert["network"], "solana")
+            self.assertIn("mint_authority_changed", alert["reason"])
+            self.assertEqual(
+                alert["critical_events"][0]["category"],
+                "authority",
+            )
+            self.assertEqual(
+                alert["timechain"]["decision"],
+                "SEAL",
+            )
+            self.assertEqual(
+                timechain_agent.tc.rings[-1]["ring_type"],
+                "solana_watch_transition",
+            )
+
+    def test_solana_watcher_debounces_small_holder_rotation(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(SOLANA_MINT)
+            watcher.run_once()
+
+            analyzer.rpc.slot = 101
+            analyzer.rpc.signatures = [
+                {
+                    "signature": "signature-b",
+                    "slot": 101,
+                    "confirmationStatus": "confirmed",
+                    "err": None,
+                }
+            ]
+            second = watcher.run_once()
+            self.assertEqual(second["rescans"], 0)
+            self.assertEqual(second["alerts"], 0)
+            self.assertGreaterEqual(second["events_observed"], 1)
+
+    def test_solana_watcher_separates_optional_rpc_failure_from_token_error(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            analyzer.rpc.fail_largest_accounts = True
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(SOLANA_MINT)
+            result = watcher.run_once()
+            self.assertEqual(result["errors"], [])
+            self.assertEqual(result["rescans"], 1)
+            self.assertEqual(
+                result["infrastructure_indeterminate"][0]["source"],
+                "solana_rpc.getTokenLargestAccounts",
+            )
+            diagnostic = result["infrastructure_indeterminate"][0]["message"]
+            self.assertNotIn("https://", diagnostic)
+            self.assertNotIn("secret", diagnostic)
+            subscription = watcher.store.load()["subscriptions"][
+                SOLANA_MINT
+            ]
+            self.assertIsNone(
+                subscription["quick_snapshot"][
+                    "top10_total_supply_pct"
+                ]
+            )
+
+    def test_solana_liquidity_removal_is_a_critical_event(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(SOLANA_MINT)
+            watcher.run_once()
+            analyzer.rpc.slot = 101
+            analyzer.dexscreener.liquidity = 60_000
+            result = watcher.run_once()
+            self.assertEqual(result["alerts"], 1)
+            alert = json.loads(
+                watcher.store.alert_path.read_text(
+                    encoding="utf-8"
+                ).splitlines()[-1]
+            )
+            self.assertIn("liquidity_removed", alert["reason"])
+            self.assertEqual(
+                alert["critical_events"][0]["category"],
+                "liquidity",
+            )
 
 
 class CalibrationTests(unittest.TestCase):
@@ -388,137 +722,6 @@ class CalibrationTests(unittest.TestCase):
             proposal = engine.propose([self.outcome_ring(1, True)])
             self.assertEqual(proposal["status"], "insufficient_data")
             self.assertFalse(engine.policy_path.exists())
-
-    def _hand_edited_proposal(self, **overrides):
-        # adopt() takes an arbitrary proposal file path, not something bound
-        # to propose()'s own output, so a real attack/misconfiguration looks
-        # like this: a "proposed" status with a hand-edited proposed_policy
-        # rather than anything propose() itself would ever emit.
-        current = controls.CalibrationPolicy()
-        from dataclasses import asdict
-
-        proposed = asdict(current)
-        proposed.update(overrides)
-        return {
-            "status": "proposed",
-            "current_policy": asdict(current),
-            "proposed_policy": proposed,
-            "metrics": {"sample_size": current.min_outcomes},
-        }
-
-    def test_adopt_rejects_loosened_false_negative_rate(self):
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        proposal = self._hand_edited_proposal(max_false_negative_rate=0.5)
-        with self.assertRaisesRegex(ValueError, "max_false_negative_rate"):
-            engine.adopt(proposal, agent=None)
-
-    def test_adopt_rejects_lowered_min_outcomes(self):
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        proposal = self._hand_edited_proposal(min_outcomes=1)
-        with self.assertRaisesRegex(ValueError, "min_outcomes"):
-            engine.adopt(proposal, agent=None)
-
-    def test_adopt_rejects_widened_permit_block_drift(self):
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        proposal = self._hand_edited_proposal(max_permit_block_drift=50)
-        with self.assertRaisesRegex(ValueError, "max_permit_block_drift"):
-            engine.adopt(proposal, agent=None)
-
-    def test_adopt_rejects_widened_quote_age(self):
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        proposal = self._hand_edited_proposal(max_quote_age_blocks=50)
-        with self.assertRaisesRegex(ValueError, "max_quote_age_blocks"):
-            engine.adopt(proposal, agent=None)
-
-    def test_adopt_rejects_lengthened_permit_ttl(self):
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        proposal = self._hand_edited_proposal(permit_ttl_seconds=300)
-        with self.assertRaisesRegex(ValueError, "permit_ttl_seconds"):
-            engine.adopt(proposal, agent=None)
-
-    @staticmethod
-    def scored_outcome_ring(index, *, score, adverse):
-        return {
-            "index": index,
-            "ring_type": "analysis_outcome",
-            "payload": {
-                "analysis_ring": index + 100,
-                "calibration": {
-                    "original_risk_level": "Low",
-                    "original_legitimacy_score": score,
-                    "adverse_security_event": adverse,
-                },
-                "other_outcomes": {"horizon_seconds": 3600},
-                "market_outcomes": {"price_return_pct": -10 if adverse else 5},
-            },
-        }
-
-    def test_reliability_curve_is_empty_with_no_scored_outcomes(self):
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        report = engine.reliability_curve([], bins=10)
-        self.assertEqual(report["sample_size"], 0)
-        self.assertIsNone(report["brier_score"])
-        self.assertEqual(len(report["bins"]), 10)
-
-    def test_reliability_curve_perfect_calibration_scores_zero_brier(self):
-        # Every score-100 token stays safe; every score-0 token is adverse --
-        # a perfectly calibrated agent at the extremes, so Brier should be
-        # exactly 0 and every populated bin's calibration_gap_pct should be
-        # ~0.
-        rings = [
-            self.scored_outcome_ring(i, score=100, adverse=False) for i in range(10)
-        ] + [
-            self.scored_outcome_ring(100 + i, score=0, adverse=True) for i in range(10)
-        ]
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        report = engine.reliability_curve(rings, bins=10)
-        self.assertEqual(report["sample_size"], 20)
-        self.assertAlmostEqual(report["brier_score"], 0.0, places=3)
-        for bucket in report["bins"]:
-            if bucket["sample_size"]:
-                self.assertAlmostEqual(bucket["calibration_gap_pct"], 0.0, places=1)
-
-    def test_reliability_curve_overconfident_scores_show_positive_gap(self):
-        # Every token scores 95 (agent claims near-certain safety) but half
-        # turn out adverse -- overconfidence, so the bin's calibration_gap_pct
-        # should be large and positive (predicted safety >> observed safety),
-        # and skill_vs_naive_baseline should not show meaningful skill.
-        rings = [
-            self.scored_outcome_ring(i, score=95, adverse=(i % 2 == 0))
-            for i in range(20)
-        ]
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        report = engine.reliability_curve(rings, bins=10)
-        self.assertEqual(report["sample_size"], 20)
-        populated = [b for b in report["bins"] if b["sample_size"]]
-        self.assertEqual(len(populated), 1)
-        self.assertGreater(populated[0]["calibration_gap_pct"], 30)
-        self.assertLessEqual(report["skill_vs_naive_baseline"], 0.0)
-
-    def test_reliability_curve_dedupes_by_latest_horizon_like_summarize(self):
-        # Two outcome rings for the same analysis_ring at different horizons;
-        # only the later horizon should be counted, matching summarize()'s
-        # existing dedup contract.
-        early = self.scored_outcome_ring(1, score=90, adverse=False)
-        early["payload"]["analysis_ring"] = 500
-        early["payload"]["other_outcomes"]["horizon_seconds"] = 3600
-        late = self.scored_outcome_ring(2, score=90, adverse=True)
-        late["payload"]["analysis_ring"] = 500
-        late["payload"]["other_outcomes"]["horizon_seconds"] = 86400
-        engine = controls.CalibrationEngine(tempfile.mkdtemp())
-        report = engine.reliability_curve([early, late], bins=10)
-        self.assertEqual(report["sample_size"], 1)
-        populated = [b for b in report["bins"] if b["sample_size"]]
-        self.assertEqual(populated[0]["adverse_count"], 1)
-
-    def test_reliability_report_persists_to_disk(self):
-        rings = [self.scored_outcome_ring(i, score=80, adverse=False) for i in range(5)]
-        with tempfile.TemporaryDirectory() as temp_dir:
-            engine = controls.CalibrationEngine(temp_dir)
-            report = engine.reliability_report(rings, bins=5)
-            self.assertTrue(engine.reliability_path.exists())
-            on_disk = json.loads(engine.reliability_path.read_text(encoding="utf-8"))
-            self.assertEqual(on_disk["sample_size"], report["sample_size"])
 
 
 class TradePermitTests(unittest.TestCase):

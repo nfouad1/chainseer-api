@@ -24,9 +24,18 @@ RUN python -m zipfile -e /tmp/cypher-tempre.zip /tmp/cypher-tempre \
       /opt/cypher-tempre-self-model \
     && rm -rf /tmp/cypher-tempre /tmp/cypher-tempre.zip \
     && test -f /opt/cypher-tempre-self-model/timechain.py \
-    && test -f /opt/cypher-tempre-self-model/poq.py
+    && test -f /opt/cypher-tempre-self-model/poq.py \
+    && test -f /opt/cypher-tempre-self-model/recall.py \
+    && test -f /opt/cypher-tempre-self-model/cambium.py \
+    && test -f /opt/cypher-tempre-self-model/epochs.py \
+    && test -f /opt/cypher-tempre-self-model/immune.py \
+    && test -f /opt/cypher-tempre-self-model/modality_ops.py \
+    && test -f /opt/cypher-tempre-self-model/registry/senses.json \
+    && test -f /opt/cypher-tempre-self-model/registry/modalities.json
 
-COPY chainseer.py chainseer_core.py chainseer_alerts.py chainseer_controls.py chainseer_api.py ./
+COPY chainseer.py chainseer_controls.py chainseer_base_public.py \
+    chainseer_solana_public.py chainseer_benchmark.py \
+    chainseer_entity_graph.py chainseer_api.py ./
 
 RUN useradd --create-home --uid 10001 chainseer \
     && mkdir -p /data/chainseer_chain \

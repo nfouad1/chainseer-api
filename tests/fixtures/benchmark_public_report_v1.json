@@ -1,0 +1,30 @@
+{
+  "analyzed_at": "2026-01-01T00:00:01+00:00",
+  "decision": {
+    "action": "REVIEW",
+    "hard_stops": [],
+    "legitimacy_score": 71.5,
+    "risk_level": "Medium"
+  },
+  "evidence": {
+    "anchor_type": "block_pin",
+    "block_pin": 123,
+    "facts": [
+      {
+        "response_hash": "1111111111111111111111111111111111111111111111111111111111111111",
+        "timestamp": "2026-01-01T00:00:00+00:00"
+      }
+    ],
+    "infrastructure_indeterminate": []
+  },
+  "schema_version": "1.1",
+  "timechain": {
+    "ring": 10,
+    "ring_hash": "2222222222222222222222222222222222222222222222222222222222222222"
+  },
+  "token": {
+    "address": "0x1111111111111111111111111111111111111111",
+    "chain": "Robinhood Chain",
+    "chain_id": 4663
+  }
+}

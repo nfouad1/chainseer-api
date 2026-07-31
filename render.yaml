@@ -20,6 +20,10 @@ services:
         sync: false
       - key: CHAINSEER_RPC_URL
         value: https://rpc.mainnet.chain.robinhood.com
+      - key: CHAINSEER_BASE_RPC_URL
+        sync: false
+      - key: CHAINSEER_SOLANA_RPC_URL
+        value: https://api.mainnet-beta.solana.com
       - key: CHAINSEER_CHAIN_ROOT
         value: /data/chainseer_chain
       - key: CHAINSEER_SKILL_DIR
@@ -44,3 +48,25 @@ services:
         value: "15"
       - key: CHAINSEER_WATCHER_CONFIRMATIONS
         value: "2"
+      - key: CHAINSEER_BENCHMARK_CAPTURE_ENABLED
+        value: "1"
+      - key: CHAINSEER_BENCHMARK_ROOT
+        value: /data/benchmark
+      - key: CHAINSEER_BENCHMARK_ROBINHOOD_COHORT
+        value: robinhood_public_analysis
+      - key: CHAINSEER_BENCHMARK_SOLANA_COHORT
+        value: solana_public_analysis
+      - key: CHAINSEER_BENCHMARK_BASE_COHORT
+        value: base_public_analysis
+      - key: CT_AUTOGROW
+        value: "1"
+      - key: CT_PROMOTE_AT
+        value: "1"
+      - key: CT_AUTOGROW_MIN_SALIENCE
+        value: "170"
+      - key: CT_SEMANTIC_GAP
+        value: "1"
+      - key: CT_IMMUNE_FAILCLOSED
+        value: "1"
+      - key: CT_AUTO_QUARANTINE
+        value: "1"
