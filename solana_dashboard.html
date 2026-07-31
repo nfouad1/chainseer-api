@@ -1,0 +1,981 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Chainseer · Solana Learn-Once Observatory</title>
+  <style>
+    :root {
+      --bg: #07080d;
+      --panel: rgba(16, 18, 29, .84);
+      --panel-solid: #10121d;
+      --panel-2: #0b0d15;
+      --ink: #f5f5fa;
+      --muted: #999caf;
+      --dim: #626578;
+      --line: rgba(178, 146, 255, .15);
+      --purple: #b292ff;
+      --purple-2: #7f5cff;
+      --mint: #2de2b6;
+      --cyan: #60d9ff;
+      --amber: #ffca6a;
+      --red: #ff647c;
+      --radius: 20px;
+      --mono: ui-monospace, "SFMono-Regular", Consolas, monospace;
+      --sans: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+    * { box-sizing: border-box; }
+    html { scroll-behavior: smooth; }
+    body {
+      margin: 0;
+      min-height: 100vh;
+      color: var(--ink);
+      font-family: var(--sans);
+      background:
+        radial-gradient(circle at 78% -10%, rgba(127,92,255,.20), transparent 32rem),
+        radial-gradient(circle at -10% 35%, rgba(45,226,182,.08), transparent 30rem),
+        var(--bg);
+    }
+    body::before {
+      content: "";
+      position: fixed;
+      inset: 0;
+      pointer-events: none;
+      opacity: .18;
+      background-image:
+        linear-gradient(rgba(255,255,255,.025) 1px, transparent 1px),
+        linear-gradient(90deg, rgba(255,255,255,.025) 1px, transparent 1px);
+      background-size: 42px 42px;
+      mask-image: linear-gradient(to bottom, black, transparent 72%);
+    }
+    button { font: inherit; }
+    .shell { width: min(1480px, calc(100% - 42px)); margin: 0 auto; padding: 25px 0 48px; }
+    .topbar { display:flex; align-items:center; justify-content:space-between; gap:20px; padding:8px 0 25px; }
+    .brand { display:flex; align-items:center; gap:13px; }
+    .mark {
+      width:39px; height:39px; display:grid; place-items:center; border-radius:12px;
+      color:var(--purple); border:1px solid rgba(178,146,255,.38);
+      background:rgba(127,92,255,.09); box-shadow:0 0 38px rgba(127,92,255,.12);
+    }
+    .mark svg { width:24px; height:24px; }
+    .brand strong { display:block; font-size:14px; letter-spacing:.18em; text-transform:uppercase; }
+    .brand span { display:block; margin-top:3px; color:var(--muted); font:10px/1.3 var(--mono); letter-spacing:.09em; }
+    .actions { display:flex; align-items:center; gap:9px; }
+    .pill, .refresh {
+      min-height:36px; display:inline-flex; align-items:center; gap:8px; border:1px solid var(--line);
+      border-radius:999px; padding:0 13px; background:rgba(16,18,29,.74);
+      color:var(--muted); font:10px/1 var(--mono); letter-spacing:.06em;
+    }
+    .refresh { cursor:pointer; color:var(--ink); transition:.2s ease; }
+    .refresh:hover { border-color:rgba(178,146,255,.5); transform:translateY(-1px); }
+    .refresh:disabled { opacity:.55; cursor:wait; }
+    .dot { width:7px; height:7px; border-radius:50%; background:var(--dim); box-shadow:0 0 0 4px rgba(98,101,120,.12); flex:none; }
+    .dot.ok { background:var(--mint); box-shadow:0 0 0 4px rgba(45,226,182,.10),0 0 16px rgba(45,226,182,.45); }
+    .dot.warn { background:var(--amber); box-shadow:0 0 0 4px rgba(255,202,106,.10); }
+    .dot.bad { background:var(--red); box-shadow:0 0 0 4px rgba(255,100,124,.10); }
+    .dot.running { background:var(--mint); box-shadow:0 0 0 4px rgba(45,226,182,.10),0 0 16px rgba(45,226,182,.45); animation:pulse 1.6s ease-in-out infinite; }
+    @keyframes pulse { 0%,100%{opacity:1} 50%{opacity:.45} }
+    .refresh:disabled, #learn-duration:disabled { opacity:.5; cursor:not-allowed; }
+    #learn-toggle.is-stop { color:var(--red); border-color:rgba(255,100,124,.4); }
+    #learn-duration { text-align:center; }
+    .panel, .stat, .hero-main, .hero-side {
+      position:relative; overflow:hidden; border:1px solid var(--line);
+      border-radius:var(--radius); background:var(--panel); backdrop-filter:blur(18px);
+    }
+    .hero { display:grid; grid-template-columns:minmax(0,1.34fr) minmax(320px,.66fr); gap:18px; margin-bottom:18px; }
+    .hero-main { min-height:285px; padding:34px; }
+    .hero-main::after {
+      content:""; position:absolute; width:420px; height:420px; right:-178px; top:-230px;
+      border-radius:50%; border:1px solid rgba(178,146,255,.18);
+      box-shadow:0 0 0 54px rgba(127,92,255,.025),0 0 0 108px rgba(127,92,255,.014);
+    }
+    .eyebrow { color:var(--purple); font:10px/1.4 var(--mono); letter-spacing:.16em; text-transform:uppercase; }
+    h1 { max-width:790px; margin:17px 0 14px; font-size:clamp(36px,5vw,66px); line-height:.98; letter-spacing:-.056em; font-weight:620; }
+    .hero p { max-width:720px; margin:0; color:var(--muted); font-size:14px; line-height:1.72; }
+    .tags { display:flex; flex-wrap:wrap; gap:8px; margin-top:25px; }
+    .tag { padding:7px 9px; border:1px solid rgba(178,146,255,.17); border-radius:7px; background:rgba(127,92,255,.035); color:#c9cad6; font:9px/1 var(--mono); letter-spacing:.09em; text-transform:uppercase; }
+    .hero-side { padding:26px; display:flex; flex-direction:column; justify-content:space-between; }
+    .side-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
+    .ring { margin-top:26px; font:52px/1 var(--mono); letter-spacing:-.07em; }
+    .ring small { color:var(--muted); font:10px var(--mono); letter-spacing:.09em; margin-left:7px; }
+    .hash { margin-top:20px; padding:13px 14px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#090a11; color:var(--muted); font:10px/1.55 var(--mono); overflow-wrap:anywhere; }
+    .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:13px; margin-bottom:18px; }
+    .stat { min-height:120px; padding:20px; }
+    .stat-label { color:var(--muted); font:9px/1.3 var(--mono); letter-spacing:.12em; text-transform:uppercase; }
+    .stat-value { margin-top:16px; font:30px/1 var(--mono); letter-spacing:-.055em; }
+    .stat-note { margin-top:9px; color:var(--dim); font-size:10px; line-height:1.45; }
+    .positive { color:var(--mint)!important; }
+    .negative { color:var(--red)!important; }
+    .warning { color:var(--amber)!important; }
+    .grid { display:grid; grid-template-columns:minmax(0,1.08fr) minmax(360px,.92fr); gap:18px; margin-bottom:18px; }
+    .panel { padding:24px; }
+    .panel-head { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; margin-bottom:21px; }
+    .panel h2 { margin:0; font-size:17px; letter-spacing:-.02em; }
+    .sub { margin-top:6px; color:var(--muted); font-size:11px; line-height:1.5; }
+    .status { display:inline-flex; align-items:center; gap:7px; color:var(--muted); font:9px var(--mono); letter-spacing:.06em; text-transform:uppercase; white-space:nowrap; }
+    .evidence-bar { display:flex; height:22px; overflow:hidden; border:1px solid rgba(255,255,255,.06); border-radius:7px; background:#090a11; }
+    .evidence-bar span { min-width:0; transition:width .35s ease; }
+    .safe { background:linear-gradient(90deg,rgba(45,226,182,.45),var(--mint)); }
+    .unsafe { background:linear-gradient(90deg,rgba(255,100,124,.42),var(--red)); }
+    .indeterminate { background:linear-gradient(90deg,rgba(255,202,106,.42),var(--amber)); }
+    .evidence-counts { display:grid; grid-template-columns:repeat(3,1fr); gap:10px; margin-top:15px; }
+    .mini { padding:13px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:rgba(0,0,0,.13); }
+    .mini strong { display:block; font:19px/1 var(--mono); }
+    .mini span { display:block; margin-top:7px; color:var(--muted); font:9px/1.35 var(--mono); letter-spacing:.07em; text-transform:uppercase; }
+    .quality-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:10px; margin-top:17px; }
+    .meter { padding:13px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#0b0d15; }
+    .meter-head { display:flex; justify-content:space-between; gap:12px; color:var(--muted); font:9px var(--mono); text-transform:uppercase; letter-spacing:.06em; }
+    .meter strong { color:var(--ink); font:12px var(--mono); }
+    .meter-track { height:5px; margin-top:11px; border-radius:999px; overflow:hidden; background:#1b1d2b; }
+    .meter-fill { height:100%; border-radius:inherit; background:linear-gradient(90deg,var(--purple-2),var(--cyan)); }
+    .callout { margin-top:15px; padding:13px 14px; border:1px solid rgba(255,202,106,.16); border-radius:11px; background:rgba(255,202,106,.035); color:var(--muted); font-size:11px; line-height:1.55; }
+    .promotion-grid { display:grid; grid-template-columns:repeat(2,1fr); gap:9px; }
+    .gate { padding:12px; border:1px solid rgba(255,255,255,.06); border-radius:10px; background:#0b0d15; }
+    .gate-top { display:flex; justify-content:space-between; align-items:center; gap:8px; }
+    .gate-name { color:var(--muted); font:9px var(--mono); letter-spacing:.06em; text-transform:uppercase; }
+    .gate-value { margin-top:10px; font:17px/1 var(--mono); }
+    .blockers { display:flex; flex-wrap:wrap; gap:7px; margin-top:16px; }
+    .blocker { padding:7px 8px; border-radius:7px; border:1px solid rgba(255,100,124,.15); background:rgba(255,100,124,.035); color:#dca1ab; font:8px/1 var(--mono); letter-spacing:.055em; text-transform:uppercase; }
+    .infra-grid { display:grid; grid-template-columns:repeat(6,1fr); gap:10px; }
+    .infra { min-height:108px; padding:14px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#0b0d15; }
+    .infra-name { color:var(--muted); font:8px/1.4 var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .infra-value { margin-top:13px; font:18px/1 var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .infra-note { margin-top:8px; color:var(--dim); font-size:9px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .integrity { display:grid; grid-template-columns:repeat(5,1fr); gap:0; align-items:center; }
+    .node { position:relative; min-height:105px; padding:14px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#0b0d15; }
+    .node + .node { margin-left:22px; }
+    .node:not(:last-child)::after { content:"→"; position:absolute; right:-22px; top:40px; z-index:2; color:var(--purple); font:14px var(--mono); }
+    .node-top { display:flex; justify-content:space-between; gap:8px; align-items:center; }
+    .node-name { color:var(--muted); font:8px var(--mono); letter-spacing:.08em; text-transform:uppercase; }
+    .node-value { margin-top:15px; font:17px/1 var(--mono); }
+    .node-note { margin-top:8px; color:var(--dim); font-size:9px; white-space:nowrap; overflow:hidden; text-overflow:ellipsis; }
+    .table-panel { padding:0; }
+    .table-panel .panel-head { padding:24px 24px 0; }
+    .table-scroll { overflow:auto; max-height:500px; }
+    table { width:100%; border-collapse:collapse; min-width:900px; }
+    th { position:sticky; top:0; z-index:1; padding:12px 16px; text-align:left; border-block:1px solid rgba(255,255,255,.06); background:#10121d; color:var(--dim); font:8px var(--mono); letter-spacing:.1em; text-transform:uppercase; }
+    td { padding:14px 16px; border-bottom:1px solid rgba(255,255,255,.05); color:#cfd0da; font-size:11px; vertical-align:top; }
+    tbody tr:hover { background:rgba(178,146,255,.025); }
+    .mono { font-family:var(--mono); }
+    .token { max-width:170px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .decision-note { max-width:300px; color:var(--muted); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .empty { min-height:175px; display:grid; place-items:center; padding:22px; border:1px dashed rgba(255,255,255,.09); border-radius:12px; color:var(--muted); text-align:center; font-size:12px; line-height:1.55; }
+    .events { display:grid; gap:9px; max-height:500px; overflow:auto; }
+    .event { padding:12px 13px; border:1px solid rgba(255,255,255,.06); border-radius:10px; background:#0b0d15; }
+    .event-line { display:flex; justify-content:space-between; gap:12px; }
+    .event-type { color:#ddddea; font:9px var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .event-time { color:var(--dim); font:8px var(--mono); white-space:nowrap; }
+    .event-meta { margin-top:7px; color:var(--muted); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .position-list { display:grid; gap:10px; }
+    .position { display:grid; grid-template-columns:minmax(90px,1fr) repeat(3,auto); gap:16px; align-items:center; padding:13px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#0b0d15; }
+    .position strong { display:block; font:11px var(--mono); }
+    .position small { display:block; margin-top:5px; color:var(--muted); font:8px var(--mono); }
+    .position-metric { min-width:74px; text-align:right; }
+    .position-metric strong { font:13px var(--mono); }
+    .position-metric span { display:block; margin-top:5px; color:var(--dim); font:8px var(--mono); text-transform:uppercase; }
+    footer { display:flex; justify-content:space-between; gap:20px; padding-top:2px; color:var(--dim); font:9px/1.6 var(--mono); letter-spacing:.04em; }
+
+    /* Top candidates strip — the answer in 1 second */
+    .candidates { margin-bottom:18px; }
+    .candidate-grid { display:grid; grid-template-columns:repeat(4,1fr); gap:13px; }
+    .candidate {
+      position:relative; display:flex; flex-direction:column; gap:9px; padding:16px;
+      border:1px solid var(--line); border-radius:14px; background:#0b0d15;
+      transition:border-color .2s ease, transform .2s ease;
+    }
+    .candidate:hover { border-color:rgba(178,146,255,.42); transform:translateY(-1px); }
+    .candidate-top { display:flex; align-items:flex-start; justify-content:space-between; gap:10px; }
+    .candidate-id { min-width:0; }
+    .candidate-id strong { display:block; font:14px/1.1 var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .candidate-id small { display:block; margin-top:5px; color:var(--dim); font:9px var(--mono); overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
+    .rank {
+      flex:none; width:24px; height:24px; display:grid; place-items:center; border-radius:7px;
+      color:var(--purple); border:1px solid rgba(178,146,255,.28); background:rgba(127,92,255,.08);
+      font:10px/1 var(--mono);
+    }
+    .candidate-score { font:26px/1 var(--mono); letter-spacing:-.04em; }
+    .candidate-score small { color:var(--dim); font:10px var(--mono); letter-spacing:.06em; margin-left:6px; }
+    .candidate-meta { display:flex; justify-content:space-between; gap:10px; color:var(--muted); font:9px/1.35 var(--mono); letter-spacing:.04em; }
+    .candidate-meta span { display:flex; flex-direction:column; gap:3px; }
+    .candidate-meta b { color:var(--ink); font:11px var(--mono); font-weight:400; }
+
+    /* Sortable + filterable decisions table */
+    .table-controls { display:flex; flex-wrap:wrap; align-items:center; gap:8px; }
+    .segment { display:inline-flex; border:1px solid var(--line); border-radius:999px; overflow:hidden; background:rgba(16,18,29,.74); }
+    .segment button {
+      min-height:30px; padding:0 11px; border:0; background:transparent; cursor:pointer;
+      color:var(--muted); font:9px/1 var(--mono); letter-spacing:.06em; text-transform:uppercase; transition:.18s ease;
+    }
+    .segment button:hover { color:var(--ink); }
+    .segment button[aria-pressed="true"] { background:rgba(127,92,255,.18); color:var(--ink); }
+    .filter-input {
+      min-height:30px; padding:0 12px; border:1px solid var(--line); border-radius:999px;
+      background:rgba(16,18,29,.74); color:var(--ink); font:10px var(--mono);
+    }
+    .filter-input::placeholder { color:var(--dim); }
+    .filter-input:focus { outline:none; border-color:rgba(178,146,255,.5); }
+    th[role="columnheader"] button.sort {
+      display:inline-flex; align-items:center; gap:6px; padding:0; border:0; background:transparent;
+      cursor:pointer; color:var(--dim); font:inherit; letter-spacing:.1em; text-transform:uppercase;
+    }
+    th[role="columnheader"] button.sort:hover { color:var(--ink); }
+    th[role="columnheader"] button.sort[aria-sort="ascending"] , th[role="columnheader"] button.sort[aria-sort="descending"] { color:var(--purple); }
+    .sort-glyph { font:9px var(--mono); opacity:.7; }
+
+    @media (max-width:1100px) {
+      .hero,.grid { grid-template-columns:1fr; }
+      .stats { grid-template-columns:repeat(2,1fr); }
+      .infra-grid { grid-template-columns:repeat(3,1fr); }
+      .integrity { grid-template-columns:1fr; gap:9px; }
+      .node + .node { margin-left:0; }
+      .node:not(:last-child)::after { content:"↓"; right:19px; top:auto; bottom:-16px; }
+      .candidate-grid { grid-template-columns:repeat(2,1fr); }
+    }
+    @media (max-width:650px) {
+      .shell { width:min(100% - 22px,1480px); padding-top:13px; }
+      .actions .pill { display:none; }
+      .hero-main { padding:25px; }
+      .hero-side,.panel { padding:19px; }
+      .stats { gap:9px; }
+      .stat { padding:16px; min-height:105px; }
+      .stat-value { font-size:24px; }
+      .infra-grid { grid-template-columns:repeat(2,1fr); }
+      .quality-grid,.promotion-grid { grid-template-columns:1fr; }
+      .position { grid-template-columns:1fr 1fr; }
+      .candidate-grid { grid-template-columns:1fr; }
+      footer { flex-direction:column; }
+    }
+  </style>
+</head>
+<body>
+  <main class="shell">
+    <header class="topbar">
+      <div class="brand">
+        <div class="mark" aria-hidden="true">
+          <svg viewBox="0 0 24 24" fill="none">
+            <path d="M12 2.8 20 7.4v9.2L12 21.2 4 16.6V7.4L12 2.8Z" stroke="currentColor"/>
+            <path d="m8 9.2 4-2.3 4 2.3v4.6l-4 2.3-4-2.3V9.2Z" fill="currentColor"/>
+            <path d="M12 6.9v9.2M8 9.2l8 4.6M16 9.2l-8 4.6" stroke="#07080d" stroke-width=".8"/>
+          </svg>
+        </div>
+        <div><strong>Chainseer</strong><span>SOLANA LEARN-ONCE / PUMP.FUN</span></div>
+      </div>
+      <div class="actions">
+        <div class="pill"><span class="dot" id="connection-dot"></span><span id="connection-label">CONNECTING</span></div>
+        <button class="refresh" id="refresh" type="button">↻ REFRESH</button>
+        <input class="refresh" id="learn-duration" type="number" min="1" step="1" placeholder="min (∞)" style="width:88px" aria-label="Learning duration in minutes (blank = run until stopped)">
+        <button class="refresh" id="learn-toggle" type="button">▶ START</button>
+        <div class="pill" id="learn-status-pill" hidden><span class="dot running" id="learn-dot"></span><span id="learn-label">LEARNING</span></div>
+      </div>
+    </header>
+
+    <section class="hero">
+      <article class="hero-main">
+        <div class="eyebrow">Solana launch intelligence · paper-only boundary</div>
+        <h1>Learning in public.<br>Executing nowhere.</h1>
+        <p>A live read-only observatory for Pump.fun discovery, tri-state on-chain evidence, Jupiter route quality, shadow outcomes, promotion gates, and every analysis sealed into Chainseer’s dedicated Solana Timechain.</p>
+        <div class="tags">
+          <span class="tag">Confirmed CreateEvent</span>
+          <span class="tag">Mint + curve binding</span>
+          <span class="tag">Jupiter round-trip</span>
+          <span class="tag">Shadow positions</span>
+          <span class="tag">No signing</span>
+        </div>
+      </article>
+      <aside class="hero-side">
+        <div>
+          <div class="side-head">
+            <div><div class="eyebrow">Solana Timechain head</div><div class="sub" id="ring-type">Awaiting integrity check</div></div>
+            <span class="dot" id="timechain-dot"></span>
+          </div>
+          <div class="ring"><span id="ring-height">—</span><small>RINGS</small></div>
+        </div>
+        <div class="hash"><span id="ring-hash">No head loaded</span><br><span id="ring-summary"></span></div>
+      </aside>
+    </section>
+
+    <section class="panel candidates" aria-label="Top candidates">
+      <div class="panel-head">
+        <div><h2>Graduated-market candidates</h2><div class="sub">Canonical PumpSwap pool + DexScreener market + execution evidence · for review, not a buy signal</div></div>
+        <span class="status"><span class="dot" id="candidates-dot"></span><span id="candidates-status">—</span></span>
+      </div>
+      <div class="candidate-grid" id="top-candidates"><div class="empty">No graduated-market-ready candidates yet.</div></div>
+    </section>
+
+    <section class="stats" aria-label="Key metrics">
+      <article class="stat"><div class="stat-label">Scheduled learner</div><div class="stat-value" id="scheduler-state">—</div><div class="stat-note" id="scheduler-note">No schedule recorded</div></article>
+      <article class="stat"><div class="stat-label">Launch catalog</div><div class="stat-value" id="catalog-size">—</div><div class="stat-note">Confirmed Pump.fun launch events</div></article>
+      <article class="stat"><div class="stat-label">Risk analyses</div><div class="stat-value" id="analysis-count">—</div><div class="stat-note" id="analysis-note">Persisted token decisions</div></article>
+      <article class="stat"><div class="stat-label">Shadow portfolio</div><div class="stat-value" id="shadow-open">—</div><div class="stat-note" id="shadow-note">Open / closed positions</div></article>
+    </section>
+
+    <section class="panel" style="margin-bottom:18px">
+      <div class="panel-head">
+        <div><h2>Guarded recursive learning</h2><div class="sub">A checkpoint pauses the paper learner before Timechain-guided review, code changes, regression tests, and a controlled smoke cycle</div></div>
+        <span class="status"><span class="dot" id="reflection-dot"></span><span id="reflection-status">ARMED</span></span>
+      </div>
+      <div class="infra-grid" style="grid-template-columns:repeat(4,1fr)">
+        <div class="infra"><div class="infra-name">Analysis cadence</div><div class="infra-value" id="reflection-cadence">—</div><div class="infra-note">Committed analyses per checkpoint</div></div>
+        <div class="infra"><div class="infra-name">Next reflection</div><div class="infra-value" id="reflection-remaining">—</div><div class="infra-note" id="reflection-next-note">Waiting for evidence</div></div>
+        <div class="infra"><div class="infra-name">Controller cycles</div><div class="infra-value" id="controller-cycles">—</div><div class="infra-note" id="controller-note">No controller state</div></div>
+        <div class="infra"><div class="infra-name">Code adaptation</div><div class="infra-value positive">GATED</div><div class="infra-note">Never in-process · tests + smoke required</div></div>
+      </div>
+      <div class="callout" id="reflection-callout">No reflection checkpoint is pending. The first canonical graduation triggers an immediate review.</div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <div class="panel-head">
+          <div><h2>Evidence quality</h2><div class="sub">Token safety and infrastructure failure are never conflated</div></div>
+          <span class="status"><span class="dot" id="evidence-dot"></span><span id="evidence-label">AWAITING DATA</span></span>
+        </div>
+        <div class="evidence-bar" aria-label="Evidence state distribution">
+          <span class="safe" id="evidence-safe-bar"></span>
+          <span class="unsafe" id="evidence-unsafe-bar"></span>
+          <span class="indeterminate" id="evidence-pending-bar"></span>
+          <span class="indeterminate" id="evidence-indeterminate-bar"></span>
+        </div>
+        <div class="evidence-counts" style="grid-template-columns:repeat(4,1fr)">
+          <div class="mini"><strong class="positive" id="evidence-safe">—</strong><span>Complete safe</span></div>
+          <div class="mini"><strong class="negative" id="evidence-unsafe">—</strong><span>Complete unsafe</span></div>
+          <div class="mini"><strong class="warning" id="evidence-pending">—</strong><span>Distribution pending</span></div>
+          <div class="mini"><strong class="warning" id="evidence-indeterminate">—</strong><span>Infrastructure indeterminate</span></div>
+        </div>
+        <div class="quality-grid">
+          <div class="meter">
+            <div class="meter-head"><span>Two-way quote coverage</span><strong id="quote-coverage">—</strong></div>
+            <div class="meter-track"><div class="meter-fill" id="quote-meter"></div></div>
+          </div>
+          <div class="meter">
+            <div class="meter-head"><span>Unsigned assembly coverage</span><strong id="assembly-coverage">—</strong></div>
+            <div class="meter-track"><div class="meter-fill" id="assembly-meter"></div></div>
+          </div>
+        </div>
+        <div class="callout" id="evidence-callout">The dashboard will explain the dominant evidence limitation after the first refresh.</div>
+      </article>
+
+      <article class="panel">
+        <div class="panel-head">
+          <div><h2>Promotion readiness</h2><div class="sub">Passing means manual review—not automatic live capital</div></div>
+          <span class="status"><span class="dot" id="promotion-dot"></span><span id="promotion-status">NOT EVALUATED</span></span>
+        </div>
+        <div class="promotion-grid">
+          <div class="gate"><div class="gate-top"><span class="gate-name">Observations</span><span class="dot" id="gate-observations-dot"></span></div><div class="gate-value" id="gate-observations">—</div></div>
+          <div class="gate"><div class="gate-top"><span class="gate-name">Closed positions</span><span class="dot" id="gate-closed-dot"></span></div><div class="gate-value" id="gate-closed">—</div></div>
+          <div class="gate"><div class="gate-top"><span class="gate-name">Winner rate</span><span class="dot" id="gate-winners-dot"></span></div><div class="gate-value" id="gate-winners">—</div></div>
+          <div class="gate"><div class="gate-top"><span class="gate-name">Max drawdown</span><span class="dot" id="gate-drawdown-dot"></span></div><div class="gate-value" id="gate-drawdown">—</div></div>
+          <div class="gate"><div class="gate-top"><span class="gate-name">Net return</span><span class="dot" id="gate-return-dot"></span></div><div class="gate-value" id="gate-return">—</div></div>
+          <div class="gate"><div class="gate-top"><span class="gate-name">Indeterminate rate</span><span class="dot" id="gate-indeterminate-dot"></span></div><div class="gate-value" id="gate-indeterminate">—</div></div>
+        </div>
+        <div class="blockers" id="promotion-blockers"><span class="blocker">Awaiting evaluation</span></div>
+      </article>
+    </section>
+
+    <section class="panel" style="margin-bottom:18px">
+      <div class="panel-head">
+        <div><h2>Concentration calibration</h2><div class="sub">Descriptive distribution of observed tokens · does NOT validate or auto-tune the threshold</div></div>
+        <span class="status"><span class="dot" id="calibration-dot"></span><span id="calibration-status">—</span></span>
+      </div>
+      <div class="infra-grid" style="grid-template-columns:repeat(3,1fr)">
+        <div class="infra"><div class="infra-name">Top-1 holder · median</div><div class="infra-value" id="cal-top1-median">—</div><div class="infra-note" id="cal-top1-range">—</div></div>
+        <div class="infra"><div class="infra-name">Top-10 holders · median</div><div class="infra-value" id="cal-top10-median">—</div><div class="infra-note" id="cal-top10-range">—</div></div>
+        <div class="infra"><div class="infra-name">Joint gate admit rate</div><div class="infra-value" id="cal-joint">—</div><div class="infra-note">concentration AND retention at active policy</div></div>
+      </div>
+      <div class="quality-grid" style="grid-template-columns:repeat(3,1fr);margin-top:13px">
+        <div class="meter">
+          <div class="meter-head"><span>Top-1 threshold sensitivity</span><strong id="cal-top1-active">—</strong></div>
+          <div class="meter-track"><div class="meter-fill" id="cal-top1-meter"></div></div>
+          <div class="infra-note" id="cal-top1-grid" style="margin-top:8px">—</div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span>Top-10 threshold sensitivity</span><strong id="cal-top10-active">—</strong></div>
+          <div class="meter-track"><div class="meter-fill" id="cal-top10-meter"></div></div>
+          <div class="infra-note" id="cal-top10-grid" style="margin-top:8px">—</div>
+        </div>
+        <div class="meter">
+          <div class="meter-head"><span>Roundtrip retention sensitivity</span><strong id="cal-ret-active">—</strong></div>
+          <div class="meter-track"><div class="meter-fill" id="cal-ret-meter"></div></div>
+          <div class="infra-note" id="cal-ret-grid" style="margin-top:8px">—</div>
+        </div>
+      </div>
+      <div class="callout" id="calibration-callout">Calibration characterizes the distribution; threshold validation requires realized outcomes that are not yet collected.</div>
+    </section>
+
+    <section class="panel" style="margin-bottom:18px">
+      <div class="panel-head">
+        <div><h2>Infrastructure & execution evidence</h2><div class="sub">Credential-safe health telemetry; endpoint secrets and API keys are never returned</div></div>
+        <span class="status"><span class="dot" id="infra-dot"></span><span id="infra-status">CHECKING</span></span>
+      </div>
+      <div class="infra-grid">
+        <div class="infra"><div class="infra-name">RPC success</div><div class="infra-value" id="rpc-success">—</div><div class="infra-note" id="rpc-counts">No attempts</div></div>
+        <div class="infra"><div class="infra-name">RPC failures</div><div class="infra-value" id="rpc-failures">—</div><div class="infra-note">Cumulative logical failures</div></div>
+        <div class="infra"><div class="infra-name">RPC retries</div><div class="infra-value" id="rpc-retries">—</div><div class="infra-note" id="rpc-method-note">Cumulative method telemetry</div></div>
+        <div class="infra"><div class="infra-name">RPC origin</div><div class="infra-value" id="rpc-origin">—</div><div class="infra-note" id="rpc-origin-note">Path and query redacted</div></div>
+        <div class="infra"><div class="infra-name">Recovery queue</div><div class="infra-value" id="recovery-pending">—</div><div class="infra-note" id="recovery-note">Restart-safe reanalysis</div></div>
+        <div class="infra"><div class="infra-name">Jupiter access</div><div class="infra-value" id="jupiter-key">—</div><div class="infra-note" id="jupiter-note">Presence only, never value</div></div>
+        <div class="infra"><div class="infra-name">Paper taker</div><div class="infra-value" id="paper-taker">—</div><div class="infra-note">Public address presence</div></div>
+        <div class="infra"><div class="infra-name">Execution mode</div><div class="infra-value positive">PAPER</div><div class="infra-note">Signing and broadcast absent</div></div>
+      </div>
+    </section>
+
+    <section class="panel" style="margin-bottom:18px">
+      <div class="panel-head">
+        <div><h2>Evidence & integrity path</h2><div class="sub">Every refresh re-verifies local ledgers, policy-bound state, and the Solana Timechain</div></div>
+        <span class="status"><span class="dot" id="integrity-dot"></span><span id="integrity-label">CHECKING</span></span>
+      </div>
+      <div class="integrity">
+        <div class="node"><div class="node-top"><span class="node-name">Launch catalog</span><span class="dot" id="catalog-dot"></span></div><div class="node-value" id="catalog-node">—</div><div class="node-note">Confirmed program events</div></div>
+        <div class="node"><div class="node-top"><span class="node-name">Analysis ledger</span><span class="dot" id="observation-dot"></span></div><div class="node-value" id="observation-node">—</div><div class="node-note" id="observation-report">Hash-linked evidence</div></div>
+        <div class="node"><div class="node-top"><span class="node-name">Shadow ledger</span><span class="dot" id="shadow-dot"></span></div><div class="node-value" id="shadow-node">—</div><div class="node-note" id="shadow-report">Hash-linked paper events</div></div>
+        <div class="node"><div class="node-top"><span class="node-name">Policy state</span><span class="dot" id="policy-dot"></span></div><div class="node-value" id="policy-node">—</div><div class="node-note">Policy hash binding</div></div>
+        <div class="node"><div class="node-top"><span class="node-name">Timechain</span><span class="dot" id="chain-dot"></span></div><div class="node-value" id="chain-node">—</div><div class="node-note" id="chain-report">Tamper-evident rings</div></div>
+      </div>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <div class="panel-head">
+          <div><h2>Shadow portfolio</h2><div class="sub">Only positions with executable quote marks contribute to modeled return</div></div>
+          <span class="status"><span class="dot" id="portfolio-dot"></span><span id="portfolio-status">NO POSITIONS</span></span>
+        </div>
+        <div class="evidence-counts">
+          <div class="mini"><strong id="portfolio-return">—</strong><span>Modeled return</span></div>
+          <div class="mini"><strong id="portfolio-ex-best">—</strong><span>Return excluding best</span></div>
+          <div class="mini"><strong id="portfolio-winners">—</strong><span>Winner rate</span></div>
+        </div>
+        <div class="position-list" id="positions" style="margin-top:15px"><div class="empty">No shadow positions have been opened.</div></div>
+      </article>
+      <article class="panel">
+        <div class="panel-head"><div><h2>Sealed activity</h2><div class="sub">Recent observation and shadow ledgers</div></div></div>
+        <div class="events" id="events"><div class="empty">No ledger activity yet.</div></div>
+      </article>
+    </section>
+
+    <section class="panel table-panel" style="margin-bottom:18px">
+      <div class="panel-head">
+        <div><h2>Latest token decisions</h2><div class="sub">Real persisted risk analyses · click a column to sort, use the filter to narrow</div></div>
+        <div class="table-controls">
+          <div class="segment" role="group" aria-label="Filter by evidence state">
+            <button type="button" data-filter="all" aria-pressed="true">All</button>
+            <button type="button" data-filter="complete_safe">Safe</button>
+            <button type="button" data-filter="complete_unsafe">Unsafe</button>
+            <button type="button" data-filter="distribution_pending">Pending</button>
+            <button type="button" data-filter="infrastructure_indeterminate">Indet.</button>
+          </div>
+          <input class="filter-input" id="decision-text-filter" type="search" placeholder="symbol / mint…" aria-label="Filter by symbol or mint">
+          <span class="sub" id="decision-count">—</span>
+        </div>
+      </div>
+      <div class="table-scroll">
+        <table>
+          <thead><tr>
+            <th role="columnheader"><button class="sort" type="button" data-sort="symbol" aria-sort="none">Asset <span class="sort-glyph">↕</span></button></th>
+            <th role="columnheader"><button class="sort" type="button" data-sort="evidence_state" aria-sort="none">Evidence <span class="sort-glyph">↕</span></button></th>
+            <th role="columnheader"><button class="sort" type="button" data-sort="risk_level" aria-sort="none">Risk <span class="sort-glyph">↕</span></button></th>
+            <th role="columnheader"><button class="sort" type="button" data-sort="score" aria-sort="descending">Score <span class="sort-glyph">▼</span></button></th>
+            <th>Coverage</th>
+            <th role="columnheader"><button class="sort" type="button" data-sort="roundtrip_retention_pct" aria-sort="none">Round-trip <span class="sort-glyph">↕</span></button></th>
+            <th>Admission state</th>
+            <th>Dominant finding</th>
+            <th role="columnheader"><button class="sort" type="button" data-sort="updated_at" aria-sort="none">Updated <span class="sort-glyph">↕</span></button></th>
+          </tr></thead>
+          <tbody id="decision-rows"><tr><td colspan="9">Loading decisions…</td></tr></tbody>
+        </table>
+      </div>
+    </section>
+
+    <footer>
+      <span>READ-ONLY LOCAL OBSERVATORY · NO SIGNING · NO BROADCAST · NO PRIVATE KEYS</span>
+      <span id="updated">Not yet refreshed</span>
+    </footer>
+  </main>
+  <script>
+    const $ = id => document.getElementById(id);
+    const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
+    const num = (value, digits=0) => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined,{maximumFractionDigits:digits}) : "—";
+    const pct = value => Number.isFinite(Number(value)) && value !== null ? `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(2)}%` : "—";
+    const sol = value => Number.isFinite(Number(value)) && value !== null ? `${Number(value).toFixed(4)} SOL` : "—";
+    const short = (value, front=10, back=5) => value ? `${String(value).slice(0,front)}…${String(value).slice(-back)}` : "—";
+    const ago = seconds => {
+      if (!Number.isFinite(Number(seconds)) || seconds === null) return "—";
+      const s=Number(seconds); if (s<60) return `${Math.round(s)}s`;
+      if (s<3600) return `${Math.round(s/60)}m`; if (s<86400) return `${(s/3600).toFixed(1)}h`;
+      return `${(s/86400).toFixed(1)}d`;
+    };
+    const when = value => {
+      if (!value) return "—"; const d=new Date(value); if (Number.isNaN(d.valueOf())) return "—";
+      return d.toLocaleString([], {month:"short",day:"2-digit",hour:"2-digit",minute:"2-digit",second:"2-digit"});
+    };
+    const setDot = (id, state) => { $(id).className=`dot ${state === true ? "ok" : state === false ? "bad" : "warn"}`; };
+    const stateLabel = value => String(value || "unknown").replaceAll("_"," ").toUpperCase();
+    const stateClass = value => value === "complete_safe" ? "positive" : value === "complete_unsafe" ? "negative" : value === "distribution_pending" ? "warning" : "warning";
+    const blockerLabel = value => String(value || "").replaceAll("_"," ").replace("not met","").trim();
+
+    // Score color-banding shared by the top-candidates strip and the decisions table.
+    const scoreClass = value => {
+      const n = Number(value);
+      if (!Number.isFinite(n) || value === null) return "";
+      return n >= 85 ? "positive" : n >= 70 ? "" : n >= 50 ? "warning" : "negative";
+    };
+
+    // Sort + filter state for the decisions table. Lives outside render() so the
+    // 10s auto-refresh preserves the user's current selection rather than resetting.
+    let sortKey = "score", sortDir = "desc", filterState = "all", filterText = "";
+    const SORT_KEYS = ["symbol","evidence_state","risk_level","score","roundtrip_retention_pct","updated_at"];
+
+    const decisionSortValue = (item, key) => {
+      const raw = item[key];
+      if (key === "score" || key === "roundtrip_retention_pct") return Number(raw);
+      if (key === "updated_at") return String(raw || "");
+      return String(raw ?? "").toLowerCase();
+    };
+
+    const sortedDecisions = decisions => {
+      const needle = filterText.trim().toLowerCase();
+      const filtered = decisions.filter(item => {
+        if (filterState !== "all" && item.evidence_state !== filterState) return false;
+        if (needle) {
+          const hay = `${String(item.symbol ?? "")} ${String(item.mint ?? "")}`.toLowerCase();
+          if (!hay.includes(needle)) return false;
+        }
+        return true;
+      });
+      const dir = sortDir === "asc" ? 1 : -1;
+      return filtered.sort((a, b) => {
+        const av = decisionSortValue(a, sortKey), bv = decisionSortValue(b, sortKey);
+        if (av < bv) return -1 * dir;
+        if (av > bv) return 1 * dir;
+        return 0;
+      });
+    };
+
+    const applySortGlyphs = () => {
+      document.querySelectorAll('th[role="columnheader"] button.sort').forEach(btn => {
+        const key = btn.dataset.sort;
+        const glyph = btn.querySelector(".sort-glyph");
+        if (key === sortKey) {
+          btn.setAttribute("aria-sort", sortDir === "asc" ? "ascending" : "descending");
+          if (glyph) glyph.textContent = sortDir === "asc" ? "▲" : "▼";
+        } else {
+          btn.setAttribute("aria-sort", "none");
+          if (glyph) glyph.textContent = "↕";
+        }
+      });
+    };
+
+    function renderEvidence(data) {
+      const states=data.evidence_states || {};
+      const safe=Number(states.complete_safe||0), unsafe=Number(states.complete_unsafe||0), pend=Number(states.distribution_pending||0), ind=Number(states.infrastructure_indeterminate||0);
+      const total=safe+unsafe+pend+ind;
+      $("evidence-safe").textContent=num(safe);
+      $("evidence-unsafe").textContent=num(unsafe);
+      $("evidence-pending").textContent=num(pend);
+      $("evidence-indeterminate").textContent=num(ind);
+      $("evidence-safe-bar").style.width=`${total ? safe/total*100 : 0}%`;
+      $("evidence-unsafe-bar").style.width=`${total ? unsafe/total*100 : 0}%`;
+      $("evidence-pending-bar").style.width=`${total ? pend/total*100 : 0}%`;
+      $("evidence-indeterminate-bar").style.width=`${total ? ind/total*100 : 0}%`;
+      $("evidence-label").textContent=total ? `${num(total)} CLASSIFIED` : "AWAITING DATA";
+      setDot("evidence-dot", total ? (ind === 0 ? true : null) : null);
+      const coverage=data.evidence_coverage || {};
+      $("quote-coverage").textContent=pct(coverage.two_way_quote_pct);
+      $("assembly-coverage").textContent=pct(coverage.unsigned_assembly_pct);
+      $("quote-meter").style.width=`${Math.max(0,Math.min(100,Number(coverage.two_way_quote_pct||0)))}%`;
+      $("assembly-meter").style.width=`${Math.max(0,Math.min(100,Number(coverage.unsigned_assembly_pct||0)))}%`;
+      if (!total) {
+        $("evidence-callout").textContent="Run learn-once to populate evidence. Until then, no token classification is claimed.";
+      } else if (ind > 0) {
+        $("evidence-callout").textContent=`${ind} analysis${ind===1?" is":"es are"} infrastructure-indeterminate. Missing RPC or Jupiter evidence blocks shadow admission but is not labeled as token danger.`;
+      } else if (unsafe > 0) {
+        $("evidence-callout").textContent=`${unsafe} token${unsafe===1?" has":"s have"} complete evidence and a token-specific hard stop.`;
+      } else {
+        $("evidence-callout").textContent="All current analyses have complete evidence and no token-specific hard stop.";
+      }
+    }
+
+    function renderPromotion(promotion) {
+      const metrics=promotion.metrics || {}, policy=promotion.policy || {};
+      const status=String(promotion.status || "not evaluated");
+      $("promotion-status").textContent=stateLabel(status);
+      setDot("promotion-dot", status === "PROMOTABLE_FOR_REVIEW" || status === "promotable_for_review" ? true : false);
+      const gates = [
+        ["gate-observations","gate-observations-dot",metrics.observations,policy.minimum_observations,true,v=>`${num(v)} / ${num(policy.minimum_observations)}`],
+        ["gate-closed","gate-closed-dot",metrics.closed_positions,policy.minimum_closed_positions,true,v=>`${num(v)} / ${num(policy.minimum_closed_positions)}`],
+        ["gate-winners","gate-winners-dot",metrics.winner_rate_pct,policy.minimum_winner_rate_pct,true,v=>`${pct(v)} / ${num(policy.minimum_winner_rate_pct)}%`],
+        ["gate-drawdown","gate-drawdown-dot",metrics.maximum_drawdown_pct,policy.maximum_drawdown_pct,false,v=>`${pct(v)} / ${num(policy.maximum_drawdown_pct)}%`],
+        ["gate-return","gate-return-dot",metrics.net_return_pct,0,true,v=>pct(v)],
+        ["gate-indeterminate","gate-indeterminate-dot",metrics.infrastructure_indeterminate_rate_pct,policy.maximum_indeterminate_rate_pct,false,v=>`${pct(v)} / ${num(policy.maximum_indeterminate_rate_pct)}%`],
+      ];
+      gates.forEach(([valueId,dotId,value,target,higher,format])=>{
+        $(valueId).textContent=format(value);
+        const finite=Number.isFinite(Number(value)) && value !== null;
+        setDot(dotId, finite ? (higher ? Number(value)>=Number(target) : Number(value)<=Number(target)) : false);
+      });
+      const blockers=promotion.blockers || [];
+      $("promotion-blockers").innerHTML=blockers.length
+        ? blockers.map(item=>`<span class="blocker">${esc(blockerLabel(item))}</span>`).join("")
+        : '<span class="tag">All evidence gates pass · manual review required</span>';
+    }
+
+    function renderCalibration(cal) {
+      const dist = cal.distribution || {}, policy = cal.active_policy || {};
+      const sens = cal.threshold_sensitivity || {};
+      const top1 = dist.top1_circulating_pct || {}, top10 = dist.top10_circulating_pct || {};
+      const top1Active = Number(policy.maximum_top1_circulating_pct);
+      const top10Active = Number(policy.maximum_top10_circulating_pct);
+      const joint = cal.joint_gate_at_active_policy || {};
+
+      $("calibration-status").textContent = cal.observations ? `${num(cal.observations)} OBS · ${num(cal.concentration_resolved)} RESOLVED` : "—";
+      setDot("calibration-dot", cal.observations ? (cal.concentration_unresolved === 0 ? true : null) : null);
+
+      $("cal-top1-median").textContent = top1.median !== undefined && top1.median !== null ? `${num(top1.median, 1)}%` : "—";
+      $("cal-top1-median").className = `infra-value ${scoreClass(top1.median ? 100 - top1.median : 0)}`;
+      $("cal-top1-range").textContent = top1.min !== null ? `${num(top1.min, 1)}% – ${num(top1.max, 1)}%` : "—";
+      $("cal-top10-median").textContent = top10.median !== undefined && top10.median !== null ? `${num(top10.median, 1)}%` : "—";
+      $("cal-top10-median").className = `infra-value ${scoreClass(top10.median ? 100 - top10.median : 0)}`;
+      $("cal-top10-range").textContent = top10.min !== null ? `${num(top10.min, 1)}% – ${num(top10.max, 1)}%` : "—";
+      $("cal-joint").textContent = joint.admit_rate_pct !== null && joint.admit_rate_pct !== undefined ? `${num(joint.admit_rate_pct, 1)}%` : "—";
+      $("cal-joint").className = `infra-value ${Number(joint.admit_rate_pct) > 0 ? "positive" : "warning"}`;
+
+      const renderGrid = (rows, activeThreshold, higherIsWorse) => {
+        if (!Array.isArray(rows) || !rows.length) return "—";
+        const active = rows.find(r => Number(r.threshold_pct) === Number(activeThreshold));
+        const activeRate = active ? `${num(active.admit_rate_pct, 1)}% admit` : "not in grid";
+        const detail = rows.map(r => {
+          const isActive = Number(r.threshold_pct) === Number(activeThreshold);
+          return `${isActive ? "▶ " : ""}${num(r.threshold_pct)}%→${num(r.admit_rate_pct, 1)}%`;
+        }).join("  ·  ");
+        return `${activeRate}<br>${esc(detail)}`;
+      };
+      const top1Rows = sens.top1_circulating_pct || [];
+      const top10Rows = sens.top10_circulating_pct || [];
+      const retRows = sens.roundtrip_retention_pct || [];
+      const retActive = Number(policy.minimum_roundtrip_retention_pct);
+
+      $("cal-top1-active").textContent = `≤ ${num(top1Active)}%`;
+      $("cal-top1-grid").innerHTML = renderGrid(top1Rows, top1Active, true);
+      $("cal-top10-active").textContent = `≤ ${num(top10Active)}%`;
+      $("cal-top10-grid").innerHTML = renderGrid(top10Rows, top10Active, true);
+      $("cal-ret-active").textContent = `≥ ${num(retActive)}%`;
+      $("cal-ret-grid").innerHTML = renderGrid(retRows, retActive, false);
+
+      const top1Admit = (top1Rows.find(r => Number(r.threshold_pct) === top1Active) || {}).admit_rate_pct;
+      $("cal-top1-meter").style.width = `${Math.max(0, Math.min(100, Number(top1Admit || 0)))}%`;
+      const top10Admit = (top10Rows.find(r => Number(r.threshold_pct) === top10Active) || {}).admit_rate_pct;
+      $("cal-top10-meter").style.width = `${Math.max(0, Math.min(100, Number(top10Admit || 0)))}%`;
+      const retAdmit = (retRows.find(r => Number(r.threshold_pct) === retActive) || {}).admit_rate_pct;
+      $("cal-ret-meter").style.width = `${Math.max(0, Math.min(100, Number(retAdmit || 0)))}%`;
+
+      const caveats = cal.caveats || [];
+      $("calibration-callout").innerHTML = caveats.length
+        ? caveats.map(c => esc(c)).join(" ")
+        : "Calibration characterizes the distribution; threshold validation requires realized outcomes that are not yet collected.";
+    }
+
+    function renderInfrastructure(data) {
+      const rpc=data.rpc_health || {}, config=data.configuration || {}, jupiter=data.jupiter_health || {}, recovery=data.recovery || {};
+      $("rpc-success").textContent=pct(rpc.success_rate_pct);
+      $("rpc-counts").textContent=`${num(rpc.successes)} success / ${num(rpc.attempts)} attempts`;
+      $("rpc-failures").textContent=num(rpc.failures);
+      $("rpc-retries").textContent=num(rpc.retries);
+      const methodRows=Object.entries(rpc.methods || {}).sort((a,b)=>Number(b[1]?.failures||0)-Number(a[1]?.failures||0));
+      $("rpc-method-note").textContent=methodRows.length ? `${methodRows.length} methods · highest failures ${methodRows[0][0]} (${num(methodRows[0][1]?.failures)})` : "No method telemetry yet";
+      const configuredRpc=String(config.rpc_endpoint || rpc.configured_rpc_url || "—");
+      const observedRpc=String(rpc.rpc_url || "—");
+      $("rpc-origin").textContent=configuredRpc.replace(/^https?:\/\//,"");
+      $("rpc-origin").title=configuredRpc;
+      $("rpc-origin-note").textContent=observedRpc !== "—" && observedRpc !== configuredRpc
+        ? `Current configured origin · telemetry last observed ${observedRpc.replace(/^https?:\/\//,"")}`
+        : `${rpc.configured_rpc_required ? "Configured RPC required" : "Current configured origin"} · path and query redacted`;
+      $("recovery-pending").textContent=num(recovery.pending);
+      $("recovery-pending").className=`infra-value ${Number(recovery.pending||0) ? "warning" : "positive"}`;
+      $("recovery-note").textContent=`${num(recovery.due)} due · ${num(recovery.resolved)} resolved`;
+      const access=String(jupiter.access_mode || (config.jupiter_api_key_configured ? "api_key" : "keyless"));
+      $("jupiter-key").textContent=access === "api_key" ? "API KEY" : "KEYLESS";
+      $("jupiter-key").className=`infra-value ${access === "api_key"?"positive":"warning"}`;
+      $("jupiter-note").textContent=`${num(jupiter.successes)} success · ${num(jupiter.retries)} retries · secret never shown`;
+      $("paper-taker").textContent=config.paper_taker_configured ? "CONFIGURED" : "OPTIONAL";
+      $("paper-taker").className=`infra-value ${config.paper_taker_configured?"positive":"warning"}`;
+      const healthy=Number(rpc.last_cycle?.failures||0)===0 && Number(jupiter.failures||0)===0;
+      $("infra-status").textContent=healthy ? "HEALTHY" : "ATTENTION";
+      setDot("infra-dot", healthy ? true : null);
+    }
+
+    function renderReflection(data) {
+      const reflection=data.reflection || {}, controller=data.controller || {};
+      const pending=reflection.status === "pending" || reflection.pause_requested === true;
+      $("reflection-status").textContent=pending ? "PAUSED FOR REVIEW" : String(reflection.status || "armed").toUpperCase();
+      setDot("reflection-dot", pending ? null : true);
+      $("reflection-cadence").textContent=num(reflection.analysis_interval);
+      $("reflection-remaining").textContent=num(reflection.analyses_until_checkpoint);
+      $("reflection-remaining").className=`infra-value ${pending ? "warning" : "positive"}`;
+      $("reflection-next-note").textContent=pending
+        ? `checkpoint ${short(reflection.pending_checkpoint?.checkpoint_id,8,4)}`
+        : `${num(reflection.analysis_events)} committed analyses`;
+      $("controller-cycles").textContent=num(controller.cycles_completed);
+      $("controller-note").textContent=controller.last_completed_at
+        ? `${num(controller.cycles_failed)} failed · last ${when(controller.last_completed_at)}`
+        : "No completed scheduler cycle recorded";
+      const reason=reflection.pending_checkpoint?.reason;
+      $("reflection-callout").textContent=pending
+        ? `Analysis is fail-closed at a sealed ${stateLabel(reason)} checkpoint. The reviewer must verify both chains, inspect evidence, run regression + paper smoke, and acknowledge before resuming.`
+        : `Next interval review in ${num(reflection.analyses_until_checkpoint)} analyses. The first canonical graduated market still triggers an immediate checkpoint.`;
+    }
+
+    function renderIntegrity(data) {
+      const integrity=data.integrity || {}, chain=integrity.timechain || {};
+      $("catalog-node").textContent=num(data.catalog_size); setDot("catalog-dot", Number(data.catalog_size)>=0);
+      $("observation-node").textContent=num(data.events?.observation);
+      $("observation-report").textContent=integrity.observation_ledger || "No report";
+      setDot("observation-dot", String(integrity.observation_ledger||"").toLowerCase().includes("verified"));
+      $("shadow-node").textContent=num(data.events?.shadow);
+      $("shadow-report").textContent=integrity.shadow_ledger || "No report";
+      setDot("shadow-dot", String(integrity.shadow_ledger||"").toLowerCase().includes("verified"));
+      $("policy-node").textContent=integrity.state_policy_bound ? "BOUND" : "FAILED"; setDot("policy-dot", integrity.state_policy_bound);
+      $("chain-node").textContent=num(chain.height); $("chain-report").textContent=chain.report || "No report"; setDot("chain-dot", chain.ok);
+      $("integrity-label").textContent=integrity.ok ? "ALL CHECKS PASS" : "ATTENTION REQUIRED"; setDot("integrity-dot", integrity.ok);
+      $("ring-height").textContent=num(chain.height);
+      $("ring-type").textContent=chain.head ? `${stateLabel(chain.head.ring_type)} · RING ${chain.head.index}` : "No Timechain head";
+      $("ring-hash").textContent=chain.head ? short(chain.head.ring_hash,18,8) : "No head loaded";
+      $("ring-summary").textContent=chain.head?.summary || "";
+      setDot("timechain-dot", chain.ok);
+    }
+
+    function renderPositions(shadow) {
+      const positions=shadow.positions || [];
+      $("portfolio-status").textContent=positions.length ? `${num(shadow.open)} OPEN · ${num(shadow.closed)} CLOSED` : "NO POSITIONS";
+      setDot("portfolio-dot", positions.length ? true : null);
+      $("portfolio-return").textContent=pct(shadow.modeled_return_pct);
+      $("portfolio-return").className=Number(shadow.modeled_return_pct)>=0 ? "positive" : "negative";
+      if (shadow.modeled_return_pct === null) $("portfolio-return").className="";
+      $("portfolio-ex-best").textContent=pct(shadow.return_without_best_pct);
+      $("portfolio-winners").textContent=pct(shadow.winner_rate_pct);
+      if (!positions.length) {
+        $("positions").innerHTML='<div class="empty">No shadow positions have been opened. Only complete-safe evidence can reach the shadow portfolio.</div>';
+        return;
+      }
+      $("positions").innerHTML=positions.slice(0,12).map(position=>{
+        const multiple=Number(position.multiple);
+        const multipleClass=Number.isFinite(multiple) ? (multiple>=1?"positive":"negative") : "";
+        return `<div class="position">
+          <div><strong>${esc(position.symbol)}</strong><small title="${esc(position.mint)}">${short(position.mint,9,5)} · ${esc(stateLabel(position.status))}</small></div>
+          <div class="position-metric"><strong class="${multipleClass}">${Number.isFinite(multiple)?`${multiple.toFixed(3)}×`:"—"}</strong><span>Multiple</span></div>
+          <div class="position-metric"><strong>${sol(position.modeled_value_sol)}</strong><span>Modeled value</span></div>
+          <div class="position-metric"><strong>${ago(position.mark_age_seconds)}</strong><span>Mark age</span></div>
+        </div>`;
+      }).join("");
+    }
+
+    function renderTopCandidates(decisions) {
+      const safe = decisions
+        .filter(item => item.admission_state === "graduated_market_ready" && Number.isFinite(Number(item.score)))
+        .sort((a, b) => Number(b.score) - Number(a.score))
+        .slice(0, 4);
+      $("candidates-status").textContent = safe.length ? `${num(safe.length)} READY · TOP SHOWN` : "0 READY";
+      setDot("candidates-dot", safe.length ? true : null);
+      if (!safe.length) {
+        $("top-candidates").innerHTML = '<div class="empty">No graduated-market-ready candidates yet. Pre-graduation launches remain observation-only.</div>';
+        return;
+      }
+      $("top-candidates").innerHTML = safe.map((item, index) => {
+        const score = Number(item.score);
+        const retention = Number(item.roundtrip_retention_pct);
+        const retentionText = Number.isFinite(retention) ? `${retention.toFixed(1)}%` : "—";
+        const ageSeconds = item.updated_at ? (Date.now() - new Date(item.updated_at).valueOf()) / 1000 : null;
+        return `<div class="candidate">
+          <div class="candidate-top">
+            <div class="candidate-id">
+              <strong title="${esc(item.name || item.symbol)}">${esc(item.symbol)}</strong>
+              <small title="${esc(item.mint)}">${short(item.mint, 8, 5)}</small>
+            </div>
+            <div class="rank">${num(index + 1)}</div>
+          </div>
+          <div class="candidate-score ${scoreClass(score)}">${num(score, 1)}<small>/ 100</small></div>
+          <div class="candidate-meta">
+            <span>Round-trip<b>${esc(retentionText)}</b></span>
+            <span>Updated<b>${ageSeconds !== null ? ago(ageSeconds) : "—"}</b></span>
+          </div>
+        </div>`;
+      }).join("");
+    }
+
+    function renderDecisions(decisions) {
+      const view = sortedDecisions(decisions);
+      $("decision-count").textContent = `${num(view.length)} / ${num(decisions.length)} SHOWN`;
+      applySortGlyphs();
+      if (!view.length) {
+        const reason = decisions.length ? "No decisions match the current filter." : "No persisted token analyses yet.";
+        $("decision-rows").innerHTML = `<tr><td colspan="9">${esc(reason)}</td></tr>`;
+        return;
+      }
+      $("decision-rows").innerHTML=view.map(item=>{
+        const dominant=(item.infrastructure_errors||[])[0] || (item.hard_stops||[])[0] || (item.warnings||[])[0] || "No adverse finding";
+        const retention=Number(item.roundtrip_retention_pct);
+        const roundtrip=Number.isFinite(retention) ? `${(100-retention).toFixed(2)}% cost` : "—";
+        return `<tr>
+          <td><div class="mono">${esc(item.symbol)}</div><div class="sub mono token" title="${esc(item.mint)}">${short(item.mint,8,5)}</div></td>
+          <td class="${stateClass(item.evidence_state)}">${esc(stateLabel(item.evidence_state))}${item.distribution_stage === "pre_distribution" ? '<div class="sub warning" style="margin-top:4px;font-size:9px">pre-distribution · unjudgeable</div>' : ""}</td>
+          <td>${esc(item.risk_level || "—")}</td>
+          <td class="mono ${scoreClass(Number(item.score))}">${num(item.score,1)}</td>
+          <td class="mono">${num(item.coverage_complete)} / ${num(item.coverage_total)}</td>
+          <td class="mono">${esc(roundtrip)}</td>
+          <td><span class="status"><span class="dot ${item.shadow_entry_allowed?"ok":"warn"}"></span>${esc(stateLabel(item.admission_state))}</span></td>
+          <td class="decision-note" title="${esc(dominant)}">${esc(String(dominant).replaceAll("_"," "))}</td>
+          <td class="mono">${when(item.updated_at)}</td>
+        </tr>`;
+      }).join("");
+    }
+
+    function renderEvents(events) {
+      if (!events.length) {
+        $("events").innerHTML='<div class="empty">No observation or shadow events yet.</div>';
+        return;
+      }
+      $("events").innerHTML=events.map(event=>`<div class="event">
+        <div class="event-line"><span class="event-type">${esc(stateLabel(event.event_type))}</span><span class="event-time">${esc(when(event.timestamp))}</span></div>
+        <div class="event-meta">${esc(event.symbol || short(event.mint,8,5))} · ${esc(event.source || "ledger")}${event.reason?` · ${esc(event.reason)}`:""}</div>
+      </div>`).join("");
+    }
+
+    function render(data) {
+      const schedule=data.schedule || {}, scheduler=data.scheduler || {};
+      const enabled=schedule.installed && schedule.enabled !== false;
+      const schedulerState=enabled ? String(scheduler.status || "scheduled").toUpperCase() : (schedule.installed ? "STOPPED" : "NOT INSTALLED");
+      $("scheduler-state").textContent=schedulerState;
+      $("scheduler-state").className=`stat-value ${enabled ? (scheduler.status === "failed" ? "negative" : "positive") : "warning"}`;
+      const cadence=schedule.interval_minutes ? `every ${num(schedule.interval_minutes)}m` : "no cadence";
+      const lastCycle=data.cycle?.timestamp ? `last cycle ${ago(data.cycle.age_seconds)} ago · ${num(data.cycle.analyzed)} analyzed` : "no cycle recorded";
+      $("scheduler-note").textContent=`${cadence} · ${lastCycle}`;
+      $("catalog-size").textContent=num(data.catalog_size);
+      $("analysis-count").textContent=num(data.analysis_count);
+      $("analysis-note").textContent=`${num(data.graduated_market_count)} graduated markets · ${num(data.admission_states?.graduated_market_ready)} ready`;
+      $("shadow-open").textContent=num(data.shadow?.open);
+      $("shadow-note").textContent=`${num(data.shadow?.open)} open / ${num(data.shadow?.closed)} closed · ${num(data.shadow?.unpriced)} unpriced`;
+      renderEvidence(data);
+      renderPromotion(data.promotion || {});
+      renderCalibration(data.concentration_calibration || {});
+      renderInfrastructure(data);
+      renderReflection(data);
+      renderIntegrity(data);
+      renderPositions(data.shadow || {});
+      renderDecisions(data.decisions || []);
+      renderTopCandidates(data.decisions || []);
+      renderEvents(data.events?.recent || []);
+      renderLearningLoop(data.learning_loop);
+      $("connection-label").textContent="LIVE LOCAL DATA"; setDot("connection-dot",true);
+      $("updated").textContent=`STATUS GENERATED ${when(data.generated_at)}`;
+    }
+
+    function renderLearningLoop(loop) {
+      const pill=$("learn-status-pill"), label=$("learn-label"), toggle=$("learn-toggle"), durationInput=$("learn-duration");
+      if (!loop) { pill.hidden=true; return; }
+      if (loop.running) {
+        pill.hidden=false;
+        const elapsedMin = loop.elapsed_seconds!=null ? Math.floor(loop.elapsed_seconds/60) : null;
+        if (loop.duration_seconds==null) {
+          label.textContent = `LEARNING · ${num(elapsedMin)}min (∞)`;
+        } else {
+          const remainMin = loop.remaining_seconds!=null ? Math.ceil(loop.remaining_seconds/60) : null;
+          label.textContent = `LEARNING · ${num(elapsedMin)}/${num(Math.round(loop.duration_seconds/60))}min`;
+        }
+        toggle.textContent="⏹ STOP"; toggle.classList.add("is-stop");
+        durationInput.disabled=true;
+      } else {
+        const hadError = loop.last_error && loop.cycles===0;
+        if (hadError) { pill.hidden=false; label.textContent=`ERROR: ${String(loop.last_error).slice(0,40)}`; }
+        else { pill.hidden=true; }
+        toggle.textContent="▶ START"; toggle.classList.remove("is-stop");
+        durationInput.disabled=false;
+      }
+    }
+
+    async function refresh() {
+      $("refresh").disabled=true;
+      try {
+        const response=await fetch("/api/status",{cache:"no-store"});
+        if (!response.ok) throw new Error(`Status API ${response.status}`);
+        render(await response.json());
+      } catch (error) {
+        $("connection-label").textContent="STATUS UNAVAILABLE"; setDot("connection-dot",false);
+        $("updated").textContent=error.message;
+      } finally {
+        $("refresh").disabled=false;
+      }
+    }
+    $("refresh").addEventListener("click",refresh);
+
+    // Learning loop Start/Stop. POSTs to the backend controller; the next
+    // 10s tick (or an immediate refresh) reflects the new running state.
+    $("learn-toggle").addEventListener("click", async () => {
+      const toggle=$("learn-toggle");
+      const pill=$("learn-status-pill"), label=$("learn-label");
+      toggle.disabled=true;
+      pill.hidden=false; label.textContent="…";
+      try {
+        const response = toggle.classList.contains("is-stop")
+          ? await fetch("/api/learn/stop", {method:"POST"})
+          : await fetch("/api/learn/start", {
+              method:"POST",
+              headers:{"Content-Type":"application/json"},
+              body:JSON.stringify(
+                ($("learn-duration").value.trim()==="") ? {} : {duration_minutes: Number($("learn-duration").value.trim())}
+              ),
+            });
+        if (!response.ok) {
+          label.textContent=`HTTP ${response.status}`;
+        } else {
+          // Reflect the controller's reply immediately rather than waiting.
+          const st = await response.json();
+          renderLearningLoop(st);
+        }
+        refresh();
+      } catch (error) {
+        label.textContent=`ERR: ${String(error).slice(0,30)}`;
+      } finally {
+        toggle.disabled=false;
+      }
+    });
+
+    // Sortable column headers. Toggling the active column flips asc/desc;
+    // clicking a new column defaults to descending (score-like) which matches
+    // the "best first" intent for most columns.
+    document.querySelectorAll('th[role="columnheader"] button.sort').forEach(btn => {
+      btn.addEventListener("click", () => {
+        const key = btn.dataset.sort;
+        if (!SORT_KEYS.includes(key)) return;
+        if (key === sortKey) {
+          sortDir = sortDir === "asc" ? "desc" : "asc";
+        } else {
+          sortKey = key;
+          sortDir = "desc";
+        }
+        applySortGlyphs();
+        refresh();
+      });
+    });
+
+    // Evidence-state segmented filter.
+    document.querySelectorAll('.segment [data-filter]').forEach(btn => {
+      btn.addEventListener("click", () => {
+        filterState = btn.dataset.filter;
+        document.querySelectorAll('.segment [data-filter]').forEach(b => {
+          b.setAttribute("aria-pressed", String(b === btn));
+        });
+        refresh();
+      });
+    });
+
+    // Free-text symbol/mint filter (debounced so typing doesn't spam the API).
+    let filterTimer = null;
+    $("decision-text-filter").addEventListener("input", event => {
+      filterText = event.target.value || "";
+      if (filterTimer) clearTimeout(filterTimer);
+      filterTimer = setTimeout(refresh, 220);
+    });
+
+    refresh();
+    setInterval(()=>{ if (!document.hidden) refresh(); },10000);
+  </script>
+</body>
+</html>

@@ -1,0 +1,62 @@
+# Python
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# Secrets / env
+.env
+.env.*
+!.env.*.example
+!.env.example
+
+# Runtime / generated state (chains, ledgers, learning data, logs, caches)
+chainseer_chain/
+chainseer_chain_archive_corrupted/
+base_learning/
+base_prototype/
+base_prototype_smoke/
+chain/
+chainseer_api_repo/
+controls_smoke_20260727/
+evidence/
+pons_chain/
+pons_chain_smoke/
+pons_learning/
+pons_prototype_smoke/
+solana_chain/
+solana_learning/
+solana_prototype_smoke/
+solana_prototype_smoke_100/
+solana_prototype_smoke_100_retry/
+solana_reflection_smoke_b146d63d/
+ta_cache/
+test_chainseer_chain/
+api_smoke_chain/
+.chainseer-review-timechain/
+.chainseer-local.json
+.sites-init-staging/
+.zcode/
+.agents/
+.pnpm-store/
+*.log
+*.stdout.log
+*.stderr.log
+chainseer_report_*.json
+ta_confluence_*.json
+ta_lead_lag_*.json
+ta_patterns_*.json
+ta_walkforward_*.json
+learning_summary.json
+
+# Node
+node_modules/
+.next/
+out/
+
+# Local agent/dev tooling
+.claude/
+
+# OS
+.DS_Store
+Thumbs.db
+chainseer_web/

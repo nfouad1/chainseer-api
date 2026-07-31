@@ -1,0 +1,41 @@
+FROM python:3.13-slim
+
+ARG CYPHER_TEMPRE_COMMIT=5b7783f5c84706c5034273cc2772563d5d8fdb76
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONUTF8=1 \
+    CHAINSEER_API_HOST=0.0.0.0 \
+    CHAINSEER_CHAIN_ROOT=/data/chainseer_chain \
+    CHAINSEER_SKILL_DIR=/opt/cypher-tempre-self-model
+
+WORKDIR /app
+
+COPY requirements-api.txt .
+RUN pip install --no-cache-dir -r requirements-api.txt
+
+# Pin the MIT-licensed Cypher Tempre runtime so production analyses use the
+# same reproducible Timechain implementation on every build. User chain data
+# is never copied into the image; it lives only on the persistent /data disk.
+ADD https://github.com/cyberphysicsai/cypher-tempre-genesis/archive/${CYPHER_TEMPRE_COMMIT}.zip /tmp/cypher-tempre.zip
+RUN python -m zipfile -e /tmp/cypher-tempre.zip /tmp/cypher-tempre \
+    && cp -R \
+      /tmp/cypher-tempre/cypher-tempre-genesis-${CYPHER_TEMPRE_COMMIT}/skills/codex/cypher-tempre-self-model \
+      /opt/cypher-tempre-self-model \
+    && rm -rf /tmp/cypher-tempre /tmp/cypher-tempre.zip \
+    && test -f /opt/cypher-tempre-self-model/timechain.py \
+    && test -f /opt/cypher-tempre-self-model/poq.py
+
+COPY chainseer.py chainseer_controls.py chainseer_api.py ./
+
+RUN useradd --create-home --uid 10001 chainseer \
+    && mkdir -p /data/chainseer_chain \
+    && chown -R chainseer:chainseer /app /data \
+    && chmod -R a-w /opt/cypher-tempre-self-model
+
+USER chainseer
+
+EXPOSE 8000
+VOLUME ["/data"]
+
+CMD ["python", "-X", "utf8", "chainseer_api.py"]
