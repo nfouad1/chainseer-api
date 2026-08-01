@@ -39,13 +39,13 @@ services:
       - key: CHAINSEER_SCAN_CACHE_TTL_SECONDS
         value: "300"
       - key: CHAINSEER_RESULT_TTL_SECONDS
-        value: "3600"
+        value: "600"
       - key: CHAINSEER_SHUTDOWN_GRACE_SECONDS
         value: "20"
       - key: CHAINSEER_WATCHER_ENABLED
         value: "1"
       - key: CHAINSEER_WATCHER_INTERVAL_SECONDS
-        value: "15"
+        value: "60"
       - key: CHAINSEER_WATCHER_CONFIRMATIONS
         value: "2"
       - key: CHAINSEER_BENCHMARK_CAPTURE_ENABLED

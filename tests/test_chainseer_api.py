@@ -681,9 +681,16 @@ class ServiceTests(unittest.TestCase):
                 cached = service.submit(TOKEN)
                 cached_job = service.get(cached.job_id)
                 self.assertTrue(cached.cached)
+                # A cache hit now returns the original completed job
+                # (job_id included) rather than minting a duplicate Job
+                # entry per repeat lookup, so its benchmark_capture reflects
+                # that job's real, one-time capture rather than a synthetic
+                # per-hit status. The invariant that matters -- no second
+                # observation gets written -- is the assertion below.
+                self.assertEqual(cached.job_id, accepted.job_id)
                 self.assertEqual(
                     cached_job.benchmark_capture["status"],
-                    "cache_hit_not_recaptured",
+                    "captured",
                 )
                 self.assertEqual(
                     len(

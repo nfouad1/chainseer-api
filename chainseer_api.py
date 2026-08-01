@@ -159,7 +159,11 @@ class Settings:
     )
     result_ttl_seconds: int = field(
         default_factory=lambda: _env_int(
-            "CHAINSEER_RESULT_TTL_SECONDS", 3600, 60, 86400
+            # A completed job only needs to outlive a client's poll loop, not
+            # sit resident for an hour. On a memory-constrained instance with
+            # continuous watcher-driven analyses, an hour of full result
+            # retention was a major contributor to sustained RSS growth.
+            "CHAINSEER_RESULT_TTL_SECONDS", 600, 60, 86400
         )
     )
     cache_ttl_seconds: int = field(
@@ -199,7 +203,12 @@ class Settings:
     )
     watcher_interval_seconds: int = field(
         default_factory=lambda: _env_int(
-            "CHAINSEER_WATCHER_INTERVAL_SECONDS", 15, 3, 3600
+            # Each idle tick still allocates RPC/HTTP call structures for
+            # every subscription across all three networks even when no
+            # rescan is due; at 15s this churn runs continuously. 60s cuts
+            # that allocation/deallocation volume roughly 4x with no material
+            # loss of monitoring freshness.
+            "CHAINSEER_WATCHER_INTERVAL_SECONDS", 60, 3, 3600
         )
     )
     watcher_confirmations: int = field(
@@ -717,22 +726,22 @@ class AnalysisService:
             self._prune(now)
             cached = self.cache.get(normalized)
             if cached and cached[0] > now:
-                job = Job(
-                    id=uuid.uuid4().hex,
-                    address=address,
-                    network=network,
-                    status="succeeded",
-                    started_at=now,
-                    finished_at=now,
-                    result=cached[1],
-                    benchmark_capture={
-                        "status": "cache_hit_not_recaptured"
-                    },
-                )
-                self.jobs[job.id] = job
-                return JobAccepted(
-                    job_id=job.id, status=job.status, cached=True
-                )
+                cached_job = self.jobs.get(cached[1])
+                if cached_job is not None:
+                    # Serve the existing completed job rather than minting a
+                    # new Job entry per cache hit: cache_ttl_seconds is always
+                    # <= result_ttl_seconds by convention, so the job this
+                    # entry points to is still present whenever the cache
+                    # entry itself hasn't expired. Repeat lookups of a hot
+                    # address used to grow self.jobs by one entry each time.
+                    return JobAccepted(
+                        job_id=cached_job.id,
+                        status=cached_job.status,
+                        cached=True,
+                    )
+                # The pointer outlived its job (e.g. mismatched TTL
+                # configuration) -- fall through and treat this as a miss.
+                self.cache.pop(normalized, None)
 
             active_id = self.active_by_address.get(normalized)
             if active_id:
@@ -1027,7 +1036,7 @@ class AnalysisService:
                         self.cache[f"{job.network}:{cache_address}"] = (
                             time.time()
                             + self.settings.cache_ttl_seconds,
-                            public_report,
+                            job.id,
                         )
             except PublicAnalysisError as exc:
                 with self._lock:
