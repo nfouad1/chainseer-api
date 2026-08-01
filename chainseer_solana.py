@@ -4702,6 +4702,8 @@ def serve_solana_dashboard(
     *,
     host: str = "127.0.0.1",
     port: int = 8767,
+    auto_start_learner: bool = False,
+    auto_start_duration_minutes: float | None = None,
 ) -> None:
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError(
@@ -4713,6 +4715,26 @@ def serve_solana_dashboard(
             f"Solana dashboard was not found: {dashboard_path}"
         )
     learning_loop = LearningLoopController(engine)
+    if auto_start_learner:
+        # Opt-in: a plain `dashboard` launch (e.g. to inspect existing state)
+        # must not silently kick off a new paper-learning run. Only start
+        # here when the caller explicitly asked for it via --auto-start-
+        # learner, mirroring exactly what clicking START in the browser does.
+        duration_seconds = (
+            auto_start_duration_minutes * 60.0
+            if auto_start_duration_minutes is not None
+            else None
+        )
+        started = learning_loop.start(duration_seconds)
+        print(
+            "Learning loop auto-started "
+            + (
+                f"for {auto_start_duration_minutes:g} minutes"
+                if auto_start_duration_minutes is not None
+                else "(no duration limit; stop from the dashboard or Ctrl+C this process)"
+            )
+            + f" -- running={started.get('running')}"
+        )
 
     class DashboardHandler(BaseHTTPRequestHandler):
         def _send(self, status: int, content_type: str, body: bytes) -> None:
@@ -4914,6 +4936,20 @@ def main() -> None:
     dashboard = subparsers.add_parser("dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8767)
+    dashboard.add_argument(
+        "--auto-start-learner",
+        action="store_true",
+        help="Start the paper-learning loop immediately, same as clicking "
+        "START in the dashboard. Off by default so opening the dashboard "
+        "to inspect existing state never silently kicks off a new run.",
+    )
+    dashboard.add_argument(
+        "--auto-start-duration-minutes",
+        type=float,
+        default=None,
+        help="Duration for --auto-start-learner. Omit to run until stopped "
+        "(same as leaving the dashboard's duration field blank).",
+    )
     subparsers.add_parser("status")
     subparsers.add_parser("promotion")
     subparsers.add_parser("calibration")
@@ -4988,7 +5024,13 @@ def main() -> None:
             )
         )
     elif args.command == "dashboard":
-        serve_solana_dashboard(engine, host=args.host, port=args.port)
+        serve_solana_dashboard(
+            engine,
+            host=args.host,
+            port=args.port,
+            auto_start_learner=args.auto_start_learner,
+            auto_start_duration_minutes=args.auto_start_duration_minutes,
+        )
     elif args.command == "verify":
         report = engine.verify()
         print(json.dumps(report, indent=2))
