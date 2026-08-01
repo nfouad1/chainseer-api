@@ -522,6 +522,89 @@ class SolanaPrototypeTests(unittest.TestCase):
             self.assertEqual(observer.recent(1)[0].symbol, "SAFE")
             self.assertTrue(ledger.verify()[0])
 
+    def test_resolve_candidate_finds_genesis_transaction_via_bounded_paging(self):
+        mint_seed = 42
+        mint = chainseer_solana._b58encode(b58_bytes(mint_seed))
+        rpc = FakeRPC()
+        signatures = []
+        for i in range(11):
+            sig = f"trade-{i}"
+            block_time = 2_000_000_000 - i
+            signatures.append(
+                {"signature": sig, "slot": 100 + i, "blockTime": block_time, "err": None}
+            )
+            rpc.transactions[sig] = {
+                "blockTime": block_time,
+                "transaction": {
+                    "message": {
+                        "accountKeys": [{"pubkey": chainseer_solana.PUMP_PROGRAM_ID}]
+                    }
+                },
+                "meta": {"err": None, "logMessages": []},
+            }
+        genesis_block_time = 2_000_000_000 - 11
+        signatures.append(
+            {
+                "signature": "genesis",
+                "slot": 1,
+                "blockTime": genesis_block_time,
+                "err": None,
+            }
+        )
+        rpc.transactions["genesis"] = {
+            "blockTime": genesis_block_time,
+            "transaction": {
+                "message": {
+                    "accountKeys": [{"pubkey": chainseer_solana.PUMP_PROGRAM_ID}]
+                }
+            },
+            "meta": {
+                "err": None,
+                "logMessages": [
+                    "Program data: "
+                    + farm_create_event_payload(
+                        mint_seed=mint_seed,
+                        creator=b58_bytes(4),
+                        block_time=genesis_block_time,
+                    )
+                ],
+            },
+        }
+        rpc.signatures = signatures
+
+        with tempfile.TemporaryDirectory() as temp:
+            ledger = chainseer_solana.HashLedger(Path(temp) / "events.jsonl")
+            observer = chainseer_solana.PumpFunObserver(rpc, temp, ledger)
+            found = observer.resolve_candidate(
+                mint, max_pages=5, page_size=5, decode_last=10
+            )
+            self.assertIsNotNone(found)
+            self.assertEqual(found.mint, mint)
+
+            # A second lookup must be served from the catalog it just wrote,
+            # not by re-scanning -- clearing rpc.signatures proves that.
+            rpc.signatures = []
+            cached = observer.resolve_candidate(
+                mint, max_pages=5, page_size=5, decode_last=10
+            )
+            self.assertIsNotNone(cached)
+            self.assertEqual(cached.mint, mint)
+
+    def test_resolve_candidate_gives_up_past_max_pages(self):
+        mint = chainseer_solana._b58encode(b58_bytes(43))
+        rpc = FakeRPC()
+        rpc.signatures = [
+            {"signature": f"sig-{i}", "slot": i, "blockTime": 2_000_000_000 - i, "err": None}
+            for i in range(20)
+        ]
+        with tempfile.TemporaryDirectory() as temp:
+            ledger = chainseer_solana.HashLedger(Path(temp) / "events.jsonl")
+            observer = chainseer_solana.PumpFunObserver(rpc, temp, ledger)
+            found = observer.resolve_candidate(
+                mint, max_pages=3, page_size=5, decode_last=10
+            )
+            self.assertIsNone(found)
+
     def test_pregraduation_safe_evidence_remains_observation_only(self):
         analyzer = chainseer_solana.SolanaRiskAnalyzer(FakeRPC(), FakeJupiter())
         with patch("chainseer_solana.time.time", return_value=1_700_000_120):

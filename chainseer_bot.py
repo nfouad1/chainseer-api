@@ -65,8 +65,16 @@ except ImportError:
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from chainseer import Chainseer, ensure_utf8_runtime
+import chainseer_solana
+from chainseer_solana_public import SolanaPublicAnalyzer, SolanaMintError, validate_solana_mint
 
 BOT_TOKEN = os.environ.get("CHAINSEER_BOT_TOKEN", "")
+# Same defaults chainseer_solana.py's own CLI uses -- if the autotrader and
+# this bot run from the same working directory (the normal single-operator
+# setup), Solana lookups transparently share its catalog and get a richer,
+# already-computed answer for anything it has already discovered.
+SOLANA_ROOT = os.environ.get("CHAINSEER_SOLANA_BOT_ROOT", "solana_learning")
+SOLANA_CHAIN_ROOT = os.environ.get("CHAINSEER_SOLANA_BOT_CHAIN_ROOT", "solana_chain")
 
 # Rate limiting: 1 analysis per user per 60 seconds
 USER_RATE_LIMIT = 60
@@ -74,6 +82,7 @@ user_last_analysis = defaultdict(float)
 inflight_users = set()
 
 ADDR_RE = re.compile(r"0x[a-fA-F0-9]{40}")
+SOLANA_ADDR_RE = re.compile(r"\b[1-9A-HJ-NP-Za-km-z]{32,44}\b")
 
 logging.basicConfig(
     format="%(asctime)s [%(name)s] %(levelname)s: %(message)s",
@@ -112,6 +121,109 @@ def get_agent() -> Chainseer:
 def extract_address(text: str) -> str | None:
     m = ADDR_RE.search(text)
     return m.group(0) if m else None
+
+
+def extract_solana_mint(text: str) -> str | None:
+    """First base58-shaped candidate in text that actually decodes to a
+    32-byte pubkey. The shape regex alone accepts strings that decode to the
+    wrong byte length (not every base58-alphabet string of the right length
+    is a real pubkey encoding), so each candidate is validated for real."""
+    for match in SOLANA_ADDR_RE.finditer(text):
+        try:
+            return validate_solana_mint(match.group(0))
+        except SolanaMintError:
+            continue
+    return None
+
+
+_solana_engine = None
+_solana_public_analyzer = None
+_solana_lock = asyncio.Lock()
+
+
+def get_solana_engine() -> "chainseer_solana.SolanaPrototypeEngine":
+    """The SAME engine class the standalone autotrader uses, constructed
+    read-only-in-intent here: the bot only ever calls evaluate_candidate()
+    with shadow_enter=False, so it never opens/closes a paper position or
+    touches the live-execution boundary (which is hard-disabled anyway)."""
+    global _solana_engine
+    if _solana_engine is None:
+        _solana_engine = chainseer_solana.SolanaPrototypeEngine(
+            root=SOLANA_ROOT, chain_root=SOLANA_CHAIN_ROOT,
+        )
+    return _solana_engine
+
+
+def get_solana_public_analyzer() -> SolanaPublicAnalyzer:
+    """Fallback for a mint that isn't a Pump.fun launch (or is too old/deep
+    in its own signature history for resolve_candidate's bounded on-demand
+    scan to recover) -- handles any SPL mint, just without deployer/creator
+    history since that requires verified Pump.fun launch provenance."""
+    global _solana_public_analyzer
+    if _solana_public_analyzer is None:
+        _solana_public_analyzer = SolanaPublicAnalyzer(chainseer_solana.SOLANA_RPC_URL)
+    return _solana_public_analyzer
+
+
+def _format_solana_deep_summary(mint: str, result: dict) -> str:
+    decision = result["decision"]
+    icon = {"Low": "✅", "Medium": "⚠️", "High": "\U0001f534"}.get(
+        decision["risk_level"], "❓"
+    )
+    lines = [
+        f"{icon} *{decision['risk_level'].upper()}* -- score {decision['score']}/100",
+        f"Pump.fun launch, verified on-chain. `{mint[:6]}...{mint[-6:]}`",
+        f"Evidence: {decision['evidence_state']} | Admission: {decision['admission_state']}",
+    ]
+    if decision["hard_stops"]:
+        lines.append("\n\U0001f6d1 Hard stops:")
+        lines.extend(f"  - {item}" for item in decision["hard_stops"])
+    if decision["warnings"]:
+        lines.append("\n⚠️ Warnings:")
+        lines.extend(f"  - {item}" for item in decision["warnings"])
+    if not decision["hard_stops"] and not decision["warnings"]:
+        lines.append("\nNo hard stops or warnings raised.")
+    lines.append(
+        "\nIncludes deployer/creator deployment-cadence history and wallet "
+        "convergence -- Chainseer's Pump.fun-specific evidence, not just a "
+        "generic SPL mint check."
+    )
+    return "\n".join(lines)
+
+
+def _format_solana_public_summary(mint: str, result: dict) -> str:
+    analysis = result["analysis"]
+    red_flags = analysis.get("red_flags") or []
+    yellow_flags = analysis.get("yellow_flags") or []
+    risk_level = analysis.get("risk_level", "Unknown")
+    icon = {"Low": "✅", "Medium": "⚠️", "High": "\U0001f534"}.get(risk_level, "❓")
+    lines = [
+        f"{icon} *{risk_level.upper()}* -- score {analysis.get('legitimacy_score')}/100 "
+        "(general SPL mint check)",
+        f"`{mint[:6]}...{mint[-6:]}`",
+        "No verified Pump.fun launch provenance found for this mint -- "
+        "deployer/creator history is unknown, not cleared.",
+    ]
+    if red_flags:
+        lines.append("\n\U0001f6d1 Hard stops:")
+        lines.extend(f"  - {item}" for item in red_flags)
+    if yellow_flags:
+        lines.append("\n⚠️ Warnings:")
+        lines.extend(f"  - {item}" for item in yellow_flags)
+    if not red_flags and not yellow_flags:
+        lines.append("\nNo hard stops or warnings raised.")
+    return "\n".join(lines)
+
+
+def _run_solana_analysis(mint: str):
+    """Run blocking RPC/Jupiter/DexScreener work outside the event loop."""
+    engine = get_solana_engine()
+    candidate = engine.observer.resolve_candidate(mint)
+    if candidate is not None:
+        result = engine.evaluate_candidate(candidate, shadow_enter=False)
+        return "deep", _format_solana_deep_summary(mint, result)
+    result = get_solana_public_analyzer().analyze_token(mint)
+    return "public", _format_solana_public_summary(mint, result)
 
 
 def _run_analysis(token: str, full: bool):
@@ -187,16 +299,57 @@ async def send_analysis(update: Update, token: str, full: bool = False):
         inflight_users.discard(user_id)
 
 
+async def send_solana_analysis(update: Update, mint: str):
+    chat_id = update.effective_chat.id
+    user_id = update.effective_user.id
+
+    now = time.time()
+    if user_id in inflight_users or now - user_last_analysis[user_id] < USER_RATE_LIMIT:
+        await update.message.reply_text("⏳ Please wait a moment before requesting another analysis.")
+        return
+    inflight_users.add(user_id)
+
+    await update.message.reply_text(
+        f"🔍 Analyzing `{mint[:6]}...{mint[-6:]}` on Solana...\n"
+        "This takes ~15-30 seconds."
+    )
+
+    try:
+        async with _solana_lock:
+            mode, summary = await asyncio.to_thread(_run_solana_analysis, mint)
+
+        user_last_analysis[user_id] = time.time()
+        await update.message.reply_text(summary)
+
+    except SolanaMintError as e:
+        await update.message.reply_text(f"❌ {e.message}")
+    except chainseer_solana.ConfiguredSolanaRpcRequiredError:
+        logger.exception("Solana RPC policy mismatch")
+        await update.message.reply_text(
+            "❌ Analysis temporarily unavailable (Solana RPC configuration). "
+            "Try again later."
+        )
+    except Exception as e:
+        logger.exception("Solana analysis failed")
+        await update.message.reply_text(
+            f"❌ Analysis failed: {str(e)[:150]}\n"
+            "The RPC or an API may be temporarily unavailable. Try again later."
+        )
+    finally:
+        inflight_users.discard(user_id)
+
+
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "🔍 *Chainseer — Robinhood Chain Analysis*\n\n"
-        "Paste any token contract address (0x...) and I'll give you an "
-        "investor-grade risk verdict in seconds.\n\n"
+        "🔍 *Chainseer — On-Chain Analysis*\n\n"
+        "Paste a token contract address (0x... on Robinhood Chain, or a "
+        "Solana mint) and I'll give you an investor-grade risk verdict in "
+        "seconds.\n\n"
         "*Commands:*\n"
         "`<address>` — quick verdict\n"
-        "`/full <address>` — detailed report\n"
+        "`/full <0x address>` — detailed Robinhood Chain report\n"
         "`/help` — usage help\n"
         "`/about` — how it works\n\n"
         "Every analysis is provenance-tracked and sealed to the Timechain."
@@ -206,9 +359,12 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*Usage:*\n\n"
-        "1. Paste a token address: `0x407470F85e0b342a52AaE2F191E135cEF2947777`\n"
+        "1. Paste a token address:\n"
+        "   `0x407470F85e0b342a52AaE2F191E135cEF2947777` (Robinhood Chain)\n"
+        "   or a Solana mint address\n"
         "2. Get a verdict: ✅ LOW / ⚠️ MEDIUM / 🔴 HIGH\n\n"
-        "Use `/full <address>` for the full 12-factor breakdown.\n\n"
+        "Use `/full <address>` for the full 12-factor Robinhood Chain "
+        "breakdown.\n\n"
         "Tip: Copy addresses directly from DexScreener or the explorer."
     )
 
@@ -216,11 +372,16 @@ async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def cmd_about(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
         "*About Chainseer*\n\n"
-        "Chainseer analyzes Robinhood Chain tokens using multiple sources:\n"
+        "Robinhood Chain tokens are analyzed using multiple sources:\n"
         "• GoPlus Security API\n"
         "• DexScreener\n"
         "• Blockscout\n"
         "• Direct RPC calls\n\n"
+        "Solana mints launched on Pump.fun get Chainseer's deeper "
+        "verification: on-chain bonding-curve/mint decode, canonical-pool "
+        "cross-check, deployer deployment-cadence history, and wallet "
+        "convergence. Any other Solana mint falls back to a general SPL "
+        "check (mint/freeze authority, liquidity, Jupiter route).\n\n"
         "Every claim is provenance-tracked (query + response hash) "
         "and sealed to the Cypher Tempre Timechain for verifiability."
     )
@@ -244,9 +405,15 @@ async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     addr = extract_address(text)
     if addr:
         await send_analysis(update, addr, full=False)
-    elif not text.startswith("/"):
+        return
+    mint = extract_solana_mint(text)
+    if mint:
+        await send_solana_analysis(update, mint)
+        return
+    if not text.startswith("/"):
         await update.message.reply_text(
-            "📋 Paste a token contract address (0x...) to analyze it.\n"
+            "📋 Paste a token contract address (0x... or a Solana mint) to "
+            "analyze it.\n"
             "Example: `0x407470F85e0b342a52AaE2F191E135cEF2947777`"
         )
 

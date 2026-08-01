@@ -1218,6 +1218,11 @@ class PumpFunObserver:
                 "newest_slot": newest_slot,
                 "updated_at": _utc_now(),
             }
+        self._write_catalog(catalog)
+        _atomic_json(self.cursor_path, cursor)
+        return discovered
+
+    def _write_catalog(self, catalog: dict) -> None:
         retention_cutoff = time.time() - CATALOG_RETENTION_SECONDS
         catalog["tokens"] = {
             mint: value
@@ -1226,8 +1231,6 @@ class PumpFunObserver:
         }
         catalog["updated_at"] = _utc_now()
         _atomic_json(self.catalog_path, catalog)
-        _atomic_json(self.cursor_path, cursor)
-        return discovered
 
     def recent(self, limit: int = 10) -> list[SolanaLaunchCandidate]:
         tokens = _read_json(self.catalog_path, {}).get("tokens", {})
@@ -1239,6 +1242,78 @@ class PumpFunObserver:
     def by_mint(self, mint: str) -> SolanaLaunchCandidate | None:
         value = _read_json(self.catalog_path, {}).get("tokens", {}).get(mint)
         return SolanaLaunchCandidate.from_dict(value) if value else None
+
+    def resolve_candidate(
+        self,
+        mint: str,
+        *,
+        max_pages: int = 40,
+        page_size: int = 1000,
+        decode_last: int = 10,
+    ) -> SolanaLaunchCandidate | None:
+        """Best-effort resolution of an arbitrary mint's original Pump.fun
+        CreateEvent, for on-demand lookups (e.g. a bot command) of a mint
+        the continuous sync() sweep hasn't necessarily seen.
+
+        Checks the catalog first -- free, and covers virtually every recent
+        launch once the observer has been running for a while. On a miss,
+        walks the mint account's OWN signature history backwards using cheap
+        metadata-only getSignaturesForAddress pages (no transaction decode)
+        until the final, smallest page is reached -- that page holds the
+        mint's oldest signatures, and since the mint account did not exist
+        before Pump's create instruction made it, the genesis transaction
+        must be among the very oldest of them. Only those few are actually
+        decoded via getTransaction.
+
+        Bounded by max_pages so a long-lived, heavily-traded mint (which is
+        almost certainly already graduated and off Pump.fun's launch catalog
+        anyway) fails closed with None rather than replaying its entire
+        history -- callers should fall back to a general-purpose analyzer
+        for that case.
+        """
+        cached = self.by_mint(mint)
+        if cached:
+            return cached
+
+        last_batch: list[dict] = []
+        before_signature: str | None = None
+        for _ in range(max_pages):
+            batch = self.rpc.get_signatures(mint, limit=page_size, before=before_signature)
+            if not batch:
+                break
+            last_batch = batch
+            if len(batch) < page_size:
+                break
+            before_signature = batch[-1].get("signature")
+            if not before_signature:
+                break
+        else:
+            # Exhausted the page budget without ever reaching a partial
+            # (final) page -- this mint's history is deeper than we're
+            # willing to replay on demand.
+            return None
+
+        for row in reversed(last_batch[-decode_last:]):
+            if row.get("err"):
+                continue
+            try:
+                transaction = self.rpc.get_transaction(row["signature"])
+            except InfrastructureIndeterminateError:
+                continue
+            for candidate in self.decode_transaction(row, transaction):
+                if candidate.mint == mint:
+                    catalog = _read_json(
+                        self.catalog_path,
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "ecosystem": "pump_fun",
+                            "tokens": {},
+                        },
+                    )
+                    catalog["tokens"][candidate.mint] = candidate.to_dict()
+                    self._write_catalog(catalog)
+                    return candidate
+        return None
 
 
 class JupiterClient:
