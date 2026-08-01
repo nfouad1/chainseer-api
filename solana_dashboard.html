@@ -79,27 +79,26 @@
     .refresh:disabled, #learn-duration:disabled { opacity:.5; cursor:not-allowed; }
     #learn-toggle.is-stop { color:var(--red); border-color:rgba(255,100,124,.4); }
     #learn-duration { text-align:center; }
-    .panel, .stat, .hero-main, .hero-side {
+    .panel, .stat {
       position:relative; overflow:hidden; border:1px solid var(--line);
       border-radius:var(--radius); background:var(--panel); backdrop-filter:blur(18px);
     }
-    .hero { display:grid; grid-template-columns:minmax(0,1.34fr) minmax(320px,.66fr); gap:18px; margin-bottom:18px; }
-    .hero-main { min-height:285px; padding:34px; }
-    .hero-main::after {
-      content:""; position:absolute; width:420px; height:420px; right:-178px; top:-230px;
-      border-radius:50%; border:1px solid rgba(178,146,255,.18);
-      box-shadow:0 0 0 54px rgba(127,92,255,.025),0 0 0 108px rgba(127,92,255,.014);
-    }
     .eyebrow { color:var(--purple); font:10px/1.4 var(--mono); letter-spacing:.16em; text-transform:uppercase; }
-    h1 { max-width:790px; margin:17px 0 14px; font-size:clamp(36px,5vw,66px); line-height:.98; letter-spacing:-.056em; font-weight:620; }
-    .hero p { max-width:720px; margin:0; color:var(--muted); font-size:14px; line-height:1.72; }
-    .tags { display:flex; flex-wrap:wrap; gap:8px; margin-top:25px; }
-    .tag { padding:7px 9px; border:1px solid rgba(178,146,255,.17); border-radius:7px; background:rgba(127,92,255,.035); color:#c9cad6; font:9px/1 var(--mono); letter-spacing:.09em; text-transform:uppercase; }
-    .hero-side { padding:26px; display:flex; flex-direction:column; justify-content:space-between; }
-    .side-head { display:flex; align-items:flex-start; justify-content:space-between; gap:12px; }
-    .ring { margin-top:26px; font:52px/1 var(--mono); letter-spacing:-.07em; }
-    .ring small { color:var(--muted); font:10px var(--mono); letter-spacing:.09em; margin-left:7px; }
-    .hash { margin-top:20px; padding:13px 14px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#090a11; color:var(--muted); font:10px/1.55 var(--mono); overflow-wrap:anywhere; }
+    /* Compact overview strip: identity + one-line description on the left,
+       Timechain head on the right. Replaces a much larger two-column
+       marketing hero so real data (candidates/evidence/decisions) starts
+       higher on the page. */
+    .hero-strip {
+      display:flex; align-items:center; justify-content:space-between; flex-wrap:wrap;
+      gap:22px; padding:20px 26px; margin-bottom:18px;
+    }
+    .hero-strip-left { min-width:260px; max-width:540px; }
+    .hero-strip-desc { margin:6px 0 0; color:var(--muted); font-size:12px; line-height:1.6; }
+    .hero-strip-right { display:flex; align-items:center; gap:16px; flex-wrap:wrap; }
+    .side-head { display:flex; align-items:flex-start; gap:10px; }
+    .ring-compact { font:26px/1 var(--mono); letter-spacing:-.04em; white-space:nowrap; }
+    .ring-compact small { color:var(--muted); font:9px var(--mono); letter-spacing:.09em; margin-left:6px; }
+    .hash { padding:11px 13px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#090a11; color:var(--muted); font:10px/1.55 var(--mono); overflow-wrap:anywhere; max-width:340px; }
     .stats { display:grid; grid-template-columns:repeat(4,1fr); gap:13px; margin-bottom:18px; }
     .stat { min-height:120px; padding:20px; }
     .stat-label { color:var(--muted); font:9px/1.3 var(--mono); letter-spacing:.12em; text-transform:uppercase; }
@@ -231,7 +230,7 @@
     .sort-glyph { font:9px var(--mono); opacity:.7; }
 
     @media (max-width:1100px) {
-      .hero,.grid { grid-template-columns:1fr; }
+      .grid { grid-template-columns:1fr; }
       .stats { grid-template-columns:repeat(2,1fr); }
       .infra-grid { grid-template-columns:repeat(3,1fr); }
       .integrity { grid-template-columns:1fr; gap:9px; }
@@ -242,8 +241,8 @@
     @media (max-width:650px) {
       .shell { width:min(100% - 22px,1480px); padding-top:13px; }
       .actions .pill { display:none; }
-      .hero-main { padding:25px; }
-      .hero-side,.panel { padding:19px; }
+      .hero-strip,.panel { padding:19px; }
+      .hero-strip-right { width:100%; justify-content:space-between; }
       .stats { gap:9px; }
       .stat { padding:16px; min-height:105px; }
       .stat-value { font-size:24px; }
@@ -287,29 +286,19 @@
       <ul id="verdict-reasons" class="verdict-reasons"></ul>
     </section>
 
-    <section class="hero">
-      <article class="hero-main">
+    <section class="panel hero-strip" aria-label="Observatory overview">
+      <div class="hero-strip-left">
         <div class="eyebrow">Solana launch intelligence · paper-only boundary</div>
-        <h1>Learning in public.<br>Executing nowhere.</h1>
-        <p>A live read-only observatory for Pump.fun discovery, tri-state on-chain evidence, Jupiter route quality, shadow outcomes, promotion gates, and every analysis sealed into Chainseer’s dedicated Solana Timechain.</p>
-        <div class="tags">
-          <span class="tag">Confirmed CreateEvent</span>
-          <span class="tag">Mint + curve binding</span>
-          <span class="tag">Jupiter round-trip</span>
-          <span class="tag">Shadow positions</span>
-          <span class="tag">No signing</span>
+        <p class="hero-strip-desc">Read-only observatory for Pump.fun discovery — tri-state on-chain evidence, Jupiter route quality, shadow outcomes. No signing, no broadcast, no private keys.</p>
+      </div>
+      <div class="hero-strip-right">
+        <div class="side-head">
+          <span class="dot" id="timechain-dot"></span>
+          <div><div class="eyebrow">Solana Timechain head</div><div class="sub" id="ring-type">Awaiting integrity check</div></div>
         </div>
-      </article>
-      <aside class="hero-side">
-        <div>
-          <div class="side-head">
-            <div><div class="eyebrow">Solana Timechain head</div><div class="sub" id="ring-type">Awaiting integrity check</div></div>
-            <span class="dot" id="timechain-dot"></span>
-          </div>
-          <div class="ring"><span id="ring-height">—</span><small>RINGS</small></div>
-        </div>
+        <div class="ring-compact"><span id="ring-height">—</span><small>RINGS</small></div>
         <div class="hash"><span id="ring-hash">No head loaded</span><br><span id="ring-summary"></span></div>
-      </aside>
+      </div>
     </section>
 
     <section class="panel candidates" aria-label="Top candidates">
@@ -634,10 +623,20 @@
       const schedulerFailed = schedule.installed && scheduler.status === "failed";
       const schedulerRunning = schedule.installed && schedule.enabled !== false && scheduler.status !== "failed";
       const promotion = data.promotion || {};
+      const loop = data.learning_loop || {};
+      const pausedReason = !loop.running ? loop.paused_reason : null;
       const reasons = [];
       let level, headline;
 
-      if (!total) {
+      if (pausedReason) {
+        // An intentional governance pause (e.g. a sealed reflection
+        // checkpoint) is the single most actionable fact on the page --
+        // show it here in full rather than only in the topbar's
+        // space-constrained, truncated pill.
+        level="warning";
+        headline=`Learner paused for review — ${String(pausedReason).replace(/^[^:]+:\s*/,"")}`;
+        reasons.push("acknowledge via reflection-ack to resume learning");
+      } else if (!total) {
         level="warning";
         headline="No data yet — run learn-once to populate the observatory.";
       } else if (schedulerFailed) {
@@ -702,11 +701,15 @@
         const hadError = loop.last_error && loop.cycles===0;
         if (paused) {
           pill.hidden=false;
-          label.textContent = `PAUSED · ${String(paused).replace(/^[^:]+:\s*/,"").slice(0,40)}`;
+          const reasonText = String(paused).replace(/^[^:]+:\s*/,"");
+          label.textContent = `PAUSED · ${reasonText.slice(0,40)}`;
+          pill.title = reasonText;
         } else if (hadError) {
           pill.hidden=false; label.textContent=`ERROR: ${String(loop.last_error).slice(0,40)}`;
+          pill.title = String(loop.last_error);
         } else {
           pill.hidden=true;
+          pill.removeAttribute("title");
         }
         toggle.textContent="▶ START"; toggle.classList.remove("is-stop");
         durationInput.disabled=false;
