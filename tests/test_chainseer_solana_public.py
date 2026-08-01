@@ -51,8 +51,8 @@ class FakeRPC:
         return {
             "context": {"slot": 323},
             "value": [
-                {"address": "holder-one", "amount": "100000000000000"},
-                {"address": "holder-two", "amount": "50000000000000"},
+                {"address": "3" * 44, "amount": "100000000000000"},
+                {"address": "4" * 44, "amount": "50000000000000"},
             ],
         }
 
@@ -63,7 +63,11 @@ class FakeRPC:
                 {
                     "data": {
                         "parsed": {
-                            "info": {"owner": f"owner-{index}"}
+                            # A valid-looking base58 owner per account, not
+                            # the entity graph's real owner-resolution logic
+                            # under test here -- just needs to satisfy
+                            # SOLANA_ADDRESS_RE so the graph node is built.
+                            "info": {"owner": str(index + 1) * 44}
                         }
                     }
                 }

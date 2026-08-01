@@ -669,6 +669,12 @@ class ServiceTests(unittest.TestCase):
                     Path(benchmark_root) / "observations-v1.jsonl"
                 )
                 self.assertEqual(len(observations), 1)
+                # The aggregate summary reload is throttled (see
+                # BENCHMARK_SUMMARY_REFRESH_MIN_INTERVAL_SECONDS) and won't
+                # reflect this capture yet on its own -- durability on disk
+                # (asserted above) is the ground truth. force=True proves the
+                # summary is eventually correct once actually recomputed.
+                service._benchmark._refresh_summary(force=True)
                 self.assertEqual(
                     service.benchmark_status()["observations"],
                     1,
@@ -700,6 +706,63 @@ class ServiceTests(unittest.TestCase):
                         )
                     ),
                     1,
+                )
+            finally:
+                service.stop()
+
+    def test_benchmark_summary_refresh_is_throttled_across_captures(self):
+        # append_observation()/case_bank_status() both reload and re-validate
+        # the entire historical observation ledger from disk -- doing that
+        # unconditionally after every single capture makes each analysis
+        # progressively more expensive as the ledger grows. This proves the
+        # throttle actually skips the recompute on a rapid second capture,
+        # and that force=True still reaches ground truth on demand.
+        second_token = "0x" + "b" * 40
+        with tempfile.TemporaryDirectory() as root:
+            chain_root = str(Path(root) / "chain")
+            benchmark_root = str(Path(root) / "benchmark")
+            service = AnalysisService(
+                self.settings(
+                    chain_root,
+                    benchmark_root=benchmark_root,
+                    benchmark_capture_enabled=True,
+                )
+            )
+            service._agent = FakeAgent()
+            service.start()
+            try:
+                for token in (TOKEN, second_token):
+                    accepted = service.submit(token)
+                    deadline = time.time() + 3
+                    job = service.get(accepted.job_id)
+                    while job and job.status not in {"succeeded", "failed"}:
+                        self.assertLess(time.time(), deadline)
+                        time.sleep(0.01)
+                        job = service.get(accepted.job_id)
+                    self.assertEqual(job.status, "succeeded")
+
+                # Both captures landed on disk regardless of the throttle.
+                self.assertEqual(
+                    len(
+                        load_jsonl(
+                            Path(benchmark_root) / "observations-v1.jsonl"
+                        )
+                    ),
+                    2,
+                )
+                # Neither capture's summary refresh fired within the
+                # throttle window (the first was skipped because
+                # _initialize()'s startup refresh had just run; the second
+                # was skipped because the first capture attempted -- and
+                # skipped -- its own refresh moments earlier).
+                self.assertEqual(
+                    service.benchmark_status()["observations"],
+                    0,
+                )
+                service._benchmark._refresh_summary(force=True)
+                self.assertEqual(
+                    service.benchmark_status()["observations"],
+                    2,
                 )
             finally:
                 service.stop()

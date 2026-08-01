@@ -144,7 +144,7 @@ class RobinhoodEntityGraphTests(unittest.TestCase):
 class SolanaEntityGraphTests(unittest.TestCase):
     def test_resolves_authority_control_without_inventing_vault_identity(self):
         mint = "So11111111111111111111111111111111111111112"
-        authority = "authority-address"
+        authority = "9" * 44
         graph = build_solana_entity_graph(
             mint,
             {
@@ -153,14 +153,14 @@ class SolanaEntityGraphTests(unittest.TestCase):
                     "freeze_authority": authority,
                 },
                 "dex_pairs": {
-                    "primary_pair": "pair-address",
+                    "primary_pair": "8" * 44,
                     "primary_amm_version": "orca",
                     "total_liquidity_usd": 50_000,
                 },
                 "holder_concentration": {
                     "largest_accounts": [
                         {
-                            "token_account": "token-account-1",
+                            "token_account": "7" * 44,
                             "owner": authority,
                             "amount_raw": 250,
                             "pct_total_supply": 25,
@@ -209,8 +209,8 @@ class SolanaEntityGraphTests(unittest.TestCase):
                 "holder_concentration": {
                     "largest_accounts": [
                         {
-                            "token_account": "token-account-1",
-                            "owner": "ordinary-owner",
+                            "token_account": "7" * 44,
+                            "owner": "6" * 44,
                             "amount_raw": 900,
                             "pct_total_supply": 90,
                         }

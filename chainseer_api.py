@@ -457,6 +457,19 @@ def _iso(value: float | None) -> str | None:
     return datetime.fromtimestamp(value, timezone.utc).isoformat()
 
 
+#: case_bank_status()/append_observation() both reload and fully
+#: re-validate the entire append-only observation/outcome ledgers from disk
+#: -- O(total historical observations), growing without bound as the ledger
+#: accumulates over the service's lifetime. status()/health_status() already
+#: document this summary as an "immutable-enough" (eventually consistent)
+#: snapshot, so the expensive recompute is throttled to at most once per
+#: this interval rather than run unconditionally after every single
+#: capture() -- otherwise every analysis gets progressively more expensive
+#: as the ledger grows, compounding the allocation-churn pressure that also
+#: drove the OOM investigation.
+BENCHMARK_SUMMARY_REFRESH_MIN_INTERVAL_SECONDS = 30
+
+
 class BenchmarkCaptureRecorder:
     """Append fresh analysis predictions to the durable benchmark ledger."""
 
@@ -467,6 +480,7 @@ class BenchmarkCaptureRecorder:
         self.observations_path = self.root / "observations-v1.jsonl"
         self.outcomes_path = self.root / "outcomes-v1.jsonl"
         self._lock = threading.Lock()
+        self._last_summary_refresh_at = 0.0
         self._summary: dict[str, Any] = {
             "enabled": self.enabled,
             "state": "disabled" if not self.enabled else "initializing",
@@ -479,7 +493,7 @@ class BenchmarkCaptureRecorder:
     def _initialize(self) -> None:
         try:
             self.root.mkdir(parents=True, exist_ok=True)
-            self._refresh_summary()
+            self._refresh_summary(force=True)
         except Exception as exc:
             LOGGER.exception("Benchmark capture storage initialization failed")
             self._summary = {
@@ -493,7 +507,14 @@ class BenchmarkCaptureRecorder:
                 },
             }
 
-    def _refresh_summary(self) -> None:
+    def _refresh_summary(self, *, force: bool = False) -> None:
+        now = time.monotonic()
+        if (
+            not force
+            and now - self._last_summary_refresh_at
+            < BENCHMARK_SUMMARY_REFRESH_MIN_INTERVAL_SECONDS
+        ):
+            return
         ledger = case_bank_status(
             load_jsonl(self.observations_path),
             load_jsonl(self.outcomes_path),
@@ -505,6 +526,7 @@ class BenchmarkCaptureRecorder:
             "last_error": None,
             **ledger,
         }
+        self._last_summary_refresh_at = now
 
     def capture(
         self,

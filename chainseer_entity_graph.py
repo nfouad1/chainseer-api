@@ -18,6 +18,13 @@ from typing import Any, Iterable
 GRAPH_SCHEMA_VERSION = "1.0"
 EVM_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 EVM_TX_HASH_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
+# Base58 (Bitcoin alphabet: excludes 0, O, I, l), 32-44 chars covers every
+# real 32-byte Solana pubkey encoding. A lightweight format sanity check --
+# not a full decode/checksum -- so malformed upstream data (a corrupted
+# authority field, a stray URL, an empty string) can't become a graph node
+# that looks like a real address. EVM identifiers already get this via
+# EVM_ADDRESS_RE below; Solana had no equivalent.
+SOLANA_ADDRESS_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{32,44}$")
 ZERO_EVM_ADDRESS = "0x" + "0" * 40
 PRIVILEGED_ROLES = {
     "contract_owner",
@@ -76,6 +83,9 @@ def _normalize_identifier(network: str, identifier: Any) -> str | None:
             return None
         value = value.lower()
         if value == ZERO_EVM_ADDRESS:
+            return None
+    elif network == "solana":
+        if not SOLANA_ADDRESS_RE.fullmatch(value):
             return None
     return value
 
