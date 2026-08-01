@@ -4574,6 +4574,7 @@ class LearningLoopController:
             "cycles": 0,
             "last_cycle_at": None,
             "last_error": None,
+            "paused_reason": None,
         }
 
     def start(self, duration_seconds: float | None) -> dict:
@@ -4593,6 +4594,7 @@ class LearningLoopController:
                 "cycles": 0,
                 "last_cycle_at": None,
                 "last_error": None,
+                "paused_reason": None,
             }
             self._thread = threading.Thread(
                 target=self._run,
@@ -4663,6 +4665,20 @@ class LearningLoopController:
                     ) + 1
                     self._status["last_cycle_at"] = _utc_now()
                     self._status["last_error"] = None
+            except (ReflectionCheckpointPending, LiveExecutionDisabledError) as exc:
+                # Intentional control-flow signals, NOT transient errors. The
+                # learner is paused for a sealed checkpoint review (or blocked
+                # from live execution). Retrying every cooldown is futile -- the
+                # pause persists until a human acknowledges the checkpoint.
+                # Stop the loop cleanly and record an informative status so the
+                # UI can explain WHY the loop stopped rather than showing a
+                # scary error.
+                with self._lock:
+                    self._status["last_error"] = None
+                    self._status["paused_reason"] = _redact_sensitive_text(
+                        f"{type(exc).__name__}: {exc}"
+                    )
+                break
             except Exception as exc:
                 # Continue on cycle error: log redacted message and proceed to
                 # the next cycle after cooldown (resilient to transient outages).

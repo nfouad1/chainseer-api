@@ -272,7 +272,7 @@
         <div class="pill"><span class="dot" id="connection-dot"></span><span id="connection-label">CONNECTING</span></div>
         <button class="refresh" id="refresh" type="button">↻ REFRESH</button>
         <input class="refresh" id="learn-duration" type="number" min="1" step="1" placeholder="min (∞)" style="width:88px" aria-label="Learning duration in minutes (blank = run until stopped)">
-        <button class="refresh" id="learn-toggle" type="button">▶ START</button>
+        <button class="refresh" id="learn-toggle" type="button" onclick="window.toggleLearnLoop&&window.toggleLearnLoop()">▶ START</button>
         <div class="pill" id="learn-status-pill" hidden><span class="dot running" id="learn-dot"></span><span id="learn-label">LEARNING</span></div>
       </div>
     </header>
@@ -387,70 +387,6 @@
         </div>
         <div class="blockers" id="promotion-blockers"><span class="blocker">Awaiting evaluation</span></div>
       </article>
-    </section>
-
-    <section class="panel" style="margin-bottom:18px">
-      <div class="panel-head">
-        <div><h2>Concentration calibration</h2><div class="sub">Descriptive distribution of observed tokens · does NOT validate or auto-tune the threshold</div></div>
-        <span class="status"><span class="dot" id="calibration-dot"></span><span id="calibration-status">—</span></span>
-      </div>
-      <details class="disclosure">
-        <summary>Show distribution &amp; sensitivity detail</summary>
-        <div class="infra-grid" style="grid-template-columns:repeat(3,1fr)">
-          <div class="infra"><div class="infra-name">Top-1 holder · median</div><div class="infra-value" id="cal-top1-median">—</div><div class="infra-note" id="cal-top1-range">—</div></div>
-          <div class="infra"><div class="infra-name">Top-10 holders · median</div><div class="infra-value" id="cal-top10-median">—</div><div class="infra-note" id="cal-top10-range">—</div></div>
-          <div class="infra"><div class="infra-name">Joint gate admit rate</div><div class="infra-value" id="cal-joint">—</div><div class="infra-note">concentration AND retention at active policy</div></div>
-        </div>
-        <div class="quality-grid" style="grid-template-columns:repeat(3,1fr);margin-top:13px">
-          <div class="meter">
-            <div class="meter-head"><span>Top-1 threshold sensitivity</span><strong id="cal-top1-active">—</strong></div>
-            <div class="meter-track"><div class="meter-fill" id="cal-top1-meter"></div></div>
-            <div class="infra-note" id="cal-top1-grid" style="margin-top:8px">—</div>
-          </div>
-          <div class="meter">
-            <div class="meter-head"><span>Top-10 threshold sensitivity</span><strong id="cal-top10-active">—</strong></div>
-            <div class="meter-track"><div class="meter-fill" id="cal-top10-meter"></div></div>
-            <div class="infra-note" id="cal-top10-grid" style="margin-top:8px">—</div>
-          </div>
-          <div class="meter">
-            <div class="meter-head"><span>Roundtrip retention sensitivity</span><strong id="cal-ret-active">—</strong></div>
-            <div class="meter-track"><div class="meter-fill" id="cal-ret-meter"></div></div>
-            <div class="infra-note" id="cal-ret-grid" style="margin-top:8px">—</div>
-          </div>
-        </div>
-        <div class="callout" id="calibration-callout">Calibration characterizes the distribution; threshold validation requires realized outcomes that are not yet collected.</div>
-      </details>
-    </section>
-
-    <section class="panel" style="margin-bottom:18px">
-      <div class="panel-head">
-        <div><h2>Infrastructure & execution evidence</h2><div class="sub">Credential-safe health telemetry; endpoint secrets and API keys are never returned</div></div>
-        <span class="status"><span class="dot" id="infra-dot"></span><span id="infra-status">CHECKING</span></span>
-      </div>
-      <div class="infra-grid">
-        <div class="infra"><div class="infra-name">RPC success</div><div class="infra-value" id="rpc-success">—</div><div class="infra-note" id="rpc-counts">No attempts</div></div>
-        <div class="infra"><div class="infra-name">RPC failures</div><div class="infra-value" id="rpc-failures">—</div><div class="infra-note">Cumulative logical failures</div></div>
-        <div class="infra"><div class="infra-name">RPC retries</div><div class="infra-value" id="rpc-retries">—</div><div class="infra-note" id="rpc-method-note">Cumulative method telemetry</div></div>
-        <div class="infra"><div class="infra-name">RPC origin</div><div class="infra-value" id="rpc-origin">—</div><div class="infra-note" id="rpc-origin-note">Path and query redacted</div></div>
-        <div class="infra"><div class="infra-name">Recovery queue</div><div class="infra-value" id="recovery-pending">—</div><div class="infra-note" id="recovery-note">Restart-safe reanalysis</div></div>
-        <div class="infra"><div class="infra-name">Jupiter access</div><div class="infra-value" id="jupiter-key">—</div><div class="infra-note" id="jupiter-note">Presence only, never value</div></div>
-        <div class="infra"><div class="infra-name">Paper taker</div><div class="infra-value" id="paper-taker">—</div><div class="infra-note">Public address presence</div></div>
-        <div class="infra"><div class="infra-name">Execution mode</div><div class="infra-value positive">PAPER</div><div class="infra-note">Signing and broadcast absent</div></div>
-      </div>
-    </section>
-
-    <section class="panel" style="margin-bottom:18px">
-      <div class="panel-head">
-        <div><h2>Evidence & integrity path</h2><div class="sub">Every refresh re-verifies local ledgers, policy-bound state, and the Solana Timechain</div></div>
-        <span class="status"><span class="dot" id="integrity-dot"></span><span id="integrity-label">CHECKING</span></span>
-      </div>
-      <div class="integrity">
-        <div class="node"><div class="node-top"><span class="node-name">Launch catalog</span><span class="dot" id="catalog-dot"></span></div><div class="node-value" id="catalog-node">—</div><div class="node-note">Confirmed program events</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Analysis ledger</span><span class="dot" id="observation-dot"></span></div><div class="node-value" id="observation-node">—</div><div class="node-note" id="observation-report">Hash-linked evidence</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Shadow ledger</span><span class="dot" id="shadow-dot"></span></div><div class="node-value" id="shadow-node">—</div><div class="node-note" id="shadow-report">Hash-linked paper events</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Policy state</span><span class="dot" id="policy-dot"></span></div><div class="node-value" id="policy-node">—</div><div class="node-note">Policy hash binding</div></div>
-        <div class="node"><div class="node-top"><span class="node-name">Timechain</span><span class="dot" id="chain-dot"></span></div><div class="node-value" id="chain-node">—</div><div class="node-note" id="chain-report">Tamper-evident rings</div></div>
-      </div>
     </section>
 
     <section class="grid">
@@ -638,90 +574,6 @@
         : '<span class="tag">All evidence gates pass · manual review required</span>';
     }
 
-    function renderCalibration(cal) {
-      const dist = cal.distribution || {}, policy = cal.active_policy || {};
-      const sens = cal.threshold_sensitivity || {};
-      const top1 = dist.top1_circulating_pct || {}, top10 = dist.top10_circulating_pct || {};
-      const top1Active = Number(policy.maximum_top1_circulating_pct);
-      const top10Active = Number(policy.maximum_top10_circulating_pct);
-      const joint = cal.joint_gate_at_active_policy || {};
-
-      $("calibration-status").textContent = cal.observations ? `${num(cal.observations)} OBS · ${num(cal.concentration_resolved)} RESOLVED` : "—";
-      setDot("calibration-dot", cal.observations ? (cal.concentration_unresolved === 0 ? true : null) : null);
-
-      $("cal-top1-median").textContent = top1.median !== undefined && top1.median !== null ? `${num(top1.median, 1)}%` : "—";
-      $("cal-top1-median").className = `infra-value ${scoreClass(top1.median ? 100 - top1.median : 0)}`;
-      $("cal-top1-range").textContent = top1.min !== null ? `${num(top1.min, 1)}% – ${num(top1.max, 1)}%` : "—";
-      $("cal-top10-median").textContent = top10.median !== undefined && top10.median !== null ? `${num(top10.median, 1)}%` : "—";
-      $("cal-top10-median").className = `infra-value ${scoreClass(top10.median ? 100 - top10.median : 0)}`;
-      $("cal-top10-range").textContent = top10.min !== null ? `${num(top10.min, 1)}% – ${num(top10.max, 1)}%` : "—";
-      $("cal-joint").textContent = joint.admit_rate_pct !== null && joint.admit_rate_pct !== undefined ? `${num(joint.admit_rate_pct, 1)}%` : "—";
-      $("cal-joint").className = `infra-value ${Number(joint.admit_rate_pct) > 0 ? "positive" : "warning"}`;
-
-      const renderGrid = (rows, activeThreshold, higherIsWorse) => {
-        if (!Array.isArray(rows) || !rows.length) return "—";
-        const active = rows.find(r => Number(r.threshold_pct) === Number(activeThreshold));
-        const activeRate = active ? `${num(active.admit_rate_pct, 1)}% admit` : "not in grid";
-        const detail = rows.map(r => {
-          const isActive = Number(r.threshold_pct) === Number(activeThreshold);
-          return `${isActive ? "▶ " : ""}${num(r.threshold_pct)}%→${num(r.admit_rate_pct, 1)}%`;
-        }).join("  ·  ");
-        return `${activeRate}<br>${esc(detail)}`;
-      };
-      const top1Rows = sens.top1_circulating_pct || [];
-      const top10Rows = sens.top10_circulating_pct || [];
-      const retRows = sens.roundtrip_retention_pct || [];
-      const retActive = Number(policy.minimum_roundtrip_retention_pct);
-
-      $("cal-top1-active").textContent = `≤ ${num(top1Active)}%`;
-      $("cal-top1-grid").innerHTML = renderGrid(top1Rows, top1Active, true);
-      $("cal-top10-active").textContent = `≤ ${num(top10Active)}%`;
-      $("cal-top10-grid").innerHTML = renderGrid(top10Rows, top10Active, true);
-      $("cal-ret-active").textContent = `≥ ${num(retActive)}%`;
-      $("cal-ret-grid").innerHTML = renderGrid(retRows, retActive, false);
-
-      const top1Admit = (top1Rows.find(r => Number(r.threshold_pct) === top1Active) || {}).admit_rate_pct;
-      $("cal-top1-meter").style.width = `${Math.max(0, Math.min(100, Number(top1Admit || 0)))}%`;
-      const top10Admit = (top10Rows.find(r => Number(r.threshold_pct) === top10Active) || {}).admit_rate_pct;
-      $("cal-top10-meter").style.width = `${Math.max(0, Math.min(100, Number(top10Admit || 0)))}%`;
-      const retAdmit = (retRows.find(r => Number(r.threshold_pct) === retActive) || {}).admit_rate_pct;
-      $("cal-ret-meter").style.width = `${Math.max(0, Math.min(100, Number(retAdmit || 0)))}%`;
-
-      const caveats = cal.caveats || [];
-      $("calibration-callout").innerHTML = caveats.length
-        ? caveats.map(c => esc(c)).join(" ")
-        : "Calibration characterizes the distribution; threshold validation requires realized outcomes that are not yet collected.";
-    }
-
-    function renderInfrastructure(data) {
-      const rpc=data.rpc_health || {}, config=data.configuration || {}, jupiter=data.jupiter_health || {}, recovery=data.recovery || {};
-      $("rpc-success").textContent=pct(rpc.success_rate_pct);
-      $("rpc-counts").textContent=`${num(rpc.successes)} success / ${num(rpc.attempts)} attempts`;
-      $("rpc-failures").textContent=num(rpc.failures);
-      $("rpc-retries").textContent=num(rpc.retries);
-      const methodRows=Object.entries(rpc.methods || {}).sort((a,b)=>Number(b[1]?.failures||0)-Number(a[1]?.failures||0));
-      $("rpc-method-note").textContent=methodRows.length ? `${methodRows.length} methods · highest failures ${methodRows[0][0]} (${num(methodRows[0][1]?.failures)})` : "No method telemetry yet";
-      const configuredRpc=String(config.rpc_endpoint || rpc.configured_rpc_url || "—");
-      const observedRpc=String(rpc.rpc_url || "—");
-      $("rpc-origin").textContent=configuredRpc.replace(/^https?:\/\//,"");
-      $("rpc-origin").title=configuredRpc;
-      $("rpc-origin-note").textContent=observedRpc !== "—" && observedRpc !== configuredRpc
-        ? `Current configured origin · telemetry last observed ${observedRpc.replace(/^https?:\/\//,"")}`
-        : `${rpc.configured_rpc_required ? "Configured RPC required" : "Current configured origin"} · path and query redacted`;
-      $("recovery-pending").textContent=num(recovery.pending);
-      $("recovery-pending").className=`infra-value ${Number(recovery.pending||0) ? "warning" : "positive"}`;
-      $("recovery-note").textContent=`${num(recovery.due)} due · ${num(recovery.resolved)} resolved`;
-      const access=String(jupiter.access_mode || (config.jupiter_api_key_configured ? "api_key" : "keyless"));
-      $("jupiter-key").textContent=access === "api_key" ? "API KEY" : "KEYLESS";
-      $("jupiter-key").className=`infra-value ${access === "api_key"?"positive":"warning"}`;
-      $("jupiter-note").textContent=`${num(jupiter.successes)} success · ${num(jupiter.retries)} retries · secret never shown`;
-      $("paper-taker").textContent=config.paper_taker_configured ? "CONFIGURED" : "OPTIONAL";
-      $("paper-taker").className=`infra-value ${config.paper_taker_configured?"positive":"warning"}`;
-      const healthy=Number(rpc.last_cycle?.failures||0)===0 && Number(jupiter.failures||0)===0;
-      $("infra-status").textContent=healthy ? "HEALTHY" : "ATTENTION";
-      setDot("infra-dot", healthy ? true : null);
-    }
-
     function renderReflection(data) {
       const reflection=data.reflection || {}, controller=data.controller || {};
       const pending=reflection.status === "pending" || reflection.pause_requested === true;
@@ -743,18 +595,14 @@
         : `Next interval review in ${num(reflection.analyses_until_checkpoint)} analyses. The first canonical graduated market still triggers an immediate checkpoint.`;
     }
 
+    // Renders only the header's Timechain-head widget (ring-height/-type/
+    // -hash/-summary, timechain-dot). The former "Evidence & integrity
+    // path" panel (catalog/observation/shadow/policy/chain-report nodes)
+    // was intentionally removed; this function used to drive that panel
+    // too, hence the name -- kept as renderIntegrity since it is still the
+    // Timechain integrity signal, just narrower in scope now.
     function renderIntegrity(data) {
-      const integrity=data.integrity || {}, chain=integrity.timechain || {};
-      $("catalog-node").textContent=num(data.catalog_size); setDot("catalog-dot", Number(data.catalog_size)>=0);
-      $("observation-node").textContent=num(data.events?.observation);
-      $("observation-report").textContent=integrity.observation_ledger || "No report";
-      setDot("observation-dot", String(integrity.observation_ledger||"").toLowerCase().includes("verified"));
-      $("shadow-node").textContent=num(data.events?.shadow);
-      $("shadow-report").textContent=integrity.shadow_ledger || "No report";
-      setDot("shadow-dot", String(integrity.shadow_ledger||"").toLowerCase().includes("verified"));
-      $("policy-node").textContent=integrity.state_policy_bound ? "BOUND" : "FAILED"; setDot("policy-dot", integrity.state_policy_bound);
-      $("chain-node").textContent=num(chain.height); $("chain-report").textContent=chain.report || "No report"; setDot("chain-dot", chain.ok);
-      $("integrity-label").textContent=integrity.ok ? "ALL CHECKS PASS" : "ATTENTION REQUIRED"; setDot("integrity-dot", integrity.ok);
+      const chain = (data.integrity || {}).timechain || {};
       $("ring-height").textContent=num(chain.height);
       $("ring-type").textContent=chain.head ? `${stateLabel(chain.head.ring_type)} · RING ${chain.head.index}` : "No Timechain head";
       $("ring-hash").textContent=chain.head ? short(chain.head.ring_hash,18,8) : "No head loaded";
@@ -920,8 +768,6 @@
       $("shadow-note").textContent=`${num(data.shadow?.open)} open / ${num(data.shadow?.closed)} closed · ${num(data.shadow?.unpriced)} unpriced`;
       renderEvidence(data);
       renderPromotion(data.promotion || {});
-      renderCalibration(data.concentration_calibration || {});
-      renderInfrastructure(data);
       renderReflection(data);
       renderIntegrity(data);
       renderPositions(data.shadow || {});
@@ -948,9 +794,17 @@
         toggle.textContent="⏹ STOP"; toggle.classList.add("is-stop");
         durationInput.disabled=true;
       } else {
+        // Not running. Distinguish intentional pauses (checkpoint) from errors.
+        const paused = loop.paused_reason;
         const hadError = loop.last_error && loop.cycles===0;
-        if (hadError) { pill.hidden=false; label.textContent=`ERROR: ${String(loop.last_error).slice(0,40)}`; }
-        else { pill.hidden=true; }
+        if (paused) {
+          pill.hidden=false;
+          label.textContent = `PAUSED · ${String(paused).replace(/^[^:]+:\s*/,"").slice(0,40)}`;
+        } else if (hadError) {
+          pill.hidden=false; label.textContent=`ERROR: ${String(loop.last_error).slice(0,40)}`;
+        } else {
+          pill.hidden=true;
+        }
         toggle.textContent="▶ START"; toggle.classList.remove("is-stop");
         durationInput.disabled=false;
       }
@@ -971,37 +825,55 @@
     }
     $("refresh").addEventListener("click",refresh);
 
-    // Learning loop Start/Stop. POSTs to the backend controller; the next
-    // 10s tick (or an immediate refresh) reflects the new running state.
-    $("learn-toggle").addEventListener("click", async () => {
+    // Learning loop Start/Stop. Defined as a named global so the button's
+    // inline onclick works even if addEventListener never attached (e.g. if a
+    // JS error elsewhere aborted the script). POSTs to the backend controller;
+    // the reply is rendered immediately, then refresh() syncs the rest.
+    async function toggleLearnLoop() {
       const toggle=$("learn-toggle");
       const pill=$("learn-status-pill"), label=$("learn-label");
+      if (!toggle || !pill || !label) { console.error("learn controls missing from DOM"); return; }
+      console.log("toggleLearnLoop fired; is-stop:", toggle.classList.contains("is-stop"));
       toggle.disabled=true;
       pill.hidden=false; label.textContent="…";
       try {
-        const response = toggle.classList.contains("is-stop")
-          ? await fetch("/api/learn/stop", {method:"POST"})
-          : await fetch("/api/learn/start", {
-              method:"POST",
-              headers:{"Content-Type":"application/json"},
-              body:JSON.stringify(
-                ($("learn-duration").value.trim()==="") ? {} : {duration_minutes: Number($("learn-duration").value.trim())}
-              ),
-            });
+        let response;
+        if (toggle.classList.contains("is-stop")) {
+          response = await fetch("/api/learn/stop", {method:"POST"});
+        } else {
+          const raw=$("learn-duration").value.trim();
+          let body = {};
+          if (raw !== "") {
+            const minutes = Number(raw);
+            if (!Number.isFinite(minutes) || minutes < 1) {
+              label.textContent = "DURATION MUST BE >= 1 MIN (OR BLANK)";
+              return;
+            }
+            body = {duration_minutes: minutes};
+          }
+          response = await fetch("/api/learn/start", {
+            method:"POST",
+            headers:{"Content-Type":"application/json"},
+            body:JSON.stringify(body),
+          });
+        }
         if (!response.ok) {
           label.textContent=`HTTP ${response.status}`;
         } else {
-          // Reflect the controller's reply immediately rather than waiting.
           const st = await response.json();
           renderLearningLoop(st);
         }
         refresh();
       } catch (error) {
         label.textContent=`ERR: ${String(error).slice(0,30)}`;
+        console.error("toggleLearnLoop error:", error);
       } finally {
         toggle.disabled=false;
       }
-    });
+    }
+    window.toggleLearnLoop = toggleLearnLoop;
+    const _learnBtn = $("learn-toggle");
+    if (_learnBtn) { _learnBtn.addEventListener("click", toggleLearnLoop); }
 
     // Sortable column headers. Toggling the active column flips asc/desc;
     // clicking a new column defaults to descending (score-like) which matches
