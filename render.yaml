@@ -43,7 +43,7 @@ services:
       - key: CHAINSEER_SHUTDOWN_GRACE_SECONDS
         value: "20"
       - key: CHAINSEER_WATCHER_ENABLED
-        value: "1"
+        value: "0"
       - key: CHAINSEER_WATCHER_INTERVAL_SECONDS
         value: "60"
       - key: CHAINSEER_WATCHER_CONFIRMATIONS
