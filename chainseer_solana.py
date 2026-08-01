@@ -440,6 +440,8 @@ class HashLedger:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self._tail_hash: str | None = None
+        self._length: int | None = None
 
     def load(self) -> list[dict]:
         if not self.path.exists():
@@ -450,11 +452,23 @@ class HashLedger:
                 rows.append(json.loads(line))
         return rows
 
+    def _tail_state(self) -> tuple[str, int]:
+        if self._tail_hash is None or self._length is None:
+            previous_hash = "0" * 64
+            length = 0
+            if self.path.exists():
+                for line in self.path.read_text(encoding="utf-8").splitlines():
+                    if line.strip():
+                        previous_hash = json.loads(line)["event_hash"]
+                        length += 1
+            self._tail_hash = previous_hash
+            self._length = length
+        return self._tail_hash, self._length
+
     def append(self, event_type: str, payload: dict) -> dict:
-        rows = self.load()
-        previous_hash = rows[-1]["event_hash"] if rows else "0" * 64
+        previous_hash, length = self._tail_state()
         event = {
-            "index": len(rows),
+            "index": length,
             "timestamp": _utc_now(),
             "event_type": event_type,
             "payload": payload,
@@ -465,6 +479,8 @@ class HashLedger:
         ).hexdigest()
         with self.path.open("a", encoding="utf-8", newline="\n") as handle:
             handle.write(_canonical_json(event) + "\n")
+        self._tail_hash = event["event_hash"]
+        self._length = length + 1
         return event
 
     def verify(self) -> tuple[bool, str]:
