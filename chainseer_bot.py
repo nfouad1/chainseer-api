@@ -75,6 +75,10 @@ BOT_TOKEN = os.environ.get("CHAINSEER_BOT_TOKEN", "")
 # already-computed answer for anything it has already discovered.
 SOLANA_ROOT = os.environ.get("CHAINSEER_SOLANA_BOT_ROOT", "solana_learning")
 SOLANA_CHAIN_ROOT = os.environ.get("CHAINSEER_SOLANA_BOT_CHAIN_ROOT", "solana_chain")
+# The operator's own chat -- reflection-checkpoint pushes go here, and only
+# this chat is allowed to run /reflection or /ack. Unset means those two
+# commands are unreachable for everyone (fail closed), not merely hidden.
+OWNER_CHAT_ID = os.environ.get("CHAINSEER_TELEGRAM_CHAT_ID", "").strip()
 
 # Rate limiting: 1 analysis per user per 60 seconds
 USER_RATE_LIMIT = 60
@@ -134,6 +138,10 @@ def extract_solana_mint(text: str) -> str | None:
         except SolanaMintError:
             continue
     return None
+
+
+def _is_owner(update: Update) -> bool:
+    return bool(OWNER_CHAT_ID) and str(update.effective_chat.id) == OWNER_CHAT_ID
 
 
 _solana_engine = None
@@ -342,7 +350,7 @@ async def send_solana_analysis(update: Update, mint: str):
 # ── Commands ─────────────────────────────────────────────────────────────────
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(
+    text = (
         "🔍 *Chainseer — On-Chain Analysis*\n\n"
         "Paste a token contract address (0x... on Robinhood Chain, or a "
         "Solana mint) and I'll give you an investor-grade risk verdict in "
@@ -354,6 +362,13 @@ async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE):
         "`/about` — how it works\n\n"
         "Every analysis is provenance-tracked and sealed to the Timechain."
     )
+    if _is_owner(update):
+        text += (
+            "\n\n*Owner commands:*\n"
+            "`/reflection` — Solana learner's reflection-checkpoint status\n"
+            "`/ack <applied|no_change> <summary>` — resume a paused learner"
+        )
+    await update.message.reply_text(text)
 
 
 async def cmd_help(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -400,6 +415,70 @@ async def cmd_full(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await send_analysis(update, addr, full=True)
 
 
+async def cmd_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Show the Solana learner's reflection-checkpoint state -- same
+    context a pause notification carries, available on demand so
+    acknowledging is never done blind."""
+    if not _is_owner(update):
+        await update.message.reply_text("❌ This command is restricted to the bot owner.")
+        return
+    try:
+        engine = await asyncio.to_thread(get_solana_engine)
+        state = await asyncio.to_thread(engine.reflection_status)
+    except Exception as e:
+        logger.exception("reflection status failed")
+        await update.message.reply_text(f"❌ {str(e)[:200]}")
+        return
+
+    if not state.get("pause_requested") and state.get("status") != "pending":
+        lines = [
+            "✅ No reflection checkpoint pending.",
+            f"Analyses so far: {state.get('analysis_events')}",
+            f"Next checkpoint in: {state.get('analyses_until_checkpoint')} analyses",
+        ]
+        if state.get("last_reflection_at"):
+            lines.append(
+                f"Last reflection ({state.get('last_reflection_outcome')}): "
+                f"{state.get('last_reflection_summary')}"
+            )
+        await update.message.reply_text("\n".join(lines))
+        return
+
+    pending = state.get("pending_checkpoint") or {}
+    text = await asyncio.to_thread(
+        engine._reflection_notification_text, pending
+    )
+    await update.message.reply_text(text)
+
+
+async def cmd_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not _is_owner(update):
+        await update.message.reply_text("❌ This command is restricted to the bot owner.")
+        return
+    text = update.message.text or ""
+    parts = text.split(maxsplit=2)
+    if len(parts) < 3 or parts[1] not in ("applied", "no_change"):
+        await update.message.reply_text(
+            "Usage: /ack <applied|no_change> <summary text>\n"
+            "Run /reflection first if you need the details to write the summary."
+        )
+        return
+    outcome, summary = parts[1], parts[2]
+    try:
+        engine = await asyncio.to_thread(get_solana_engine)
+        await asyncio.to_thread(engine.acknowledge_reflection, outcome, summary)
+    except ValueError as e:
+        await update.message.reply_text(f"❌ {e}")
+        return
+    except Exception as e:
+        logger.exception("reflection ack failed")
+        await update.message.reply_text(f"❌ {str(e)[:200]}")
+        return
+    await update.message.reply_text(
+        f"✅ Acknowledged ({outcome}). Learning resumes on the next cycle."
+    )
+
+
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
     addr = extract_address(text)
@@ -431,7 +510,14 @@ def main():
     app.add_handler(CommandHandler("help", cmd_help))
     app.add_handler(CommandHandler("about", cmd_about))
     app.add_handler(CommandHandler("full", cmd_full))
+    app.add_handler(CommandHandler("reflection", cmd_reflection))
+    app.add_handler(CommandHandler("ack", cmd_ack))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    if not OWNER_CHAT_ID:
+        print(
+            "⚠ CHAINSEER_TELEGRAM_CHAT_ID not set -- reflection-checkpoint "
+            "push notifications and /reflection, /ack are disabled."
+        )
 
     print("🚀 Chainseer Telegram Bot is running...")
     app.run_polling()

@@ -1,7 +1,9 @@
 import json
 import tempfile
+import types
 import unittest
 from pathlib import Path
+from unittest.mock import AsyncMock, patch
 
 try:
     import telegram  # noqa: F401
@@ -11,11 +13,25 @@ except ImportError:
     _TELEGRAM_AVAILABLE = False
 
 
+def _fake_update(chat_id, text):
+    """A minimal stand-in for python-telegram-bot's Update, just enough
+    surface for the command handlers under test: effective_chat.id (owner
+    check), message.text (argument parsing), message.reply_text (assert
+    what was sent back)."""
+    message = types.SimpleNamespace(text=text, reply_text=AsyncMock())
+    update = types.SimpleNamespace(
+        effective_chat=types.SimpleNamespace(id=chat_id),
+        effective_user=types.SimpleNamespace(id=chat_id),
+        message=message,
+    )
+    return update, message.reply_text
+
+
 @unittest.skipUnless(
     _TELEGRAM_AVAILABLE,
     "python-telegram-bot is not installed in this environment",
 )
-class ChainseerBotSolanaRoutingTests(unittest.TestCase):
+class ChainseerBotSolanaRoutingTests(unittest.IsolatedAsyncioTestCase):
     """chainseer_bot.py routes Solana lookups through SolanaRiskAnalyzer
     (via SolanaPrototypeEngine.evaluate_candidate) when a mint's Pump.fun
     launch can be resolved, and only falls back to the general-purpose
@@ -112,6 +128,84 @@ class ChainseerBotSolanaRoutingTests(unittest.TestCase):
         self.assertEqual(mode, "public")
         self.assertIn("general SPL mint check", summary)
         self.assertIn("No verified Pump.fun launch provenance", summary)
+
+    def test_is_owner_requires_matching_configured_chat_id(self):
+        update = types.SimpleNamespace(effective_chat=types.SimpleNamespace(id=999))
+        with patch.object(self.bot, "OWNER_CHAT_ID", ""):
+            self.assertFalse(self.bot._is_owner(update))
+        with patch.object(self.bot, "OWNER_CHAT_ID", "999"):
+            self.assertTrue(self.bot._is_owner(update))
+        with patch.object(self.bot, "OWNER_CHAT_ID", "111"):
+            self.assertFalse(self.bot._is_owner(update))
+
+    async def test_cmd_ack_rejects_non_owner(self):
+        update, reply = _fake_update(1, "/ack no_change looks fine")
+        with patch.object(self.bot, "OWNER_CHAT_ID", "999"):
+            await self.bot.cmd_ack(update, None)
+        reply.assert_awaited_once()
+        self.assertIn("restricted", reply.await_args.args[0])
+
+    async def test_cmd_ack_invalid_outcome_shows_usage(self):
+        update, reply = _fake_update(999, "/ack maybe unclear")
+        with patch.object(self.bot, "OWNER_CHAT_ID", "999"):
+            await self.bot.cmd_ack(update, None)
+        reply.assert_awaited_once()
+        self.assertIn("Usage", reply.await_args.args[0])
+
+    async def test_cmd_ack_acknowledges_pending_checkpoint(self):
+        engine = self._build_engine()
+        state = engine.reflection_status()
+        state["next_analysis_checkpoint"] = 1
+        self.chainseer_solana._atomic_json(engine.reflection_state_path, state)
+        engine.observation_ledger.append(
+            "solana_risk_analysis", {"mint": self.candidate().mint}
+        )
+        engine._maybe_request_reflection()
+        self.assertTrue(engine.reflection_status()["pause_requested"])
+        self.bot._solana_engine = engine
+
+        update, reply = _fake_update(999, "/ack no_change reviewed, all clear")
+        with patch.object(self.bot, "OWNER_CHAT_ID", "999"):
+            await self.bot.cmd_ack(update, None)
+        reply.assert_awaited_once()
+        self.assertIn("Acknowledged", reply.await_args.args[0])
+        self.assertFalse(engine.reflection_status()["pause_requested"])
+
+    async def test_cmd_reflection_reports_armed_state(self):
+        engine = self._build_engine()
+        self.bot._solana_engine = engine
+
+        update, reply = _fake_update(999, "/reflection")
+        with patch.object(self.bot, "OWNER_CHAT_ID", "999"):
+            await self.bot.cmd_reflection(update, None)
+        reply.assert_awaited_once()
+        self.assertIn("No reflection checkpoint pending", reply.await_args.args[0])
+
+    async def test_cmd_reflection_reports_pending_state_with_context(self):
+        engine = self._build_engine()
+        state = engine.reflection_status()
+        state["next_analysis_checkpoint"] = 1
+        self.chainseer_solana._atomic_json(engine.reflection_state_path, state)
+        engine.observation_ledger.append(
+            "solana_risk_analysis", {"mint": self.candidate().mint}
+        )
+        engine._maybe_request_reflection()
+        self.bot._solana_engine = engine
+
+        update, reply = _fake_update(999, "/reflection")
+        with patch.object(self.bot, "OWNER_CHAT_ID", "999"):
+            await self.bot.cmd_reflection(update, None)
+        reply.assert_awaited_once()
+        text = reply.await_args.args[0]
+        self.assertIn("paused for review", text)
+        self.assertIn("/ack", text)
+
+    async def test_cmd_reflection_rejects_non_owner(self):
+        update, reply = _fake_update(1, "/reflection")
+        with patch.object(self.bot, "OWNER_CHAT_ID", "999"):
+            await self.bot.cmd_reflection(update, None)
+        reply.assert_awaited_once()
+        self.assertIn("restricted", reply.await_args.args[0])
 
 
 if __name__ == "__main__":

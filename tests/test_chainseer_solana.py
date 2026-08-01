@@ -3,6 +3,7 @@ import json
 import struct
 import tempfile
 import time
+import types
 import unittest
 from os import environ
 from pathlib import Path
@@ -1017,6 +1018,146 @@ class SolanaPrototypeTests(unittest.TestCase):
             self.assertFalse(acknowledged["pause_requested"])
             engine.assert_learning_allowed()
             self.assertTrue(engine.reflection_ledger.verify()[0])
+
+    def test_send_telegram_notification_noop_without_configuration(self):
+        with patch.dict(
+            environ,
+            {"CHAINSEER_BOT_TOKEN": "", "CHAINSEER_TELEGRAM_CHAT_ID": ""},
+            clear=False,
+        ), patch(
+            "chainseer_solana._windows_user_environment", return_value=None
+        ), patch("chainseer_solana.requests.post") as post:
+            result = chainseer_solana._send_telegram_notification("hello")
+        self.assertFalse(result)
+        post.assert_not_called()
+
+    def test_send_telegram_notification_posts_when_configured(self):
+        fake_response = types.SimpleNamespace(ok=True)
+        with patch.dict(
+            environ,
+            {
+                "CHAINSEER_BOT_TOKEN": "test-token",
+                "CHAINSEER_TELEGRAM_CHAT_ID": "12345",
+            },
+            clear=False,
+        ), patch(
+            "chainseer_solana.requests.post", return_value=fake_response
+        ) as post:
+            result = chainseer_solana._send_telegram_notification("hello world")
+        self.assertTrue(result)
+        post.assert_called_once()
+        args, kwargs = post.call_args
+        self.assertIn("test-token", args[0])
+        self.assertEqual(kwargs["json"]["chat_id"], "12345")
+        self.assertEqual(kwargs["json"]["text"], "hello world")
+
+    def test_send_telegram_notification_swallows_request_errors(self):
+        with patch.dict(
+            environ,
+            {
+                "CHAINSEER_BOT_TOKEN": "test-token",
+                "CHAINSEER_TELEGRAM_CHAT_ID": "12345",
+            },
+            clear=False,
+        ), patch(
+            "chainseer_solana.requests.post",
+            side_effect=OSError("network down"),
+        ):
+            result = chainseer_solana._send_telegram_notification("hello")
+        self.assertFalse(result)
+
+    def test_reflection_checkpoint_notifies_with_interval_context(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            state = engine.reflection_status()
+            state["next_analysis_checkpoint"] = 1
+            chainseer_solana._atomic_json(engine.reflection_state_path, state)
+            engine.observation_ledger.append(
+                "solana_risk_analysis", {"mint": candidate().mint}
+            )
+            with patch(
+                "chainseer_solana._send_telegram_notification"
+            ) as notify:
+                pending = engine._maybe_request_reflection()
+            self.assertEqual(pending["status"], "pending")
+            notify.assert_called_once()
+            (text,) = notify.call_args.args
+            self.assertIn("paused for review", text)
+            self.assertIn("analysis_interval", text)
+            self.assertIn("/ack no_change", text)
+            self.assertIn("reflection-ack", text)
+
+    def test_reflection_checkpoint_not_triggered_sends_no_notification(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            with patch(
+                "chainseer_solana._send_telegram_notification"
+            ) as notify:
+                state = engine._maybe_request_reflection()
+            self.assertEqual(state["status"], "armed")
+            notify.assert_not_called()
+
+    def test_reflection_checkpoint_notification_includes_graduated_market_verdict(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            item = candidate()
+            index = {
+                "schema_version": 1,
+                "tokens": {
+                    item.mint: {
+                        "candidate": item.to_dict(),
+                        "decision": {
+                            "evidence_state": "complete_safe",
+                            "admission_state": "graduated_market_ready",
+                            "score": 95.0,
+                            "hard_stops": [],
+                            "warnings": ["unsigned_buy_transaction_not_assembled"],
+                            "cohort": "graduated_market",
+                            "graduation": {
+                                "canonical_pool_verified_on_chain": True
+                            },
+                        },
+                        "updated_at": chainseer_solana._utc_now(),
+                    }
+                },
+            }
+            chainseer_solana._atomic_json(engine.analysis_index_path, index)
+            with patch(
+                "chainseer_solana._send_telegram_notification"
+            ) as notify:
+                pending = engine._maybe_request_reflection()
+            self.assertEqual(pending["status"], "pending")
+            self.assertEqual(
+                pending["pending_checkpoint"]["reason"],
+                "first_canonical_graduated_market",
+            )
+            notify.assert_called_once()
+            (text,) = notify.call_args.args
+            self.assertIn(item.mint, text)
+            self.assertIn(item.symbol, text)
+            self.assertIn("score 95.0", text)
+            self.assertIn("Hard stops: none", text)
+            self.assertIn(
+                "Warnings: unsigned_buy_transaction_not_assembled", text
+            )
 
     def test_curve_completion_without_canonical_pool_stays_pending(self):
         analyzer = chainseer_solana.SolanaRiskAnalyzer(

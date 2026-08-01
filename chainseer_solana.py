@@ -64,6 +64,38 @@ def _environment_setting(name: str) -> str | None:
     return value or _windows_user_environment(name)
 
 
+def _send_telegram_notification(text: str) -> bool:
+    """Best-effort push notification for reflection-checkpoint pauses.
+
+    Reuses the same bot token chainseer_bot.py runs under (CHAINSEER_BOT_TOKEN)
+    plus an explicit CHAINSEER_TELEGRAM_CHAT_ID for the operator's chat --
+    Telegram bots cannot proactively message someone who hasn't already
+    started a chat with them, so this is required, not derived. A no-op
+    when either is unset, and never raises: a Telegram outage or missing
+    configuration must not affect the learning pipeline it's reporting on.
+    No parse_mode is set -- plain text avoids Markdown-escaping issues from
+    token symbols/summaries that may contain '*', '_', or other special
+    characters (same reasoning chainseer_bot.py uses for its own replies).
+    """
+    token = _environment_setting("CHAINSEER_BOT_TOKEN")
+    chat_id = _environment_setting("CHAINSEER_TELEGRAM_CHAT_ID")
+    if not token or not chat_id:
+        return False
+    try:
+        response = requests.post(
+            f"https://api.telegram.org/bot{token}/sendMessage",
+            json={
+                "chat_id": chat_id,
+                "text": text,
+                "disable_web_page_preview": True,
+            },
+            timeout=10,
+        )
+        return bool(response.ok)
+    except (REQUEST_EXCEPTION, OSError, ValueError):
+        return False
+
+
 SOLANA_RPC_URL = (
     _environment_setting("CHAINSEER_SOLANA_RPC_URL")
     or PUBLIC_SOLANA_RPC_URL
@@ -3358,7 +3390,84 @@ class SolanaPrototypeEngine:
             }
         )
         _atomic_json(self.reflection_state_path, state)
+        # Notification is a side channel on top of an already-sealed,
+        # already-paused state -- a failure here must never unwind the
+        # pause or the ledger/Timechain entries above.
+        try:
+            _send_telegram_notification(self._reflection_notification_text(checkpoint))
+        except Exception:
+            pass
         return state
+
+    def _evidence_state_tally(self) -> dict[str, int]:
+        analyses = _read_json(
+            self.analysis_index_path, {}
+        ).get("tokens", {})
+        tally = {
+            "complete_safe": 0,
+            "complete_unsafe": 0,
+            "distribution_pending": 0,
+            "infrastructure_indeterminate": 0,
+        }
+        for row in analyses.values():
+            state = (row.get("decision") or {}).get("evidence_state")
+            if state in tally:
+                tally[state] += 1
+        return tally
+
+    def _reflection_notification_text(self, checkpoint: dict) -> str:
+        """Human-readable pause explanation, for both the pushed Telegram
+        notification and (via the bot's /reflection command) an on-demand
+        recap -- the goal is that acknowledging never means acting blind."""
+        reason = checkpoint.get("reason")
+        lines = [
+            "Chainseer Solana learner paused for review.",
+            "",
+            f"Reason: {reason}",
+            f"Analyses so far: {checkpoint.get('analysis_events')}",
+        ]
+        mint = checkpoint.get("first_graduated_mint")
+        if mint:
+            row = (
+                _read_json(self.analysis_index_path, {})
+                .get("tokens", {})
+                .get(mint)
+                or {}
+            )
+            decision = row.get("decision") or {}
+            candidate = row.get("candidate") or {}
+            hard_stops = decision.get("hard_stops") or []
+            warnings = decision.get("warnings") or []
+            lines += [
+                "",
+                f"First graduated market: {candidate.get('symbol') or '?'} ({mint})",
+                f"Verdict: {decision.get('evidence_state')}, "
+                f"admission {decision.get('admission_state')}, "
+                f"score {decision.get('score')}",
+                f"Hard stops: {', '.join(hard_stops) if hard_stops else 'none'}",
+                f"Warnings: {', '.join(warnings) if warnings else 'none'}",
+            ]
+        else:
+            tally = self._evidence_state_tally()
+            lines += [
+                "",
+                f"Evidence so far: {tally['complete_safe']} safe, "
+                f"{tally['complete_unsafe']} unsafe, "
+                f"{tally['distribution_pending']} pending, "
+                f"{tally['infrastructure_indeterminate']} indeterminate",
+            ]
+        lines += [
+            "",
+            "From Telegram:",
+            "  /reflection -- full details",
+            "  /ack no_change <summary>",
+            "  /ack applied <summary>",
+            "",
+            "Or from the CLI:",
+            "  chainseer_solana.py reflection-ack "
+            '--outcome <applied|no_change> --summary "..."',
+        ]
+        return "\n".join(lines)
 
     def acknowledge_reflection(self, outcome: str, summary: str) -> dict:
         if outcome not in {"applied", "no_change"}:
