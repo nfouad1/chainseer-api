@@ -205,6 +205,49 @@ const factorNames: Record<string, string> = {
   trend: "Trend strength",
 };
 
+// Plain-language explanations for the Q&A section below -- kept as a
+// separate map (rather than folded into factorNames) so the short label
+// used on live reports and the longer explanation used in the FAQ can
+// each be edited without disturbing the other. Keys must match
+// factorNames so every dimension a report can actually return has an
+// explanation here.
+const factorDescriptions: Record<string, string> = {
+  security:
+    "Whether privileged contract functions -- mint authority, ownership, upgradability, pause or blacklist controls -- are still active and could change the rules after you buy.",
+  honeypot_safety:
+    "Whether a real buy-then-sell round trip actually completes and returns a reasonable amount back, not just that a buy alone looks fine.",
+  liquidity:
+    "How much capital is actually sitting in the trading pool relative to typical trade sizes. Thin liquidity means even a modest sell can move the price sharply.",
+  lp_lock:
+    "Whether the liquidity backing the pool is locked or can otherwise be pulled out from under holders.",
+  holder_distribution:
+    "How concentrated the circulating supply is among the largest wallets, with pool and program vaults excluded so they don't distort the picture.",
+  volume:
+    "Whether trading volume looks organic relative to liquidity, versus signs of wash trading or a market that's effectively dead.",
+  maturity:
+    "How long the token has actually been trading. Very new tokens carry structurally higher uncertainty regardless of what else checks out.",
+  creator_risk:
+    "What's knowable about the wallet(s) that deployed or control the token, when that can be established from on-chain evidence.",
+  wash_trading:
+    "Whether the observed trading pattern shows signs of self-dealing meant to inflate apparent activity.",
+  deployer:
+    "The deploying wallet's track record -- whether it has launched other tokens, and how those played out.",
+  sentiment: "The balance of buys versus sells in recent activity.",
+  trend: "Recent price direction and momentum.",
+};
+
+// A factor dimension is 0-100, "higher is safer." Two tones (good/warn)
+// made a near-zero score look identical to a merely-mediocre one, hiding
+// exactly the signal this panel exists to surface. Thresholds mirror the
+// headline risk badge's red/amber split (see .live-risk.risk-critical /
+// .risk-medium in globals.css) so a bad sub-score and a bad overall verdict
+// read as the same color everywhere on the page.
+function factorTone(score: number): "good" | "warn" | "bad" {
+  if (score >= 70) return "good";
+  if (score >= 40) return "warn";
+  return "bad";
+}
+
 function errorMessage(body: unknown, fallback: string) {
   if (!body || typeof body !== "object") return fallback;
   if (
@@ -518,11 +561,15 @@ function LiveReport({
 }) {
   const factorEntries = Object.entries(report.factors)
     .filter(([key, value]) => key !== "legitimacy" && Number.isFinite(value))
-    .map(([key, value]) => ({
-      key,
-      label: factorNames[key] || key.replaceAll("_", " "),
-      score: Math.max(0, Math.min(100, Number(value))),
-    }));
+    .map(([key, value]) => {
+      const score = Math.max(0, Math.min(100, Number(value)));
+      return {
+        key,
+        label: factorNames[key] || key.replaceAll("_", " "),
+        score,
+        tone: factorTone(score),
+      };
+    });
   const hardStops = report.decision.hard_stops || [];
   const risk = (report.decision.risk_level || "Unknown").toLowerCase();
   const isSlotAnchor = report.evidence.anchor_type === "confirmed_slot_anchor";
@@ -696,7 +743,7 @@ function LiveReport({
                   </div>
                   <div className="bar">
                     <span
-                      className={factor.score >= 70 ? "good" : "warn"}
+                      className={factor.tone}
                       style={{ width: `${factor.score}%` }}
                     />
                   </div>
@@ -759,18 +806,18 @@ function LiveReport({
 }
 
 const factors = [
-  { label: "Contract security", score: 94, tone: "good" },
-  { label: "Honeypot safety", score: 100, tone: "good" },
-  { label: "Liquidity health", score: 76, tone: "good" },
-  { label: "LP lock", score: 82, tone: "good" },
-  { label: "Holder distribution", score: 61, tone: "warn" },
-  { label: "Volume quality", score: 72, tone: "good" },
-  { label: "Token maturity", score: 45, tone: "warn" },
-  { label: "Creator risk", score: 68, tone: "warn" },
-  { label: "Wash trading", score: 87, tone: "good" },
-  { label: "Deployer history", score: 74, tone: "good" },
-  { label: "Market sentiment", score: 70, tone: "good" },
-  { label: "Trend strength", score: 66, tone: "warn" },
+  { label: "Contract security", score: 94 },
+  { label: "Honeypot safety", score: 100 },
+  { label: "Liquidity health", score: 76 },
+  { label: "LP lock", score: 82 },
+  { label: "Holder distribution", score: 61 },
+  { label: "Volume quality", score: 72 },
+  { label: "Token maturity", score: 45 },
+  { label: "Creator risk", score: 68 },
+  { label: "Wash trading", score: 87 },
+  { label: "Deployer history", score: 74 },
+  { label: "Market sentiment", score: 70 },
+  { label: "Trend strength", score: 66 },
 ];
 
 const evidence = [
@@ -1149,6 +1196,7 @@ export default function Home() {
         <nav aria-label="Primary navigation">
           <a href="#report">Demo report</a>
           <a href="#method">Method</a>
+          <a href="#faq">Q&amp;A</a>
           <a href="#timechain">Timechain</a>
           <a href="#evidence" onClick={() => setShowExample(true)}>Evidence</a>
         </nav>
@@ -1397,7 +1445,7 @@ export default function Home() {
               <div className="factor" key={factor.label}>
                 <div className="factor-label"><span>{factor.label}</span><strong>{factor.score}</strong></div>
                 <div className="bar">
-                  <span className={factor.tone} style={{ width: `${factor.score}%` }} />
+                  <span className={factorTone(factor.score)} style={{ width: `${factor.score}%` }} />
                 </div>
               </div>
             ))}
@@ -1450,6 +1498,156 @@ export default function Home() {
           <article><span>02</span><h3>Challenge</h3><p>Run hard-stop gates and test conflicting evidence before scoring.</p></article>
           <article><span>03</span><h3>Explain</h3><p>Translate the result into an investor-friendly action and watchlist.</p></article>
           <article><span>04</span><h3>Remember</h3><p>Seal evidence and compare later outcomes without rewriting history.</p></article>
+        </div>
+      </section>
+
+      <section className="faq" id="faq">
+        <div className="section-heading">
+          <div>
+            <div className="eyebrow muted">Q&amp;A</div>
+            <h2>What Chainseer actually checks, and how.</h2>
+          </div>
+          <p>
+            A verdict is only as trustworthy as the reasoning behind it. This
+            is the plain-language version of the twelve-factor engine and the
+            evidence rules that decide what counts as a hard stop, a warning,
+            or simply unknown.
+          </p>
+        </div>
+        <div className="faq-list">
+          <details className="analysis-disclosure faq-item">
+            <summary className="panel-head analysis-disclosure-trigger">
+              <div>
+                <span className="panel-index">01</span>
+                <h3>How does Chainseer actually analyze a token?</h3>
+              </div>
+            </summary>
+            <div className="analysis-disclosure-body">
+              <p>
+                Every report is built from direct evidence, not a single
+                third-party score. On Robinhood Chain and Base that means
+                GoPlus Security, DexScreener, Blockscout, and direct RPC calls
+                pinned to a specific block. On Solana it means direct Solana
+                RPC calls, Jupiter route quotes, and DexScreener market data.
+              </p>
+              <p>
+                That evidence runs through four stages: <strong>Observe</strong>{" "}
+                collects the token&rsquo;s controls, liquidity, holder, execution,
+                and market signals; <strong>Challenge</strong> runs deterministic
+                hard-stop gates and checks for conflicting evidence before any
+                score is computed; <strong>Explain</strong> turns the result into
+                an investor-readable verdict and watchlist, not just a number;
+                and <strong>Remember</strong> seals the completed analysis so it
+                can be checked against outcomes later without quietly rewriting
+                what was actually said at the time.
+              </p>
+            </div>
+          </details>
+
+          <details className="analysis-disclosure faq-item">
+            <summary className="panel-head analysis-disclosure-trigger">
+              <div>
+                <span className="panel-index">02</span>
+                <h3>What do the twelve risk dimensions measure?</h3>
+              </div>
+            </summary>
+            <div className="analysis-disclosure-body">
+              <p>
+                Each report scores twelve independent dimensions from 0-100,
+                higher is safer, shown on every report&rsquo;s Risk dimensions
+                panel:
+              </p>
+              <dl className="faq-factors">
+                {Object.entries(factorNames).map(([key, label]) => (
+                  <div key={key}>
+                    <dt>{label}</dt>
+                    <dd>{factorDescriptions[key]}</dd>
+                  </div>
+                ))}
+              </dl>
+            </div>
+          </details>
+
+          <details className="analysis-disclosure faq-item">
+            <summary className="panel-head analysis-disclosure-trigger">
+              <div>
+                <span className="panel-index">03</span>
+                <h3>What&rsquo;s the difference between a hard stop, a warning, and an unknown?</h3>
+              </div>
+            </summary>
+            <div className="analysis-disclosure-body">
+              <p>
+                A <strong>hard stop</strong> is a deterministic, evidence-backed
+                condition -- an active mint authority, a failed round-trip sell,
+                unlocked liquidity -- that blocks a positive verdict outright,
+                regardless of how the other eleven dimensions score. A{" "}
+                <strong>warning</strong> (a yellow flag) is material but not
+                disqualifying on its own: worth weighing, not automatically
+                fatal. An <strong>unknown</strong> means a piece of evidence
+                genuinely couldn&rsquo;t be obtained or verified -- it is never
+                treated as a passing result.
+              </p>
+            </div>
+          </details>
+
+          <details className="analysis-disclosure faq-item">
+            <summary className="panel-head analysis-disclosure-trigger">
+              <div>
+                <span className="panel-index">04</span>
+                <h3>Why does Chainseer say &ldquo;unknown&rdquo; instead of assuming something is safe?</h3>
+              </div>
+            </summary>
+            <div className="analysis-disclosure-body">
+              <p>
+                Because a missing answer and a good answer are not the same
+                thing, even though both can look reassuring at a glance. If a
+                data source is unavailable or a check can&rsquo;t be completed,
+                Chainseer reports that gap explicitly under Unknowns and
+                limits rather than quietly defaulting to safe. A confident
+                wrong answer is worse than an honest gap.
+              </p>
+            </div>
+          </details>
+
+          <details className="analysis-disclosure faq-item">
+            <summary className="panel-head analysis-disclosure-trigger">
+              <div>
+                <span className="panel-index">05</span>
+                <h3>Does the analysis differ by chain?</h3>
+              </div>
+            </summary>
+            <div className="analysis-disclosure-body">
+              <p>
+                Robinhood Chain and Base share the same full twelve-factor
+                engine described above. Solana mints currently get a
+                general-purpose check -- mint and freeze authority, liquidity,
+                holder concentration, and a real Jupiter buy/sell round trip --
+                rather than chain-specific deployer history, since that
+                requires launch provenance this public lookup doesn&rsquo;t yet
+                verify for an arbitrary address.
+              </p>
+            </div>
+          </details>
+
+          <details className="analysis-disclosure faq-item">
+            <summary className="panel-head analysis-disclosure-trigger">
+              <div>
+                <span className="panel-index">06</span>
+                <h3>What does the score mean, and is a high score a guarantee?</h3>
+              </div>
+            </summary>
+            <div className="analysis-disclosure-body">
+              <p>
+                The score summarizes the twelve dimensions into one number,
+                but it is not the verdict on its own -- a single hard stop caps
+                the outcome regardless of score. No score, however high, is a
+                guarantee: markets and on-chain state can change the moment
+                after an analysis is sealed, which is exactly why every report
+                is pinned to a specific block and timestamped rather than
+                presented as a standing truth.
+              </p>
+            </div>
+          </details>
         </div>
       </section>
 
