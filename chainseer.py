@@ -958,6 +958,15 @@ class RPCError(Exception):
         super().__init__(f"[RPC {code}] {message}")
 
 
+#: RPCError.code sentinels raised by RobinhoodRPC._call() for a request that
+#: never got a response from the chain at all (connect failure, timeout,
+#: non-2xx HTTP, other transport error) -- see _call()'s except clauses.
+#: These tell us nothing about the contract; only a genuine JSON-RPC error
+#: response (the node evaluated the call and rejected it, code taken from
+#: data["error"]) is evidence close to "no owner() function exists."
+_RPC_TRANSPORT_FAILURE_CODES = {-1, -2, -3}
+
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # Helper decoders
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1626,11 +1635,33 @@ class Chainseer:
         code_hex = code.replace("0x", "").lower()
 
         dangerous_found = [name for name, sel in HONEYPOT_SELECTORS.items() if sel in code_hex]
+        owner_check_failed = False
         try:
             owner = self.rpc.erc20_owner(token)
-        except RPCError:
-            owner = "0x" + "0" * 40  # revert = no owner function = effectively renounced
-        is_zero_owner = (owner == "0x" + "0" * 40 or owner == "0x" + "dead".zfill(40))
+        except RPCError as exc:
+            if (
+                exc.code in _RPC_TRANSPORT_FAILURE_CODES
+                # RPC HTTP response failed: -(http_status), e.g. -429/-500/
+                # -503. Bounded to the real HTTP status range (100-599) so
+                # this never swallows a genuine JSON-RPC error code -- the
+                # JSON-RPC 2.0 reserved range (-32768..-32000) is far more
+                # negative and must still be treated as a real revert
+                # response, not a transport failure.
+                or -599 <= exc.code <= -100
+            ):
+                # Never reached the chain -- a timeout or connection drop is
+                # not evidence of anything, and must not be treated the same
+                # as an on-chain revert.
+                owner = None
+                owner_check_failed = True
+            else:
+                # A real JSON-RPC error response: the node evaluated the
+                # call and rejected it.
+                owner = "0x" + "0" * 40  # revert = no owner function = effectively renounced
+        is_zero_owner = (
+            not owner_check_failed
+            and (owner == "0x" + "0" * 40 or owner == "0x" + "dead".zfill(40))
+        )
         has_mint = "a0712d68" in code_hex or "40c10f19" in code_hex
 
         return {
@@ -1640,6 +1671,7 @@ class Chainseer:
             ).hexdigest(),
             "owner": owner,
             "ownership_renounced": is_zero_owner,
+            "owner_check_failed": owner_check_failed,
             "has_mint_function": has_mint,
             "dangerous_functions": dangerous_found,
         }
@@ -1679,6 +1711,12 @@ class Chainseer:
             "primary_dex": primary.get("dexId"),
             "primary_labels": primary.get("labels", []),
             "primary_amm_version": _amm_version(primary),
+            # Full raw pair object, not just the fields extracted above --
+            # _estimate_tax_from_reserves() needs priceNative and
+            # liquidity.quote/base, which aren't otherwise carried through.
+            # Without this the GoPlus-unavailable tax-estimation fallback
+            # silently always returned available=False.
+            "primary_pair_raw": primary,
             # Only addresses supplied by this network's DEX market record
             # are eligible for structural AMM exclusion in holder analysis.
             # V4 pool ids are 32-byte identifiers, not holder addresses.
@@ -2797,7 +2835,22 @@ class Chainseer:
                     flags["yellow"].append(f"Active owner: {owner_addr[:10]}...")
         else:
             # Fallback: use bytecode analysis
-            if contract.get("ownership_renounced"):
+            if contract.get("owner_check_failed"):
+                # The owner() call never reached the chain (timeout/connect
+                # failure), not a revert -- this is exactly the scenario
+                # (GoPlus already unavailable, now the RPC cross-check also
+                # fails) where a false "renounced" green flag would go
+                # unchecked. Score it like an active owner, not renounced.
+                uncertain["ownership"] = (
+                    "Owner check failed due to an RPC/network error "
+                    "(GoPlus was also unavailable); ownership status "
+                    "could not be determined."
+                )
+                flags["yellow"].append(
+                    "Ownership status unknown (RPC error, GoPlus unavailable)"
+                )
+                security_score -= 10
+            elif contract.get("ownership_renounced"):
                 flags["green"].append("Ownership renounced")
                 security_score -= 0
             else:

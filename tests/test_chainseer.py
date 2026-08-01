@@ -88,6 +88,66 @@ class FakeV2LiquidityRPC:
         raise chainseer.RPCError("selector unavailable", -1)
 
 
+class OwnershipCheckFallbackTests(unittest.TestCase):
+    """_analyze_contract() must not conflate an RPC transport failure
+    (timeout, connection drop, non-2xx) with a genuine on-chain revert --
+    only the latter is real evidence "no owner() function exists"."""
+
+    @staticmethod
+    def _agent(rpc):
+        # _analyze_contract only touches self.rpc, so a bare namespace
+        # standing in for `self` is enough to call it unbound.
+        return types.SimpleNamespace(rpc=rpc)
+
+    def test_transport_failure_is_reported_as_unknown_not_renounced(self):
+        class TimingOutRPC:
+            def get_code(self, _token):
+                return "0x6080"
+
+            def erc20_owner(self, _token):
+                raise chainseer.RPCError(
+                    "RPC request timed out after 30s", -2
+                )
+
+        result = chainseer.Chainseer._analyze_contract(
+            self._agent(TimingOutRPC()), "0x" + "1" * 40
+        )
+        self.assertTrue(result["owner_check_failed"])
+        self.assertFalse(result["ownership_renounced"])
+        self.assertIsNone(result["owner"])
+
+    def test_http_failure_is_also_reported_as_unknown(self):
+        class RateLimitedRPC:
+            def get_code(self, _token):
+                return "0x6080"
+
+            def erc20_owner(self, _token):
+                raise chainseer.RPCError(
+                    "RPC HTTP response failed (429)", -429
+                )
+
+        result = chainseer.Chainseer._analyze_contract(
+            self._agent(RateLimitedRPC()), "0x" + "1" * 40
+        )
+        self.assertTrue(result["owner_check_failed"])
+        self.assertFalse(result["ownership_renounced"])
+
+    def test_genuine_revert_is_still_treated_as_renounced(self):
+        class RevertingRPC:
+            def get_code(self, _token):
+                return "0x6080"
+
+            def erc20_owner(self, _token):
+                raise chainseer.RPCError("execution reverted", -32000)
+
+        result = chainseer.Chainseer._analyze_contract(
+            self._agent(RevertingRPC()), "0x" + "1" * 40
+        )
+        self.assertFalse(result["owner_check_failed"])
+        self.assertTrue(result["ownership_renounced"])
+        self.assertEqual(result["owner"], "0x" + "0" * 40)
+
+
 class ChainseerInfrastructureTests(unittest.TestCase):
     def test_version_dead_code_and_verification_scope_are_honest(self):
         source = Path(chainseer.__file__).read_text(encoding="utf-8")
@@ -451,6 +511,45 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertEqual(
             result["discarded_quote_or_unbound_pair_count"], 1
         )
+
+    def test_goplus_unavailable_tax_fallback_actually_computes_a_result(self):
+        # _estimate_tax_from_reserves() reads dex_data["primary_pair_raw"],
+        # which _analyze_dex_pairs() computes internally but never used to
+        # store on the returned dict -- the GoPlus-unavailable fallback
+        # always silently returned available=False. This proves the field
+        # is now wired through and the fallback actually estimates a tax.
+        token = "0x" + "a" * 40
+        pair = {
+            "chainId": "robinhood",
+            "pairAddress": "0x" + "2" * 64,
+            "baseToken": {"address": token},
+            "quoteToken": {"address": chainseer.WETH_ADDRESS},
+            "labels": ["v2"],
+            "liquidity": {"usd": 10_000, "quote": 10, "base": 1_000_000},
+            "priceUsd": "0.001",
+            "priceNative": "0.0000105",
+        }
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.rpc = FailOnLPTokenRPC()
+        dex_pairs = agent._analyze_dex_pairs(
+            token,
+            {"dexscreener": {"pairs": [pair]}, "goplus_security": {}},
+        )
+        self.assertEqual(dex_pairs["primary_pair_raw"], pair)
+
+        tax = agent._estimate_tax_from_reserves(
+            token,
+            {
+                **dex_pairs,
+                "on_chain_reserves": {
+                    "reserve_eth": 10,
+                    "reserve_tokens_raw": 1_000_000,
+                },
+            },
+        )
+        self.assertTrue(tax["available"])
+        self.assertIsNotNone(tax["buy_tax_estimate"])
+        self.assertGreater(tax["buy_tax_estimate"], 0)
 
     def test_holder_analysis_excludes_only_verified_amm_and_uses_supply(self):
         pool = "0x" + "a" * 40

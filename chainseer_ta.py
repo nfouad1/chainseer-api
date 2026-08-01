@@ -508,25 +508,31 @@ class TAEngine:
                 "volume": last.volume,
                 "trades": last.trades,
             },
+            # `is not None` (not truthiness) below: these series use None
+            # only for warmup indices with insufficient history (see sma()/
+            # ema()); a genuinely computed 0.0 -- MACD histogram at a
+            # crossover, price sitting exactly on a Bollinger band -- is a
+            # real, meaningful value, not missing data, and must not be
+            # reported as None.
             "indicators": {
-                "rsi_14": {"value": round(rsi_val, 2) if rsi_val else None, "label": rsi_label},
+                "rsi_14": {"value": round(rsi_val, 2) if rsi_val is not None else None, "label": rsi_label},
                 "macd": {
-                    "value": round(macd_val, 2) if macd_val else None,
-                    "signal": round(signal_val, 2) if signal_val else None,
-                    "histogram": round(hist[i], 2) if hist[i] else None,
+                    "value": round(macd_val, 2) if macd_val is not None else None,
+                    "signal": round(signal_val, 2) if signal_val is not None else None,
+                    "histogram": round(hist[i], 2) if hist[i] is not None else None,
                     "label": macd_label,
                 },
                 "bollinger": {
-                    "upper": round(bb_upper[i], 2) if bb_upper[i] else None,
-                    "middle": round(bb_mid[i], 2) if bb_mid[i] else None,
-                    "lower": round(bb_lower[i], 2) if bb_lower[i] else None,
-                    "position_pct": round(bb_position, 1) if bb_position else None,
+                    "upper": round(bb_upper[i], 2) if bb_upper[i] is not None else None,
+                    "middle": round(bb_mid[i], 2) if bb_mid[i] is not None else None,
+                    "lower": round(bb_lower[i], 2) if bb_lower[i] is not None else None,
+                    "position_pct": round(bb_position, 1) if bb_position is not None else None,
                 },
-                "atr_14": {"value": round(atr_series[i], 2) if atr_series[i] else None},
-                "sma_50": {"value": round(sma50[i], 2) if sma50[i] else None},
-                "sma_200": {"value": round(sma200[i], 2) if sma200[i] else None},
-                "ema_12": {"value": round(ema12[i], 2) if ema12[i] else None},
-                "ema_26": {"value": round(ema26[i], 2) if ema26[i] else None},
+                "atr_14": {"value": round(atr_series[i], 2) if atr_series[i] is not None else None},
+                "sma_50": {"value": round(sma50[i], 2) if sma50[i] is not None else None},
+                "sma_200": {"value": round(sma200[i], 2) if sma200[i] is not None else None},
+                "ema_12": {"value": round(ema12[i], 2) if ema12[i] is not None else None},
+                "ema_26": {"value": round(ema26[i], 2) if ema26[i] is not None else None},
             },
             "interpretation": {
                 "trend": trend,
@@ -1293,7 +1299,8 @@ def _max_drawdown(returns: list) -> float:
 def walk_forward_validate(engine: "TAEngine", setup_id: str,
                           asset: str, timeframe: str,
                           window_years: float = 2.0,
-                          horizon: int = 7) -> dict:
+                          horizon: int = 7,
+                          min_window_samples: int = 5) -> dict:
     """Walk-forward validation of a single pattern.
 
     Splits history into non-overlapping windows, computes the pattern's
@@ -1310,6 +1317,11 @@ def walk_forward_validate(engine: "TAEngine", setup_id: str,
         setup_id: pattern id from CONFLUENCE_SETUPS
         window_years: size of each walk-forward window
         horizon: forward-return horizon in candles
+        min_window_samples: a window below this occurrence count is too
+            small for its win_rate to mean anything (one lucky trade can
+            swing it from 0% to 100%) and is excluded from the
+            windows_passing_55pct verdict, though it is still reported in
+            full in `windows` for transparency.
     """
     candles = engine._get_candles(asset, timeframe)
     if len(candles) < 400:
@@ -1436,9 +1448,22 @@ def walk_forward_validate(engine: "TAEngine", setup_id: str,
     pattern_dd = _max_drawdown(pattern_returns)
     bh_dd = _max_drawdown(all_period_returns)
 
-    # Verdict logic
-    windows_passing = sum(1 for w in window_stats if w["win_rate"] > 0.55)
-    windows_total = len(window_stats)
+    # Verdict logic. A window below min_window_samples proves nothing --
+    # one lucky (or unlucky) trade can swing win_rate from 0% to 100%, and
+    # unlike validate_patterns() (min_samples=30 on the whole dataset) this
+    # loop previously had no floor at all. Only windows with enough
+    # occurrences to be minimally informative count toward the verdict;
+    # every window is still reported in full in `windows` above.
+    eligible_windows = [
+        w for w in window_stats if w["samples"] >= min_window_samples
+    ]
+    windows_passing = sum(
+        1 for w in eligible_windows if w["win_rate"] > 0.55
+    )
+    windows_total = len(eligible_windows)
+    windows_excluded_insufficient_samples = (
+        len(window_stats) - windows_total
+    )
     ci_significant = ci_lo is not None and ci_lo > 0.50
     beats_bh = pattern_compounded > bh_compounded
 
@@ -1465,6 +1490,10 @@ def walk_forward_validate(engine: "TAEngine", setup_id: str,
         "windows": window_stats,
         "windows_passing_55pct": windows_passing,
         "windows_total": windows_total,
+        "min_window_samples": min_window_samples,
+        "windows_excluded_insufficient_samples": (
+            windows_excluded_insufficient_samples
+        ),
         "pattern_compounded_return": round(pattern_compounded, 4),
         "buyhold_compounded_return": round(bh_compounded, 4),
         "beats_buyhold": beats_bh,
@@ -1495,11 +1524,17 @@ def print_walk_forward_report(result: dict):
               f"{'SIGNIFICANT' if result['ci_significant'] else 'NOT SIG (includes 50%)'}")
     print()
 
-    print(f" Walk-forward windows ({result['windows_total']} windows):")
+    min_n = result["min_window_samples"]
+    print(f" Walk-forward windows ({len(result['windows'])} windows, "
+          f"{result['windows_total']} with >={min_n} samples counted "
+          f"toward the verdict):")
     for w in result["windows"]:
         bar_len = int(w["win_rate"] * 20)
         bar = "#" * bar_len + "." * (20 - bar_len)
-        tag = "PASS" if w["win_rate"] > 0.55 else "fail"
+        if w["samples"] < min_n:
+            tag = "thin"  # too few samples to count toward the verdict
+        else:
+            tag = "PASS" if w["win_rate"] > 0.55 else "fail"
         print(f"   {w['first_date']} to {w['last_date']}: "
               f"win={w['win_rate']:.1%} [{bar}] "
               f"exp={w['expectancy']:+.2%} n={w['samples']} [{tag}]")

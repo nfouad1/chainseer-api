@@ -356,6 +356,38 @@ class RateLimiterTests(unittest.TestCase):
         self.assertFalse(limiter.allow("client", now=12))
         self.assertTrue(limiter.allow("client", now=71))
 
+    def test_global_limit_bounds_throughput_across_rotated_identities(self):
+        # request_identity() cannot verify the caller-supplied identity
+        # header, so a caller rotating a fresh fake identity every request
+        # would otherwise never hit the per-identity limit at all. The
+        # global cap must still bind regardless of how many distinct
+        # identities are claimed.
+        limiter = SlidingWindowRateLimiter(
+            limit=100, window_seconds=60, global_limit=3
+        )
+        self.assertTrue(limiter.allow("identity-a", now=1))
+        self.assertTrue(limiter.allow("identity-b", now=1))
+        self.assertTrue(limiter.allow("identity-c", now=1))
+        self.assertFalse(limiter.allow("identity-d", now=1))
+        # A brand-new identity is still refused while the global window is
+        # full, even though it has never been seen before.
+        self.assertFalse(limiter.allow("identity-e", now=1))
+        self.assertTrue(limiter.allow("identity-f", now=62))
+
+    def test_tracked_identities_are_bounded_and_evicted_lru(self):
+        limiter = SlidingWindowRateLimiter(limit=100, window_seconds=60)
+        limiter.MAX_TRACKED_IDENTITIES = 3
+        limiter.allow("a", now=1)
+        limiter.allow("b", now=1)
+        limiter.allow("c", now=1)
+        self.assertEqual(len(limiter._events), 3)
+        # A fourth distinct identity must not grow the tracked set past the
+        # cap -- the least-recently-used one ("a") is evicted instead.
+        limiter.allow("d", now=1)
+        self.assertEqual(len(limiter._events), 3)
+        self.assertNotIn("a", limiter._events)
+        self.assertIn("d", limiter._events)
+
 
 class SettingsTests(unittest.TestCase):
     def test_server_port_uses_platform_port(self):

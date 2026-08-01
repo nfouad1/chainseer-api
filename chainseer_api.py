@@ -20,7 +20,7 @@ import socket
 import threading
 import time
 import uuid
-from collections import defaultdict, deque
+from collections import OrderedDict, deque
 from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -174,6 +174,15 @@ class Settings:
     rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int(
             "CHAINSEER_RATE_LIMIT_PER_MINUTE", 6, 1, 120
+        )
+    )
+    global_rate_limit_per_minute: int = field(
+        # Bounds total request throughput across every claimed identity
+        # combined, since the per-identity limit alone is only as strong as
+        # request_identity()'s unverifiable header (see
+        # SlidingWindowRateLimiter's docstring).
+        default_factory=lambda: _env_int(
+            "CHAINSEER_GLOBAL_RATE_LIMIT_PER_MINUTE", 60, 1, 6000
         )
     )
     shutdown_grace_seconds: int = field(
@@ -608,22 +617,66 @@ class BenchmarkCaptureRecorder:
 
 
 class SlidingWindowRateLimiter:
-    def __init__(self, limit: int, window_seconds: int = 60):
+    #: request_identity() cannot cryptographically verify the caller-supplied
+    #: X-Chainseer-Client header (it only checks the format matches a
+    #: 64-hex digest -- see request_identity()'s docstring), so a caller who
+    #: already holds the bearer token could rotate fake identities forever.
+    #: Without a bound, every distinct identity -- spoofed or a real
+    #: long-lived device -- permanently grows self._events, since nothing
+    #: ever sweeps a key whose window has fully expired if that identity is
+    #: never seen again. Evict least-recently-used identities past this cap
+    #: instead of growing without bound.
+    MAX_TRACKED_IDENTITIES = 10_000
+
+    def __init__(
+        self,
+        limit: int,
+        window_seconds: int = 60,
+        *,
+        global_limit: int | None = None,
+    ):
         self.limit = limit
         self.window_seconds = window_seconds
-        self._events: dict[str, deque[float]] = defaultdict(deque)
+        # Defense-in-depth against the same unverifiable-identity gap: even
+        # if every request claims a different identity, total throughput
+        # across all of them combined is still bounded. None disables it.
+        self.global_limit = global_limit
+        self._events: "OrderedDict[str, deque[float]]" = OrderedDict()
+        self._global_events: deque[float] = deque()
         self._lock = threading.Lock()
 
     def allow(self, identity: str, now: float | None = None) -> bool:
         now = now if now is not None else time.monotonic()
         cutoff = now - self.window_seconds
         with self._lock:
-            events = self._events[identity]
-            while events and events[0] <= cutoff:
-                events.popleft()
+            if self.global_limit is not None:
+                global_events = self._global_events
+                while global_events and global_events[0] <= cutoff:
+                    global_events.popleft()
+                if len(global_events) >= self.global_limit:
+                    return False
+
+            events = self._events.get(identity)
+            if events is None:
+                events = deque()
+            else:
+                self._events.move_to_end(identity)
+                while events and events[0] <= cutoff:
+                    events.popleft()
+
             if len(events) >= self.limit:
+                if events:
+                    self._events[identity] = events
+                else:
+                    self._events.pop(identity, None)
                 return False
+
             events.append(now)
+            self._events[identity] = events
+            while len(self._events) > self.MAX_TRACKED_IDENTITIES:
+                self._events.popitem(last=False)
+            if self.global_limit is not None:
+                self._global_events.append(now)
             return True
 
 
@@ -1441,7 +1494,10 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
 SETTINGS = Settings()
 SETTINGS.validate()
 SERVICE = AnalysisService(SETTINGS)
-LIMITER = SlidingWindowRateLimiter(SETTINGS.rate_limit_per_minute)
+LIMITER = SlidingWindowRateLimiter(
+    SETTINGS.rate_limit_per_minute,
+    global_limit=SETTINGS.global_rate_limit_per_minute,
+)
 LEASE = SingleProcessLease(SETTINGS.chain_root)
 
 

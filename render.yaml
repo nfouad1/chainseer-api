@@ -36,6 +36,8 @@ services:
         value: "20"
       - key: CHAINSEER_RATE_LIMIT_PER_MINUTE
         value: "6"
+      - key: CHAINSEER_GLOBAL_RATE_LIMIT_PER_MINUTE
+        value: "60"
       - key: CHAINSEER_SCAN_CACHE_TTL_SECONDS
         value: "300"
       - key: CHAINSEER_RESULT_TTL_SECONDS
