@@ -19,6 +19,7 @@ import re
 import struct
 import threading
 import time
+from collections import OrderedDict
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -127,6 +128,17 @@ from chainseer_core import (
 # Bind chainseer_core.canonical_json to reproduce that exact behavior so
 # historical event_hash values in solana_chain/ keep re-verifying.
 _canonical_json = functools.partial(_canonical_json_impl, ensure_ascii=False, default=None)
+
+# catalog.json and analysis_index.json accumulate one entry per token ever
+# observed/analyzed and are fully read+rewritten every learn cycle -- on an
+# active launchpad this grows without bound for as long as the process runs
+# (the same failure shape as the OOM-causing watcher churn already fixed
+# elsewhere). Prune anything older than this on every write. Well beyond
+# SolanaShadowPolicy.maximum_hold_seconds (6h default) so open positions and
+# their candidates are never pruned out from under an in-flight mark/exit.
+CATALOG_RETENTION_SECONDS = _safe_int(
+    _environment_setting("CHAINSEER_SOLANA_CATALOG_RETENTION_DAYS"), 30
+) * 86_400
 
 
 def _timestamp(value: str | None) -> float | None:
@@ -351,7 +363,19 @@ class SolanaRiskPolicy:
     # tokens in a short window) is empirically token-farm behaviour. Thresholds
     # set high enough that only genuine farms trigger (legitimate launchpad
     # services rarely exceed these), with a warning tier below the hard-stop.
+    # Page size for each getSignaturesForAddress call against the creator's
+    # wallet. A single page is not enough recall on its own -- see
+    # creator_history_max_pages below.
     creator_history_signature_limit: int = 30
+    # getSignaturesForAddress returns EVERY signature for the creator wallet,
+    # not just Pump.fun interactions -- a deployer who also trades/swaps on
+    # the same wallet burns through a single page with unrelated activity,
+    # silently hiding genuine prior launches from the scan. Paging backwards
+    # (like PumpFunObserver.sync) until the lookback window is covered fixes
+    # the recall gap; these two caps bound the worst-case RPC cost of doing
+    # so (a wallet with heavy unrelated activity within the window).
+    creator_history_max_pages: int = 6
+    creator_history_max_transactions_scanned: int = 180
     creator_history_window_hours: float = 72.0
     creator_history_warning_count: int = 5
     creator_history_hard_stop_count: int = 10
@@ -368,6 +392,10 @@ class SolanaRiskPolicy:
             raise ValueError("minimum_graduated_market_age_seconds must be non-negative")
         if self.creator_history_signature_limit <= 0:
             raise ValueError("creator_history_signature_limit must be positive")
+        if self.creator_history_max_pages <= 0:
+            raise ValueError("creator_history_max_pages must be positive")
+        if self.creator_history_max_transactions_scanned <= 0:
+            raise ValueError("creator_history_max_transactions_scanned must be positive")
         if self.creator_history_window_hours <= 0:
             raise ValueError("creator_history_window_hours must be positive")
         if not 0 < self.creator_history_warning_count < self.creator_history_hard_stop_count:
@@ -1174,6 +1202,12 @@ class PumpFunObserver:
                 "newest_slot": newest_slot,
                 "updated_at": _utc_now(),
             }
+        retention_cutoff = time.time() - CATALOG_RETENTION_SECONDS
+        catalog["tokens"] = {
+            mint: value
+            for mint, value in catalog["tokens"].items()
+            if _safe_int(value.get("block_time")) >= retention_cutoff
+        }
         catalog["updated_at"] = _utc_now()
         _atomic_json(self.catalog_path, catalog)
         _atomic_json(self.cursor_path, cursor)
@@ -1615,9 +1649,23 @@ class SolanaRiskAnalyzer:
         self.convergence = convergence
         # Per-creator history cache: many tokens share a creator, and the scan
         # is ~N getTransaction calls, so caching amortizes the cost. Keyed by
-        # creator pubkey; entries are (fetched_at_monotonic, result).
-        self._creator_history_cache: dict[str, tuple[float, dict]] = {}
+        # creator pubkey; entries are (fetched_at_monotonic, result). A
+        # long-running process observes an unbounded number of distinct
+        # creator wallets over time, so this is size-capped with LRU eviction
+        # (same shape as the rate-limiter identity leak fixed in
+        # chainseer_api.py) rather than left to grow for the life of the
+        # process.
+        self._creator_history_cache: "OrderedDict[str, tuple[float, dict]]" = (
+            OrderedDict()
+        )
         self._creator_history_ttl = 300.0  # 5 min
+        self._creator_history_cache_max = 5_000
+
+    def _cache_creator_history(self, creator: str, now: float, value: dict) -> None:
+        self._creator_history_cache[creator] = (now, value)
+        self._creator_history_cache.move_to_end(creator)
+        while len(self._creator_history_cache) > self._creator_history_cache_max:
+            self._creator_history_cache.popitem(last=False)
 
     @staticmethod
     def _decode_curve(account: dict | None) -> dict:
@@ -1824,6 +1872,10 @@ class SolanaRiskAnalyzer:
         result = {
             "creator": creator,
             "scanned": False,
+            "scan_degraded": False,
+            "transactions_failed": 0,
+            "pages_scanned": 0,
+            "signatures_scanned": 0,
             "prior_deployments_in_window": 0,
             "prior_deployments_total_observed": 0,
             "window_hours": self.policy.creator_history_window_hours,
@@ -1840,26 +1892,64 @@ class SolanaRiskAnalyzer:
         cached = self._creator_history_cache.get(creator)
         now = time.monotonic()
         if cached and now - cached[0] <= self._creator_history_ttl:
+            self._creator_history_cache.move_to_end(creator)
             cached_result = cached[1]
             # The cached result is creator-scoped, so it's valid for this token.
             return {**cached_result, "cache_hit": True}
 
+        window_seconds = self.policy.creator_history_window_hours * 3600.0
+        now_epoch = time.time()
+        cutoff_epoch = now_epoch - window_seconds
+
+        # getSignaturesForAddress returns EVERY signature for this wallet, not
+        # just Pump.fun interactions -- a creator who also trades/swaps on the
+        # same wallet can fill a single page with unrelated activity and hide
+        # genuine prior launches from a one-shot scan. Page backwards (like
+        # PumpFunObserver.sync) until the lookback window is covered, bounded
+        # by max_pages / max_transactions_scanned as an RPC cost ceiling.
+        signatures: list[dict] = []
+        before_signature: str | None = None
+        pages_scanned = 0
         try:
-            signatures = self.rpc.get_signatures(
-                creator,
-                limit=self.policy.creator_history_signature_limit,
-            )
+            for _ in range(self.policy.creator_history_max_pages):
+                batch = self.rpc.get_signatures(
+                    creator,
+                    limit=self.policy.creator_history_signature_limit,
+                    before=before_signature,
+                )
+                pages_scanned += 1
+                if not batch:
+                    break
+                signatures.extend(batch)
+                oldest_row = batch[-1]
+                before_signature = oldest_row.get("signature")
+                if (
+                    not before_signature
+                    or len(signatures)
+                    >= self.policy.creator_history_max_transactions_scanned
+                ):
+                    break
+                oldest_time = _safe_int(oldest_row.get("blockTime"), None)
+                if oldest_time is not None and oldest_time < cutoff_epoch:
+                    break
         except InfrastructureIndeterminateError:
             return result
 
+        result["pages_scanned"] = pages_scanned
         if not signatures:
-            self._creator_history_cache[creator] = (now, dict(result))
+            self._cache_creator_history(creator, now, dict(result))
             return result
+
+        signatures = signatures[
+            : self.policy.creator_history_max_transactions_scanned
+        ]
+        result["signatures_scanned"] = len(signatures)
 
         # Decode each transaction and collect CreateEvents attributed to this
         # creator. Non-create activity (buys/sells) yields no candidates.
         prior_deployments: list[SolanaLaunchCandidate] = []
         oldest_slot = None
+        transactions_failed = 0
         for row in signatures:
             slot = _safe_int(row.get("slot"))
             if oldest_slot is None or (slot and slot < oldest_slot):
@@ -1869,6 +1959,7 @@ class SolanaRiskAnalyzer:
             try:
                 transaction = self.rpc.get_transaction(row["signature"])
             except InfrastructureIndeterminateError:
+                transactions_failed += 1
                 continue
             for decoded in PumpFunObserver.decode_transaction(row, transaction):
                 # Only count deployments attributed to THIS creator (a wallet
@@ -1877,12 +1968,15 @@ class SolanaRiskAnalyzer:
                     prior_deployments.append(decoded)
 
         result["scanned"] = True
+        # A partial scan (some getTransaction lookups failed) must not look
+        # identical to a clean one -- surfaced so callers/dashboards can flag
+        # that the deployment count is a floor, not a confirmed total.
+        result["scan_degraded"] = transactions_failed > 0
+        result["transactions_failed"] = transactions_failed
         result["prior_deployments_total_observed"] = len(prior_deployments)
         result["oldest_observed_slot"] = oldest_slot
 
         # Cadence within the lookback window (recent-first signatures).
-        window_seconds = self.policy.creator_history_window_hours * 3600.0
-        now_epoch = time.time()
         recent = [
             d for d in prior_deployments
             if (now_epoch - d.block_time) <= window_seconds
@@ -1911,7 +2005,7 @@ class SolanaRiskAnalyzer:
         ]
 
         cache_value = {k: v for k, v in result.items() if k != "cache_hit"}
-        self._creator_history_cache[creator] = (now, cache_value)
+        self._cache_creator_history(creator, now, cache_value)
         return result
 
     def _concentration(
@@ -2103,6 +2197,17 @@ class SolanaRiskAnalyzer:
                         "creator_multiple_recent_deployments_"
                         f"{in_window}_in_"
                         f"{int(self.policy.creator_history_window_hours)}h"
+                    )
+                # A degraded scan (some getTransaction lookups failed) can
+                # only under-count deployment cadence, never over-count -- a
+                # clean "no farming detected" result is not trustworthy when
+                # the scan itself was incomplete, so this stays visible even
+                # when no hard-stop/warning fired above.
+                if creator_evidence.get("scan_degraded"):
+                    warnings.append(
+                        "creator_history_scan_degraded_"
+                        f"{_safe_int(creator_evidence.get('transactions_failed'))}"
+                        "_lookups_failed"
                     )
         except InfrastructureIndeterminateError as exc:
             infrastructure_errors.append(str(exc))
@@ -3229,6 +3334,18 @@ class SolanaPrototypeEngine:
         return value
 
     def _save_recovery_queue(self, queue: dict) -> None:
+        # Resolved items are kept forever otherwise (only ever marked
+        # "resolved", never removed) -- the same unbounded-growth shape as
+        # catalog.json/analysis_index.json. Pending items are never pruned
+        # here regardless of age: an old still-pending item is exactly the
+        # thing this queue exists to keep retrying.
+        retention_cutoff = time.time() - CATALOG_RETENTION_SECONDS
+        queue["items"] = {
+            mint: item
+            for mint, item in queue["items"].items()
+            if item.get("status") != "resolved"
+            or (_timestamp(item.get("resolved_at")) or 0) >= retention_cutoff
+        }
         queue["schema_version"] = SCHEMA_VERSION
         queue["updated_at"] = _utc_now()
         _atomic_json(self.recovery_queue_path, queue)
@@ -3624,6 +3741,18 @@ class SolanaPrototypeEngine:
             "candidate": candidate.to_dict(),
             "decision": decision.to_dict(),
             "updated_at": _utc_now(),
+        }
+        # Same unbounded-growth shape as catalog.json: every analyzed mint
+        # would otherwise stay forever. A recoverable/pending token is not
+        # lost by this -- _seed_recovery_queue() runs every learn cycle and
+        # copies any still-pending mint's candidate into recovery_queue.json
+        # (which is not pruned by age) well before it ages out here.
+        retention_cutoff = time.time() - CATALOG_RETENTION_SECONDS
+        index["tokens"] = {
+            mint: row
+            for mint, row in index["tokens"].items()
+            if _safe_int((row.get("candidate") or {}).get("block_time"))
+            >= retention_cutoff
         }
         index["updated_at"] = _utc_now()
         _atomic_json(self.analysis_index_path, index)

@@ -2,6 +2,7 @@ import base64
 import json
 import struct
 import tempfile
+import time
 import unittest
 from os import environ
 from pathlib import Path
@@ -39,6 +40,29 @@ def create_event_payload() -> str:
         + b58_bytes(3)
         + b58_bytes(4)
         + struct.pack("<q", 1_700_000_000)
+        + struct.pack("<Q", 1_073_000_000_000_000)
+        + struct.pack("<Q", 30_000_000_000)
+        + struct.pack("<Q", 793_100_000_000_000)
+        + struct.pack("<Q", 1_000_000_000_000_000)
+        + b58_bytes(5)
+        + b"\0\0"
+    )
+    return base64.b64encode(raw).decode()
+
+
+def farm_create_event_payload(*, mint_seed: int, creator: bytes, block_time: int) -> str:
+    """A CreateEvent payload for a different mint/creator, used to simulate a
+    creator's prior deployment history during a _creator_history scan."""
+    raw = (
+        chainseer_solana.PUMP_CREATE_EVENT_DISCRIMINATOR
+        + borsh_string("Farm Token")
+        + borsh_string("FARM")
+        + borsh_string("https://example.invalid/farm.json")
+        + b58_bytes(mint_seed)
+        + b58_bytes(mint_seed + 100)
+        + b58_bytes(mint_seed + 200)
+        + creator
+        + struct.pack("<q", block_time)
         + struct.pack("<Q", 1_073_000_000_000_000)
         + struct.pack("<Q", 30_000_000_000)
         + struct.pack("<Q", 793_100_000_000_000)
@@ -143,15 +167,25 @@ class FakeRPC:
         self.canonical_pool = canonical_pool
         self.signatures = []
         self.transactions = {}
+        self.failing_transaction_signatures: set[str] = set()
 
     def get_signatures(
         self, _address, *, limit, until=None, before=None
     ):
+        rows = self.signatures
         if before:
-            return []
-        return self.signatures[:limit]
+            index = next(
+                (i for i, row in enumerate(rows) if row.get("signature") == before),
+                None,
+            )
+            rows = rows[index + 1:] if index is not None else []
+        return rows[:limit]
 
     def get_transaction(self, signature):
+        if signature in self.failing_transaction_signatures:
+            raise chainseer_solana.InfrastructureIndeterminateError(
+                f"transaction {signature} temporarily unavailable"
+            )
         return self.transactions.get(signature)
 
     def get_account_info(self, address, *, encoding="jsonParsed"):
@@ -482,7 +516,8 @@ class SolanaPrototypeTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temp:
             ledger = chainseer_solana.HashLedger(Path(temp) / "events.jsonl")
             observer = chainseer_solana.PumpFunObserver(rpc, temp, ledger)
-            found = observer.sync(signature_limit=10)
+            with patch("chainseer_solana.time.time", return_value=1_700_000_120):
+                found = observer.sync(signature_limit=10)
             self.assertEqual(len(found), 1)
             self.assertEqual(observer.recent(1)[0].symbol, "SAFE")
             self.assertTrue(ledger.verify()[0])
@@ -500,7 +535,10 @@ class SolanaPrototypeTests(unittest.TestCase):
     def test_recovery_reopens_resolved_legacy_admission_schema(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
-            item = candidate()
+            # A recent block_time (rather than the shared fixture's fixed
+            # 2023 epoch) so this item survives analysis_index.json's
+            # age-based retention pruning regardless of wall-clock time.
+            item = candidate(block_time=int(time.time()) - 3600)
             legacy_decision = {
                 "evidence_state": "complete_unsafe",
                 "hard_stops": ["mint_authority_active"],
@@ -570,6 +608,176 @@ class SolanaPrototypeTests(unittest.TestCase):
             self.assertEqual(
                 normalized["admission_state"], "graduation_pending"
             )
+
+    def test_creator_history_scan_pages_past_unrelated_wallet_activity(self):
+        """A single 30-signature page can be entirely unrelated wallet noise,
+        hiding a genuine token-farm creator's prior deployments. Paging
+        backwards until the lookback window is covered must recover them."""
+        now = 2_000_000_000.0
+        creator = candidate().creator
+        rpc = FakeRPC()
+        noise = [
+            {
+                "signature": f"noise-{i}",
+                "slot": 10_000 + i,
+                "blockTime": int(now - 60 * i),
+                "err": "some-other-instruction-failed",
+            }
+            for i in range(30)
+        ]
+        farm_rows = []
+        for i in range(12):
+            sig = f"farm-{i}"
+            block_time = int(now - 3600 - 60 * i)
+            farm_rows.append(
+                {
+                    "signature": sig,
+                    "slot": 5_000 + i,
+                    "blockTime": block_time,
+                    "err": None,
+                }
+            )
+            rpc.transactions[sig] = {
+                "blockTime": block_time,
+                "transaction": {
+                    "message": {
+                        "accountKeys": [{"pubkey": chainseer_solana.PUMP_PROGRAM_ID}]
+                    }
+                },
+                "meta": {
+                    "err": None,
+                    "logMessages": [
+                        "Program data: "
+                        + farm_create_event_payload(
+                            mint_seed=10 + i,
+                            creator=b58_bytes(4),
+                            block_time=block_time,
+                        )
+                    ],
+                },
+            }
+        # Newest-first, matching real getSignaturesForAddress ordering: the
+        # unrelated noise occupies all of page one, the farm deployments only
+        # surface on page two.
+        rpc.signatures = noise + farm_rows
+
+        analyzer = chainseer_solana.SolanaRiskAnalyzer(rpc, FakeJupiter())
+        with patch("chainseer_solana.time.time", return_value=now):
+            history = analyzer._creator_history(candidate())
+            decision = analyzer.analyze(candidate())
+
+        self.assertGreaterEqual(history["pages_scanned"], 2)
+        self.assertEqual(history["prior_deployments_in_window"], 12)
+        self.assertTrue(
+            any(
+                h.startswith("creator_industrialized_deployment_")
+                for h in decision.hard_stops
+            ),
+            decision.hard_stops,
+        )
+
+    def test_creator_history_scan_degraded_when_transaction_lookup_fails(self):
+        now = 2_000_000_000.0
+        rpc = FakeRPC()
+        rows = []
+        for i in range(3):
+            sig = f"sig-{i}"
+            block_time = int(now - 60 * i)
+            rows.append(
+                {"signature": sig, "slot": i, "blockTime": block_time, "err": None}
+            )
+            rpc.transactions[sig] = {
+                "blockTime": block_time,
+                "transaction": {
+                    "message": {
+                        "accountKeys": [{"pubkey": chainseer_solana.PUMP_PROGRAM_ID}]
+                    }
+                },
+                "meta": {"err": None, "logMessages": []},
+            }
+        rpc.signatures = rows
+        rpc.failing_transaction_signatures = {"sig-1"}
+
+        analyzer = chainseer_solana.SolanaRiskAnalyzer(rpc, FakeJupiter())
+        with patch("chainseer_solana.time.time", return_value=now):
+            result = analyzer._creator_history(candidate())
+        self.assertTrue(result["scanned"])
+        self.assertTrue(result["scan_degraded"])
+        self.assertEqual(result["transactions_failed"], 1)
+
+        with patch("chainseer_solana.time.time", return_value=now):
+            decision = analyzer.analyze(candidate())
+        self.assertTrue(
+            any(
+                w.startswith("creator_history_scan_degraded_")
+                for w in decision.warnings
+            ),
+            decision.warnings,
+        )
+
+    def test_creator_history_cache_is_bounded_with_lru_eviction(self):
+        analyzer = chainseer_solana.SolanaRiskAnalyzer(FakeRPC(), FakeJupiter())
+        analyzer._creator_history_cache_max = 3
+        for i in range(5):
+            analyzer._cache_creator_history(
+                f"creator-{i}", time.monotonic(), {"scanned": False}
+            )
+        self.assertEqual(len(analyzer._creator_history_cache), 3)
+        self.assertNotIn("creator-0", analyzer._creator_history_cache)
+        self.assertNotIn("creator-1", analyzer._creator_history_cache)
+        self.assertIn("creator-4", analyzer._creator_history_cache)
+
+    def test_catalog_prunes_entries_older_than_retention_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            stale = candidate(
+                mint=chainseer_solana._b58encode(b58_bytes(9)),
+                block_time=1,
+            ).to_dict()
+            (root / "catalog.json").write_text(
+                json.dumps(
+                    {
+                        "schema_version": 1,
+                        "ecosystem": "pump_fun",
+                        "tokens": {stale["mint"]: stale},
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ledger = chainseer_solana.HashLedger(root / "events.jsonl")
+            observer = chainseer_solana.PumpFunObserver(FakeRPC(), root, ledger)
+            with patch("chainseer_solana.time.time", return_value=2_000_000_000.0):
+                observer.sync(signature_limit=10)
+            catalog = json.loads(
+                (root / "catalog.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn(stale["mint"], catalog["tokens"])
+
+    def test_recovery_queue_prunes_old_resolved_items_but_keeps_pending(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            queue = engine._load_recovery_queue()
+            queue["items"]["stale-mint"] = {
+                "mint": "stale-mint",
+                "status": "resolved",
+                "resolved_at": "2000-01-01T00:00:00+00:00",
+            }
+            queue["items"]["fresh-mint"] = {
+                "mint": "fresh-mint",
+                "status": "pending",
+            }
+            engine._save_recovery_queue(queue)
+            saved = json.loads(
+                (root / "recovery_queue.json").read_text(encoding="utf-8")
+            )
+            self.assertNotIn("stale-mint", saved["items"])
+            self.assertIn("fresh-mint", saved["items"])
 
     def test_canonical_graduated_market_allows_shadow_entry(self):
         dex = FakeDexScreener()
