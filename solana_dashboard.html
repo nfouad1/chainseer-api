@@ -320,27 +320,6 @@
       <div class="candidate-grid" id="top-candidates"><div class="empty">No graduated-market-ready candidates yet.</div></div>
     </section>
 
-    <section class="stats" aria-label="Key metrics">
-      <article class="stat"><div class="stat-label">Scheduled learner</div><div class="stat-value" id="scheduler-state">—</div><div class="stat-note" id="scheduler-note">No schedule recorded</div></article>
-      <article class="stat"><div class="stat-label">Launch catalog</div><div class="stat-value" id="catalog-size">—</div><div class="stat-note">Confirmed Pump.fun launch events</div></article>
-      <article class="stat"><div class="stat-label">Risk analyses</div><div class="stat-value" id="analysis-count">—</div><div class="stat-note" id="analysis-note">Persisted token decisions</div></article>
-      <article class="stat"><div class="stat-label">Shadow portfolio</div><div class="stat-value" id="shadow-open">—</div><div class="stat-note" id="shadow-note">Open / closed positions</div></article>
-    </section>
-
-    <section class="panel" style="margin-bottom:18px">
-      <div class="panel-head">
-        <div><h2>Guarded recursive learning</h2><div class="sub">A checkpoint pauses the paper learner before Timechain-guided review, code changes, regression tests, and a controlled smoke cycle</div></div>
-        <span class="status"><span class="dot" id="reflection-dot"></span><span id="reflection-status">ARMED</span></span>
-      </div>
-      <div class="infra-grid" style="grid-template-columns:repeat(4,1fr)">
-        <div class="infra"><div class="infra-name">Analysis cadence</div><div class="infra-value" id="reflection-cadence">—</div><div class="infra-note">Committed analyses per checkpoint</div></div>
-        <div class="infra"><div class="infra-name">Next reflection</div><div class="infra-value" id="reflection-remaining">—</div><div class="infra-note" id="reflection-next-note">Waiting for evidence</div></div>
-        <div class="infra"><div class="infra-name">Controller cycles</div><div class="infra-value" id="controller-cycles">—</div><div class="infra-note" id="controller-note">No controller state</div></div>
-        <div class="infra"><div class="infra-name">Code adaptation</div><div class="infra-value positive">GATED</div><div class="infra-note">Never in-process · tests + smoke required</div></div>
-      </div>
-      <div class="callout" id="reflection-callout">No reflection checkpoint is pending. The first canonical graduation triggers an immediate review.</div>
-    </section>
-
     <section class="grid">
       <article class="panel">
         <div class="panel-head">
@@ -370,22 +349,6 @@
           </div>
         </div>
         <div class="callout" id="evidence-callout">The dashboard will explain the dominant evidence limitation after the first refresh.</div>
-      </article>
-
-      <article class="panel">
-        <div class="panel-head">
-          <div><h2>Promotion readiness</h2><div class="sub">Passing means manual review—not automatic live capital</div></div>
-          <span class="status"><span class="dot" id="promotion-dot"></span><span id="promotion-status">NOT EVALUATED</span></span>
-        </div>
-        <div class="promotion-grid">
-          <div class="gate"><div class="gate-top"><span class="gate-name">Observations</span><span class="dot" id="gate-observations-dot"></span></div><div class="gate-value" id="gate-observations">—</div></div>
-          <div class="gate"><div class="gate-top"><span class="gate-name">Closed positions</span><span class="dot" id="gate-closed-dot"></span></div><div class="gate-value" id="gate-closed">—</div></div>
-          <div class="gate"><div class="gate-top"><span class="gate-name">Winner rate</span><span class="dot" id="gate-winners-dot"></span></div><div class="gate-value" id="gate-winners">—</div></div>
-          <div class="gate"><div class="gate-top"><span class="gate-name">Max drawdown</span><span class="dot" id="gate-drawdown-dot"></span></div><div class="gate-value" id="gate-drawdown">—</div></div>
-          <div class="gate"><div class="gate-top"><span class="gate-name">Net return</span><span class="dot" id="gate-return-dot"></span></div><div class="gate-value" id="gate-return">—</div></div>
-          <div class="gate"><div class="gate-top"><span class="gate-name">Indeterminate rate</span><span class="dot" id="gate-indeterminate-dot"></span></div><div class="gate-value" id="gate-indeterminate">—</div></div>
-        </div>
-        <div class="blockers" id="promotion-blockers"><span class="blocker">Awaiting evaluation</span></div>
       </article>
     </section>
 
@@ -550,51 +513,6 @@
       }
     }
 
-    function renderPromotion(promotion) {
-      const metrics=promotion.metrics || {}, policy=promotion.policy || {};
-      const status=String(promotion.status || "not evaluated");
-      $("promotion-status").textContent=stateLabel(status);
-      setDot("promotion-dot", status === "PROMOTABLE_FOR_REVIEW" || status === "promotable_for_review" ? true : false);
-      const gates = [
-        ["gate-observations","gate-observations-dot",metrics.observations,policy.minimum_observations,true,v=>`${num(v)} / ${num(policy.minimum_observations)}`],
-        ["gate-closed","gate-closed-dot",metrics.closed_positions,policy.minimum_closed_positions,true,v=>`${num(v)} / ${num(policy.minimum_closed_positions)}`],
-        ["gate-winners","gate-winners-dot",metrics.winner_rate_pct,policy.minimum_winner_rate_pct,true,v=>`${pct(v)} / ${num(policy.minimum_winner_rate_pct)}%`],
-        ["gate-drawdown","gate-drawdown-dot",metrics.maximum_drawdown_pct,policy.maximum_drawdown_pct,false,v=>`${pct(v)} / ${num(policy.maximum_drawdown_pct)}%`],
-        ["gate-return","gate-return-dot",metrics.net_return_pct,0,true,v=>pct(v)],
-        ["gate-indeterminate","gate-indeterminate-dot",metrics.infrastructure_indeterminate_rate_pct,policy.maximum_indeterminate_rate_pct,false,v=>`${pct(v)} / ${num(policy.maximum_indeterminate_rate_pct)}%`],
-      ];
-      gates.forEach(([valueId,dotId,value,target,higher,format])=>{
-        $(valueId).textContent=format(value);
-        const finite=Number.isFinite(Number(value)) && value !== null;
-        setDot(dotId, finite ? (higher ? Number(value)>=Number(target) : Number(value)<=Number(target)) : false);
-      });
-      const blockers=promotion.blockers || [];
-      $("promotion-blockers").innerHTML=blockers.length
-        ? blockers.map(item=>`<span class="blocker">${esc(blockerLabel(item))}</span>`).join("")
-        : '<span class="tag">All evidence gates pass · manual review required</span>';
-    }
-
-    function renderReflection(data) {
-      const reflection=data.reflection || {}, controller=data.controller || {};
-      const pending=reflection.status === "pending" || reflection.pause_requested === true;
-      $("reflection-status").textContent=pending ? "PAUSED FOR REVIEW" : String(reflection.status || "armed").toUpperCase();
-      setDot("reflection-dot", pending ? null : true);
-      $("reflection-cadence").textContent=num(reflection.analysis_interval);
-      $("reflection-remaining").textContent=num(reflection.analyses_until_checkpoint);
-      $("reflection-remaining").className=`infra-value ${pending ? "warning" : "positive"}`;
-      $("reflection-next-note").textContent=pending
-        ? `checkpoint ${short(reflection.pending_checkpoint?.checkpoint_id,8,4)}`
-        : `${num(reflection.analysis_events)} committed analyses`;
-      $("controller-cycles").textContent=num(controller.cycles_completed);
-      $("controller-note").textContent=controller.last_completed_at
-        ? `${num(controller.cycles_failed)} failed · last ${when(controller.last_completed_at)}`
-        : "No completed scheduler cycle recorded";
-      const reason=reflection.pending_checkpoint?.reason;
-      $("reflection-callout").textContent=pending
-        ? `Analysis is fail-closed at a sealed ${stateLabel(reason)} checkpoint. The reviewer must verify both chains, inspect evidence, run regression + paper smoke, and acknowledge before resuming.`
-        : `Next interval review in ${num(reflection.analyses_until_checkpoint)} analyses. The first canonical graduated market still triggers an immediate checkpoint.`;
-    }
-
     // Renders only the header's Timechain-head widget (ring-height/-type/
     // -hash/-summary, timechain-dot). The former "Evidence & integrity
     // path" panel (catalog/observation/shadow/policy/chain-report nodes)
@@ -753,22 +671,7 @@
 
     function render(data) {
       renderVerdict(data);
-      const schedule=data.schedule || {}, scheduler=data.scheduler || {};
-      const enabled=schedule.installed && schedule.enabled !== false;
-      const schedulerState=enabled ? String(scheduler.status || "scheduled").toUpperCase() : (schedule.installed ? "STOPPED" : "NOT INSTALLED");
-      $("scheduler-state").textContent=schedulerState;
-      $("scheduler-state").className=`stat-value ${enabled ? (scheduler.status === "failed" ? "negative" : "positive") : "warning"}`;
-      const cadence=schedule.interval_minutes ? `every ${num(schedule.interval_minutes)}m` : "no cadence";
-      const lastCycle=data.cycle?.timestamp ? `last cycle ${ago(data.cycle.age_seconds)} ago · ${num(data.cycle.analyzed)} analyzed` : "no cycle recorded";
-      $("scheduler-note").textContent=`${cadence} · ${lastCycle}`;
-      $("catalog-size").textContent=num(data.catalog_size);
-      $("analysis-count").textContent=num(data.analysis_count);
-      $("analysis-note").textContent=`${num(data.graduated_market_count)} graduated markets · ${num(data.admission_states?.graduated_market_ready)} ready`;
-      $("shadow-open").textContent=num(data.shadow?.open);
-      $("shadow-note").textContent=`${num(data.shadow?.open)} open / ${num(data.shadow?.closed)} closed · ${num(data.shadow?.unpriced)} unpriced`;
       renderEvidence(data);
-      renderPromotion(data.promotion || {});
-      renderReflection(data);
       renderIntegrity(data);
       renderPositions(data.shadow || {});
       renderDecisions(data.decisions || []);
