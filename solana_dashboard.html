@@ -174,7 +174,7 @@
     .event-time { color:var(--dim); font:8px var(--mono); white-space:nowrap; }
     .event-meta { margin-top:7px; color:var(--muted); font-size:10px; overflow:hidden; text-overflow:ellipsis; white-space:nowrap; }
     .position-list { display:grid; gap:10px; }
-    .position { display:grid; grid-template-columns:minmax(90px,1fr) repeat(3,auto); gap:16px; align-items:center; padding:13px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#0b0d15; }
+    .position { display:grid; grid-template-columns:minmax(90px,1fr) repeat(4,auto); gap:16px; align-items:center; padding:13px; border:1px solid rgba(255,255,255,.06); border-radius:11px; background:#0b0d15; }
     .position strong { display:block; font:11px var(--mono); }
     .position small { display:block; margin-top:5px; color:var(--muted); font:8px var(--mono); }
     .position-metric { min-width:74px; text-align:right; }
@@ -404,6 +404,11 @@
     const num = (value, digits=0) => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined,{maximumFractionDigits:digits}) : "—";
     const pct = value => Number.isFinite(Number(value)) && value !== null ? `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(2)}%` : "—";
     const sol = value => Number.isFinite(Number(value)) && value !== null ? `${Number(value).toFixed(4)} SOL` : "—";
+    const usd = value => {
+      const n = Number(value);
+      if (!Number.isFinite(n) || value === null) return "—";
+      return `$${n.toLocaleString(undefined, {notation: n >= 1000 ? "compact" : "standard", maximumFractionDigits: n >= 1000 ? 1 : 2})}`;
+    };
     const short = (value, front=10, back=5) => value ? `${String(value).slice(0,front)}…${String(value).slice(-back)}` : "—";
     const ago = seconds => {
       if (!Number.isFinite(Number(seconds)) || seconds === null) return "—";
@@ -535,6 +540,7 @@
         const multipleClass=Number.isFinite(multiple) ? (multiple>=1?"positive":"negative") : "";
         return `<div class="position">
           <div><strong>${esc(position.symbol)}</strong><small title="${esc(position.mint)}">${short(position.mint,9,5)} · ${esc(stateLabel(position.status))}</small></div>
+          <div class="position-metric"><strong>${usd(position.entry_market_cap_usd)}</strong><span>Entry mcap</span></div>
           <div class="position-metric"><strong class="${multipleClass}">${Number.isFinite(multiple)?`${multiple.toFixed(3)}×`:"—"}</strong><span>Multiple</span></div>
           <div class="position-metric"><strong>${sol(position.modeled_value_sol)}</strong><span>Modeled value</span></div>
           <div class="position-metric"><strong>${ago(position.mark_age_seconds)}</strong><span>Mark age</span></div>

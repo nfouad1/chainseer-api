@@ -1249,6 +1249,26 @@ class SolanaPrototypeTests(unittest.TestCase):
             )
             self.assertTrue(ledger.verify()[0])
 
+    def test_shadow_position_records_entry_market_cap(self):
+        with tempfile.TemporaryDirectory() as temp:
+            ledger = chainseer_solana.HashLedger(Path(temp) / "shadow.jsonl")
+            trader = chainseer_solana.SolanaShadowTrader(
+                Path(temp) / "state.json", ledger
+            )
+            analyzer = chainseer_solana.SolanaRiskAnalyzer(
+                FakeRPC(curve_complete=True),
+                FakeJupiter(),
+                dexscreener=FakeDexScreener(),
+            )
+            with patch("chainseer_solana.time.time", return_value=1_700_000_120):
+                decision = analyzer.analyze(candidate())
+            position = trader.enter(candidate(), decision)
+            self.assertEqual(position["entry_market_cap_usd"], 1_000_000)
+            self.assertEqual(position["entry_price_usd"], 0.01)
+            self.assertEqual(position["entry_fdv_usd"], 1_000_000)
+            stored = trader.state["positions"][candidate().mint]
+            self.assertEqual(stored["entry_market_cap_usd"], 1_000_000)
+
     def test_live_broadcast_is_absent(self):
         with tempfile.TemporaryDirectory() as temp:
             trader = chainseer_solana.SolanaShadowTrader(

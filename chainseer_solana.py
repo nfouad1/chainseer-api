@@ -2706,6 +2706,12 @@ class SolanaShadowTrader:
         if token_raw <= 0:
             return None
         cost = int(self.policy.amount_sol * 1_000_000_000)
+        # DexScreener market evidence is already gathered before shadow_entry_
+        # allowed can be true (analyze() only sets it once admission_state ==
+        # "graduated_market_ready", which requires secondary_market_observed),
+        # so the market cap at the moment of entry is free to capture here --
+        # no extra RPC/API call needed.
+        dex_market = (decision.market or {}).get("dexscreener") or {}
         position = {
             "mint": candidate.mint,
             "symbol": candidate.symbol,
@@ -2717,6 +2723,9 @@ class SolanaShadowTrader:
             "entry_score": decision.score,
             "entry_evidence_state": decision.evidence_state,
             "entry_quote": buy,
+            "entry_price_usd": _safe_float(dex_market.get("price_usd"), None),
+            "entry_market_cap_usd": _safe_float(dex_market.get("market_cap"), None),
+            "entry_fdv_usd": _safe_float(dex_market.get("fdv"), None),
             "marks": [],
             "paper_only": True,
             "live_execution_enabled": False,
@@ -4472,6 +4481,8 @@ def _solana_dashboard_cohort(trader: SolanaShadowTrader) -> dict:
                 "status": status,
                 "entry_score": value.get("entry_score"),
                 "entry_evidence_state": value.get("entry_evidence_state"),
+                "entry_market_cap_usd": value.get("entry_market_cap_usd"),
+                "entry_price_usd": value.get("entry_price_usd"),
                 "opened_at": value.get("opened_at"),
                 "marked_at": marked_at,
                 "mark_age_seconds": mark_age,
