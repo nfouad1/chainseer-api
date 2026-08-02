@@ -1634,14 +1634,16 @@ export default function Home() {
               <p>
                 Robinhood Chain and Base share the same EVM analysis engine.
                 Solana uses the same report schema and dimension labels, but
-                the evidence method is chain-specific. Creator/deployer history
-                and supported pool-custody verification require the mint to
-                resolve to an on-chain-verified Pump.fun launch. Solana
-                wash-trading is currently a lightweight DexScreener market
-                heuristic; EVM analysis uses transfer-window evidence. When
-                provenance or coverage cannot be established, the affected
-                checks report unknown rather than borrowing confidence from a
-                different chain or launch platform.
+                the evidence method is chain-specific. Creator/deployer
+                history requires the mint to resolve to an on-chain-verified
+                Pump.fun or Meteora Dynamic Bonding Curve launch, and
+                pool-custody verification currently covers PumpSwap, Meteora
+                DAMM v2, and Meteora DLMM pools. Solana wash-trading is
+                currently a lightweight DexScreener market heuristic; EVM
+                analysis uses transfer-window evidence. When provenance or
+                coverage cannot be established, the affected checks report
+                unknown rather than borrowing confidence from a different
+                chain or launch platform.
               </p>
             </div>
           </details>

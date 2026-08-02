@@ -7,6 +7,12 @@ from pathlib import Path
 from unittest.mock import patch
 
 from chainseer_pumpfun_provenance import PUMP_AMM_PROGRAM_ID, PUMP_PROGRAM_ID, _b58encode
+from chainseer_meteora_provenance import (
+    DAMM_V2_PROGRAM_ID,
+    DBC_PROGRAM_ID,
+    DLMM_PROGRAM_ID,
+    _DBC_POOL_CREATION_DISCRIMINATORS,
+)
 from chainseer_solana_public import (
     SolanaMintError,
     SolanaPublicAnalyzer,
@@ -71,6 +77,41 @@ def create_transaction(*, program_data_b64: str) -> dict:
             "err": None,
             "logMessages": ["Program data: " + program_data_b64],
         },
+    }
+
+
+def dbc_instruction(
+    *, variant="spl_token", creator=None, base_mint=None, pool=None, program_id=None
+) -> dict:
+    """A "partially decoded" jsonParsed instruction for a Meteora DBC pool-
+    creation call -- accounts is already a list of resolved pubkey strings
+    (Solana RPC's jsonParsed behavior for a program it has no built-in
+    parser for), matching what chainseer_meteora_provenance expects."""
+    discriminator = next(
+        raw for raw, name in _DBC_POOL_CREATION_DISCRIMINATORS.items()
+        if name == variant
+    )
+    accounts = [
+        _b58encode(bytes([1]) * 32),  # config
+        _b58encode(bytes([2]) * 32),  # pool_authority
+        creator or _b58encode(bytes([3]) * 32),
+        base_mint or _b58encode(bytes([4]) * 32),
+        _b58encode(bytes([5]) * 32),  # quote_mint
+        pool or _b58encode(bytes([6]) * 32),
+        _b58encode(bytes([7]) * 32),  # base_vault
+        _b58encode(bytes([8]) * 32),  # quote_vault
+    ]
+    return {
+        "programId": program_id or DBC_PROGRAM_ID,
+        "accounts": accounts,
+        "data": _b58encode(discriminator + b"\x00" * 8),
+    }
+
+
+def dbc_transaction(instructions: list[dict], *, err=None) -> dict:
+    return {
+        "transaction": {"message": {"instructions": instructions}},
+        "meta": {"err": err, "innerInstructions": []},
     }
 
 
@@ -206,6 +247,7 @@ class ConfigurableDexScreener:
         sells=100,
         volume_h24=65_000.0,
         liquidity_usd=150_000.0,
+        labels=None,
     ):
         self.dex_id = dex_id
         self.pair_address = pair_address
@@ -213,12 +255,14 @@ class ConfigurableDexScreener:
         self.sells = sells
         self.volume_h24 = volume_h24
         self.liquidity_usd = liquidity_usd
+        self.labels = labels or []
 
     def token_pairs(self, mint):
         return [
             {
                 "chainId": "solana",
                 "dexId": self.dex_id,
+                "labels": self.labels,
                 "pairAddress": self.pair_address,
                 "url": "https://dexscreener.com/solana/" + self.pair_address,
                 "baseToken": {"address": mint, "name": "Example", "symbol": "EX"},
@@ -669,6 +713,114 @@ class ProvenanceScoringTests(unittest.TestCase):
         self.assertNotIn(
             "wash_trading", report["analysis"]["uncertain_components"]
         )
+
+
+class MeteoraProvenanceWiringTests(unittest.TestCase):
+    """Meteora Dynamic Bonding Curve is tried as a fallback when Pump.fun
+    provenance doesn't resolve, and DAMM v2 / DLMM pools get the same
+    on-chain custody verification PumpSwap pools already had."""
+
+    def test_falls_back_to_meteora_dbc_when_no_pump_fun_provenance(self):
+        now = int(time.time())
+        mint_addr = _b58encode(bytes([50]) * 32)
+        creator_addr = _b58encode(bytes([99]) * 32)
+
+        rpc = FakeRPC()
+        rpc.signatures = [
+            signature_row("genesis", slot=1, block_time=now - 3600)
+        ]
+        rpc.transactions["genesis"] = dbc_transaction(
+            [dbc_instruction(creator=creator_addr, base_mint=mint_addr)]
+        )
+        rpc.creator_token_accounts = [
+            {
+                "account": {
+                    "data": {
+                        "parsed": {"info": {"tokenAmount": {"amount": "1000"}}}
+                    }
+                }
+            }
+        ]
+
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=FakeDexScreener(),
+            jupiter=FakeJupiter(),
+        ).analyze_token(mint_addr)
+
+        self.assertEqual(report["data"]["deployer"]["launch_venue"], "meteora_dbc")
+        self.assertEqual(report["data"]["deployer"]["creator"], creator_addr)
+        self.assertEqual(report["data"]["creator"]["launch_venue"], "meteora_dbc")
+        self.assertTrue(report["coverage"]["creator_attribution"])
+        self.assertNotIn("deployer", report["analysis"]["uncertain_components"])
+
+    def test_lp_lock_verifies_program_owned_damm_v2_pool(self):
+        rpc = FakeRPC(pool_owner=DAMM_V2_PROGRAM_ID)
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=ConfigurableDexScreener(
+                dex_id="meteora", labels=["DYN2"], pair_address="pool-good"
+            ),
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertEqual(report["data"]["lp_lock"]["state"], "protocol_secured")
+        self.assertEqual(report["data"]["lp_lock"]["amm_version"], "meteora_damm_v2")
+        self.assertEqual(report["analysis"]["component_scores"]["lp_lock"], 95.0)
+        self.assertTrue(report["coverage"]["liquidity_custody"])
+
+    def test_lp_lock_verifies_program_owned_dlmm_pool(self):
+        rpc = FakeRPC(pool_owner=DLMM_PROGRAM_ID)
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=ConfigurableDexScreener(
+                dex_id="meteora", labels=["DLMM"], pair_address="pool-good"
+            ),
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertEqual(report["data"]["lp_lock"]["state"], "protocol_secured")
+        self.assertEqual(report["data"]["lp_lock"]["amm_version"], "meteora_dlmm")
+        self.assertEqual(report["analysis"]["component_scores"]["lp_lock"], 95.0)
+
+    def test_lp_lock_flags_unexpected_owner_for_meteora_pool(self):
+        rpc = FakeRPC(pool_owner=TOKEN_PROGRAM_ID)
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=ConfigurableDexScreener(
+                dex_id="meteora", labels=["DYN2"], pair_address="pool-bad"
+            ),
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertEqual(report["data"]["lp_lock"]["state"], "custody_unexpected_owner")
+        self.assertEqual(report["analysis"]["component_scores"]["lp_lock"], 15.0)
+        red_flags = report["analysis"]["red_flags"]
+        self.assertTrue(
+            any("not owned by the canonical" in flag for flag in red_flags),
+            red_flags,
+        )
+
+    def test_lp_lock_stays_unverified_for_unrecognized_meteora_pool_type(self):
+        """An older/unlabeled Meteora pool variant this module has no
+        verified program ID for must stay honestly unresolved rather than
+        risk a false custody claim."""
+        rpc = FakeRPC(pool_owner=DAMM_V2_PROGRAM_ID)
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=ConfigurableDexScreener(
+                dex_id="meteora", labels=["DYN"], pair_address="pool-legacy"
+            ),
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertEqual(report["data"]["lp_lock"]["state"], "custody_unverified")
+        self.assertFalse(report["coverage"]["liquidity_custody"])
 
 
 class AlertWiringTests(unittest.TestCase):

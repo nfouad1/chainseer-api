@@ -31,6 +31,12 @@ from chainseer_pumpfun_provenance import (
     creator_deployment_history,
     resolve_genesis_creator,
 )
+from chainseer_meteora_provenance import (
+    DAMM_V2_PROGRAM_ID,
+    DLMM_PROGRAM_ID,
+    creator_deployment_history as meteora_creator_deployment_history,
+    resolve_genesis_creator as meteora_resolve_genesis_creator,
+)
 from chainseer_wallet_convergence import WalletConvergenceTracker
 
 
@@ -479,6 +485,33 @@ class SolanaPublicAnalyzer:
         return f"{max(1, age_seconds // 604800)}w old"
 
     @staticmethod
+    def _expected_pool_owner_program(
+        pair: dict | None,
+    ) -> tuple[str, str, str] | None:
+        """Which program, if any, should own this DexScreener pair's pool
+        account -- the venues this module has a verified program ID for.
+
+        DexScreener uses a single dexId ("meteora") for every Meteora pool
+        type, distinguishing the variant only via `labels` (confirmed
+        against live DexScreener search results): "DYN2" is DAMM v2,
+        "DLMM" is the DLMM program. Older "DYN" (Dynamic AMM v1) pools are
+        deliberately left unverified here -- no v1 program ID has been
+        confirmed against MeteoraAg's own source yet, and guessing one
+        would risk a false custody claim, which is worse than staying
+        honestly unresolved.
+        """
+        dex_id = str((pair or {}).get("dexId") or "").lower()
+        if dex_id == "pumpswap":
+            return PUMP_AMM_PROGRAM_ID, "pumpswap", "pump_amm_program"
+        if dex_id == "meteora":
+            labels = {str(label).upper() for label in (pair or {}).get("labels") or []}
+            if "DYN2" in labels:
+                return DAMM_V2_PROGRAM_ID, "meteora_damm_v2", "meteora_damm_v2_program"
+            if "DLMM" in labels:
+                return DLMM_PROGRAM_ID, "meteora_dlmm", "meteora_dlmm_program"
+        return None
+
+    @staticmethod
     def _score_liquidity(liquidity: float | None) -> float:
         if liquidity is None:
             return 35.0
@@ -622,23 +655,28 @@ class SolanaPublicAnalyzer:
     def _deployer_and_creator_risk(
         self, mint: str, *, supply_raw: int
     ) -> tuple[dict, dict, list[dict]]:
-        """Resolve Pump.fun launch provenance (if any) and score both the
-        deployer's cadence -- the Solana analog of chainseer.py's
+        """Resolve launch provenance -- Pump.fun first, then Meteora Dynamic
+        Bonding Curve as a fallback -- and score both the deployer's
+        cadence -- the Solana analog of chainseer.py's
         _analyze_deployer_and_creation serial-deployer check -- and the
         creator's current supply concentration, the analog of chainseer.py's
         GoPlus-sourced creator_percent check.
 
         Both stay honestly unresolved when the mint isn't a verifiable
-        Pump.fun launch, matching this module's existing principle of never
-        claiming provenance that wasn't actually established -- most SPL
-        mints on this public, arbitrary-address endpoint won't be Pump.fun
-        launches at all.
+        launch on either supported venue, matching this module's existing
+        principle of never claiming provenance that wasn't actually
+        established -- most SPL mints on this public, arbitrary-address
+        endpoint won't be a launch on either at all.
         """
         facts: list[dict] = []
-        unresolved_reason = "No verified Pump.fun launch provenance for this mint."
+        unresolved_reason = (
+            "No verified Pump.fun or Meteora Dynamic Bonding Curve launch "
+            "provenance for this mint."
+        )
         deployer_data: dict = {"resolved": False, "reason": unresolved_reason}
         creator_data: dict = {"resolved": False, "reason": unresolved_reason}
 
+        venue = "pump_fun"
         try:
             event = resolve_genesis_creator(
                 self.rpc.get_signatures_for_address,
@@ -648,9 +686,24 @@ class SolanaPublicAnalyzer:
         except InfrastructureIndeterminateError:
             event = None
         if event is None:
+            venue = "meteora_dbc"
+            try:
+                event = meteora_resolve_genesis_creator(
+                    self.rpc.get_signatures_for_address,
+                    self.rpc.get_transaction,
+                    mint,
+                )
+            except InfrastructureIndeterminateError:
+                event = None
+        if event is None:
             return deployer_data, creator_data, facts
 
-        history = creator_deployment_history(
+        history_fn = (
+            creator_deployment_history
+            if venue == "pump_fun"
+            else meteora_creator_deployment_history
+        )
+        history = history_fn(
             self.rpc.get_signatures_for_address,
             self.rpc.get_transaction,
             event.creator,
@@ -658,6 +711,7 @@ class SolanaPublicAnalyzer:
         )
         deployer_data = {
             "resolved": True,
+            "launch_venue": venue,
             "creator": event.creator,
             "genesis_signature": event.signature,
             **history,
@@ -668,7 +722,7 @@ class SolanaPublicAnalyzer:
                 "solana_rpc",
                 {
                     "method": "getSignaturesForAddress+getTransaction",
-                    "purpose": "pump_fun_genesis_and_creator_cadence",
+                    "purpose": f"{venue}_genesis_and_creator_cadence",
                     "mint": mint,
                     "creator": event.creator,
                 },
@@ -705,6 +759,7 @@ class SolanaPublicAnalyzer:
             )
             creator_data = {
                 "resolved": True,
+                "launch_venue": venue,
                 "creator": event.creator,
                 "holding_raw": holding_raw,
                 "pct_total_supply": (
@@ -716,6 +771,7 @@ class SolanaPublicAnalyzer:
         except InfrastructureIndeterminateError:
             creator_data = {
                 "resolved": True,
+                "launch_venue": venue,
                 "creator": event.creator,
                 "holding_raw": None,
                 "pct_total_supply": None,
@@ -1117,7 +1173,9 @@ class SolanaPublicAnalyzer:
         }
         lp_lock_score = 50.0
         pool_address = (pair or {}).get("pairAddress")
-        if pool_address and str((pair or {}).get("dexId") or "").lower() == "pumpswap":
+        expected_custody = self._expected_pool_owner_program(pair)
+        if pool_address and expected_custody is not None:
+            expected_owner, amm_version, protocol_label = expected_custody
             try:
                 pool_account = (
                     self.rpc.get_account_info(pool_address, encoding="base64") or {}
@@ -1129,23 +1187,24 @@ class SolanaPublicAnalyzer:
                         "solana_rpc",
                         {
                             "method": "getAccountInfo",
-                            "purpose": "pumpswap_pool_custody",
+                            "purpose": f"{amm_version}_pool_custody",
                             "pool": pool_address,
                         },
                         {"owner": pool_owner},
                         slot_anchor,
                     )
                 )
-                if pool_owner == PUMP_AMM_PROGRAM_ID:
-                    # PumpSwap pool vaults are PDAs owned by the AMM program
-                    # itself -- no single wallet (not even the creator) can
-                    # unilaterally withdraw the pool's liquidity. That's the
-                    # Solana analog of an EVM LP token being locked/burned:
-                    # proof custody sits with the protocol, not a person.
+                if pool_owner == expected_owner:
+                    # Pool vaults for these protocols are PDAs owned by the
+                    # AMM program itself -- no single wallet (not even the
+                    # creator) can unilaterally withdraw the pool's
+                    # liquidity. That's the Solana analog of an EVM LP token
+                    # being locked/burned: proof custody sits with the
+                    # protocol, not a person.
                     lp_lock_data = {
                         "state": "protocol_secured",
-                        "amm_version": "pumpswap",
-                        "method": "pool_account_owned_by_pump_amm_program",
+                        "amm_version": amm_version,
+                        "method": f"pool_account_owned_by_{protocol_label}",
                         "locked": True,
                         "withdrawal_verified": True,
                         "withdrawable_pct": 0.0,
@@ -1153,13 +1212,13 @@ class SolanaPublicAnalyzer:
                     lp_lock_score = 95.0
                     green.append(
                         "Liquidity custody protocol secured: pool is "
-                        "owned by the canonical PumpSwap program."
+                        f"owned by the canonical {amm_version} program."
                     )
                 else:
                     lp_lock_data = {
                         "state": "custody_unexpected_owner",
-                        "amm_version": "pumpswap",
-                        "method": "pool_account_owned_by_pump_amm_program",
+                        "amm_version": amm_version,
+                        "method": f"pool_account_owned_by_{protocol_label}",
                         "locked": False,
                         "withdrawal_verified": False,
                         "withdrawable_pct": None,
@@ -1168,17 +1227,19 @@ class SolanaPublicAnalyzer:
                     hard_stops.append(
                         self._hard_stop(
                             "lp_custody_unexpected_owner",
-                            "The DexScreener-reported PumpSwap pool address "
-                            "is not owned by the canonical PumpSwap program "
+                            f"The DexScreener-reported {amm_version} pool "
+                            "address is not owned by the canonical program "
                             "on-chain.",
                         )
                     )
                 del unknown["lp_lock"]
             except InfrastructureIndeterminateError as exc:
                 infrastructure_errors.append(str(exc))
-        # Any other dex (Raydium, Orca, etc.) or no market at all stays
-        # honestly custody_unverified -- only the PumpSwap case above has a
-        # concrete, cheap on-chain ownership check built for it so far.
+        # Any other dex (Raydium, Orca, a Meteora pool type without a
+        # verified program ID here, or no market at all) stays honestly
+        # custody_unverified -- only the venues in
+        # _expected_pool_owner_program have a concrete, cheap on-chain
+        # ownership check built for them so far.
 
         token_info: dict | None = None
         try:
@@ -1395,10 +1456,12 @@ class SolanaPublicAnalyzer:
         confidence = "MODERATE" if completed == len(essential_coverage) else "LIMITED"
         confidence_detail = (
             f"{completed}/{len(essential_coverage)} core Solana evidence groups. "
-            "Creator attribution and pool-vault custody are verified when the "
-            "mint resolves to a real Pump.fun launch; wash-trading uses a "
-            "lightweight DexScreener-derived heuristic, not on-chain "
-            "transfer-graph analysis."
+            "Creator attribution is verified when the mint resolves to a "
+            "real Pump.fun or Meteora Dynamic Bonding Curve launch; "
+            "pool-vault custody is verified for PumpSwap, Meteora DAMM v2, "
+            "and Meteora DLMM pools. Wash-trading uses a lightweight "
+            "DexScreener-derived heuristic, not on-chain transfer-graph "
+            "analysis."
         )
         if hard_stops:
             risk_level = "High"
