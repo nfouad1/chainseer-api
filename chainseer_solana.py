@@ -3864,11 +3864,32 @@ class SolanaPrototypeEngine:
             "admission_state"
         )
 
-    @staticmethod
-    def _is_recoverable(decision: dict | SolanaRiskDecision) -> bool:
+    # Hard-stop codes whose underlying condition can genuinely change as a
+    # market matures -- concentration redistributes and execution liquidity
+    # deepens over time, unlike e.g. mint_authority_active or
+    # creator_industrialized_deployment_*, which are permanent facts about
+    # the token/creator and must never be re-offered a second chance. Was
+    # previously only consulted for a legacy pre-admission-schema migration
+    # path (see _is_recoverable below); real data showed concentration
+    # hard-stops dominate (198 of ~240 total across one operator's dataset)
+    # and that a hard-stopped token was PERMANENTLY excluded from re-
+    # analysis even after genuinely distributing further -- this constant
+    # is now also consulted for current-schema decisions, not just legacy
+    # ones (see _is_recoverable).
+    TRANSIENT_HARD_STOP_PREFIXES = (
+        "top1_circulating_concentration_high",
+        "top10_circulating_concentration_high",
+        "jupiter_roundtrip_retention_low",
+        "jupiter_buy_price_impact_high",
+    )
+
+    @classmethod
+    def _is_recoverable(cls, decision: dict | SolanaRiskDecision) -> bool:
         """A decision is recoverable (worth re-analyzing later) when it is not
-        yet judgeable, or when a launch is still progressing toward the separately
-        evidenced graduated-market cohort."""
+        yet judgeable, when a launch is still progressing toward the separately
+        evidenced graduated-market cohort, or when every hard-stop it carries
+        is one of TRANSIENT_HARD_STOP_PREFIXES (a verdict that can genuinely
+        flip as the market matures, not a permanent disqualification)."""
         evidence_state = (
             decision.evidence_state if isinstance(decision, SolanaRiskDecision)
             else decision.get("evidence_state")
@@ -3886,6 +3907,10 @@ class SolanaPrototypeEngine:
             if isinstance(decision, SolanaRiskDecision)
             else decision.get("admission_state")
         )
+        hard_stops = (
+            decision.hard_stops if isinstance(decision, SolanaRiskDecision)
+            else decision.get("hard_stops")
+        ) or []
         if admission_state is None and not isinstance(
             decision, SolanaRiskDecision
         ):
@@ -3894,18 +3919,19 @@ class SolanaPrototypeEngine:
             # only blockers can genuinely change as a market matures.
             if evidence_state == "complete_safe":
                 return True
-            transient_prefixes = (
-                "top1_circulating_concentration_high",
-                "top10_circulating_concentration_high",
-                "jupiter_roundtrip_retention_low",
-                "jupiter_buy_price_impact_high",
-            )
-            hard_stops = decision.get("hard_stops") or []
             if hard_stops and all(
-                str(stop).startswith(transient_prefixes)
+                str(stop).startswith(cls.TRANSIENT_HARD_STOP_PREFIXES)
                 for stop in hard_stops
             ):
                 return True
+        if admission_state in {
+            "graduated_market_unsafe",
+            "launch_observation_unsafe",
+        } and hard_stops and all(
+            str(stop).startswith(cls.TRANSIENT_HARD_STOP_PREFIXES)
+            for stop in hard_stops
+        ):
+            return True
         return admission_state in {
             "graduation_pending",
             "canonical_migration_pending",

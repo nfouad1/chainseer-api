@@ -2360,5 +2360,187 @@ class ConcentrationPoolVaultExclusionTests(unittest.TestCase):
         )
 
 
+class TransientHardStopRecoveryTests(unittest.TestCase):
+    """A hard-stop whose underlying condition can genuinely change (holder
+    concentration, execution liquidity) must not permanently exclude a
+    token from re-analysis -- real operator data showed concentration
+    hard-stops dominate (198 of ~240 total) and every graduated token
+    checked had been stuck in graduated_market_unsafe forever, even once
+    its concentration had since improved. Extends the SAME transient-
+    hard-stop concept the legacy pre-admission-schema migration path
+    already used (see TRANSIENT_HARD_STOP_PREFIXES), rather than adding a
+    new recovery mechanism."""
+
+    @staticmethod
+    def _decision(admission_state, hard_stops, *, evidence_state="complete_unsafe"):
+        return {
+            "evidence_state": evidence_state,
+            "admission_state": admission_state,
+            "hard_stops": hard_stops,
+            "concentration": {"distribution_stage": "measurable"},
+        }
+
+    def test_graduated_market_unsafe_with_only_transient_stops_is_recoverable(self):
+        decision = self._decision(
+            "graduated_market_unsafe",
+            ["top1_circulating_concentration_high", "top10_circulating_concentration_high"],
+        )
+        self.assertTrue(
+            chainseer_solana.SolanaPrototypeEngine._is_recoverable(decision)
+        )
+
+    def test_launch_observation_unsafe_with_only_transient_stops_is_recoverable(self):
+        decision = self._decision(
+            "launch_observation_unsafe", ["jupiter_roundtrip_retention_low"]
+        )
+        self.assertTrue(
+            chainseer_solana.SolanaPrototypeEngine._is_recoverable(decision)
+        )
+
+    def test_permanent_hard_stop_is_never_recoverable(self):
+        """mint_authority_active is a fact about the contract, not a market
+        condition -- it can never become recoverable regardless of how the
+        predicate is extended."""
+        decision = self._decision("graduated_market_unsafe", ["mint_authority_active"])
+        self.assertFalse(
+            chainseer_solana.SolanaPrototypeEngine._is_recoverable(decision)
+        )
+
+    def test_mixed_transient_and_permanent_stops_is_not_recoverable(self):
+        """ALL hard-stops must be transient -- a single permanent one (e.g.
+        creator farming) must veto recovery even alongside transient ones."""
+        decision = self._decision(
+            "graduated_market_unsafe",
+            [
+                "top1_circulating_concentration_high",
+                "creator_industrialized_deployment_10_in_24h",
+            ],
+        )
+        self.assertFalse(
+            chainseer_solana.SolanaPrototypeEngine._is_recoverable(decision)
+        )
+
+    def test_sealed_solanariskdecision_object_is_also_recognized(self):
+        """The predicate must work identically whether called with the
+        persisted dict form (analysis_index.json) or the live dataclass
+        (evaluate_candidate's in-memory decision)."""
+        decision = chainseer_solana.SolanaRiskDecision(
+            score=51.0,
+            risk_level="High",
+            evidence_state="complete_unsafe",
+            shadow_entry_allowed=False,
+            hard_stops=["top10_circulating_concentration_high"],
+            warnings=[],
+            infrastructure_errors=[],
+            coverage={},
+            origin={},
+            mint={},
+            bonding_curve={},
+            concentration={},
+            creator_evidence={},
+            convergence_evidence={},
+            market={},
+            execution_evidence={},
+            admission_state="graduated_market_unsafe",
+        )
+        self.assertTrue(
+            chainseer_solana.SolanaPrototypeEngine._is_recoverable(decision)
+        )
+
+    def test_seed_recovery_queue_picks_up_an_existing_transient_hard_stop_backlog(self):
+        """End-to-end: a token already recorded as graduated_market_unsafe
+        (like the real Jordan/BOT/CATE/TOM backlog) must be picked up by
+        the very next learn_once cycle's seed step, with no separate
+        backfill needed -- the recovery loop IS the transition mechanism."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            item = candidate()
+            index = {
+                "schema_version": 1,
+                "tokens": {
+                    item.mint: {
+                        "candidate": item.to_dict(),
+                        "decision": {
+                            "evidence_state": "complete_unsafe",
+                            "admission_state": "graduated_market_unsafe",
+                            "score": 51.0,
+                            "hard_stops": [
+                                "top1_circulating_concentration_high",
+                                "top10_circulating_concentration_high",
+                            ],
+                            "warnings": [],
+                            "cohort": "graduated_market",
+                            "concentration": {"distribution_stage": "measurable"},
+                            "graduation": {
+                                "canonical_pool_verified_on_chain": True
+                            },
+                        },
+                        "updated_at": chainseer_solana._utc_now(),
+                    }
+                },
+            }
+            chainseer_solana._atomic_json(engine.analysis_index_path, index)
+
+            added = engine._seed_recovery_queue()
+
+            self.assertEqual(added, 1)
+            queue = engine._load_recovery_queue()
+            queued = queue["items"][item.mint]
+            self.assertEqual(queued["status"], "pending")
+            self.assertEqual(
+                queued["last_admission_state"], "graduated_market_unsafe"
+            )
+
+    def test_recovery_clears_once_concentration_genuinely_improves(self):
+        """Once re-analysis produces a decision that no longer trips
+        _is_recoverable, _update_recovery_queue must mark the item
+        resolved -- confirming the queue naturally drains rather than
+        re-checking a token forever."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            item = candidate()
+            unsafe_decision = chainseer_solana.SolanaRiskDecision(
+                score=51.0, risk_level="High", evidence_state="complete_unsafe",
+                shadow_entry_allowed=False,
+                hard_stops=["top1_circulating_concentration_high"],
+                warnings=[], infrastructure_errors=[], coverage={}, origin={},
+                mint={}, bonding_curve={}, concentration={}, creator_evidence={},
+                convergence_evidence={}, market={}, execution_evidence={},
+                admission_state="graduated_market_unsafe",
+            )
+            engine._update_recovery_queue(item, unsafe_decision, recovery=False)
+            self.assertEqual(
+                engine._load_recovery_queue()["items"][item.mint]["status"],
+                "pending",
+            )
+
+            clean_decision = chainseer_solana.SolanaRiskDecision(
+                score=95.0, risk_level="Low", evidence_state="complete_safe",
+                shadow_entry_allowed=True, hard_stops=[], warnings=[],
+                infrastructure_errors=[], coverage={}, origin={}, mint={},
+                bonding_curve={}, concentration={}, creator_evidence={},
+                convergence_evidence={}, market={}, execution_evidence={},
+                admission_state="graduated_market_ready",
+            )
+            engine._update_recovery_queue(item, clean_decision, recovery=True)
+
+            self.assertEqual(
+                engine._load_recovery_queue()["items"][item.mint]["status"],
+                "resolved",
+            )
+
+
 if __name__ == "__main__":
     unittest.main()
