@@ -1322,6 +1322,16 @@ a { color: inherit; text-decoration: none; }
   font-size: 11px;
 }
 .demo-content { padding: 16px; }
+.demo-content > .live-report {
+  width: 100%;
+  margin: 0;
+  border: 0;
+  box-shadow: none;
+}
+.demo-live-report .eyebrow,
+.demo-live-report .status-dot { color: var(--amber); }
+.demo-live-report .status-dot { background: var(--amber); box-shadow: 0 0 14px rgba(255, 179, 71, 0.55); }
+.critical-monitor.monitor-demo button:disabled { cursor: not-allowed; }
 .decision-grid { display: grid; grid-template-columns: 1.2fr 0.8fr; gap: 16px; }
 .decision-card, .stops-card, .factor-panel, .evidence-panel {
   border: 1px solid var(--line);

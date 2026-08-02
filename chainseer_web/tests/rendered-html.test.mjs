@@ -38,6 +38,11 @@ test("server-renders the Chainseer product page", async () => {
   assert.match(html, /SPL · slot-anchored/);
   assert.match(html, /Timechain-sealed/);
   assert.match(html, /Powered by Cypher Tempre/);
+  assert.match(html, /Fictional report preview · not sealed/);
+  assert.match(html, /Sentinel Demo/);
+  assert.match(html, /Available after a real token scan/);
+  assert.match(html, /Fictional deployer/);
+  assert.match(html, /DEMO · NOT SEALED/);
   assert.doesNotMatch(html, /Private beta/i);
   assert.match(html, /not financial advice/i);
   assert.doesNotMatch(html, /Your site is taking shape|react-loading-skeleton/);
@@ -102,7 +107,7 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, /What Chainseer actually checks, and how/);
   assert.match(page, /external-provider\s+responses are timestamped and hash-committed/);
   assert.match(page, /An &ldquo;unlocked&rdquo; label by\s+itself is not enough/);
-  assert.match(page, /Solana\s+wash-trading is currently a lightweight DexScreener market\s+heuristic/);
+  assert.match(page, /Solana\s+wash-trading\s+is\s+currently a lightweight DexScreener market\s+heuristic/);
   assert.match(page, /public scanner does not hold a wallet key/);
   assert.doesNotMatch(page, /real buy-then-sell round trip actually completes/);
   assert.doesNotMatch(page, /twelve independent dimensions/);
@@ -134,6 +139,14 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(styles, /\.analysis-disclosure-trigger::after/);
   assert.match(page, /SAMPLE DATA · NOT LIVE/);
   assert.match(page, /nothing was sealed/);
+  assert.match(page, /const demoReport: PublicReport/);
+  assert.match(page, /report=\{demoReport\}/);
+  assert.match(page, /Fictional report preview · not sealed/);
+  assert.match(page, /Available after a real token scan/);
+  assert.match(page, /DEMO · NOT SEALED/);
+  assert.match(page, /demo-live-report/);
+  assert.doesNotMatch(page, /const factors = \[/);
+  assert.doesNotMatch(page, /className="decision-word"/);
   assert.match(page, /setShowExample\(false\)/);
   assert.match(page, /Monitor critical events/);
   assert.match(page, /chainseer-critical-monitors-v1/);

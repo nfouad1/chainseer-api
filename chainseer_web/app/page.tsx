@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useState } from "react";
+import { FormEvent, useEffect, useId, useState } from "react";
 
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -324,6 +324,7 @@ function nodePriority(node: EntityGraphNode, graph: EntityGraph) {
 function EntityEvidenceGraph({ graph }: { graph?: EntityGraph }) {
   const [filter, setFilter] = useState<GraphFilter>("all");
   const [selectedId, setSelectedId] = useState(graph?.root_entity_id || "");
+  const titleId = useId();
 
   if (!graph?.graph_hash || !graph.nodes?.length) {
     return (
@@ -384,13 +385,13 @@ function EntityEvidenceGraph({ graph }: { graph?: EntityGraph }) {
     .slice(0, 6);
 
   return (
-    <section className="entity-graph" aria-labelledby="entity-graph-title">
+    <section className="entity-graph" aria-labelledby={titleId}>
       <details className="analysis-disclosure">
         <summary className="entity-graph-head analysis-disclosure-trigger">
           <div>
             <span className="panel-index">03</span>
             <p className="entity-kicker">Evidence-linked ownership and control</p>
-            <h3 id="entity-graph-title">Entity &amp; insider evidence</h3>
+            <h3 id={titleId}>Entity &amp; insider evidence</h3>
           </div>
           <div className={`insider-risk risk-${graph.summary.insider_risk_level.toLowerCase()}`}>
             <span>Insider risk</span>
@@ -553,11 +554,13 @@ function LiveReport({
   isMonitoring,
   monitorBusy,
   onToggleMonitor,
+  isDemo = false,
 }: {
   report: PublicReport;
   isMonitoring: boolean;
   monitorBusy: boolean;
   onToggleMonitor: () => void;
+  isDemo?: boolean;
 }) {
   const factorEntries = Object.entries(report.factors)
     .filter(([key, value]) => key !== "legitimacy" && Number.isFinite(value))
@@ -596,12 +599,16 @@ function LiveReport({
       : "No reliable count returned";
 
   return (
-    <section className="live-report" id="live-report" aria-live="polite">
+    <section
+      className={`live-report ${isDemo ? "demo-live-report" : ""}`}
+      id={isDemo ? "demo-live-report" : "live-report"}
+      aria-live={isDemo ? undefined : "polite"}
+    >
       <div className="live-report-head">
         <div>
           <div className="eyebrow">
             <span className="status-dot" />
-            Live sealed analysis
+            {isDemo ? "Fictional report preview · not sealed" : "Live sealed analysis"}
           </div>
           <h2>
             {report.token.name || "Unknown token"}
@@ -687,26 +694,31 @@ function LiveReport({
         <p>{report.decision.recommendation || "Review the evidence before making a decision."}</p>
       </div>
 
-      <div className={`critical-monitor ${isMonitoring ? "monitor-active" : ""}`}>
+      <div className={`critical-monitor ${isMonitoring ? "monitor-active" : ""} ${isDemo ? "monitor-demo" : ""}`}>
         <div>
           <span>Critical state monitor</span>
           <strong>
-            {isMonitoring
+            {isDemo
+              ? "Available after a real token scan"
+              : isMonitoring
               ? "Watching liquidity, authority, upgrades, and sellability"
               : "Get alerted when a critical token state changes"}
           </strong>
           <p>
-            Confirmed events are checked near real time while this site is open.
-            Delivery follows watcher cadence and cannot be guaranteed before a transaction.
+            {isDemo
+              ? "Monitoring is disabled for fictional sample data. A real report can activate the device-local critical-event watcher."
+              : "Confirmed events are checked near real time while this site is open. Delivery follows watcher cadence and cannot be guaranteed before a transaction."}
           </p>
         </div>
         <button
           type="button"
           onClick={onToggleMonitor}
-          disabled={monitorBusy}
-          aria-pressed={isMonitoring}
+          disabled={isDemo || monitorBusy}
+          aria-pressed={isDemo ? undefined : isMonitoring}
         >
-          {monitorBusy
+          {isDemo
+            ? "Demo only"
+            : monitorBusy
             ? "Updating…"
             : isMonitoring
               ? "Stop monitoring"
@@ -756,14 +768,14 @@ function LiveReport({
         <details className="live-evidence analysis-disclosure">
           <summary className="panel-head analysis-disclosure-trigger">
             <div><span className="panel-index">02</span><h3>Verification</h3></div>
-            <div className="verified-seal"><span>◆</span> {report.timechain.decision || "SEALED"}</div>
+            <div className="verified-seal"><span>◆</span> {isDemo ? "DEMO · NOT SEALED" : report.timechain.decision || "SEALED"}</div>
           </summary>
           <div className="analysis-disclosure-body">
             <dl>
-              <div><dt>Timechain Ring</dt><dd>{report.timechain.ring ?? "—"}</dd></div>
-              <div><dt>Ring hash</dt><dd>{report.timechain.ring_hash?.slice(0, 20) || "—"}…</dd></div>
-              <div><dt>Ledger hash</dt><dd>{report.evidence.ledger_hash?.slice(0, 20) || "—"}…</dd></div>
-              <div><dt>{anchorLabel}</dt><dd>{report.evidence.block_pin?.toLocaleString() || "—"}</dd></div>
+              <div><dt>Timechain Ring</dt><dd>{isDemo ? "Not sealed" : report.timechain.ring ?? "—"}</dd></div>
+              <div><dt>Ring hash</dt><dd>{isDemo ? "Not created" : `${report.timechain.ring_hash?.slice(0, 20) || "—"}…`}</dd></div>
+              <div><dt>Ledger hash</dt><dd>{isDemo ? "Illustrative only" : `${report.evidence.ledger_hash?.slice(0, 20) || "—"}…`}</dd></div>
+              <div><dt>{isDemo ? `Illustrative ${anchorLabel.toLowerCase()}` : anchorLabel}</dt><dd>{report.evidence.block_pin?.toLocaleString() || "—"}</dd></div>
             </dl>
             {report.evidence.anchor_caveat && (
               <p className="anchor-caveat">{report.evidence.anchor_caveat}</p>
@@ -805,44 +817,203 @@ function LiveReport({
   );
 }
 
-const factors = [
-  { label: "Contract security", score: 94 },
-  { label: "Honeypot safety", score: 100 },
-  { label: "Liquidity health", score: 76 },
-  { label: "LP lock", score: 82 },
-  { label: "Holder distribution", score: 61 },
-  { label: "Volume quality", score: 72 },
-  { label: "Token maturity", score: 45 },
-  { label: "Creator risk", score: 68 },
-  { label: "Wash trading", score: 87 },
-  { label: "Deployer history", score: 74 },
-  { label: "Market sentiment", score: 70 },
-  { label: "Trend strength", score: 66 },
-];
-
-const evidence = [
-  {
-    id: "DEMO-001",
-    label: "Source code verified",
-    source: "Blockscout",
-    block: "Demo block",
-    status: "confirmed",
+const demoReport: PublicReport = {
+  schema_version: "chainseer.public.v1",
+  token: {
+    address: "No contract address — fictional sample",
+    name: "Sentinel Demo",
+    symbol: "DEMO",
+    chain: "Base · fictional example",
+    chain_id: 8453,
   },
-  {
-    id: "DEMO-002",
-    label: "No sell restriction detected",
-    source: "GoPlus + RPC",
-    block: "Demo block",
-    status: "confirmed",
+  decision: {
+    action: "WATCHLIST",
+    risk_level: "Medium",
+    model_risk_level: "Medium",
+    score: 78,
+    confidence: "MODERATE",
+    confidence_detail:
+      "Illustrative evidence coverage with one deliberately unresolved deployer-history check.",
+    recommendation:
+      "No deterministic hard stop appears in this fictional example, but concentration and market maturity warrant monitoring before exposure.",
+    hard_stops: [],
   },
-  {
-    id: "DEMO-003",
-    label: "Top 10 holders control 31.8%",
-    source: "RPC",
-    block: "Demo block",
-    status: "watch",
+  factors: {
+    security: 94,
+    honeypot_safety: 95,
+    liquidity: 76,
+    lp_lock: 82,
+    holder_distribution: 61,
+    volume: 72,
+    maturity: 45,
+    creator_risk: 68,
+    wash_trading: 87,
+    deployer: 50,
+    sentiment: 70,
+    trend: 66,
   },
-];
+  flags: {
+    red: [],
+    yellow: [
+      "Top 10 non-pool holders control an illustrative 31.8% of supply",
+      "Fictional market is only three days old",
+    ],
+    green: [
+      "Illustrative source code is verified",
+      "No sell restriction appears in the sample evidence",
+      "Primary liquidity custody appears constrained in the sample",
+    ],
+    unknown: {
+      deployer: "Historical deployer outcomes were intentionally omitted from the demo.",
+    },
+  },
+  market: {
+    price_usd: 0.00428,
+    market_cap_usd: 4_280_000,
+    market_cap_kind: "reported_market_cap",
+    market_cap_source: "Fictional DexScreener-style sample",
+    fdv_usd: 4_280_000,
+    liquidity_usd: 185_000,
+    volume_24h_usd: 92_400,
+    age: "3d old · fictional",
+  },
+  holders: {
+    count: 1_842,
+    count_status: "reported",
+    count_source: "Fictional explorer sample",
+    sample_size: 20,
+    sample_kind: "largest non-pool holders",
+    largest_holder_pct: 12.4,
+    top10_holder_pct: 31.8,
+    concentration_basis: "illustrative circulating supply",
+    pool_and_program_vaults_excluded: true,
+    caveat: "All holder values in this demonstration are fictional.",
+  },
+  evidence: {
+    fact_count: 7,
+    block_pin: 21_234_567,
+    anchor_type: "block_pin",
+    anchor_caveat:
+      "This block number is illustrative. No node or provider was queried and no evidence ledger was created.",
+    infrastructure_indeterminate: [],
+    facts: [
+      { id: "DEMO-001", source: "Fictional RPC", block: 21_234_567 },
+      { id: "DEMO-002", source: "Fictional Blockscout", block: 21_234_567 },
+      { id: "DEMO-003", source: "Fictional GoPlus", block: 21_234_567 },
+      { id: "DEMO-004", source: "Fictional DexScreener", block: 21_234_567 },
+      { id: "DEMO-005", source: "Fictional holder sample", block: 21_234_567 },
+      { id: "DEMO-006", source: "Fictional liquidity check", block: 21_234_567 },
+      { id: "DEMO-007", source: "Fictional market snapshot", block: 21_234_567 },
+    ],
+  },
+  timechain: {
+    decision: "DEMO · NOT SEALED",
+    scores: {},
+  },
+  entity_graph: {
+    schema_version: "chainseer.entity_graph.v1",
+    network: "base",
+    root_entity_id: "demo-token",
+    anchor: { block_pin: 21_234_567, illustrative: true },
+    summary: {
+      entity_count: 4,
+      relationship_count: 3,
+      privileged_entity_count: 1,
+      confirmed_relationship_count: 2,
+      provider_attested_relationship_count: 1,
+      signal_count: 1,
+      high_or_critical_signal_count: 0,
+      insider_risk_level: "MEDIUM",
+      coverage: "ILLUSTRATIVE",
+      scoring_scope: "demo_only",
+      changes_legitimacy_score: false,
+    },
+    nodes: [
+      {
+        id: "demo-token",
+        type: "token",
+        address: "demo:token",
+        label: "Sentinel Demo",
+        roles: ["analyzed_token"],
+        attributes: { symbol: "DEMO", fictional: true },
+      },
+      {
+        id: "demo-deployer",
+        type: "wallet",
+        address: "demo:deployer",
+        label: "Fictional deployer",
+        roles: ["deployer"],
+        attributes: { attribution: "illustrative" },
+      },
+      {
+        id: "demo-market",
+        type: "market",
+        address: "demo:primary-market",
+        label: "Fictional primary market",
+        roles: ["primary_market"],
+        attributes: { liquidity_usd: 185_000 },
+      },
+      {
+        id: "demo-holder",
+        type: "wallet",
+        address: "demo:largest-holder",
+        label: "Largest observed holder",
+        roles: ["holder"],
+        attributes: { rank: 1, supply_pct: 12.4 },
+      },
+    ],
+    edges: [
+      {
+        id: "demo-edge-1",
+        source: "demo-deployer",
+        target: "demo-token",
+        relationship: "deployed",
+        evidence_status: "onchain_confirmed",
+        confidence: "illustrative",
+        evidence_refs: ["DEMO-002"],
+        attributes: {},
+      },
+      {
+        id: "demo-edge-2",
+        source: "demo-token",
+        target: "demo-market",
+        relationship: "trades_on",
+        evidence_status: "cross_source_confirmed",
+        confidence: "illustrative",
+        evidence_refs: ["DEMO-004", "DEMO-006"],
+        attributes: {},
+      },
+      {
+        id: "demo-edge-3",
+        source: "demo-holder",
+        target: "demo-token",
+        relationship: "holds",
+        evidence_status: "provider_attested",
+        confidence: "illustrative",
+        evidence_refs: ["DEMO-005"],
+        attributes: { supply_pct: 12.4 },
+      },
+    ],
+    signals: [
+      {
+        id: "demo-signal-1",
+        code: "holder_concentration_watch",
+        severity: "medium",
+        reason: "The fictional top-10 concentration merits continued monitoring.",
+        entity_ids: ["demo-holder", "demo-token"],
+        evidence_refs: ["DEMO-005"],
+        confidence: "illustrative",
+      },
+    ],
+    limitations: [
+      "This graph demonstrates the report format only; every entity and relationship is fictional.",
+    ],
+    graph_hash: "demo_graph_hash_not_sealed",
+  },
+  analyzed_at: "Fictional preview",
+  disclaimer:
+    "SAMPLE DATA · NOT LIVE. This report was not generated from a token, no external source was queried, and nothing was sealed. It is not financial advice.",
+};
 
 export default function Home() {
   const [network, setNetwork] = useState<Network>("robinhood");
@@ -1404,87 +1575,14 @@ export default function Home() {
             </span>
             <span className="demo-tag">SAMPLE DATA · NOT LIVE</span>
           </summary>
-          <div className="demo-content">
-        <div className="decision-grid">
-          <article className="decision-card">
-            <div className="card-kicker">
-              Effective action
-              <span className="demo-tag">DEMO</span>
-            </div>
-            <div className="decision-word">WATCH</div>
-            <p>
-              No critical exploit condition was detected, but concentration
-              and token maturity require monitoring before entry.
-            </p>
-            <div className="decision-footer">
-              <div><span>Risk score</span><strong>78<span>/100</span></strong></div>
-              <div><span>Confidence</span><strong className="confidence">MEDIUM</strong></div>
-            </div>
-          </article>
-
-          <article className="stops-card">
-            <div className="card-kicker">Hard-stop gate</div>
-            <div className="clear-line">
-              <span className="clear-icon">✓</span>
-              <div>
-                <strong>No hard stop triggered</strong>
-                <p>Six irreversible risk conditions checked.</p>
-              </div>
-            </div>
-            <ul className="stop-list">
-              <li><span>Honeypot behavior</span><b>Clear</b></li>
-              <li><span>Sell restrictions</span><b>Clear</b></li>
-              <li><span>Known scam flags</span><b>Clear</b></li>
-              <li><span>Unlocked liquidity</span><b>Clear</b></li>
-              <li><span>Extreme concentration</span><b>Clear</b></li>
-              <li><span>Unverified proxy</span><b>Clear</b></li>
-            </ul>
-          </article>
-        </div>
-
-        <div className="factor-panel">
-          <div className="panel-head">
-            <div><span className="panel-index">01</span><h3>Risk dimensions</h3></div>
-            <span>Higher is safer</span>
-          </div>
-          <div className="factor-grid">
-            {factors.map((factor) => (
-              <div className="factor" key={factor.label}>
-                <div className="factor-label"><span>{factor.label}</span><strong>{factor.score}</strong></div>
-                <div className="bar">
-                  <span className={factorTone(factor.score)} style={{ width: `${factor.score}%` }} />
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-
-        <div className="evidence-panel" id="evidence">
-          <div className="panel-head">
-            <div><span className="panel-index">02</span><h3>Evidence ledger</h3></div>
-            <div className="verified-seal"><span>◆</span> Demo format only</div>
-          </div>
-          <div className="evidence-table" role="table" aria-label="Fictional demonstration evidence ledger">
-            <div className="evidence-row evidence-header" role="row">
-              <span>Finding</span><span>Source</span><span>Block</span><span>Status</span>
-            </div>
-            {evidence.map((item) => (
-              <div className="evidence-row" role="row" key={item.id}>
-                <span><small>{item.id}</small>{item.label}</span>
-                <span>{item.source}</span>
-                <span className="mono">{item.block}</span>
-                <span className={`evidence-status ${item.status}`}>{item.status}</span>
-              </div>
-            ))}
-          </div>
-          <div className="chain-seal">
-            <div>
-              <span className="seal-mark">C</span>
-              <div><strong>Illustrative Timechain proof</strong><span>Format preview only · nothing was sealed</span></div>
-            </div>
-            <code>demo_ring_0001 · fictional_hash</code>
-          </div>
-        </div>
+          <div className="demo-content" id="evidence">
+            <LiveReport
+              report={demoReport}
+              isMonitoring={false}
+              monitorBusy={false}
+              onToggleMonitor={() => undefined}
+              isDemo
+            />
           </div>
         </details>
       </section>
