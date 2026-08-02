@@ -1416,6 +1416,21 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
             "pool_and_program_vaults_excluded": holder_evidence.get(
                 "pool_and_program_vaults_excluded"
             ),
+            "balance_verification": {
+                "complete": holder_evidence.get(
+                    "balance_verification_complete"
+                ),
+                "source": holder_evidence.get("holder_balance_source"),
+                "verified": holder_evidence.get(
+                    "rpc_balance_verified_count"
+                ),
+                "failures": holder_evidence.get(
+                    "rpc_balance_failure_count"
+                ),
+                "indexer_mismatches": holder_evidence.get(
+                    "indexed_balance_mismatch_count"
+                ),
+            },
             "caveat": holder_caveat,
         },
         "entity_graph": {

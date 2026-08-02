@@ -2249,6 +2249,17 @@ class Chainseer:
             if ADDRESS_RE.fullmatch(str(address or ""))
         }
         # Compute concentration excluding only verified pair/AMM addresses.
+        # Blockscout discovers the candidate holder set, but its indexed
+        # balances can lag the canonical chain (including after protocol
+        # migrations). Re-read every sampled address with balanceOf at the
+        # scan's pinned block before a balance can contribute to concentration.
+        rpc_balance_verified = 0
+        rpc_balance_failures = 0
+        indexed_balance_mismatches = 0
+        valid_holder_addresses = 0
+        pin_block = getattr(
+            getattr(self, "scan_context", None), "block_pin", None
+        )
         total_raw = 0
         excluded_amm = set()
         eoa_count = 0
@@ -2259,11 +2270,30 @@ class Chainseer:
         unclassified_contracts = []
 
         for h in holders:
-            bal = _safe_int(h.get("balance_raw", "0"))
+            indexed_bal = _safe_int(h.get("balance_raw", "0"))
+            bal = indexed_bal
+            addr = str(h.get("address") or "").lower()
+            if ADDRESS_RE.fullmatch(addr):
+                valid_holder_addresses += 1
+                try:
+                    bal = self.rpc.erc20_balance_of(
+                        token, addr, block=pin_block
+                    )
+                    rpc_balance_verified += 1
+                    h["indexed_balance_raw"] = str(indexed_bal)
+                    h["rpc_balance_raw"] = str(bal)
+                    h["balance_source"] = "pinned_rpc_balanceOf"
+                    if bal != indexed_bal:
+                        indexed_balance_mismatches += 1
+                except Exception:
+                    rpc_balance_failures += 1
+                    h["balance_source"] = "blockscout_index_unverified"
+            else:
+                rpc_balance_failures += 1
+                h["balance_source"] = "blockscout_index_unverified"
             h["balance_parsed"] = bal
             total_raw += bal
 
-            addr = h.get("address", "").lower()
             addr_info = h.get("address_info", {})
 
             # Dual-source identity: the address must be a same-network
@@ -2289,6 +2319,16 @@ class Chainseer:
             else:
                 eoa_count += 1
 
+        # The indexed ordering can be stale too. Once balances are pinned,
+        # restore descending economic order before calculating top-N metrics.
+        holders.sort(
+            key=lambda holder: holder.get("balance_parsed", 0), reverse=True
+        )
+        balance_verification_complete = bool(valid_holder_addresses) and (
+            rpc_balance_verified == valid_holder_addresses
+            and rpc_balance_failures == 0
+        )
+
         # Retain sample totals for diagnostics, but use actual token supply as
         # the concentration denominator whenever the pinned RPC read provides it.
         non_pair_total = sum(
@@ -2308,7 +2348,14 @@ class Chainseer:
             "total_supply_raw": supply_raw or None,
             "concentration_denominator_raw": concentration_denominator,
             "concentration_basis": concentration_basis,
-            "concentration_complete": supply_raw > 0,
+            "concentration_complete": (
+                supply_raw > 0 and balance_verification_complete
+            ),
+            "holder_balance_source": "pinned_rpc_balanceOf",
+            "rpc_balance_verified_count": rpc_balance_verified,
+            "rpc_balance_failure_count": rpc_balance_failures,
+            "indexed_balance_mismatch_count": indexed_balance_mismatches,
+            "balance_verification_complete": balance_verification_complete,
             "pair_contracts_excluded": sorted(excluded_amm),
             "verified_amm_addresses": sorted(verified_amm),
             "amm_verification_method": (
@@ -2322,6 +2369,23 @@ class Chainseer:
             "proxy_holders": proxy_holders,
             "eip7702_count": eip7702_count,
         }
+        if balance_verification_complete:
+            if indexed_balance_mismatches:
+                result["caveat"] = (
+                    f"{indexed_balance_mismatches} Blockscout holder balance(s) "
+                    "differed from the pinned chain state; pinned RPC "
+                    "balanceOf values were used."
+                )
+            else:
+                result["caveat"] = (
+                    "Sampled holder balances were revalidated by pinned RPC "
+                    "balanceOf calls."
+                )
+        else:
+            result["caveat"] = (
+                "Pinned RPC holder-balance verification was incomplete; "
+                "concentration is not hard-stop eligible."
+            )
 
         if concentration_denominator > 0 and holders:
             # Raw concentration (includes pair contracts)
@@ -3304,14 +3368,23 @@ class Chainseer:
         has_complete_blockscout_concentration = (
             bs_holders.get("blockscout_available")
             and bs_holders.get("adj_top_1_pct") is not None
-            and bs_holders.get("concentration_complete", True)
+            and bs_holders.get("concentration_complete", False)
         )
         if has_complete_blockscout_concentration:
             adj_top1 = bs_holders["adj_top_1_pct"]
             if holder_assessment is not None:
                 holder_assessment["largest_non_amm_holder_pct"] = adj_top1
                 holder_assessment["concentration_source"] = (
-                    "Blockscout holders / pinned total supply"
+                    "Pinned RPC holder balances / pinned total supply "
+                    "(Blockscout-discovered sample)"
+                )
+            mismatch_count = _safe_int(
+                bs_holders.get("indexed_balance_mismatch_count")
+            )
+            if mismatch_count:
+                flags["yellow"].append(
+                    f"Corrected {mismatch_count} stale holder balance(s) "
+                    "against the pinned chain state"
                 )
             if adj_top1 > 50:
                 flags["red"].append(
@@ -3367,10 +3440,16 @@ class Chainseer:
                 bs_holders.get("blockscout_available")
                 and not bs_holders.get("concentration_complete", False)
             ):
-                uncertain["holder_concentration"] = (
-                    "Total supply denominator unavailable; top-holder sample "
-                    "was not treated as a complete concentration measure"
-                )
+                if bs_holders.get("rpc_balance_failure_count"):
+                    uncertain["holder_concentration"] = (
+                        "Pinned RPC holder-balance verification was incomplete; "
+                        "indexer balances were not allowed to trigger a hard stop"
+                    )
+                else:
+                    uncertain["holder_concentration"] = (
+                        "Total supply denominator unavailable; top-holder sample "
+                        "was not treated as a complete concentration measure"
+                    )
 
         # ── 5. Volume & activity (0-100) ─────────────────────────────────
         vol_24h = dex.get("total_volume_24h", 0)
@@ -3692,7 +3771,7 @@ class Chainseer:
             )
 
         top_holder_pct = _safe_float(bs_holders.get("adj_top_1_pct"))
-        if top_holder_pct >= 50:
+        if bs_holders.get("concentration_complete") and top_holder_pct >= 50:
             severity = "Critical" if top_holder_pct >= 80 else "High"
             hard_stop(
                 "EXTREME_CONCENTRATION", severity,

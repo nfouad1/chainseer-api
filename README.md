@@ -63,8 +63,9 @@ The analyzer covers:
   price, and activity through DexScreener and on-chain calls
 - LP custody using market-type-aware states; launchpad/platform-managed
   liquidity is distinguished from independently controlled unlocked LP
-- holder adoption and supply concentration, excluding only independently
-  identified AMM contracts
+- holder adoption and supply concentration, with indexer-discovered balances
+  revalidated by `balanceOf` at the pinned block and only independently
+  identified AMM contracts excluded
 - scam-flagged wallets, proxy-holder patterns, creator concentration, and
   serial-deployer signals
 - wash-trading indicators, social-attention context, cross-chain provider
