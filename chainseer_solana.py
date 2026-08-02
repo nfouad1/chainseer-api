@@ -3577,12 +3577,12 @@ class SolanaPrototypeEngine:
             state = {
                 "schema_version": SCHEMA_VERSION,
                 "status": "armed",
-                "analysis_interval": REFLECTION_ANALYSIS_INTERVAL,
+                "analysis_interval": self._reflection_interval(),
                 "minimum_seconds_between_reflections": REFLECTION_MIN_SECONDS,
                 "baseline_analysis_events": analysis_events,
                 "last_reflected_analysis_events": analysis_events,
                 "next_analysis_checkpoint": (
-                    analysis_events + REFLECTION_ANALYSIS_INTERVAL
+                    analysis_events + self._reflection_interval()
                 ),
                 "first_graduated_market_seen": False,
                 "pause_requested": False,
@@ -3596,7 +3596,7 @@ class SolanaPrototypeEngine:
             0,
             _safe_int(
                 state.get("next_analysis_checkpoint"),
-                analysis_events + REFLECTION_ANALYSIS_INTERVAL,
+                analysis_events + self._reflection_interval(),
             )
             - analysis_events,
         )
@@ -3632,7 +3632,7 @@ class SolanaPrototypeEngine:
         analysis_events = self._analysis_event_count()
         interval_due = analysis_events >= _safe_int(
             state.get("next_analysis_checkpoint"),
-            analysis_events + REFLECTION_ANALYSIS_INTERVAL,
+            analysis_events + self._reflection_interval(),
         )
         if not first_graduated and not interval_due:
             state["analysis_events"] = analysis_events
@@ -3659,7 +3659,7 @@ class SolanaPrototypeEngine:
                 else "analysis_interval"
             ),
             "analysis_events": analysis_events,
-            "analysis_interval": REFLECTION_ANALYSIS_INTERVAL,
+            "analysis_interval": self._reflection_interval(),
             "graduated_market_count": len(graduated),
             "first_graduated_mint": graduated[0] if graduated else None,
             "observation_ledger_head": (
@@ -3813,14 +3813,14 @@ class SolanaPrototypeEngine:
                 "last_reflection_ledger_event_hash": event["event_hash"],
                 "last_reflected_analysis_events": analysis_events,
                 "next_analysis_checkpoint": (
-                    analysis_events + REFLECTION_ANALYSIS_INTERVAL
+                    analysis_events + self._reflection_interval()
                 ),
                 "first_graduated_market_seen": bool(
                     state.get("first_graduated_market_seen")
                     or pending.get("first_graduated_mint")
                 ),
                 "analysis_events": analysis_events,
-                "analyses_until_checkpoint": REFLECTION_ANALYSIS_INTERVAL,
+                "analyses_until_checkpoint": self._reflection_interval(),
                 "updated_at": _utc_now(),
             }
         )
@@ -4216,32 +4216,74 @@ class SolanaPrototypeEngine:
         stats["selected"] = len(selected)
         return selected, stats
 
+    @staticmethod
+    def _recovery_sort_key(row: dict):
+        return (
+            # Complete the admission-schema migration before ordinary
+            # cadence work so dashboards never mix legacy and v2 states
+            # longer than the bounded recovery capacity requires.
+            0 if not row.get("last_admission_state") else 1,
+            -_safe_float(
+                row.get("last_graduation_progress_pct"), -1.0
+            ),
+            _safe_int(row.get("attempts")),
+            row.get("first_queued_at") or "",
+        )
+
+    def _select_due_recovery_rows(self, *, limit: int) -> list[dict]:
+        """Round-robin the recovery budget across launch ecosystems instead
+        of one global sort-and-slice. Confirmed via real queue data
+        (chronosynaptic ring 230, perspective 3) that a single global sort
+        starves whichever ecosystem lacks a comparable progress signal:
+        Meteora's DBC curve has no reserve-ratio equivalent to Pump.fun's
+        graduation progress_pct (see analyze()'s ecosystem branch), so
+        every Meteora row sorts below essentially any Pump.fun row with
+        nonzero progress -- observed as 10 Meteora items stuck at
+        attempts=0 for hours while Pump.fun items reached up to 167
+        attempts. Taking each ecosystem's own highest-priority row in turn
+        guarantees every venue with due work gets a slot every cycle it
+        has one, without changing the within-ecosystem ordering at all."""
+        if limit <= 0:
+            return []
+        queue = self._load_recovery_queue()
+        now = time.time()
+        due = [
+            row
+            for row in queue["items"].values()
+            if row.get("status") == "pending"
+            and (_timestamp(row.get("next_attempt_at")) or 0) <= now
+        ]
+        by_ecosystem: dict[str, list[dict]] = {}
+        for row in due:
+            ecosystem = (row.get("candidate") or {}).get(
+                "launch_ecosystem", "pump_fun"
+            )
+            by_ecosystem.setdefault(ecosystem, []).append(row)
+        for rows in by_ecosystem.values():
+            rows.sort(key=self._recovery_sort_key)
+        ecosystems = sorted(by_ecosystem)
+        cursors = {ecosystem: 0 for ecosystem in ecosystems}
+        selected: list[dict] = []
+        while len(selected) < limit and any(
+            cursors[ecosystem] < len(by_ecosystem[ecosystem])
+            for ecosystem in ecosystems
+        ):
+            for ecosystem in ecosystems:
+                if len(selected) >= limit:
+                    break
+                cursor = cursors[ecosystem]
+                rows = by_ecosystem[ecosystem]
+                if cursor < len(rows):
+                    selected.append(rows[cursor])
+                    cursors[ecosystem] = cursor + 1
+        return selected
+
     def _recover_indeterminate(
         self, *, limit: int, shadow_enter: bool
     ) -> list[dict]:
         if limit <= 0:
             return []
-        queue = self._load_recovery_queue()
-        now = time.time()
-        due = sorted(
-            (
-                row
-                for row in queue["items"].values()
-                if row.get("status") == "pending"
-                and (_timestamp(row.get("next_attempt_at")) or 0) <= now
-            ),
-            key=lambda row: (
-                # Complete the admission-schema migration before ordinary
-                # cadence work so dashboards never mix legacy and v2 states
-                # longer than the bounded recovery capacity requires.
-                0 if not row.get("last_admission_state") else 1,
-                -_safe_float(
-                    row.get("last_graduation_progress_pct"), -1.0
-                ),
-                _safe_int(row.get("attempts")),
-                row.get("first_queued_at") or "",
-            ),
-        )[:limit]
+        due = self._select_due_recovery_rows(limit=limit)
         results = []
         for row in due:
             try:
@@ -4378,10 +4420,28 @@ class SolanaPrototypeEngine:
             "live_execution_enabled": False,
         }
 
+    def _observers(self) -> list:
+        return [self.observer, self.meteora_observer]
+
     def _candidate_by_mint(self, mint: str) -> SolanaLaunchCandidate | None:
-        """Look up a mint across BOTH launch-venue catalogs -- a shadow
-        position's mint could have come from either observer."""
-        return self.observer.by_mint(mint) or self.meteora_observer.by_mint(mint)
+        """Look up a mint across every launch-venue catalog -- a shadow
+        position's mint could have come from any observer."""
+        for observer in self._observers():
+            candidate = observer.by_mint(mint)
+            if candidate is not None:
+                return candidate
+        return None
+
+    def _reflection_interval(self) -> int:
+        """REFLECTION_ANALYSIS_INTERVAL is calibrated PER discovery venue --
+        scale it by how many observers actually run each learn_once() cycle
+        so a reflection checkpoint keeps arriving at roughly the same
+        WALL-CLOCK cadence regardless of how many launch venues are being
+        watched. Chosen via chronosynaptic fork (ring 230, perspective 2):
+        confirmed checkpoints had started firing in about half the elapsed
+        time since adding Meteora discovery roughly doubled total analysis
+        throughput per cycle, without this constant changing to match."""
+        return REFLECTION_ANALYSIS_INTERVAL * max(1, len(self._observers()))
 
     @staticmethod
     def _safe_observer_sync(

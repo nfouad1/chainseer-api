@@ -5,6 +5,7 @@ import unittest
 from unittest.mock import patch
 
 import chainseer_solana
+from tests.test_chainseer_solana import FakeRPC, FakeJupiter
 from chainseer_meteora_provenance import (
     DAMM_V2_PROGRAM_ID,
     DBC_PROGRAM_ID,
@@ -771,6 +772,269 @@ class LearnOnceDualObserverTests(unittest.TestCase):
             engine = self._build_engine(Path(temp))
             summary = engine.learn_once()
             self.assertEqual(summary["ecosystem"], "pump_fun+meteora_dbc")
+
+
+class ReflectionIntervalScalesWithObserversTests(unittest.TestCase):
+    """Chronosynaptic ring 230, perspective 2: REFLECTION_ANALYSIS_INTERVAL
+    (200) was calibrated when Pump.fun was the only discovery venue. With
+    Meteora also running every cycle, total analysis throughput roughly
+    doubled without the checkpoint interval changing to match, so
+    checkpoints started firing in about half the elapsed wall-clock time.
+    _reflection_interval() scales the base interval by how many observers
+    are actually active."""
+
+    @staticmethod
+    def _engine(root):
+        return chainseer_solana.SolanaPrototypeEngine(
+            root=root,
+            rpc=FakeRPC(),
+            jupiter=FakeJupiter(),
+            record_timechain=False,
+        )
+
+    def test_two_observers_double_the_base_interval(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            self.assertEqual(len(engine._observers()), 2)
+            self.assertEqual(
+                engine._reflection_interval(),
+                chainseer_solana.REFLECTION_ANALYSIS_INTERVAL * 2,
+            )
+
+    def test_reflection_status_reports_the_scaled_interval(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            state = engine.reflection_status()
+            self.assertEqual(
+                state["analysis_interval"],
+                chainseer_solana.REFLECTION_ANALYSIS_INTERVAL * 2,
+            )
+            self.assertEqual(
+                state["next_analysis_checkpoint"],
+                chainseer_solana.REFLECTION_ANALYSIS_INTERVAL * 2,
+            )
+
+    def test_falls_back_to_base_interval_with_a_single_observer(self):
+        """Scaling is observer-count-driven, not hardcoded to 2 -- confirms
+        it would correctly shrink back to the original cadence if Meteora
+        discovery were ever disabled/removed for an engine instance."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            with patch.object(engine, "_observers", return_value=[engine.observer]):
+                self.assertEqual(
+                    engine._reflection_interval(),
+                    chainseer_solana.REFLECTION_ANALYSIS_INTERVAL,
+                )
+
+    @staticmethod
+    def _establish_zero_baseline(engine):
+        """Initialize reflection_state.json via the real production
+        initialization path (reflection_status()'s first-call branch),
+        with analysis_events pinned at 0 so next_analysis_checkpoint ends
+        up exactly at the (scaled) interval -- not offset by whatever the
+        engine's own analysis history happens to already contain."""
+        with patch.object(engine, "_analysis_event_count", return_value=0):
+            engine.reflection_status()
+
+    def test_checkpoint_does_not_fire_before_the_scaled_threshold(self):
+        """The old (unscaled) threshold was 200 -- confirms reaching
+        exactly 200 analyses does NOT fire a checkpoint anymore now that
+        two observers are active; the scaled threshold is 400."""
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            self._establish_zero_baseline(engine)
+            with patch.object(
+                engine,
+                "_analysis_event_count",
+                return_value=chainseer_solana.REFLECTION_ANALYSIS_INTERVAL,
+            ), patch("chainseer_solana._send_telegram_notification"):
+                result = engine._maybe_request_reflection()
+            self.assertEqual(result["status"], "armed")
+
+    def test_checkpoint_fires_at_the_scaled_threshold(self):
+        import tempfile
+        from pathlib import Path
+        from unittest.mock import patch
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            self._establish_zero_baseline(engine)
+            scaled = chainseer_solana.REFLECTION_ANALYSIS_INTERVAL * 2
+            with patch.object(
+                engine, "_analysis_event_count", return_value=scaled
+            ), patch("chainseer_solana._send_telegram_notification"):
+                result = engine._maybe_request_reflection()
+            self.assertEqual(result["status"], "pending")
+            self.assertEqual(
+                result["pending_checkpoint"]["reason"], "analysis_interval"
+            )
+
+
+class RecoveryQueueEcosystemFairnessTests(unittest.TestCase):
+    """Chronosynaptic ring 230, perspective 3: confirmed against real
+    recovery_queue.json data before building this -- 10 Meteora items were
+    stuck at attempts=0 (some for 3+ hours) while Pump.fun items reached
+    up to 167 attempts, because the single global sort prioritizes
+    graduation progress_pct first and Meteora's DBC curve has no
+    comparable signal (see analyze()'s ecosystem branch), so every
+    Meteora row structurally sorts below nearly any Pump.fun row."""
+
+    @staticmethod
+    def _engine(root):
+        return chainseer_solana.SolanaPrototypeEngine(
+            root=root, rpc=FakeRPC(), jupiter=FakeJupiter(),
+            record_timechain=False,
+        )
+
+    @staticmethod
+    def _row(mint, *, ecosystem, attempts=0, progress=None, admission="graduation_pending"):
+        return {
+            "mint": mint,
+            "candidate": {"launch_ecosystem": ecosystem},
+            "status": "pending",
+            "attempts": attempts,
+            "first_queued_at": "2026-08-02T00:00:00+00:00",
+            "next_attempt_at": "2026-08-01T00:00:00+00:00",  # already due
+            "last_admission_state": admission,
+            "last_graduation_progress_pct": progress,
+        }
+
+    def _seed_queue(self, engine, rows: dict):
+        chainseer_solana._atomic_json(
+            engine.recovery_queue_path,
+            {"schema_version": 1, "items": rows, "updated_at": None},
+        )
+
+    def test_starved_ecosystem_gets_a_slot_even_when_outranked_on_progress(self):
+        """Reproduces the real starvation directly: many high-progress
+        Pump.fun items plus one 0-attempts Meteora item with no progress
+        signal -- the Meteora item must still be selected, not starved."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            rows = {
+                f"pump-{i}": self._row(
+                    f"pump-{i}", ecosystem="pump_fun", attempts=100 + i, progress=2.0 + i
+                )
+                for i in range(5)
+            }
+            rows["meteora-1"] = self._row(
+                "meteora-1", ecosystem="meteora_dbc", attempts=0, progress=None
+            )
+            self._seed_queue(engine, rows)
+
+            selected = engine._select_due_recovery_rows(limit=3)
+
+            selected_mints = {row["mint"] for row in selected}
+            self.assertIn(
+                "meteora-1", selected_mints,
+                "Meteora's only due item was starved out of the recovery budget",
+            )
+
+    def test_round_robin_gives_each_ecosystem_representation(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            rows = {}
+            for i in range(4):
+                rows[f"pump-{i}"] = self._row(
+                    f"pump-{i}", ecosystem="pump_fun", attempts=i, progress=float(i)
+                )
+                rows[f"meteora-{i}"] = self._row(
+                    f"meteora-{i}", ecosystem="meteora_dbc", attempts=i
+                )
+            self._seed_queue(engine, rows)
+
+            selected = engine._select_due_recovery_rows(limit=4)
+
+            ecosystems = [
+                row["candidate"]["launch_ecosystem"] for row in selected
+            ]
+            self.assertEqual(len(selected), 4)
+            self.assertEqual(ecosystems.count("pump_fun"), 2)
+            self.assertEqual(ecosystems.count("meteora_dbc"), 2)
+
+    def test_within_ecosystem_priority_order_is_unchanged(self):
+        """The round-robin only changes CROSS-ecosystem fairness -- within
+        one ecosystem's own rows, the original priority order (admission-
+        schema migration first, then progress descending, then fewest
+        attempts, then oldest-queued) must still hold."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            rows = {
+                "low-progress": self._row(
+                    "low-progress", ecosystem="pump_fun", attempts=0, progress=10.0
+                ),
+                "high-progress": self._row(
+                    "high-progress", ecosystem="pump_fun", attempts=0, progress=95.0
+                ),
+            }
+            self._seed_queue(engine, rows)
+
+            selected = engine._select_due_recovery_rows(limit=1)
+
+            self.assertEqual(selected[0]["mint"], "high-progress")
+
+    def test_ecosystem_with_no_due_items_does_not_withhold_slots(self):
+        """When only one ecosystem has due work, it should get the full
+        budget rather than artificially reserving unused slots."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            rows = {
+                f"pump-{i}": self._row(f"pump-{i}", ecosystem="pump_fun", attempts=i)
+                for i in range(3)
+            }
+            self._seed_queue(engine, rows)
+
+            selected = engine._select_due_recovery_rows(limit=3)
+
+            self.assertEqual(len(selected), 3)
+
+    def test_admission_schema_migration_rows_still_take_priority_across_both_ecosystems(self):
+        """Legacy migration rows (last_admission_state missing) must still
+        be cleared first regardless of which ecosystem they belong to."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._engine(Path(temp))
+            rows = {
+                "meteora-legacy": self._row(
+                    "meteora-legacy", ecosystem="meteora_dbc", admission=None
+                ),
+                "pump-fresh": self._row(
+                    "pump-fresh", ecosystem="pump_fun", progress=99.0
+                ),
+            }
+            self._seed_queue(engine, rows)
+
+            selected = engine._select_due_recovery_rows(limit=1)
+
+            self.assertEqual(selected[0]["mint"], "meteora-legacy")
 
 
 if __name__ == "__main__":
