@@ -476,6 +476,52 @@ class SettingsTests(unittest.TestCase):
             )
 
 
+class TrustedHostCheckTests(unittest.TestCase):
+    """Health-check paths must stay reachable for infrastructure probes (Fly,
+    Render, etc.) that don't send an externally-valid Host header, while
+    every other route keeps enforcing CHAINSEER_ALLOWED_HOSTS. Uses the
+    TestClient without the `with` context manager so ASGI lifespan (which
+    would start SERVICE and attempt real RPC calls) never runs -- only
+    middleware behavior is under test here."""
+
+    @classmethod
+    def setUpClass(cls):
+        from fastapi.testclient import TestClient
+
+        import chainseer_api
+
+        cls.client = TestClient(chainseer_api.app)
+        # Not in the default allowed_hosts (localhost,127.0.0.1,testserver).
+        cls.bad_host = "evil.example.invalid"
+
+    def test_health_live_ignores_untrusted_host_header(self):
+        response = self.client.get(
+            "/health/live", headers={"host": self.bad_host}
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.json(), {"status": "ok"})
+
+    def test_health_ready_reaches_handler_despite_untrusted_host_header(self):
+        response = self.client.get(
+            "/health/ready", headers={"host": self.bad_host}
+        )
+        # SERVICE was never started (lifespan didn't run), so this isn't
+        # necessarily 200 -- the point is it must not be rejected at 400 by
+        # host validation before reaching the handler.
+        self.assertNotEqual(response.status_code, 400)
+
+    def test_other_routes_still_reject_untrusted_host_header(self):
+        response = self.client.get("/", headers={"host": self.bad_host})
+        self.assertEqual(response.status_code, 400)
+        self.assertEqual(response.json(), {"detail": "Invalid host header"})
+
+    def test_other_routes_accept_trusted_host_header(self):
+        response = self.client.get("/", headers={"host": "localhost"})
+        # Still a 404 (no route registered at "/"), but crucially not a 400
+        # -- proves the host check itself passed for a trusted host.
+        self.assertEqual(response.status_code, 404)
+
+
 class ServiceTests(unittest.TestCase):
     def settings(
         self,

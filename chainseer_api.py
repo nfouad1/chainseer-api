@@ -30,7 +30,6 @@ from urllib.parse import urlparse
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.middleware.trustedhost import TrustedHostMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import JSONResponse
 
@@ -1560,10 +1559,40 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
-app.add_middleware(
-    TrustedHostMiddleware,
-    allowed_hosts=list(SETTINGS.allowed_hosts),
-)
+# Health-check paths are exempt from Host validation below. Infrastructure
+# health probes (Fly.io's proxy, Render's, etc.) routinely hit the app over
+# an internal network path without setting a Host header that matches any
+# externally-valid hostname -- that's normal for a trusted internal check,
+# not a spoofing attempt. The endpoints themselves return no sensitive data,
+# so exempting only these two paths doesn't weaken Host validation for
+# anything that actually needs it.
+_HOST_CHECK_EXEMPT_PATHS = {"/health/live", "/health/ready"}
+
+
+def _host_header_allowed(host_header: str, patterns: tuple[str, ...]) -> bool:
+    host = host_header.split(":")[0].lower()
+    for pattern in patterns:
+        pattern = pattern.lower()
+        if pattern.startswith("*."):
+            suffix = pattern[1:]
+            if host == pattern[2:] or host.endswith(suffix):
+                return True
+        elif host == pattern:
+            return True
+    return False
+
+
+@app.middleware("http")
+async def trusted_host_check(request: Request, call_next):
+    if request.url.path not in _HOST_CHECK_EXEMPT_PATHS:
+        if not _host_header_allowed(
+            request.headers.get("host", ""), SETTINGS.allowed_hosts
+        ):
+            return JSONResponse(
+                {"detail": "Invalid host header"},
+                status_code=status.HTTP_400_BAD_REQUEST,
+            )
+    return await call_next(request)
 
 
 @app.middleware("http")
