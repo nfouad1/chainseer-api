@@ -664,6 +664,114 @@ class LearnOnceDualObserverTests(unittest.TestCase):
             pump_sync.assert_called_once()
             meteora_sync.assert_called_once()
 
+    @staticmethod
+    def _build_engine(root):
+        class RPC:
+            def get_signatures(self, _address, *, limit, until=None, before=None):
+                return []
+
+            def get_account_info(self, address, *, encoding="jsonParsed"):
+                return {"value": {}}
+
+            def get_token_supply(self, _mint):
+                return {"value": {"amount": "0", "decimals": 6}}
+
+            def get_token_largest_accounts(self, _mint):
+                return {"value": []}
+
+            def get_multiple_accounts(self, addresses, *, encoding="jsonParsed"):
+                return {"value": [{} for _ in addresses]}
+
+            def health(self):
+                return {"attempts": 0, "successes": 0, "failures": 0}
+
+        return chainseer_solana.SolanaPrototypeEngine(
+            root=root, rpc=RPC(),
+            jupiter=chainseer_solana.JupiterClient(None),
+            record_timechain=False,
+        )
+
+    def test_observe_survives_a_failing_meteora_sync(self):
+        """chronosynaptic ring 230: sync() is not internally fault-tolerant,
+        so a transient RPC failure on ONE observer must not abort the
+        other observer's discovery or crash observe() entirely."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._build_engine(Path(temp))
+            with patch.object(
+                engine.meteora_observer,
+                "sync",
+                side_effect=chainseer_solana.InfrastructureIndeterminateError(
+                    "rpc timeout"
+                ),
+            ), patch.object(
+                engine.observer, "sync", wraps=engine.observer.sync
+            ) as pump_sync:
+                results = engine.observe(limit=1)  # must not raise
+
+            pump_sync.assert_called_once()
+            self.assertEqual(results, [])
+
+    def test_observe_survives_a_failing_pumpfun_sync(self):
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._build_engine(Path(temp))
+            with patch.object(
+                engine.observer,
+                "sync",
+                side_effect=chainseer_solana.InfrastructureIndeterminateError(
+                    "rpc timeout"
+                ),
+            ), patch.object(
+                engine.meteora_observer, "sync", wraps=engine.meteora_observer.sync
+            ) as meteora_sync:
+                results = engine.observe(limit=1)  # must not raise
+
+            meteora_sync.assert_called_once()
+            self.assertEqual(results, [])
+
+    def test_learn_once_completes_and_reports_sync_error_when_meteora_sync_fails(self):
+        """The rest of the cycle (recovery, graduation probing, promotion,
+        reflection) must still run even when one observer's sync fails --
+        before this fix, an unwrapped exception here aborted everything
+        downstream, not just that observer's discovery."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._build_engine(Path(temp))
+            with patch.object(
+                engine.meteora_observer,
+                "sync",
+                side_effect=chainseer_solana.InfrastructureIndeterminateError(
+                    "meteora rpc unavailable"
+                ),
+            ):
+                summary = engine.learn_once()  # must not raise
+
+            self.assertEqual(summary["cycle"]["new_launches_meteora_dbc"], 0)
+            self.assertIsNotNone(summary["cycle"]["sync_errors"]["meteora_dbc"])
+            self.assertIsNone(summary["cycle"]["sync_errors"]["pump_fun"])
+            # Downstream bookkeeping still ran.
+            self.assertIn("promotion", summary)
+            self.assertIn("recovery", summary)
+
+    def test_learn_once_reports_ecosystem_as_both_venues(self):
+        """The summary's ecosystem label previously stayed hardcoded to
+        pump_fun even after Meteora discovery was added -- a stale label
+        the S43-honesty principle (ring 132) exists to prevent."""
+        import tempfile
+        from pathlib import Path
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = self._build_engine(Path(temp))
+            summary = engine.learn_once()
+            self.assertEqual(summary["ecosystem"], "pump_fun+meteora_dbc")
+
 
 if __name__ == "__main__":
     unittest.main()

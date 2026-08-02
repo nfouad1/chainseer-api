@@ -4383,16 +4383,42 @@ class SolanaPrototypeEngine:
         position's mint could have come from either observer."""
         return self.observer.by_mint(mint) or self.meteora_observer.by_mint(mint)
 
+    @staticmethod
+    def _safe_observer_sync(
+        observer, *, signature_limit: int, slot_span: int | None, max_pages: int
+    ) -> tuple[list[SolanaLaunchCandidate], str | None]:
+        """sync() is not internally fault-tolerant -- its decode loop calls
+        get_transaction() per signature with no per-call error handling, so
+        a single transient RPC failure propagates out of sync() itself.
+        With two observers now running every cycle (chronosynaptic ring
+        230: this was judged the highest-leverage fix once Meteora
+        discovery was added), an unwrapped failure on EITHER one used to
+        abort the entire learn_once() cycle -- losing that cycle's
+        recovery re-checks, graduation probing, shadow marking, and
+        promotion/reflection bookkeeping, not just that observer's
+        discovery. Isolating each sync() call means one venue's RPC
+        hiccup costs only that venue's discovery for the cycle."""
+        try:
+            return observer.sync(
+                signature_limit=signature_limit,
+                slot_span=slot_span,
+                max_pages=max_pages,
+            ), None
+        except InfrastructureIndeterminateError as exc:
+            return [], _redact_sensitive_text(str(exc))
+
     def observe(
         self, *, limit: int = 10, signature_limit: int = 100,
         slot_span: int | None = None, max_pages: int = 10,
     ) -> list[dict]:
-        discovered = self.observer.sync(
-            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages
+        discovered, _pump_sync_error = self._safe_observer_sync(
+            self.observer,
+            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages,
         )
         candidates = discovered[-limit:] if discovered else self.observer.recent(limit)
-        meteora_discovered = self.meteora_observer.sync(
-            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages
+        meteora_discovered, _meteora_sync_error = self._safe_observer_sync(
+            self.meteora_observer,
+            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages,
         )
         candidates += (
             meteora_discovered[-limit:]
@@ -4450,11 +4476,13 @@ class SolanaPrototypeEngine:
         recovered = self._recover_indeterminate(
             limit=max(0, recovery_limit), shadow_enter=True
         )
-        discovered = self.observer.sync(
-            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages
+        discovered, pump_sync_error = self._safe_observer_sync(
+            self.observer,
+            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages,
         )
-        meteora_discovered = self.meteora_observer.sync(
-            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages
+        meteora_discovered, meteora_sync_error = self._safe_observer_sync(
+            self.meteora_observer,
+            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages,
         )
         recovered_mints = {
             result["candidate"]["mint"] for result in recovered
@@ -4519,9 +4547,15 @@ class SolanaPrototypeEngine:
         summary = {
             "schema_version": SCHEMA_VERSION,
             "timestamp": _utc_now(),
-            "ecosystem": "pump_fun",
+            "ecosystem": "pump_fun+meteora_dbc",
             "cycle": {
-                "new_launches": len(discovered),
+                "new_launches": len(discovered) + len(meteora_discovered),
+                "new_launches_pump_fun": len(discovered),
+                "new_launches_meteora_dbc": len(meteora_discovered),
+                "sync_errors": {
+                    "pump_fun": pump_sync_error,
+                    "meteora_dbc": meteora_sync_error,
+                },
                 "analyzed": len(results),
                 "new_analyzed": len(results) - len(recovered),
                 "recovery_analyzed": len(recovered),
