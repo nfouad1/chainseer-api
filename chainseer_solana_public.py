@@ -31,6 +31,7 @@ from chainseer_pumpfun_provenance import (
     creator_deployment_history,
     resolve_genesis_creator,
 )
+from chainseer_wallet_convergence import WalletConvergenceTracker
 
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -420,12 +421,17 @@ class SolanaPublicAnalyzer:
         jupiter: JupiterClient | None = None,
         dexscreener: DexScreenerClient | None = None,
         policy: SolanaPublicPolicy | None = None,
+        convergence_tracker: WalletConvergenceTracker | None = None,
     ):
         self.rpc = rpc or SolanaRPC(rpc_url)
         self.jupiter = jupiter or JupiterClient(jupiter_api_key)
         self.dexscreener = dexscreener or DexScreenerClient(ttl_seconds=60)
         self.timechain_agent = timechain_agent
         self.policy = policy or SolanaPublicPolicy()
+        # Optional: without a tracker, wallet convergence is skipped
+        # entirely (no coverage claim made) rather than silently degraded --
+        # callers that want the signal must opt in with a state path.
+        self.convergence_tracker = convergence_tracker
 
     @staticmethod
     def _extension_names(info: dict) -> list[str]:
@@ -902,6 +908,7 @@ class SolanaPublicAnalyzer:
             )
 
         concentration: dict = {}
+        convergence_evidence: dict | None = None
         try:
             concentration, concentration_facts = self._holder_concentration(
                 mint, supply_raw
@@ -920,6 +927,29 @@ class SolanaPublicAnalyzer:
             warnings.append(
                 "Holder concentration includes unidentified program and pool vaults."
             )
+            if self.convergence_tracker is not None:
+                holders = concentration.get("largest_accounts") or []
+                # Prospective enrollment of every observed holder, regardless
+                # of this token's own outcome -- keeps the registry free of
+                # winner-only selection bias (see chainseer_wallet_convergence).
+                for holder in holders:
+                    owner = holder.get("owner")
+                    if owner:
+                        self.convergence_tracker.observe(
+                            owner, mint, evidence_state=None
+                        )
+                convergence_evidence = self.convergence_tracker.convergence_for(
+                    holders
+                )
+                if convergence_evidence.get("converged"):
+                    # Additive context only -- never a hard-stop, never
+                    # raises a factor score. See chainseer_wallet_convergence
+                    # for the full non-overriding-signal rationale.
+                    warnings.append(
+                        "wallet_convergence_"
+                        f"{convergence_evidence['accurate_wallets_holding']}"
+                        "_accurate_holders"
+                    )
         except InfrastructureIndeterminateError as exc:
             infrastructure_errors.append(str(exc))
             unknown["holder_distribution"] = (
@@ -1400,6 +1430,15 @@ class SolanaPublicAnalyzer:
                 "source(s) were indeterminate; this lowers confidence but "
                 "does not count as token-negative evidence."
             )
+        if self.convergence_tracker is not None:
+            # This query's own verdict becomes the outcome future queries'
+            # convergence checks will read back -- "hit" is defined purely
+            # by hard-stop status (see chainseer_wallet_convergence), not by
+            # the Medium/Low split, since the near-universal pool-vault
+            # caveat above would otherwise make "complete_safe" unreachable.
+            self.convergence_tracker.regrade(
+                mint, "hard_stop_failed" if hard_stops else "complete_safe"
+            )
         red_flags = [item["reason"] for item in hard_stops]
         yellow_flags = list(dict.fromkeys(warnings))
         threshold = os.environ.get(
@@ -1420,6 +1459,9 @@ class SolanaPublicAnalyzer:
             "liquidity_custody": lp_lock_data.get("state") != "custody_unverified",
             "wash_trading": txn_total >= 5,
             "slot_anchor": bool(slot_anchor),
+            "wallet_convergence": bool(
+                convergence_evidence and convergence_evidence.get("converged")
+            ),
         }
         poq_scores = {
             "coherence": 245,
@@ -1476,6 +1518,18 @@ class SolanaPublicAnalyzer:
                 "holder_concentration": concentration,
                 "deployer": deployer_data,
                 "creator": creator_data,
+                "wallet_convergence": convergence_evidence
+                or {
+                    "accurate_wallets_holding": 0,
+                    "converged": False,
+                    "wallets": [],
+                    "reason": (
+                        "No convergence tracker configured for this analyzer "
+                        "instance."
+                        if self.convergence_tracker is None
+                        else "Holder concentration was unavailable."
+                    ),
+                },
                 "execution_evidence": execution,
                 "source_code": {
                     "is_verified": None,

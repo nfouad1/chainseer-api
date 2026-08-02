@@ -1,7 +1,9 @@
 import base64
 import struct
+import tempfile
 import time
 import unittest
+from pathlib import Path
 from unittest.mock import patch
 
 from chainseer_pumpfun_provenance import PUMP_AMM_PROGRAM_ID, PUMP_PROGRAM_ID, _b58encode
@@ -11,6 +13,7 @@ from chainseer_solana_public import (
     TOKEN_PROGRAM_ID,
     validate_solana_mint,
 )
+from chainseer_wallet_convergence import WalletConvergenceTracker
 
 
 MINT = "So11111111111111111111111111111111111111112"
@@ -708,6 +711,126 @@ class AlertWiringTests(unittest.TestCase):
 
         mocked.assert_called_once()
         self.assertEqual(mocked.call_args.kwargs["hard_stops"], [])
+
+
+class WalletConvergenceWiringTests(unittest.TestCase):
+    """The public on-demand analyzer is stateless per query, but when given
+    a WalletConvergenceTracker it builds up a real cross-query wallet
+    registry over time -- same signal as the autotrader, opt-in via the
+    convergence_tracker constructor param, and always additive-only."""
+
+    def _tracker(self, temp_dir):
+        return WalletConvergenceTracker(Path(temp_dir) / "wallet_convergence.json")
+
+    def test_without_a_tracker_convergence_is_reported_as_unavailable(self):
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=FakeRPC(),
+            dexscreener=FakeDexScreener(),
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertFalse(report["coverage"]["wallet_convergence"])
+        self.assertFalse(report["data"]["wallet_convergence"]["converged"])
+        self.assertIn("reason", report["data"]["wallet_convergence"])
+
+    def test_first_query_enrolls_holders_prospectively_with_unknown_outcome(self):
+        """Enrollment (observe) must happen with evidence_state=None -- the
+        outcome is only known once regrade() runs with this query's verdict,
+        later in the same call. Both effects land in the same call, so the
+        pre-regrade state is only observable by spying on the observe() call
+        itself, not by inspecting final persisted state."""
+        with tempfile.TemporaryDirectory() as temp:
+            tracker = self._tracker(temp)
+            original_observe = tracker.observe
+            calls = []
+
+            def spy_observe(wallet, mint, *, evidence_state, **kwargs):
+                calls.append((wallet, mint, evidence_state))
+                return original_observe(
+                    wallet, mint, evidence_state=evidence_state, **kwargs
+                )
+
+            with patch.object(tracker, "observe", side_effect=spy_observe):
+                SolanaPublicAnalyzer(
+                    "https://example.invalid",
+                    rpc=FakeRPC(),
+                    dexscreener=FakeDexScreener(),
+                    jupiter=FakeJupiter(),
+                    convergence_tracker=tracker,
+                ).analyze_token(MINT)
+
+            # FakeRPC's get_multiple_accounts derives owners "1"*44 and
+            # "2"*44 for the two largest-account rows.
+            self.assertEqual(
+                {(wallet, mint) for wallet, mint, _ in calls},
+                {("1" * 44, MINT), ("2" * 44, MINT)},
+            )
+            self.assertTrue(all(state is None for _, _, state in calls))
+
+            # regrade() then updates the SAME positions once this query's
+            # own verdict is known.
+            position = tracker.state["wallets"]["1" * 44]["positions"][MINT]
+            self.assertEqual(position["evidence_state"], "complete_safe")
+
+    def test_query_regrades_its_own_mint_with_this_verdicts_outcome(self):
+        with tempfile.TemporaryDirectory() as temp:
+            tracker = self._tracker(temp)
+            report = SolanaPublicAnalyzer(
+                "https://example.invalid",
+                rpc=FakeRPC(),
+                dexscreener=FakeDexScreener(),
+                jupiter=FakeJupiter(),
+                convergence_tracker=tracker,
+            ).analyze_token(MINT)
+
+            self.assertEqual(report["analysis"]["hard_stop_overrides"], [])
+            position = tracker.state["wallets"]["1" * 44]["positions"][MINT]
+            self.assertEqual(position["evidence_state"], "complete_safe")
+
+    def test_hard_stopped_query_regrades_as_hard_stop_failed(self):
+        with tempfile.TemporaryDirectory() as temp:
+            tracker = self._tracker(temp)
+            SolanaPublicAnalyzer(
+                "https://example.invalid",
+                rpc=FakeRPC(mint_authority="9" * 44),
+                dexscreener=FakeDexScreener(),
+                jupiter=FakeJupiter(),
+                convergence_tracker=tracker,
+            ).analyze_token(MINT)
+
+            position = tracker.state["wallets"]["1" * 44]["positions"][MINT]
+            self.assertEqual(position["evidence_state"], "hard_stop_failed")
+
+    def test_converged_wallets_add_a_warning_never_a_hard_stop(self):
+        with tempfile.TemporaryDirectory() as temp:
+            tracker = self._tracker(temp)
+            # Build up accuracy for the two wallets FakeRPC will surface as
+            # holders of MINT, using unrelated prior mints so the floor is
+            # cleared before the actual query under test.
+            for wallet in ("1" * 44, "2" * 44):
+                for i in range(3):
+                    prior_mint = f"prior-{wallet}-{i}"
+                    tracker.observe(wallet, prior_mint, evidence_state=None)
+                    tracker.regrade(prior_mint, "complete_safe")
+
+            report = SolanaPublicAnalyzer(
+                "https://example.invalid",
+                rpc=FakeRPC(),
+                dexscreener=FakeDexScreener(),
+                jupiter=FakeJupiter(),
+                convergence_tracker=tracker,
+            ).analyze_token(MINT)
+
+            self.assertTrue(report["coverage"]["wallet_convergence"])
+            self.assertTrue(report["data"]["wallet_convergence"]["converged"])
+            self.assertEqual(report["analysis"]["hard_stop_overrides"], [])
+            self.assertTrue(
+                any(
+                    flag.startswith("wallet_convergence_")
+                    for flag in report["analysis"]["yellow_flags"]
+                )
+            )
 
 
 if __name__ == "__main__":

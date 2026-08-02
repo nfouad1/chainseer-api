@@ -64,9 +64,12 @@ except ImportError:
     sys.exit(1)
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from pathlib import Path
+
 from chainseer import Chainseer, ensure_utf8_runtime
 import chainseer_solana
 from chainseer_solana_public import SolanaPublicAnalyzer, SolanaMintError, validate_solana_mint
+from chainseer_wallet_convergence import WalletConvergenceTracker
 
 # Uses chainseer_solana's env lookup (process env, falling back to the
 # persistent Windows user registry) rather than a bare os.environ.get().
@@ -175,7 +178,12 @@ def get_solana_public_analyzer() -> SolanaPublicAnalyzer:
     history since that requires verified Pump.fun launch provenance."""
     global _solana_public_analyzer
     if _solana_public_analyzer is None:
-        _solana_public_analyzer = SolanaPublicAnalyzer(chainseer_solana.SOLANA_RPC_URL)
+        _solana_public_analyzer = SolanaPublicAnalyzer(
+            chainseer_solana.SOLANA_RPC_URL,
+            convergence_tracker=WalletConvergenceTracker(
+                Path(SOLANA_ROOT) / "solana_public_wallet_convergence.json"
+            ),
+        )
     return _solana_public_analyzer
 
 

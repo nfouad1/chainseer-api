@@ -53,6 +53,7 @@ from chainseer_solana_public import (
     SolanaPublicAnalyzer,
     validate_solana_mint,
 )
+from chainseer_wallet_convergence import WalletConvergenceTracker
 
 LOGGER = logging.getLogger("chainseer.api")
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
@@ -724,6 +725,10 @@ class AnalysisService:
                 self.settings.solana_rpc_url,
                 timechain_agent=self._agent,
                 jupiter_api_key=self.settings.jupiter_api_key or None,
+                convergence_tracker=WalletConvergenceTracker(
+                    Path(self.settings.chain_root)
+                    / "solana_public_wallet_convergence.json"
+                ),
             )
         if self._base_agent is None and isinstance(self._agent, Chainseer):
             self._base_agent = BasePublicAnalyzer(
