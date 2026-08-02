@@ -113,6 +113,25 @@ SOLANA_USDC_MINT = "EPjFWdd5AufqSSqeM2qN1xzybapC8G4wEGGkZwyTDt1v"
 PUMP_CREATE_EVENT_DISCRIMINATOR = bytes([27, 114, 169, 77, 222, 235, 99, 118])
 PUMP_BONDING_CURVE_DISCRIMINATOR = bytes([23, 183, 248, 55, 96, 216, 172, 96])
 PUMP_AMM_POOL_DISCRIMINATOR = bytes([241, 154, 109, 4, 17, 177, 109, 188])
+# Meteora Dynamic Bonding Curve: account discriminator for the VirtualPool
+# account (sha256(b"account:VirtualPool")[:8], Anchor's standard account-
+# discriminator convention -- computed here, not sourced from a third
+# party) plus the byte offsets of PoolState's fields, verified field-by-
+# field against MeteoraAg/dynamic-bonding-curve's state/virtual_pool.rs and
+# state/fee.rs (VolatilityTracker::INIT_SPACE=64, PoolMetrics::INIT_SPACE=32,
+# PoolState::INIT_SPACE=416 -- both cross-checked against the source's own
+# const_assert_eq! macros, not just hand-added).
+DBC_VIRTUAL_POOL_DISCRIMINATOR = bytes.fromhex("d5e005d16245775c")
+DBC_POOL_STATE_OFFSETS = {
+    "config": 64,
+    "creator": 96,
+    "base_mint": 128,
+    "base_vault": 160,
+    "quote_vault": 192,
+    "base_reserve": 224,
+    "quote_reserve": 232,
+    "is_migrated": 297,
+}
 SCHEMA_VERSION = 1
 RPC_HEALTH_SCHEMA_VERSION = 2
 REFLECTION_ANALYSIS_INTERVAL = 200
@@ -156,6 +175,12 @@ from chainseer_core import (
     read_json as _read_json,
 )
 from chainseer_wallet_convergence import WalletConvergenceTracker
+from chainseer_meteora_provenance import (
+    DAMM_V2_PROGRAM_ID,
+    DBC_PROGRAM_ID,
+    DLMM_PROGRAM_ID,
+    decode_transaction as _meteora_decode_transaction,
+)
 
 # This adapter's original _canonical_json used ensure_ascii=False with no
 # `default=str` fallback (stricter: raises on a non-JSON-serializable value).
@@ -306,6 +331,45 @@ class SolanaLaunchCandidate:
     def from_dict(cls, value: dict) -> "SolanaLaunchCandidate":
         names = cls.__dataclass_fields__
         return cls(**{key: value[key] for key in names if key in value})
+
+    @classmethod
+    def from_meteora_pool_creation(cls, creation) -> "SolanaLaunchCandidate":
+        """Build a candidate from a chainseer_meteora_provenance
+        MeteoraPoolCreation. `bonding_curve` is repurposed to hold the DBC
+        pool (VirtualPool) account address -- the same role it plays for a
+        Pump.fun candidate: "the on-chain account whose state determines
+        curve progress/completion", just read via _decode_dbc_pool_state
+        instead of _decode_curve. virtual_token_reserves/
+        virtual_quote_reserves/real_token_reserves are unused for this
+        ecosystem (graduation is read live from the pool's own is_migrated
+        flag, not an initial-vs-current reserve comparison) and are set to
+        0 rather than a misleading approximation. name/symbol/uri are
+        unresolved here -- DBC's pool-creation instruction doesn't carry
+        them (a separate metadata instruction does, not decoded by this
+        module) -- callers fall back to Jupiter/DexScreener metadata."""
+        token_program = (
+            TOKEN_2022_PROGRAM_ID
+            if creation.variant in ("token2022", "token2022_transfer_hook")
+            else TOKEN_PROGRAM_ID
+        )
+        return cls(
+            signature=creation.signature,
+            slot=creation.slot,
+            block_time=creation.block_time,
+            name="",
+            symbol="",
+            uri="",
+            mint=creation.mint,
+            bonding_curve=creation.pool,
+            user=creation.creator,
+            creator=creation.creator,
+            token_program=token_program,
+            virtual_token_reserves=0,
+            virtual_quote_reserves=0,
+            real_token_reserves=0,
+            token_total_supply=0,
+            launch_ecosystem="meteora_dbc",
+        )
 
 
 @dataclass
@@ -1367,6 +1431,192 @@ class PumpFunObserver:
         return None
 
 
+class MeteoraObserver:
+    """Meteora Dynamic Bonding Curve analog of PumpFunObserver.
+
+    Same architecture (bounded backward-paging sync(), catalog + cursor
+    persistence, recent()/by_mint()/resolve_candidate()), watching
+    DBC_PROGRAM_ID instead of PUMP_PROGRAM_ID and decoding pool-creation
+    instructions via chainseer_meteora_provenance.decode_transaction
+    instead of Pump.fun's CreateEvent log parsing. Uses its own catalog/
+    cursor files so the two observers never contend over state.
+    """
+
+    def __init__(self, rpc: SolanaRPC, root: str | Path, ledger: HashLedger):
+        self.rpc = rpc
+        self.root = Path(root)
+        self.catalog_path = self.root / "meteora_catalog.json"
+        self.cursor_path = self.root / "meteora_observer_cursor.json"
+        self.ledger = ledger
+
+    @staticmethod
+    def decode_transaction(
+        signature_row: dict, transaction: dict | None
+    ) -> list[SolanaLaunchCandidate]:
+        return [
+            SolanaLaunchCandidate.from_meteora_pool_creation(creation)
+            for creation in _meteora_decode_transaction(signature_row, transaction)
+        ]
+
+    def sync(
+        self,
+        *,
+        signature_limit: int = 100,
+        slot_span: int | None = None,
+        max_pages: int = 10,
+    ) -> list[SolanaLaunchCandidate]:
+        """Sweep recent DBC program activity for new pool-creation
+        instructions. Mirrors PumpFunObserver.sync() exactly -- see its
+        docstring for the slot_span/max_pages bounded-paging rationale."""
+        cursor = _read_json(self.cursor_path, {})
+        cursor_signature = cursor.get("newest_signature")
+        cursor_slot = _safe_int(cursor.get("newest_slot"))
+        page_size = max(1, min(int(signature_limit), 1000))
+        max_pages = max(1, int(max_pages))
+
+        catalog = _read_json(
+            self.catalog_path,
+            {
+                "schema_version": SCHEMA_VERSION,
+                "ecosystem": "meteora_dbc",
+                "tokens": {},
+            },
+        )
+        discovered: list[SolanaLaunchCandidate] = []
+        all_signatures: list[dict] = []
+        newest_signature = cursor_signature
+        newest_slot = cursor_slot
+        before_signature: str | None = None
+        slot_floor = (
+            max(0, cursor_slot - int(slot_span))
+            if slot_span is not None and cursor_slot
+            else None
+        )
+
+        for page_index in range(max_pages):
+            batch = self.rpc.get_signatures(
+                DBC_PROGRAM_ID,
+                limit=page_size,
+                until=cursor_signature,
+                before=before_signature,
+            )
+            if not batch:
+                break
+            all_signatures.extend(batch)
+            if page_index == 0:
+                newest_signature = batch[0].get("signature", cursor_signature)
+                newest_slot = _safe_int(batch[0].get("slot"), cursor_slot)
+            oldest_in_batch = batch[-1]
+            oldest_slot = _safe_int(oldest_in_batch.get("slot"))
+
+            reached_cursor = cursor_slot and oldest_slot is not None and oldest_slot <= cursor_slot
+            reached_floor = slot_floor is not None and oldest_slot is not None and oldest_slot <= slot_floor
+            if reached_cursor or reached_floor:
+                break
+            before_signature = oldest_in_batch.get("signature")
+            if not before_signature:
+                break
+
+        for row in reversed(all_signatures):
+            if row.get("err"):
+                continue
+            transaction = self.rpc.get_transaction(row["signature"])
+            for candidate in self.decode_transaction(row, transaction):
+                catalog["tokens"][candidate.mint] = candidate.to_dict()
+                discovered.append(candidate)
+                self.ledger.append(
+                    "meteora_pool_creation_event",
+                    {
+                        "candidate": candidate.to_dict(),
+                        "source": "solana_rpc_confirmed_transaction_log",
+                    },
+                )
+        if all_signatures:
+            cursor = {
+                "newest_signature": newest_signature,
+                "newest_slot": newest_slot,
+                "updated_at": _utc_now(),
+            }
+        self._write_catalog(catalog)
+        _atomic_json(self.cursor_path, cursor)
+        return discovered
+
+    def _write_catalog(self, catalog: dict) -> None:
+        retention_cutoff = time.time() - CATALOG_RETENTION_SECONDS
+        catalog["tokens"] = {
+            mint: value
+            for mint, value in catalog["tokens"].items()
+            if _safe_int(value.get("block_time")) >= retention_cutoff
+        }
+        catalog["updated_at"] = _utc_now()
+        _atomic_json(self.catalog_path, catalog)
+
+    def recent(self, limit: int = 10) -> list[SolanaLaunchCandidate]:
+        tokens = _read_json(self.catalog_path, {}).get("tokens", {})
+        values = [SolanaLaunchCandidate.from_dict(value) for value in tokens.values()]
+        return sorted(values, key=lambda item: (item.slot, item.signature), reverse=True)[
+            : max(0, limit)
+        ]
+
+    def by_mint(self, mint: str) -> SolanaLaunchCandidate | None:
+        value = _read_json(self.catalog_path, {}).get("tokens", {}).get(mint)
+        return SolanaLaunchCandidate.from_dict(value) if value else None
+
+    def resolve_candidate(
+        self,
+        mint: str,
+        *,
+        max_pages: int = 40,
+        page_size: int = 1000,
+        decode_last: int = 10,
+    ) -> SolanaLaunchCandidate | None:
+        """Best-effort resolution of an arbitrary mint's originating DBC
+        pool-creation instruction, for on-demand lookups the continuous
+        sync() sweep hasn't necessarily seen. Mirrors PumpFunObserver.
+        resolve_candidate() -- see its docstring for the bounded backward-
+        paging rationale."""
+        cached = self.by_mint(mint)
+        if cached:
+            return cached
+
+        last_batch: list[dict] = []
+        before_signature: str | None = None
+        for _ in range(max_pages):
+            batch = self.rpc.get_signatures(mint, limit=page_size, before=before_signature)
+            if not batch:
+                break
+            last_batch = batch
+            if len(batch) < page_size:
+                break
+            before_signature = batch[-1].get("signature")
+            if not before_signature:
+                break
+        else:
+            return None
+
+        for row in reversed(last_batch[-decode_last:]):
+            if row.get("err"):
+                continue
+            try:
+                transaction = self.rpc.get_transaction(row["signature"])
+            except InfrastructureIndeterminateError:
+                continue
+            for candidate in self.decode_transaction(row, transaction):
+                if candidate.mint == mint:
+                    catalog = _read_json(
+                        self.catalog_path,
+                        {
+                            "schema_version": SCHEMA_VERSION,
+                            "ecosystem": "meteora_dbc",
+                            "tokens": {},
+                        },
+                    )
+                    catalog["tokens"][candidate.mint] = candidate.to_dict()
+                    self._write_catalog(catalog)
+                    return candidate
+        return None
+
+
 class JupiterClient:
     def __init__(
         self,
@@ -1646,6 +1896,54 @@ class SolanaRiskAnalyzer:
         return result
 
     @staticmethod
+    def _decode_dbc_pool_state(account: dict | None) -> dict:
+        """Decode a Meteora Dynamic Bonding Curve VirtualPool account.
+
+        VirtualPool is an Anchor zero_copy account -- fixed-size fields at
+        fixed byte offsets, not variable-length Borsh -- so this reads
+        directly at the offsets in DBC_POOL_STATE_OFFSETS (verified against
+        MeteoraAg/dynamic-bonding-curve's own const_assert_eq! struct-size
+        assertions; see that constant's definition for the derivation).
+        `is_migrated` is the direct on-chain analog of Pump.fun's bonding-
+        curve `complete` flag: the pool has finished its curve and moved
+        its liquidity into a DAMM v2 pool.
+        """
+        value = (account or {}).get("value") or {}
+        owner = value.get("owner")
+        data = value.get("data")
+        if not isinstance(data, list) or not data:
+            raise InfrastructureIndeterminateError("DBC pool data is unavailable")
+        try:
+            raw = base64.b64decode(data[0], validate=True)
+        except (ValueError, TypeError) as exc:
+            raise InfrastructureIndeterminateError("invalid DBC pool encoding") from exc
+        if not raw.startswith(DBC_VIRTUAL_POOL_DISCRIMINATOR):
+            raise InfrastructureIndeterminateError("unexpected DBC pool discriminator")
+        body = raw[len(DBC_VIRTUAL_POOL_DISCRIMINATOR):]
+        offsets = DBC_POOL_STATE_OFFSETS
+        minimum_size = offsets["is_migrated"] + 1
+        if len(body) < minimum_size:
+            raise InfrastructureIndeterminateError("truncated DBC pool account")
+
+        def _pubkey_at(offset: int) -> str:
+            return _b58encode(body[offset:offset + 32])
+
+        def _u64_at(offset: int) -> int:
+            return struct.unpack("<Q", body[offset:offset + 8])[0]
+
+        return {
+            "owner": owner,
+            "config": _pubkey_at(offsets["config"]),
+            "creator": _pubkey_at(offsets["creator"]),
+            "base_mint": _pubkey_at(offsets["base_mint"]),
+            "base_vault": _pubkey_at(offsets["base_vault"]),
+            "quote_vault": _pubkey_at(offsets["quote_vault"]),
+            "base_reserve": _u64_at(offsets["base_reserve"]),
+            "quote_reserve": _u64_at(offsets["quote_reserve"]),
+            "is_migrated": bool(body[offsets["is_migrated"]]),
+        }
+
+    @staticmethod
     def _decode_pump_amm_pool(row: dict) -> dict:
         account = row.get("account") or {}
         data = account.get("data")
@@ -1712,15 +2010,73 @@ class SolanaRiskAnalyzer:
             return None
         return sorted(matches, key=lambda item: item.get("pool") or "")[0]
 
+    # Migrated DBC pools graduate into either a Meteora DAMM v2 pool or a
+    # Meteora DLMM pool. Unlike PumpSwap (found via getProgramAccounts +
+    # memcmp on the pool's own account layout), the migrated pool's exact
+    # address isn't derivable here without also decoding DAMM v2/DLMM's own
+    # account layouts -- deliberately not done (see the module-level note
+    # on this scoping decision). Instead this mirrors
+    # chainseer_solana_public.py's approach: find the pool via DexScreener
+    # (whose dexId/labels scheme was verified against live search results),
+    # then verify the discovered pool ACCOUNT is really owned by the
+    # claimed AMM program on-chain -- the same level of verification
+    # PumpSwap's own canonical-pool check performs.
+    _METEORA_POOL_LABELS = {
+        "DYN2": (DAMM_V2_PROGRAM_ID, "meteora_damm_v2"),
+        "DLMM": (DLMM_PROGRAM_ID, "meteora_dlmm"),
+    }
+
+    def _meteora_canonical_pool_evidence(self, mint: str) -> dict | None:
+        pairs = self.dexscreener.token_pairs(mint)
+        candidates = []
+        for pair in pairs:
+            if str(pair.get("chainId") or "").lower() != "solana":
+                continue
+            if str(pair.get("dexId") or "").lower() != "meteora":
+                continue
+            base = pair.get("baseToken") or {}
+            quote = pair.get("quoteToken") or {}
+            if base.get("address") != mint:
+                continue
+            if quote.get("address") not in {WRAPPED_SOL_MINT, SOLANA_USDC_MINT}:
+                continue
+            pool_address = pair.get("pairAddress")
+            if not pool_address:
+                continue
+            labels = {str(label).upper() for label in pair.get("labels") or []}
+            for label, (expected_owner, amm_version) in self._METEORA_POOL_LABELS.items():
+                if label in labels:
+                    candidates.append(
+                        (pair, pool_address, expected_owner, amm_version)
+                    )
+                    break
+        if not candidates:
+            return None
+        pair, pool_address, expected_owner, amm_version = max(
+            candidates,
+            key=lambda item: _safe_float(
+                (item[0].get("liquidity") or {}).get("usd")
+            ),
+        )
+        pool_account = self.rpc.get_account_info(pool_address, encoding="base64")
+        actual_owner = ((pool_account or {}).get("value") or {}).get("owner")
+        if actual_owner != expected_owner:
+            return None
+        return {
+            "pool": pool_address,
+            "owner": actual_owner,
+            "amm_version": amm_version,
+        }
+
     def _dexscreener_market(
-        self, mint: str, canonical_pool: str
+        self, mint: str, canonical_pool: str, *, dex_id: str = "pumpswap"
     ) -> dict | None:
         pairs = self.dexscreener.token_pairs(mint)
         matches = []
         for pair in pairs:
             if str(pair.get("chainId") or "").lower() != "solana":
                 continue
-            if str(pair.get("dexId") or "").lower() != "pumpswap":
+            if str(pair.get("dexId") or "").lower() != dex_id:
                 continue
             if pair.get("pairAddress") != canonical_pool:
                 continue
@@ -1907,7 +2263,15 @@ class SolanaRiskAnalyzer:
             except InfrastructureIndeterminateError:
                 transactions_failed += 1
                 continue
-            for decoded in PumpFunObserver.decode_transaction(row, transaction):
+            # A serial deployer could farm through either venue (or both) --
+            # decode both Pump.fun CreateEvents and Meteora DBC pool-
+            # creation instructions so cadence is measured across whichever
+            # this creator actually used, not just the one the CURRENT
+            # candidate happens to be.
+            for decoded in (
+                *PumpFunObserver.decode_transaction(row, transaction),
+                *_meteora_decode_transaction(row, transaction),
+            ):
                 # Only count deployments attributed to THIS creator (a wallet
                 # could appear in other creators' txs as a buyer/signer).
                 if decoded.creator == creator and decoded.mint != candidate.mint:
@@ -1946,7 +2310,10 @@ class SolanaRiskAnalyzer:
             )
 
         result["prior_symbols_sample"] = [
-            {"symbol": d.symbol, "mint": d.mint, "block_time": d.block_time}
+            # MeteoraPoolCreation entries have no symbol (DBC's pool-
+            # creation instruction doesn't carry one) -- None is honest,
+            # not a guess.
+            {"symbol": getattr(d, "symbol", None), "mint": d.mint, "block_time": d.block_time}
             for d in sorted(recent, key=lambda d: d.block_time, reverse=True)[:10]
         ]
 
@@ -2090,13 +2457,18 @@ class SolanaRiskAnalyzer:
         }
         origin = {
             "ecosystem": candidate.launch_ecosystem,
-            "program_id": PUMP_PROGRAM_ID,
+            "program_id": (
+                DBC_PROGRAM_ID
+                if candidate.launch_ecosystem == "meteora_dbc"
+                else PUMP_PROGRAM_ID
+            ),
             "signature": candidate.signature,
             "slot": candidate.slot,
             "source": "confirmed_program_create_event",
         }
         mint_evidence: dict = {}
         curve_evidence: dict = {}
+        dbc_pool_state: dict = {}
         graduation: dict = {
             "curve_completed": False,
             "real_token_reserves_zero": False,
@@ -2193,74 +2565,121 @@ class SolanaRiskAnalyzer:
         except InfrastructureIndeterminateError as exc:
             infrastructure_errors.append(str(exc))
 
-        try:
-            curve_evidence = self._decode_curve(
-                self.rpc.get_account_info(candidate.bonding_curve, encoding="base64")
-            )
-            coverage["bonding_curve_state"] = True
-            if curve_evidence.get("owner") != PUMP_PROGRAM_ID:
-                hard_stops.append("bonding_curve_owner_mismatch")
-            if curve_evidence.get("creator") != candidate.creator:
-                hard_stops.append("bonding_curve_creator_mismatch")
-            graduation["curve_completed"] = bool(
-                curve_evidence.get("complete")
-            )
-            graduation["real_token_reserves_zero"] = (
-                _safe_int(curve_evidence.get("real_token_reserves"), -1) == 0
-            )
-            current_real_reserves = _safe_int(
-                curve_evidence.get("real_token_reserves"), -1
-            )
-            graduation["current_real_token_reserves"] = (
-                current_real_reserves
-                if current_real_reserves >= 0
-                else None
-            )
-            if candidate.real_token_reserves > 0 and current_real_reserves >= 0:
-                graduation["progress_pct"] = round(
-                    100.0
-                    * max(
-                        0.0,
-                        min(
-                            1.0,
-                            1.0
-                            - current_real_reserves
-                            / candidate.real_token_reserves,
-                        ),
-                    ),
-                    4,
-                )
-            graduation["completion_verified_on_chain"] = bool(
-                graduation["curve_completed"]
-                and graduation["real_token_reserves_zero"]
-            )
-            coverage["curve_completion"] = graduation[
-                "completion_verified_on_chain"
-            ]
-            if graduation["curve_completed"] != graduation[
-                "real_token_reserves_zero"
-            ]:
-                hard_stops.append("bonding_curve_completion_state_inconsistent")
-        except InfrastructureIndeterminateError as exc:
-            infrastructure_errors.append(str(exc))
-
-        if graduation["completion_verified_on_chain"]:
+        is_meteora = candidate.launch_ecosystem == "meteora_dbc"
+        if is_meteora:
+            # candidate.bonding_curve holds the DBC VirtualPool account
+            # address for this ecosystem (see
+            # SolanaLaunchCandidate.from_meteora_pool_creation). is_migrated
+            # is DBC's direct on-chain analog of Pump.fun's `complete` flag
+            # -- no initial-vs-current reserve comparison needed, so
+            # progress_pct stays honestly unresolved rather than
+            # approximated from a curve shape this module doesn't model.
             try:
-                canonical_pool = self._canonical_pool_evidence(candidate.mint)
-                if canonical_pool:
-                    graduation["canonical_pool_verified_on_chain"] = True
-                    graduation["canonical_pool"] = canonical_pool
-                    coverage["canonical_pumpswap_pool"] = True
-                else:
-                    warnings.append("canonical_pumpswap_migration_pending")
+                pool_state = self._decode_dbc_pool_state(
+                    self.rpc.get_account_info(
+                        candidate.bonding_curve, encoding="base64"
+                    )
+                )
+                dbc_pool_state = pool_state
+                coverage["bonding_curve_state"] = True
+                if pool_state.get("owner") != DBC_PROGRAM_ID:
+                    hard_stops.append("bonding_curve_owner_mismatch")
+                if pool_state.get("creator") != candidate.creator:
+                    hard_stops.append("bonding_curve_creator_mismatch")
+                is_migrated = bool(pool_state.get("is_migrated"))
+                graduation["curve_completed"] = is_migrated
+                graduation["real_token_reserves_zero"] = is_migrated
+                graduation["current_real_token_reserves"] = pool_state.get(
+                    "base_reserve"
+                )
+                graduation["completion_verified_on_chain"] = is_migrated
+                coverage["curve_completion"] = is_migrated
             except InfrastructureIndeterminateError as exc:
                 infrastructure_errors.append(str(exc))
+
+            if graduation["completion_verified_on_chain"]:
+                try:
+                    canonical_pool = self._meteora_canonical_pool_evidence(
+                        candidate.mint
+                    )
+                    if canonical_pool:
+                        graduation["canonical_pool_verified_on_chain"] = True
+                        graduation["canonical_pool"] = canonical_pool
+                        coverage["canonical_pumpswap_pool"] = True
+                    else:
+                        warnings.append("canonical_meteora_migration_pending")
+                except InfrastructureIndeterminateError as exc:
+                    infrastructure_errors.append(str(exc))
+        else:
+            try:
+                curve_evidence = self._decode_curve(
+                    self.rpc.get_account_info(candidate.bonding_curve, encoding="base64")
+                )
+                coverage["bonding_curve_state"] = True
+                if curve_evidence.get("owner") != PUMP_PROGRAM_ID:
+                    hard_stops.append("bonding_curve_owner_mismatch")
+                if curve_evidence.get("creator") != candidate.creator:
+                    hard_stops.append("bonding_curve_creator_mismatch")
+                graduation["curve_completed"] = bool(
+                    curve_evidence.get("complete")
+                )
+                graduation["real_token_reserves_zero"] = (
+                    _safe_int(curve_evidence.get("real_token_reserves"), -1) == 0
+                )
+                current_real_reserves = _safe_int(
+                    curve_evidence.get("real_token_reserves"), -1
+                )
+                graduation["current_real_token_reserves"] = (
+                    current_real_reserves
+                    if current_real_reserves >= 0
+                    else None
+                )
+                if candidate.real_token_reserves > 0 and current_real_reserves >= 0:
+                    graduation["progress_pct"] = round(
+                        100.0
+                        * max(
+                            0.0,
+                            min(
+                                1.0,
+                                1.0
+                                - current_real_reserves
+                                / candidate.real_token_reserves,
+                            ),
+                        ),
+                        4,
+                    )
+                graduation["completion_verified_on_chain"] = bool(
+                    graduation["curve_completed"]
+                    and graduation["real_token_reserves_zero"]
+                )
+                coverage["curve_completion"] = graduation[
+                    "completion_verified_on_chain"
+                ]
+                if graduation["curve_completed"] != graduation[
+                    "real_token_reserves_zero"
+                ]:
+                    hard_stops.append("bonding_curve_completion_state_inconsistent")
+            except InfrastructureIndeterminateError as exc:
+                infrastructure_errors.append(str(exc))
+
+            if graduation["completion_verified_on_chain"]:
+                try:
+                    canonical_pool = self._canonical_pool_evidence(candidate.mint)
+                    if canonical_pool:
+                        graduation["canonical_pool_verified_on_chain"] = True
+                        graduation["canonical_pool"] = canonical_pool
+                        coverage["canonical_pumpswap_pool"] = True
+                    else:
+                        warnings.append("canonical_pumpswap_migration_pending")
+                except InfrastructureIndeterminateError as exc:
+                    infrastructure_errors.append(str(exc))
 
         if graduation["canonical_pool_verified_on_chain"]:
             try:
                 dex_market = self._dexscreener_market(
                     candidate.mint,
                     graduation["canonical_pool"]["pool"],
+                    dex_id="meteora" if is_meteora else "pumpswap",
                 )
                 if dex_market:
                     graduation["secondary_market_observed"] = True
@@ -2288,9 +2707,15 @@ class SolanaRiskAnalyzer:
                     candidate,
                     _safe_int(mint_evidence.get("supply_raw")),
                     pool_base_token_account=(
+                        # Post-migration Meteora candidates: not resolved
+                        # here (see _meteora_canonical_pool_evidence's
+                        # docstring on the DAMM v2/DLMM vault-address
+                        # scoping decision) -- falls through to the
+                        # pre-migration DBC vault, then to None.
                         (graduation.get("canonical_pool") or {}).get(
                             "pool_base_token_account"
                         )
+                        or dbc_pool_state.get("base_vault")
                     ),
                 )
                 coverage["holder_concentration"] = True
@@ -3065,6 +3490,9 @@ class SolanaPrototypeEngine:
         self.observer = PumpFunObserver(
             self.rpc, self.root, self.observation_ledger
         )
+        self.meteora_observer = MeteoraObserver(
+            self.rpc, self.root, self.observation_ledger
+        )
         self.convergence_tracker = WalletConvergenceTracker(
             self.root / "wallet_convergence.json"
         )
@@ -3704,27 +4132,38 @@ class SolanaPrototypeEngine:
             for candidate, account in zip(batch, values):
                 stats["scanned"] += 1
                 try:
-                    curve = self.analyzer._decode_curve({"value": account})
+                    if candidate.launch_ecosystem == "meteora_dbc":
+                        # DBC's is_migrated flag is a direct boolean, not a
+                        # reserve ratio -- no partial-progress signal to
+                        # compute here (see the module-level scoping note
+                        # on DBC graduation tracking).
+                        pool_state = self.analyzer._decode_dbc_pool_state(
+                            {"value": account}
+                        )
+                        completed = bool(pool_state.get("is_migrated"))
+                        progress = 100.0 if completed else 0.0
+                    else:
+                        curve = self.analyzer._decode_curve({"value": account})
+                        current = _safe_int(
+                            curve.get("real_token_reserves"), -1
+                        )
+                        progress = (
+                            100.0
+                            * max(
+                                0.0,
+                                min(
+                                    1.0,
+                                    1.0
+                                    - current / candidate.real_token_reserves,
+                                ),
+                            )
+                            if candidate.real_token_reserves > 0 and current >= 0
+                            else 0.0
+                        )
+                        completed = bool(curve.get("complete")) and current == 0
                 except InfrastructureIndeterminateError:
                     stats["errors"] += 1
                     continue
-                current = _safe_int(
-                    curve.get("real_token_reserves"), -1
-                )
-                progress = (
-                    100.0
-                    * max(
-                        0.0,
-                        min(
-                            1.0,
-                            1.0
-                            - current / candidate.real_token_reserves,
-                        ),
-                    )
-                    if candidate.real_token_reserves > 0 and current >= 0
-                    else 0.0
-                )
-                completed = bool(curve.get("complete")) and current == 0
                 if completed:
                     stats["completed"] += 1
                 item = queue["items"].get(candidate.mint)
@@ -3913,6 +4352,11 @@ class SolanaPrototypeEngine:
             "live_execution_enabled": False,
         }
 
+    def _candidate_by_mint(self, mint: str) -> SolanaLaunchCandidate | None:
+        """Look up a mint across BOTH launch-venue catalogs -- a shadow
+        position's mint could have come from either observer."""
+        return self.observer.by_mint(mint) or self.meteora_observer.by_mint(mint)
+
     def observe(
         self, *, limit: int = 10, signature_limit: int = 100,
         slot_span: int | None = None, max_pages: int = 10,
@@ -3921,6 +4365,14 @@ class SolanaPrototypeEngine:
             signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages
         )
         candidates = discovered[-limit:] if discovered else self.observer.recent(limit)
+        meteora_discovered = self.meteora_observer.sync(
+            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages
+        )
+        candidates += (
+            meteora_discovered[-limit:]
+            if meteora_discovered
+            else self.meteora_observer.recent(limit)
+        )
         results = [self.evaluate_candidate(candidate) for candidate in candidates]
         _atomic_json(self.root / "last_observe.json", results)
         self._persist_rpc_health()
@@ -3975,6 +4427,9 @@ class SolanaPrototypeEngine:
         discovered = self.observer.sync(
             signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages
         )
+        meteora_discovered = self.meteora_observer.sync(
+            signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages
+        )
         recovered_mints = {
             result["candidate"]["mint"] for result in recovered
         }
@@ -3990,11 +4445,11 @@ class SolanaPrototypeEngine:
         }
         candidate_map.update({
             candidate.mint: candidate
-            for candidate in discovered[-limit:]
+            for candidate in discovered[-limit:] + meteora_discovered[-limit:]
             if candidate.mint not in recovered_mints
         })
         for position in self.trader.open_positions():
-            candidate = self.observer.by_mint(position["mint"])
+            candidate = self._candidate_by_mint(position["mint"])
             if candidate and candidate.mint not in recovered_mints:
                 candidate_map[candidate.mint] = candidate
         results = list(recovered)

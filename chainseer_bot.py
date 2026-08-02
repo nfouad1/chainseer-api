@@ -240,7 +240,10 @@ def _format_solana_public_summary(mint: str, result: dict) -> str:
 def _run_solana_analysis(mint: str):
     """Run blocking RPC/Jupiter/DexScreener work outside the event loop."""
     engine = get_solana_engine()
-    candidate = engine.observer.resolve_candidate(mint)
+    candidate = (
+        engine.observer.resolve_candidate(mint)
+        or engine.meteora_observer.resolve_candidate(mint)
+    )
     if candidate is not None:
         result = engine.evaluate_candidate(candidate, shadow_enter=False)
         return "deep", _format_solana_deep_summary(mint, result)
