@@ -1,6 +1,6 @@
 # Chainseer API deployment
 
-The first production deployment targets a single Render web service in
+The production deployment targets a single Fly.io application machine in
 Frankfurt with a persistent disk mounted at `/data`.
 
 ## Why one instance
@@ -79,6 +79,14 @@ creates its own Genesis Ring and a bootstrap faculty-registry epoch on the
 persistent disk. Render's disk preserves rings, blockspace, senses, modalities,
 and safely grown faculties across service deploys and restarts. A partial or
 epoch-mismatched registry fails startup instead of being silently repaired.
+
+The image also carries the reviewed faculty pack at
+`/app/faculties/chainseer-production-v1.json`. On startup,
+`CHAINSEER_FACULTY_PACK_PATH` causes Chainseer to verify its canonical hash,
+screen it through the covenant membrane, import any missing definitions before
+Recall caches the registry, and seal the changed registry epoch. Subsequent
+restarts verify the existing definitions without producing duplicate import
+rings. `/health/ready` exposes the bounded `faculty_pack` status and pack hash.
 
 Before each release:
 

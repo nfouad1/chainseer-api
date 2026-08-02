@@ -137,6 +137,27 @@ type PublicReport = {
     ring_hash?: string;
     decision?: string;
     scores: Record<string, number>;
+    cognitive_ring?: number;
+    cognitive_ring_hash?: string;
+    cognition?: {
+      version?: string;
+      status?: string;
+      input_policy?: string;
+      salience?: number;
+      dissonance?: number;
+      senses?: Array<{ id?: number; name?: string }>;
+      modalities?: Array<{ id?: number; name?: string }>;
+      frames?: string[];
+      relevant_rings?: number[];
+      retrieved_faculties?: string[];
+      growth?: Array<{
+        action?: string;
+        faculty?: string;
+        kind?: string;
+        reason?: string;
+      }>;
+      immune?: { status?: string; covenant?: number };
+    };
   };
   entity_graph?: EntityGraph;
   analyzed_at?: string;
@@ -597,6 +618,12 @@ function LiveReport({
     : report.holders?.sample_size
       ? "Largest accounts only"
       : "No reliable count returned";
+  const cognition = report.timechain.cognition;
+  const activeSenses = cognition?.senses?.filter((item) => item.name) || [];
+  const activeModalities = cognition?.modalities?.filter((item) => item.name) || [];
+  const cognitiveGrowth = cognition?.growth?.filter(
+    (item) => item.action && item.action !== "none",
+  ) || [];
 
   return (
     <section
@@ -784,6 +811,111 @@ function LiveReport({
               <a href={report.token.explorer_url} target="_blank" rel="noreferrer">
                 Open token explorer ↗
               </a>
+            )}
+          </div>
+        </details>
+
+        <details className="live-cognition analysis-disclosure">
+          <summary className="panel-head analysis-disclosure-trigger">
+            <div><span className="panel-index">03</span><h3>Cognitive trace</h3></div>
+            <span>
+              {isDemo
+                ? "Not run for demo"
+                : cognition?.status === "complete"
+                  ? "Timechain-complete"
+                  : "Unavailable"}
+            </span>
+          </summary>
+          <div className="analysis-disclosure-body cognitive-trace-body">
+            {cognition ? (
+              <>
+                <div className="cognitive-overview">
+                  <div>
+                    <span>Input boundary</span>
+                    <strong>
+                      {cognition.input_policy === "trusted_structured_fields_only"
+                        ? "Trusted structured evidence only"
+                        : cognition.input_policy || "Unspecified"}
+                    </strong>
+                  </div>
+                  <div>
+                    <span>Cognitive ring</span>
+                    <strong>{report.timechain.cognitive_ring ?? "—"}</strong>
+                  </div>
+                  <div>
+                    <span>Salience</span>
+                    <strong>{cognition.salience ?? "—"}</strong>
+                  </div>
+                  <div>
+                    <span>Dissonance</span>
+                    <strong>{cognition.dissonance ?? "—"}</strong>
+                  </div>
+                  <div>
+                    <span>Covenant membrane</span>
+                    <strong>{cognition.immune?.status || "—"}</strong>
+                  </div>
+                </div>
+
+                <div className="cognitive-lens-grid">
+                  <div>
+                    <span>Active senses</span>
+                    <div className="cognitive-chips">
+                      {activeSenses.length ? activeSenses.map((item) => (
+                        <span key={`sense-${item.id}-${item.name}`}>{item.name}</span>
+                      )) : <em>No sense labels returned</em>}
+                    </div>
+                  </div>
+                  <div>
+                    <span>Reasoning modalities</span>
+                    <div className="cognitive-chips">
+                      {activeModalities.length ? activeModalities.map((item) => (
+                        <span key={`modality-${item.id}-${item.name}`}>{item.name}</span>
+                      )) : <em>No modality labels returned</em>}
+                    </div>
+                  </div>
+                </div>
+
+                {(cognition.frames?.length || 0) > 0 && (
+                  <div className="cognitive-frames">
+                    <span>Applied reasoning frames</span>
+                    <ul>
+                      {cognition.frames?.map((frame, index) => (
+                        <li key={`${frame}-${index}`}>{frame}</li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                {cognitiveGrowth.length > 0 && (
+                  <div className="cognitive-growth">
+                    <span>Faculty changes sealed after this analysis</span>
+                    <ul>
+                      {cognitiveGrowth.map((item, index) => (
+                        <li key={`${item.action}-${item.faculty}-${index}`}>
+                          <strong>{item.action}</strong>{" "}
+                          {item.faculty || item.kind || "faculty"}
+                        </li>
+                      ))}
+                    </ul>
+                  </div>
+                )}
+
+                <p className="cognitive-boundary">
+                  The trace shows which Timechain lenses fired and what was
+                  sealed. Deterministic on-chain evidence, scoring rules, and
+                  hard-stop gates remain authoritative; faculties cannot sign
+                  or broadcast transactions.
+                  {(cognition.relevant_rings?.length || 0) > 0
+                    ? ` Recalled rings: ${cognition.relevant_rings?.join(", ")}.`
+                    : ""}
+                </p>
+              </>
+            ) : (
+              <p className="cognitive-empty">
+                {isDemo
+                  ? "The fictional preview does not execute or seal a cognitive loop. Run a real scan to see active senses, modalities, recall, and the cognitive completion ring."
+                  : "This report predates the public cognitive-trace schema or the cognitive loop did not return a trace."}
+              </p>
             )}
           </div>
         </details>

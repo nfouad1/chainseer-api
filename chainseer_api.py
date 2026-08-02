@@ -917,6 +917,11 @@ class AnalysisService:
         return {
             "watcher_last_error": watcher_status.get("last_error"),
             "benchmark_capture": self._benchmark.health_status(),
+            "faculty_pack": (
+                dict(getattr(self._agent, "faculty_pack_status", {}) or {})
+                if self._agent is not None
+                else {"status": "not_initialized"}
+            ),
         }
 
     def watch_subscribe(
@@ -1664,6 +1669,7 @@ def ready() -> dict[str, Any]:
         "base_rpc_configured": bool(SETTINGS.base_rpc_url),
         "solana_rpc_configured": bool(SETTINGS.solana_rpc_url),
         "benchmark_capture": health["benchmark_capture"],
+        "faculty_pack": health["faculty_pack"],
     }
 
 

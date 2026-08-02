@@ -15,8 +15,13 @@ base_learning
 base_prototype
 base_prototype_smoke
 chainseer_chain
+pons_chain
+pons_learning
+solana_chain
+solana_learning
 tests
 chainseer_web
+.venv
 
 node_modules
 dist

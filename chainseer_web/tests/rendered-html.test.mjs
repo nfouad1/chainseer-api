@@ -115,6 +115,10 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, /graph_hash/);
   assert.match(page, /<details className="live-factors analysis-disclosure">/);
   assert.match(page, /<details className="live-evidence analysis-disclosure">/);
+  assert.match(page, /<details className="live-cognition analysis-disclosure">/);
+  assert.match(page, /Cognitive trace/);
+  assert.match(page, /Trusted structured evidence only/);
+  assert.match(page, /faculties cannot sign\s+or broadcast transactions/);
   assert.match(page, /<details className="analysis-disclosure">/);
   assert.match(page, /analysis-disclosure-trigger/);
   assert.match(page, /data-network=\{network\}/);
@@ -137,6 +141,8 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(styles, /\.entity-inspector/);
   assert.match(styles, /\.analysis-disclosure\[open\]/);
   assert.match(styles, /\.analysis-disclosure-trigger::after/);
+  assert.match(styles, /\.cognitive-overview/);
+  assert.match(styles, /\.cognitive-chips/);
   assert.match(page, /SAMPLE DATA · NOT LIVE/);
   assert.match(page, /nothing was sealed/);
   assert.match(page, /const demoReport: PublicReport/);

@@ -258,6 +258,178 @@ def _bootstrap_faculty_registry(chain_root: str | Path, skill_dir: str) -> Path:
     return registry
 
 
+def install_curated_faculty_pack(
+    chain_root: str | Path,
+    skill_dir: str,
+    pack_path: str | Path,
+) -> dict:
+    """Install one reviewed faculty pack before the cognitive loop is loaded.
+
+    Production owns a single Timechain writer.  This function is therefore
+    called after genesis, while the API lease is held, but before Recall caches
+    the registry or any watcher thread starts.  The embedded pack is still
+    treated as untrusted input: its canonical hash, membrane screening, flood
+    guard, registry epoch, and resulting chain are all verified.  Reboots are
+    idempotent and do not add duplicate import rings.
+
+    Faculties are a metacognitive/observability layer.  Installing a pack does
+    not connect a faculty to component scoring, hard stops, trade signing, or
+    transaction broadcast.
+    """
+    root = Path(chain_root)
+    path = Path(pack_path)
+    if not path.is_absolute():
+        path = Path(__file__).resolve().parent / path
+    if not path.is_file():
+        raise RuntimeError(f"Configured faculty pack does not exist: {path}")
+
+    try:
+        pack = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError) as exc:
+        raise RuntimeError(f"Cannot read configured faculty pack: {path}") from exc
+
+    faculties_module = _load_skill_module(skill_dir, "faculties")
+    cambium_module = _load_skill_module(skill_dir, "cambium")
+    epochs_module = _load_skill_module(skill_dir, "epochs")
+    expected_hash = str(pack.get("pack_sha256") or "")
+    actual_hash = faculties_module.pack_hash(pack)
+    if not expected_hash or actual_hash != expected_hash:
+        raise RuntimeError("Configured faculty pack failed canonical hash verification")
+
+    definitions = pack.get("faculties") or []
+    if not definitions:
+        raise RuntimeError("Configured faculty pack contains no faculties")
+    identities = [(item.get("kind"), item.get("name")) for item in definitions]
+    if any(kind not in {"sense", "modality"} or not name for kind, name in identities):
+        raise RuntimeError("Configured faculty pack has an invalid faculty definition")
+    if len(set(identities)) != len(identities):
+        raise RuntimeError("Configured faculty pack contains duplicate faculty identities")
+
+    def registry_entries() -> dict[tuple[str, str], dict]:
+        grown = cambium_module.load_grown(
+            cambium_module.registry_home(root, root)
+        )
+        entries = {}
+        for key, kind in (("senses", "sense"), ("modalities", "modality")):
+            for item in grown.get(key, []):
+                entries[(kind, item.get("name"))] = item
+        return entries
+
+    existing = registry_entries()
+    for definition in definitions:
+        identity = (definition["kind"], definition["name"])
+        current = existing.get(identity)
+        if current and current.get("function") != definition.get("function"):
+            raise RuntimeError(
+                "Faculty registry contains a conflicting definition for "
+                + definition["name"]
+            )
+
+    if all(identity in existing for identity in identities):
+        ok, epoch_report = epochs_module.check_epoch(root)
+        if not ok:
+            raise RuntimeError(
+                "Faculty pack is present but registry epoch verification failed: "
+                + "; ".join(epoch_report)
+            )
+        return {
+            "status": "verified",
+            "name": pack.get("name"),
+            "version": pack.get("version"),
+            "pack_sha256": expected_hash,
+            "faculty_count": len(definitions),
+            "imported_count": 0,
+        }
+
+    pending_definitions = [
+        definition
+        for definition in definitions
+        if (definition["kind"], definition["name"]) not in existing
+    ]
+    import_pack = dict(pack)
+    import_pack["faculties"] = pending_definitions
+    # A reviewed, embedded production configuration needs its exact named
+    # lenses. Semantic deduplication is valuable for arbitrary shared packs,
+    # but it can collapse a domain-specific lens into a broadly worded base
+    # faculty. Exact identity/function conflicts were rejected above, and only
+    # missing definitions reach this bounded import.
+    import_pack["pack_sha256"] = faculties_module.pack_hash(import_pack)
+    preview = faculties_module.import_pack(
+        root,
+        import_pack,
+        dry_run=True,
+        dedup_floor=0,
+    )
+    if preview.get("errors") or preview.get("blocked"):
+        raise RuntimeError(
+            "Faculty pack was refused during preflight: "
+            + json.dumps(
+                {
+                    "errors": preview.get("errors") or [],
+                    "blocked": preview.get("blocked") or [],
+                },
+                sort_keys=True,
+            )
+        )
+
+    result = faculties_module.import_pack(
+        root,
+        import_pack,
+        dry_run=False,
+        dedup_floor=0,
+    )
+    if result.get("errors") or result.get("blocked"):
+        raise RuntimeError(
+            "Faculty pack import failed closed: "
+            + json.dumps(
+                {
+                    "errors": result.get("errors") or [],
+                    "blocked": result.get("blocked") or [],
+                },
+                sort_keys=True,
+            )
+        )
+    installed = registry_entries()
+    missing = [name for kind, name in identities if (kind, name) not in installed]
+    if missing:
+        raise RuntimeError(
+            "Faculty pack import did not install required faculties: "
+            + ", ".join(missing)
+        )
+
+    epoch = epochs_module.seal_epoch(
+        root,
+        reason=(
+            f"reviewed Chainseer faculty pack {pack.get('name')}@"
+            f"{pack.get('version')}"
+        ),
+    )
+    ok, epoch_report = epochs_module.check_epoch(root)
+    if not ok:
+        raise RuntimeError(
+            "Faculty registry failed post-import epoch verification: "
+            + "; ".join(epoch_report)
+        )
+    tc_module = _load_timechain_module(skill_dir)
+    ok, chain_report = tc_module.Timechain(root).verify()
+    if not ok:
+        raise RuntimeError(
+            "Timechain failed after faculty pack import: "
+            + "; ".join(chain_report)
+        )
+    return {
+        "status": "installed",
+        "name": pack.get("name"),
+        "version": pack.get("version"),
+        "pack_sha256": expected_hash,
+        "faculty_count": len(definitions),
+        "imported_count": len(result.get("imported") or []),
+        "covered_count": len(result.get("skipped_covered") or []),
+        "import_ring": result.get("ring"),
+        "epoch_ring": epoch.get("index") if epoch else None,
+    }
+
+
 class ChainseerCognitiveLoop:
     """Non-bypassable Timechain perception, recall, conscience, and growth."""
 
@@ -302,6 +474,39 @@ class ChainseerCognitiveLoop:
         liquidity_custody = data.get("lp_lock") or {}
         entity_graph = data.get("entity_graph") or {}
         graph_summary = entity_graph.get("summary") or {}
+        holder_assessment = analysis.get("holder_assessment") or {}
+        concentration = data.get("holder_concentration") or {}
+        contract = data.get("contract_audit") or {}
+        basic = data.get("basic_info") or {}
+        goplus = data.get("goplus_security") or {}
+
+        def indicator(value):
+            """Preserve true/false/unknown without carrying provider text."""
+            if value in (None, ""):
+                return None
+            if isinstance(value, bool):
+                return value
+            if isinstance(value, (int, float)):
+                return bool(value)
+            normalized = str(value).strip().lower()
+            if normalized in {"1", "true", "yes"}:
+                return True
+            if normalized in {"0", "false", "no"}:
+                return False
+            return None
+
+        def bounded_number(value):
+            if value in (None, "") or isinstance(value, bool):
+                return None
+            try:
+                return round(float(value), 6)
+            except (TypeError, ValueError, OverflowError):
+                return None
+
+        owner_address = str(goplus.get("owner_address") or "").lower()
+        ownership_renounced = indicator(contract.get("ownership_renounced"))
+        if ownership_renounced is None and owner_address:
+            ownership_renounced = owner_address == ZERO_ADDRESS
         safe = {
             "task": "on-chain token risk analysis",
             "chain_id": report.get("chain_id"),
@@ -327,6 +532,54 @@ class ChainseerCognitiveLoop:
             "liquidity_usd": dex.get("total_liquidity_usd"),
             "primary_amm_version": dex.get("primary_amm_version"),
             "liquidity_custody_state": liquidity_custody.get("state"),
+            "holder_count": (
+                holder_assessment.get("holder_count")
+                or basic.get("jupiter_holder_count")
+            ),
+            "largest_non_amm_holder_pct": bounded_number(
+                holder_assessment.get("largest_non_amm_holder_pct")
+            ),
+            "top10_non_amm_holder_pct": bounded_number(
+                holder_assessment.get("top10_non_amm_holder_pct")
+            ),
+            "top1_total_supply_pct": bounded_number(
+                concentration.get("top1_total_supply_pct")
+            ),
+            "top10_total_supply_pct": bounded_number(
+                concentration.get("top10_total_supply_pct")
+            ),
+            "concentration_basis": (
+                holder_assessment.get("concentration_source")
+                or concentration.get("method")
+            ),
+            "concentration_complete": indicator(
+                concentration.get("pool_and_program_vaults_excluded")
+            ),
+            "ownership_renounced": ownership_renounced,
+            "owner_check_failed": indicator(contract.get("owner_check_failed")),
+            "mint_authority_active": (
+                bool(basic.get("mint_authority"))
+                if "mint_authority" in basic
+                else indicator(goplus.get("is_mintable"))
+            ),
+            "freeze_authority_active": (
+                bool(basic.get("freeze_authority"))
+                if "freeze_authority" in basic
+                else None
+            ),
+            "blacklist_control": indicator(goplus.get("is_blacklisted")),
+            "pause_control": indicator(goplus.get("transfer_pausable")),
+            "hidden_owner": indicator(goplus.get("hidden_owner")),
+            "is_proxy": indicator(goplus.get("is_proxy")),
+            "proxy_type": source.get("proxy_type"),
+            "implementation_verified": indicator(
+                source.get("implementation_verified")
+            ),
+            "is_honeypot": indicator(goplus.get("is_honeypot")),
+            "cannot_buy": indicator(goplus.get("cannot_buy")),
+            "cannot_sell_all": indicator(goplus.get("cannot_sell_all")),
+            "buy_tax_pct": bounded_number(goplus.get("buy_tax")),
+            "sell_tax_pct": bounded_number(goplus.get("sell_tax")),
             "entity_graph_hash": entity_graph.get("graph_hash"),
             "insider_risk_level": graph_summary.get("insider_risk_level"),
             "entity_graph_coverage": graph_summary.get("coverage"),
@@ -1374,6 +1627,7 @@ class Chainseer:
         self.explorer = self.network.explorer
         self.cross_chain_provider = cross_chain_provider
         self.social_kol_provider = social_kol_provider
+        self.faculty_pack_status = {"status": "disabled"}
 
         # Initialize Timechain
         skill_dir = _get_skill_dir()
@@ -1395,6 +1649,26 @@ class Chainseer:
             if self.tc.height() == 0:
                 self.tc.genesis(name="Chainseer")
                 print(f"  New Timechain initialized at {self.chain_root}")
+            # A curated pack mutates the faculty registries and then seals an
+            # authenticated epoch.  Prove the existing chain first so a torn
+            # or otherwise corrupt tail can never be followed by a registry
+            # mutation.  The second verification below covers the completed
+            # bootstrap/import transaction.
+            preinstall_ok, preinstall_report = self.tc.verify()
+            if not preinstall_ok:
+                raise RuntimeError(
+                    "Timechain integrity verification failed before faculty "
+                    f"initialization: {preinstall_report}"
+                )
+            faculty_pack_path = os.environ.get(
+                "CHAINSEER_FACULTY_PACK_PATH", ""
+            ).strip()
+            if faculty_pack_path:
+                self.faculty_pack_status = install_curated_faculty_pack(
+                    self.chain_root,
+                    skill_dir,
+                    faculty_pack_path,
+                )
             self.cognitive_loop = ChainseerCognitiveLoop(
                 self.chain_root, skill_dir
             )

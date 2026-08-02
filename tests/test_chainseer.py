@@ -1,5 +1,6 @@
 import json
 import inspect
+import os
 import sys
 import tempfile
 import types
@@ -208,6 +209,47 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertNotIn("provider text", str(safe))
         self.assertNotIn("provider-controlled label", str(safe))
 
+    def test_cognitive_input_exposes_bounded_production_risk_states(self):
+        safe = json.loads(
+            chainseer.ChainseerCognitiveLoop._safe_input(
+                {
+                    "token_address": "0x" + "1" * 40,
+                    "chain_id": 8453,
+                    "analysis": {
+                        "risk_level": "High",
+                        "holder_assessment": {
+                            "holder_count": 420,
+                            "largest_non_amm_holder_pct": 12.5,
+                            "concentration_source": "total_supply",
+                        },
+                        "uncertain_components": {
+                            "honeypot_safety": "provider unavailable"
+                        },
+                    },
+                    "data": {
+                        "basic_info": {},
+                        "goplus_security": {
+                            "is_proxy": "1",
+                            "cannot_sell_all": "0",
+                            "is_mintable": "1",
+                        },
+                        "source_code": {
+                            "proxy_type": "eip1967",
+                            "implementation_verified": False,
+                        },
+                        "lp_lock": {"state": "custody_unverified"},
+                    },
+                }
+            )
+        )
+        self.assertEqual(safe["holder_count"], 420)
+        self.assertEqual(safe["largest_non_amm_holder_pct"], 12.5)
+        self.assertEqual(safe["liquidity_custody_state"], "custody_unverified")
+        self.assertTrue(safe["mint_authority_active"])
+        self.assertTrue(safe["is_proxy"])
+        self.assertFalse(safe["implementation_verified"])
+        self.assertFalse(safe["cannot_sell_all"])
+
     @staticmethod
     def investor_fixture():
         return {
@@ -267,6 +309,121 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             ok, _ = agent.tc.verify()
             self.assertTrue(ok)
             self.assertTrue(callable(agent.poq_module.gate_and_seal))
+
+    def test_reviewed_faculty_pack_import_is_verified_and_idempotent(self):
+        pack_path = (
+            Path(chainseer.__file__).resolve().parent
+            / "faculties"
+            / "chainseer-production-v1.json"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.dict(
+                    os.environ,
+                    {"CHAINSEER_FACULTY_PACK_PATH": str(pack_path)},
+                ),
+                patch.object(
+                    chainseer.RobinhoodRPC,
+                    "get_block_number",
+                    return_value=100,
+                ),
+            ):
+                first = chainseer.Chainseer(chain_root=temp_dir)
+                second = chainseer.Chainseer(chain_root=temp_dir)
+
+            self.assertEqual(first.faculty_pack_status["status"], "installed")
+            self.assertEqual(second.faculty_pack_status["status"], "verified")
+            self.assertEqual(first.faculty_pack_status["faculty_count"], 12)
+            rings = second.tc.load()
+            imports = [r for r in rings if r["ring_type"] == "faculty-import"]
+            self.assertEqual(len(imports), 1)
+            grown = json.loads(
+                (Path(temp_dir) / "registry" / "grown.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            names = {
+                item["name"]
+                for key in ("senses", "modalities")
+                for item in grown.get(key, [])
+            }
+            self.assertIn("Liquidity-Custody State Sensing", names)
+            self.assertIn("Token-vs-Infrastructure Evidence Separation", names)
+            labels = second.cognitive_loop.recall.label(
+                json.dumps(
+                    {
+                        "liquidity_custody_state": "custody_unverified",
+                        "largest_non_amm_holder_pct": 42.0,
+                        "concentration_basis": "total_supply",
+                        "is_proxy": True,
+                        "implementation_verified": False,
+                        "cannot_sell_all": False,
+                        "uncertain_components": ["honeypot_safety"],
+                    },
+                    sort_keys=True,
+                )
+            )
+            active = {
+                item["name"]
+                for key in ("senses", "modalities")
+                for item in labels.get(key, [])
+            }
+            self.assertTrue(active & names)
+            ok, _ = second.tc.verify()
+            self.assertTrue(ok)
+
+    def test_faculty_pack_refuses_to_mutate_registry_on_corrupt_chain(self):
+        pack_path = (
+            Path(chainseer.__file__).resolve().parent
+            / "faculties"
+            / "chainseer-production-v1.json"
+        )
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with (
+                patch.dict(
+                    os.environ,
+                    {"CHAINSEER_FACULTY_PACK_PATH": ""},
+                ),
+                patch.object(
+                    chainseer.RobinhoodRPC,
+                    "get_block_number",
+                    return_value=100,
+                ),
+            ):
+                chainseer.Chainseer(chain_root=temp_dir)
+
+            registry_dir = Path(temp_dir) / "registry"
+            registry_before = {
+                path.name: path.read_bytes()
+                for path in registry_dir.glob("*.json")
+            }
+            rings_path = Path(temp_dir) / "chain" / "rings.jsonl"
+            with rings_path.open("ab") as handle:
+                handle.write(b"\x00")
+
+            with (
+                patch.dict(
+                    os.environ,
+                    {"CHAINSEER_FACULTY_PACK_PATH": str(pack_path)},
+                ),
+                patch.object(
+                    chainseer.RobinhoodRPC,
+                    "get_block_number",
+                    return_value=100,
+                ),
+                self.assertRaisesRegex(
+                    RuntimeError,
+                    "before faculty initialization",
+                ),
+            ):
+                chainseer.Chainseer(chain_root=temp_dir)
+
+            registry_after = {
+                path.name: path.read_bytes()
+                for path in registry_dir.glob("*.json")
+            }
+            self.assertEqual(registry_after, registry_before)
+            self.assertNotIn("grown.json", registry_after)
 
     def test_report_seals_through_poq_with_provenance(self):
         with tempfile.TemporaryDirectory() as temp_dir:

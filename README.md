@@ -150,6 +150,15 @@ Every completed analysis passes through the Cypher Tempre self-model:
 5. analysis and cognitive-completion evidence are appended to a hash-linked
    Timechain ring.
 
+Production also installs the reviewed
+[`chainseer-production-risk-lenses`](faculties/chainseer-production-v1.json)
+pack before Recall is initialized. Its 12 bounded faculties cover liquidity
+custody, holder-concentration basis, authority state, proxy upgrades,
+sellability, and infrastructure indeterminacy. The pack is canonical-hash
+verified, immune-screened, imported once, and anchored by a registry epoch.
+It transfers capability definitions onlyâ€”no developer Timechain history is
+copied into production.
+
 The result is tamper-evident and internally consistent: later verification can
 detect modified, removed, reordered, or incompatible rings and faculty
 registries. Timechain verification does not claim that a historical external
@@ -158,6 +167,12 @@ API response can always be reproduced from its present-day endpoint.
 When a genuine capability gap is detected, Cambium may grow a constrained
 primitive faculty and seal a new registry epoch. Growth is fail-closed and
 cannot silently change deterministic scoring policy.
+
+The public report exposes an expandable **Cognitive trace** with the active
+senses, reasoning modalities, bounded recall references, growth events, PoQ
+completion state, and cognitive ring. This is provenance and observability,
+not a second scoring engine: deterministic evidence and hard-stop rules remain
+authoritative, and the cognitive layer has no signing or broadcast capability.
 
 ## Monitoring and pre-trade controls
 
@@ -301,7 +316,7 @@ Interactive docs are disabled in production.
 
 ## Production architecture
 
-- one Render web-service instance in Frankfurt
+- one Fly.io application instance in Frankfurt
 - one bounded analysis worker and confirmed-block watcher
 - persistent disk mounted at `/data`
 - one filesystem lease and one ordered Timechain writer
@@ -330,7 +345,7 @@ Deployment, secrets, backups, health checks, and domain setup are covered in
 | [`CHAINSEER_CONTROLS.md`](CHAINSEER_CONTROLS.md) | Monitoring and pre-trade control operations |
 | [`BENCHMARK.md`](BENCHMARK.md) | Benchmark schema, workflow, metrics, and caveats |
 | [`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) | Entity graph schema, evidence semantics, signals, and inference limits |
-| [`API_DEPLOYMENT.md`](API_DEPLOYMENT.md) | Render deployment and production operations |
+| [`API_DEPLOYMENT.md`](API_DEPLOYMENT.md) | Fly.io deployment and production operations |
 | [`render.yaml`](render.yaml) | Render Blueprint |
 | [`Dockerfile.api`](Dockerfile.api) | Reproducible API container |
 
