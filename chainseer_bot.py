@@ -68,7 +68,13 @@ from chainseer import Chainseer, ensure_utf8_runtime
 import chainseer_solana
 from chainseer_solana_public import SolanaPublicAnalyzer, SolanaMintError, validate_solana_mint
 
-BOT_TOKEN = os.environ.get("CHAINSEER_BOT_TOKEN", "")
+# Uses chainseer_solana's env lookup (process env, falling back to the
+# persistent Windows user registry) rather than a bare os.environ.get().
+# `setx` only writes the registry -- it does not retroactively appear in
+# any shell/process that was already running before the setx call, so a
+# plain os.environ.get() here would silently miss a value that was in fact
+# set correctly, just not in this process's inherited environment.
+BOT_TOKEN = chainseer_solana._environment_setting("CHAINSEER_BOT_TOKEN") or ""
 # Same defaults chainseer_solana.py's own CLI uses -- if the autotrader and
 # this bot run from the same working directory (the normal single-operator
 # setup), Solana lookups transparently share its catalog and get a richer,
@@ -78,7 +84,7 @@ SOLANA_CHAIN_ROOT = os.environ.get("CHAINSEER_SOLANA_BOT_CHAIN_ROOT", "solana_ch
 # The operator's own chat -- reflection-checkpoint pushes go here, and only
 # this chat is allowed to run /reflection or /ack. Unset means those two
 # commands are unreachable for everyone (fail closed), not merely hidden.
-OWNER_CHAT_ID = os.environ.get("CHAINSEER_TELEGRAM_CHAT_ID", "").strip()
+OWNER_CHAT_ID = (chainseer_solana._environment_setting("CHAINSEER_TELEGRAM_CHAT_ID") or "").strip()
 
 # Rate limiting: 1 analysis per user per 60 seconds
 USER_RATE_LIMIT = 60
