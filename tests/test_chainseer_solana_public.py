@@ -2,6 +2,7 @@ import base64
 import struct
 import time
 import unittest
+from unittest.mock import patch
 
 from chainseer_pumpfun_provenance import PUMP_AMM_PROGRAM_ID, PUMP_PROGRAM_ID, _b58encode
 from chainseer_solana_public import (
@@ -665,6 +666,48 @@ class ProvenanceScoringTests(unittest.TestCase):
         self.assertNotIn(
             "wash_trading", report["analysis"]["uncertain_components"]
         )
+
+
+class AlertWiringTests(unittest.TestCase):
+    """analyze_token() must push a best-effort alert on a hard-stop
+    decision, and must never let that alert call affect the report even
+    if alerting itself is misconfigured -- alerting is fire-and-forget."""
+
+    def test_hard_stop_triggers_an_alert(self):
+        with patch(
+            "chainseer_solana_public.alert_on_decision"
+        ) as mocked:
+            mocked.return_value = {"sent": False, "reason": "no_webhook_configured"}
+            report = SolanaPublicAnalyzer(
+                "https://example.invalid",
+                rpc=FakeRPC(mint_authority="9" * 44),
+                dexscreener=FakeDexScreener(),
+                jupiter=FakeJupiter(),
+            ).analyze_token(MINT)
+
+        mocked.assert_called_once()
+        kwargs = mocked.call_args.kwargs
+        self.assertEqual(kwargs["chain"], "solana")
+        self.assertEqual(kwargs["token_address"], MINT)
+        self.assertIn("mint_authority_active", kwargs["hard_stops"])
+        self.assertEqual(report["analysis"]["risk_level"], "High")
+
+    def test_clean_token_still_calls_alert_hook_with_no_hard_stops(self):
+        # alert_on_decision itself no-ops on empty hard_stops with no
+        # threshold configured -- this just proves the call site always
+        # reports the real (empty) list rather than skipping the call.
+        with patch(
+            "chainseer_solana_public.alert_on_decision"
+        ) as mocked:
+            SolanaPublicAnalyzer(
+                "https://example.invalid",
+                rpc=FakeRPC(),
+                dexscreener=FakeDexScreener(),
+                jupiter=FakeJupiter(),
+            ).analyze_token(MINT)
+
+        mocked.assert_called_once()
+        self.assertEqual(mocked.call_args.kwargs["hard_stops"], [])
 
 
 if __name__ == "__main__":

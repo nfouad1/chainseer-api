@@ -21,6 +21,7 @@ from typing import Any
 
 import requests
 
+from chainseer_alerts import alert_on_decision
 from chainseer_entity_graph import (
     build_solana_entity_graph,
     verify_entity_graph,
@@ -1364,8 +1365,10 @@ class SolanaPublicAnalyzer:
         confidence = "MODERATE" if completed == len(essential_coverage) else "LIMITED"
         confidence_detail = (
             f"{completed}/{len(essential_coverage)} core Solana evidence groups. "
-            "Creator attribution, pool-vault custody, and wash-trading remain "
-            "unverified unless independently evidenced."
+            "Creator attribution and pool-vault custody are verified when the "
+            "mint resolves to a real Pump.fun launch; wash-trading uses a "
+            "lightweight DexScreener-derived heuristic, not on-chain "
+            "transfer-graph analysis."
         )
         if hard_stops:
             risk_level = "High"
@@ -1399,6 +1402,18 @@ class SolanaPublicAnalyzer:
             )
         red_flags = [item["reason"] for item in hard_stops]
         yellow_flags = list(dict.fromkeys(warnings))
+        threshold = os.environ.get(
+            "CHAINSEER_ALERT_HIGH_CONVICTION_THRESHOLD", ""
+        ).strip()
+        alert_on_decision(
+            chain="solana",
+            token_address=mint,
+            symbol=(token_info or {}).get("symbol") or token_meta.get("symbol") or "",
+            risk_level=risk_level,
+            score=score,
+            hard_stops=[item["code"] for item in hard_stops if item.get("code")],
+            high_conviction_threshold=float(threshold) if threshold else None,
+        )
         coverage = {
             **essential_coverage,
             "creator_attribution": bool(deployer_data.get("resolved")),

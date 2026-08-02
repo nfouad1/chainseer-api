@@ -4,7 +4,7 @@ import sys
 import tempfile
 import types
 import unittest
-from contextlib import redirect_stdout
+from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -814,6 +814,166 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertEqual(payload["security_outcomes"], {"rug_pull": True})
         self.assertEqual(payload["market_outcomes"], {"price_return_pct": -90})
         self.assertEqual(payload["analysis_ring_hash"], "original-hash")
+
+
+class AlertWiringTests(unittest.TestCase):
+    """analyze_token() must forward its final decision to the shared
+    chainseer_alerts hook -- this is the single call site that covers both
+    Robinhood Chain and Base (BasePublicAnalyzer inherits analyze_token
+    unchanged)."""
+
+    @staticmethod
+    def _run_analyze_token(stack, agent, token, basic_info, analysis):
+        """Patches every Phase 1-8 data-gathering/scoring call in
+        analyze_token() so the pipeline can run end-to-end against a real
+        agent without any network access, isolating the assertion to the
+        Phase 8 alert_on_decision call site."""
+        stack.enter_context(
+            patch.object(
+                chainseer.RobinhoodRPC, "get_code", return_value="0x" + "60" * 40
+            )
+        )
+        stack.enter_context(patch("chainseer._fetch_goplus_security", return_value={}))
+        stack.enter_context(
+            patch("chainseer._fetch_dexscreener_token", return_value={"pairs": []})
+        )
+        stack.enter_context(
+            patch("chainseer._fetch_blockscout_address", return_value={})
+        )
+        stack.enter_context(patch("chainseer._fetch_blockscout_token", return_value={}))
+        stack.enter_context(
+            patch(
+                "chainseer._fetch_blockscout_source",
+                return_value={"available": False, "is_verified": False},
+            )
+        )
+        for method, value in (
+            ("_fetch_basic_info", basic_info),
+            ("_analyze_contract", {}),
+            ("_analyze_dex_pairs", {}),
+            ("_verify_lp_lock", {}),
+            ("_estimate_tax_from_reserves", {"available": False}),
+            ("_check_transfer_activity", {}),
+            ("_analyze_deployer_and_creation", {}),
+            ("_analyze_holders_blockscout", {}),
+            ("_detect_wash_trading", {"available": False}),
+            ("_build_token_trend", {"available": False}),
+            ("_analyze", analysis),
+            (
+                "_self_evaluate",
+                {
+                    "coherence": 230, "relevance": 240, "novelty": 210,
+                    "consistency": 230, "depth": 220, "covenant": 245,
+                },
+            ),
+            # The cognitive-completion/immune-guard pipeline inside
+            # _seal_report is exercised by test_report_seals_through_poq_
+            # with_provenance; it is out of scope here (this test isolates
+            # the alert_on_decision call site, which fires before sealing).
+            ("_seal_report", None),
+            ("_print_summary", None),
+        ):
+            stack.enter_context(
+                patch.object(chainseer.Chainseer, method, return_value=value)
+            )
+        stack.enter_context(
+            patch("chainseer_controls.build_extended_evidence", return_value={})
+        )
+        stack.enter_context(
+            patch("chainseer.build_robinhood_entity_graph", return_value={})
+        )
+        stack.enter_context(
+            patch("chainseer.verify_entity_graph", return_value=(True, ""))
+        )
+        mocked_alert = stack.enter_context(patch("chainseer.alert_on_decision"))
+        report = agent.analyze_token(token)
+        return report, mocked_alert
+
+    def test_analyze_token_forwards_hard_stops_to_alert_hook(self):
+        analysis = {
+            "legitimacy_score": 12.0,
+            "risk_level": "Critical",
+            "action_label": "AVOID",
+            "hard_stop_overrides": [
+                {"code": "UNLOCKED_LP"},
+                {"code": "EXTREME_CONCENTRATION"},
+            ],
+            "recommendation": "Avoid until uncertainty is resolved.",
+            "green_flags": [],
+            "red_flags": ["Synthetic test risk"],
+            "component_scores": {"security": 10},
+            "confidence": "test",
+            "confidence_grade": "LIMITED",
+            "uncertain_components": {},
+        }
+        basic_info = {
+            "name": "Test Token",
+            "symbol": "TST",
+            "total_supply_raw": 1,
+            "total_supply": 1,
+        }
+        token = "0x" + "4" * 40
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                chainseer.RobinhoodRPC, "get_block_number", return_value=100
+            ):
+                agent = chainseer.Chainseer(chain_root=temp_dir)
+
+            with ExitStack() as stack:
+                report, mocked_alert = self._run_analyze_token(
+                    stack, agent, token, basic_info, analysis
+                )
+
+            mocked_alert.assert_called_once()
+            kwargs = mocked_alert.call_args.kwargs
+            self.assertEqual(kwargs["chain"], agent.network_key)
+            self.assertEqual(kwargs["token_address"], token)
+            self.assertEqual(kwargs["symbol"], "TST")
+            self.assertEqual(kwargs["risk_level"], "Critical")
+            self.assertEqual(kwargs["score"], 12.0)
+            self.assertEqual(
+                set(kwargs["hard_stops"]),
+                {"UNLOCKED_LP", "EXTREME_CONCENTRATION"},
+            )
+            self.assertEqual(report["analysis"]["risk_level"], "Critical")
+
+    def test_analyze_token_reports_no_hard_stops_when_clean(self):
+        analysis = {
+            "legitimacy_score": 91.0,
+            "risk_level": "Low",
+            "action_label": "PASS",
+            "hard_stop_overrides": [],
+            "recommendation": "Looks clean.",
+            "green_flags": ["Liquidity locked"],
+            "red_flags": [],
+            "component_scores": {"security": 90},
+            "confidence": "test",
+            "confidence_grade": "HIGH",
+            "uncertain_components": {},
+        }
+        basic_info = {
+            "name": "Clean Token",
+            "symbol": "CLN",
+            "total_supply_raw": 1,
+            "total_supply": 1,
+        }
+        token = "0x" + "5" * 40
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                chainseer.RobinhoodRPC, "get_block_number", return_value=100
+            ):
+                agent = chainseer.Chainseer(chain_root=temp_dir)
+
+            with ExitStack() as stack:
+                _, mocked_alert = self._run_analyze_token(
+                    stack, agent, token, basic_info, analysis
+                )
+
+            mocked_alert.assert_called_once()
+            self.assertEqual(mocked_alert.call_args.kwargs["hard_stops"], [])
+            self.assertEqual(mocked_alert.call_args.kwargs["risk_level"], "Low")
 
 
 if __name__ == "__main__":

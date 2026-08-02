@@ -2006,5 +2006,108 @@ class SolanaPrototypeTests(unittest.TestCase):
                 )
 
 
+class AlertWiringTests(unittest.TestCase):
+    """evaluate_candidate() must alert only on the rare, actionable event --
+    a real shadow position opening -- not on every hard-stop refusal, which
+    would be a firehose given the autotrader's bulk continuous scanning."""
+
+    @staticmethod
+    def _decision(**changes):
+        base = dict(
+            score=88.0,
+            risk_level="Low",
+            evidence_state="complete_safe",
+            shadow_entry_allowed=True,
+            hard_stops=[],
+            warnings=[],
+            infrastructure_errors=[],
+            coverage={},
+            origin={},
+            mint={},
+            bonding_curve={},
+            concentration={},
+            creator_evidence={},
+            convergence_evidence={},
+            market={},
+            execution_evidence={},
+        )
+        base.update(changes)
+        return chainseer_solana.SolanaRiskDecision(**base)
+
+    def test_shadow_position_opened_triggers_alert(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=temp,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            item = candidate()
+            decision = self._decision()
+            fake_position = {"mint": item.mint, "entry_score": decision.score}
+
+            with patch.object(
+                engine.analyzer, "analyze", return_value=decision
+            ), patch.object(
+                engine.trader, "enter", return_value=fake_position
+            ), patch("chainseer_solana.send_alert") as mocked_alert:
+                result = engine.evaluate_candidate(item, shadow_enter=True)
+
+            self.assertEqual(result["shadow_action"], "shadow_position_opened")
+            mocked_alert.assert_called_once()
+            args, kwargs = mocked_alert.call_args
+            self.assertEqual(kwargs["chain"], "solana")
+            self.assertEqual(kwargs["token_address"], item.mint)
+            self.assertEqual(kwargs["event_type"], "shadow_entry")
+            self.assertEqual(args[0]["risk_level"], "Low")
+            self.assertEqual(args[0]["score"], 88.0)
+
+    def test_hard_stop_refusal_does_not_trigger_alert(self):
+        """Bulk scanning hard-stops most candidates -- alerting on every one
+        would be noise, so only an opened position should ever fire."""
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=temp,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            item = candidate()
+            decision = self._decision(
+                shadow_entry_allowed=False,
+                risk_level="Critical",
+                hard_stops=["mint_authority_active"],
+            )
+
+            with patch.object(
+                engine.analyzer, "analyze", return_value=decision
+            ), patch("chainseer_solana.send_alert") as mocked_alert:
+                result = engine.evaluate_candidate(item, shadow_enter=True)
+
+            self.assertEqual(result["shadow_action"], "risk_gate_refused")
+            mocked_alert.assert_not_called()
+
+    def test_observation_only_pass_does_not_trigger_alert(self):
+        """shadow_enter=False (plain observation, no autotrade attempt) must
+        never alert even when the decision would have allowed entry."""
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=temp,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            item = candidate()
+            decision = self._decision()
+
+            with patch.object(
+                engine.analyzer, "analyze", return_value=decision
+            ), patch("chainseer_solana.send_alert") as mocked_alert:
+                result = engine.evaluate_candidate(item, shadow_enter=False)
+
+            self.assertEqual(result["shadow_action"], "observation_only")
+            mocked_alert.assert_not_called()
+
+
 if __name__ == "__main__":
     unittest.main()

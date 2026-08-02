@@ -71,6 +71,7 @@ if sys.stdout.encoding and sys.stdout.encoding.lower() not in ("utf-8", "utf8"):
 
 import requests
 
+from chainseer_alerts import alert_on_decision
 from chainseer_entity_graph import (
     build_robinhood_entity_graph,
     verify_entity_graph,
@@ -1584,6 +1585,26 @@ class Chainseer:
             )
         print(" Running analysis...")
         analysis = self._analyze(data)
+
+        # Best-effort push notification -- opt-in (CHAINSEER_ALERT_WEBHOOK_URL
+        # unset means this is a silent no-op) and fail-open, so a broken
+        # webhook can never affect the analysis itself. Fires on a hard stop
+        # always; on a high-conviction (very safe) score only if the operator
+        # opted into that too via CHAINSEER_ALERT_HIGH_CONVICTION_THRESHOLD.
+        threshold = os.environ.get("CHAINSEER_ALERT_HIGH_CONVICTION_THRESHOLD", "").strip()
+        alert_on_decision(
+            chain=self.network_key,
+            token_address=token,
+            symbol=data["basic_info"].get("symbol") or "",
+            risk_level=analysis.get("risk_level") or "Unknown",
+            score=analysis.get("legitimacy_score") or 0.0,
+            hard_stops=[
+                item.get("code")
+                for item in (analysis.get("hard_stop_overrides") or [])
+                if item.get("code")
+            ],
+            high_conviction_threshold=float(threshold) if threshold else None,
+        )
 
         # ── Phase 9: PoQ + seal ────────────────────────────────────────────
         report = {

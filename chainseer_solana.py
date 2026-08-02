@@ -35,6 +35,7 @@ from chainseer import (
     _load_timechain_module,
     ensure_utf8_runtime,
 )
+from chainseer_alerts import send_alert
 
 REQUEST_EXCEPTION = getattr(
     getattr(requests, "exceptions", None), "RequestException", OSError
@@ -4011,6 +4012,28 @@ class SolanaPrototypeEngine:
                 else ("observation_only" if not shadow_enter else "portfolio_gate_wait")
             )
         )
+        if position:
+            # Deliberately not wired to every hard-stop refusal: the
+            # autotrader bulk-scans many tokens per cycle and most get
+            # hard-stopped, so alerting on every one would be a firehose,
+            # not a signal. A shadow position actually opening is rare
+            # (requires clearing every gate) and directly actionable --
+            # exactly the "worth a human's attention" bar this channel
+            # exists for.
+            send_alert(
+                {
+                    "summary": (
+                        f"{candidate.symbol or candidate.mint}: paper shadow "
+                        f"position opened (score {decision.score})"
+                    ),
+                    "symbol": candidate.symbol,
+                    "risk_level": decision.risk_level,
+                    "score": decision.score,
+                },
+                chain="solana",
+                token_address=candidate.mint,
+                event_type="shadow_entry",
+            )
         return {
             "candidate": candidate.to_dict(),
             "decision": decision.to_dict(),
