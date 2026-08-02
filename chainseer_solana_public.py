@@ -25,6 +25,11 @@ from chainseer_entity_graph import (
     build_solana_entity_graph,
     verify_entity_graph,
 )
+from chainseer_pumpfun_provenance import (
+    PUMP_AMM_PROGRAM_ID,
+    creator_deployment_history,
+    resolve_genesis_creator,
+)
 
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -143,14 +148,25 @@ class SolanaRPC:
         address: str,
         *,
         limit: int = 25,
+        before: str | None = None,
     ):
+        options = {
+            "commitment": "confirmed",
+            "limit": max(1, min(1_000, int(limit))),
+        }
+        if before:
+            options["before"] = before
+        return self._call("getSignaturesForAddress", [address, options])
+
+    def get_transaction(self, signature: str):
         return self._call(
-            "getSignaturesForAddress",
+            "getTransaction",
             [
-                address,
+                signature,
                 {
+                    "encoding": "jsonParsed",
                     "commitment": "confirmed",
-                    "limit": max(1, min(1_000, int(limit))),
+                    "maxSupportedTransactionVersion": 0,
                 },
             ],
         )
@@ -168,6 +184,16 @@ class SolanaRPC:
             [
                 addresses,
                 {"encoding": encoding, "commitment": "confirmed"},
+            ],
+        )
+
+    def get_token_accounts_by_owner(self, owner: str, mint: str):
+        return self._call(
+            "getTokenAccountsByOwner",
+            [
+                owner,
+                {"mint": mint},
+                {"encoding": "jsonParsed", "commitment": "confirmed"},
             ],
         )
 
@@ -586,6 +612,110 @@ class SolanaPublicAnalyzer:
         ]
         return concentration, facts
 
+    def _deployer_and_creator_risk(
+        self, mint: str, *, supply_raw: int
+    ) -> tuple[dict, dict, list[dict]]:
+        """Resolve Pump.fun launch provenance (if any) and score both the
+        deployer's cadence -- the Solana analog of chainseer.py's
+        _analyze_deployer_and_creation serial-deployer check -- and the
+        creator's current supply concentration, the analog of chainseer.py's
+        GoPlus-sourced creator_percent check.
+
+        Both stay honestly unresolved when the mint isn't a verifiable
+        Pump.fun launch, matching this module's existing principle of never
+        claiming provenance that wasn't actually established -- most SPL
+        mints on this public, arbitrary-address endpoint won't be Pump.fun
+        launches at all.
+        """
+        facts: list[dict] = []
+        unresolved_reason = "No verified Pump.fun launch provenance for this mint."
+        deployer_data: dict = {"resolved": False, "reason": unresolved_reason}
+        creator_data: dict = {"resolved": False, "reason": unresolved_reason}
+
+        try:
+            event = resolve_genesis_creator(
+                self.rpc.get_signatures_for_address,
+                self.rpc.get_transaction,
+                mint,
+            )
+        except InfrastructureIndeterminateError:
+            event = None
+        if event is None:
+            return deployer_data, creator_data, facts
+
+        history = creator_deployment_history(
+            self.rpc.get_signatures_for_address,
+            self.rpc.get_transaction,
+            event.creator,
+            exclude_mint=mint,
+        )
+        deployer_data = {
+            "resolved": True,
+            "creator": event.creator,
+            "genesis_signature": event.signature,
+            **history,
+        }
+        facts.append(
+            self._fact(
+                8,
+                "solana_rpc",
+                {
+                    "method": "getSignaturesForAddress+getTransaction",
+                    "purpose": "pump_fun_genesis_and_creator_cadence",
+                    "mint": mint,
+                    "creator": event.creator,
+                },
+                {
+                    "prior_deployments_in_window": history.get(
+                        "prior_deployments_in_window"
+                    ),
+                    "scanned": history.get("scanned"),
+                    "scan_degraded": history.get("scan_degraded"),
+                },
+                event.slot,
+            )
+        )
+
+        try:
+            accounts = (
+                self.rpc.get_token_accounts_by_owner(event.creator, mint) or {}
+            )
+            holding_raw = sum(
+                _safe_int(
+                    (
+                        (
+                            ((row.get("account") or {}).get("data") or {}).get(
+                                "parsed"
+                            )
+                            or {}
+                        ).get("info")
+                        or {}
+                    )
+                    .get("tokenAmount", {})
+                    .get("amount")
+                )
+                for row in (accounts.get("value") or [])
+            )
+            creator_data = {
+                "resolved": True,
+                "creator": event.creator,
+                "holding_raw": holding_raw,
+                "pct_total_supply": (
+                    round(100.0 * holding_raw / supply_raw, 4)
+                    if supply_raw > 0
+                    else None
+                ),
+            }
+        except InfrastructureIndeterminateError:
+            creator_data = {
+                "resolved": True,
+                "creator": event.creator,
+                "holding_raw": None,
+                "pct_total_supply": None,
+                "reason": "Creator's current token balance could not be verified.",
+            }
+        return deployer_data, creator_data, facts
+
     def _seal_report(self, report: dict) -> None:
         agent = self.timechain_agent
         if agent is None:
@@ -795,6 +925,86 @@ class SolanaPublicAnalyzer:
                 "Largest-account evidence was unavailable from the configured RPC."
             )
 
+        deployer_score = 50.0
+        creator_score = 50.0
+        deployer_data = {"resolved": False, "reason": unknown["deployer"]}
+        creator_data = {"resolved": False, "reason": unknown["creator_risk"]}
+        try:
+            deployer_data, creator_data, provenance_facts = (
+                self._deployer_and_creator_risk(mint, supply_raw=supply_raw)
+            )
+            facts.extend(provenance_facts)
+            if deployer_data.get("resolved"):
+                del unknown["deployer"]
+                in_window = _safe_int(
+                    deployer_data.get("prior_deployments_in_window")
+                )
+                hard_stop_window_seconds = 24 * 3600.0
+                sample = deployer_data.get("prior_symbols_sample") or []
+                in_hard_stop_window = (
+                    sum(
+                        1
+                        for row in sample
+                        if (time.time() - _safe_int(row.get("block_time")))
+                        <= hard_stop_window_seconds
+                    )
+                    if sample
+                    else in_window
+                )
+                if in_hard_stop_window >= 10:
+                    deployer_score = 10.0
+                    hard_stops.append(
+                        self._hard_stop(
+                            "creator_industrialized_deployment",
+                            f"Deployer wallet launched {in_hard_stop_window} "
+                            "tokens in the last 24h -- industrialized "
+                            "deployment cadence.",
+                        )
+                    )
+                elif in_window >= 5:
+                    deployer_score = 40.0
+                    warnings.append(
+                        f"Deployer wallet has launched {in_window} tokens "
+                        "in the last 72h."
+                    )
+                else:
+                    deployer_score = 85.0
+                    green.append(
+                        "Deployer wallet shows no recent industrialized "
+                        "launch pattern."
+                    )
+                if deployer_data.get("scan_degraded"):
+                    warnings.append(
+                        "Deployer history scan was partial (some lookups "
+                        "failed) -- cadence figures are a floor, not a "
+                        "confirmed total."
+                    )
+            if creator_data.get("resolved"):
+                del unknown["creator_risk"]
+                creator_pct = _safe_float(
+                    creator_data.get("pct_total_supply"), None
+                )
+                if creator_pct is None:
+                    creator_score = 65.0
+                elif creator_pct > 5:
+                    creator_score = 20.0
+                    warnings.append(
+                        f"Creator wallet holds {creator_pct:.1f}% of supply."
+                    )
+                elif creator_pct > 1:
+                    creator_score = 50.0
+                    warnings.append(
+                        f"Creator wallet holds {creator_pct:.1f}% of supply."
+                    )
+                else:
+                    creator_score = 80.0
+                    green.append(
+                        f"Creator wallet holds minimal supply "
+                        f"({creator_pct:.2f}%)."
+                    )
+        except InfrastructureIndeterminateError as exc:
+            infrastructure_errors.append(str(exc))
+
         pairs: list[dict] = []
         pair: dict | None = None
         dex_ok = False
@@ -865,6 +1075,79 @@ class SolanaPublicAnalyzer:
             )
         if market_age_seconds is not None and market_age_seconds < self.policy.new_market_seconds:
             warnings.append("The selected market is less than one hour old.")
+
+        lp_lock_data = {
+            "state": "custody_unverified",
+            "amm_version": (pair or {}).get("dexId") or "unknown",
+            "method": "generic_solana_pool_custody_unresolved",
+            "locked": False,
+            "withdrawal_verified": False,
+            "withdrawable_pct": None,
+        }
+        lp_lock_score = 50.0
+        pool_address = (pair or {}).get("pairAddress")
+        if pool_address and str((pair or {}).get("dexId") or "").lower() == "pumpswap":
+            try:
+                pool_account = (
+                    self.rpc.get_account_info(pool_address, encoding="base64") or {}
+                )
+                pool_owner = (pool_account.get("value") or {}).get("owner")
+                facts.append(
+                    self._fact(
+                        10,
+                        "solana_rpc",
+                        {
+                            "method": "getAccountInfo",
+                            "purpose": "pumpswap_pool_custody",
+                            "pool": pool_address,
+                        },
+                        {"owner": pool_owner},
+                        slot_anchor,
+                    )
+                )
+                if pool_owner == PUMP_AMM_PROGRAM_ID:
+                    # PumpSwap pool vaults are PDAs owned by the AMM program
+                    # itself -- no single wallet (not even the creator) can
+                    # unilaterally withdraw the pool's liquidity. That's the
+                    # Solana analog of an EVM LP token being locked/burned:
+                    # proof custody sits with the protocol, not a person.
+                    lp_lock_data = {
+                        "state": "protocol_secured",
+                        "amm_version": "pumpswap",
+                        "method": "pool_account_owned_by_pump_amm_program",
+                        "locked": True,
+                        "withdrawal_verified": True,
+                        "withdrawable_pct": 0.0,
+                    }
+                    lp_lock_score = 95.0
+                    green.append(
+                        "Liquidity custody protocol secured: pool is "
+                        "owned by the canonical PumpSwap program."
+                    )
+                else:
+                    lp_lock_data = {
+                        "state": "custody_unexpected_owner",
+                        "amm_version": "pumpswap",
+                        "method": "pool_account_owned_by_pump_amm_program",
+                        "locked": False,
+                        "withdrawal_verified": False,
+                        "withdrawable_pct": None,
+                    }
+                    lp_lock_score = 15.0
+                    hard_stops.append(
+                        self._hard_stop(
+                            "lp_custody_unexpected_owner",
+                            "The DexScreener-reported PumpSwap pool address "
+                            "is not owned by the canonical PumpSwap program "
+                            "on-chain.",
+                        )
+                    )
+                del unknown["lp_lock"]
+            except InfrastructureIndeterminateError as exc:
+                infrastructure_errors.append(str(exc))
+        # Any other dex (Raydium, Orca, etc.) or no market at all stays
+        # honestly custody_unverified -- only the PumpSwap case above has a
+        # concrete, cheap on-chain ownership check built for it so far.
 
         token_info: dict | None = None
         try:
@@ -995,6 +1278,46 @@ class SolanaPublicAnalyzer:
             if txn_total
             else 50.0
         )
+        # Lightweight wash-trading heuristic from DexScreener's already-
+        # fetched 24h buy/sell counts and USD volume -- deliberately not the
+        # on-chain ping-pong/circular-transfer graph scan chainseer.py runs
+        # for EVM (_detect_wash_trading), which needs per-wallet transfer
+        # attribution across multiple block windows. Replicating that for
+        # Solana would mean decoding a real window of transaction history
+        # per public request, which this stateless, rate-limited endpoint
+        # isn't budgeted for. This heuristic looks for the two cheapest,
+        # DexScreener-visible tells instead: abnormally tiny average trade
+        # size (bot-like microtransactions) and a suspiciously exact
+        # buy/sell balance -- real organic markets are rarely both.
+        wash_score = 50.0
+        if txn_total >= 5:
+            del unknown["wash_trading"]
+            avg_trade_usd = (
+                (volume_24h or 0.0) / txn_total if txn_total else None
+            )
+            balance_ratio = (
+                abs(buys - sells) / txn_total if txn_total else 1.0
+            )
+            tiny_trades = avg_trade_usd is not None and avg_trade_usd < 2.0
+            suspiciously_balanced = txn_total >= 20 and balance_ratio <= 0.05
+            if tiny_trades and suspiciously_balanced:
+                wash_score = 20.0
+                warnings.append(
+                    "Trading pattern shows both abnormally small average "
+                    "trade size and a near-exact buy/sell balance -- "
+                    "consistent with wash trading, not confirmed."
+                )
+            elif tiny_trades or suspiciously_balanced:
+                wash_score = 40.0
+                warnings.append(
+                    "Trading pattern shows one wash-trading tell "
+                    f"({'tiny average trade size' if tiny_trades else 'a near-exact buy/sell balance'})."
+                )
+            else:
+                wash_score = 70.0
+                green.append(
+                    "No wash-trading tell detected in 24h buy/sell/volume pattern."
+                )
         price_change = (pair or {}).get("priceChange") or {}
         change_h24 = _safe_float(price_change.get("h24"), None)
         trend_score = (
@@ -1011,7 +1334,7 @@ class SolanaPublicAnalyzer:
                 else 50.0,
                 1,
             ),
-            "lp_lock": 50.0,
+            "lp_lock": round(lp_lock_score, 1),
             "holder_distribution": round(holder_score, 1),
             "volume": round(volume_score, 1),
             "maturity": round(
@@ -1020,9 +1343,9 @@ class SolanaPublicAnalyzer:
                 else 50.0,
                 1,
             ),
-            "creator_risk": 50.0,
-            "wash_trading": 50.0,
-            "deployer": 50.0,
+            "creator_risk": round(creator_score, 1),
+            "wash_trading": round(wash_score, 1),
+            "deployer": round(deployer_score, 1),
             "sentiment": round(sentiment_score, 1),
             "trend": round(trend_score, 1),
         }
@@ -1078,9 +1401,9 @@ class SolanaPublicAnalyzer:
         yellow_flags = list(dict.fromkeys(warnings))
         coverage = {
             **essential_coverage,
-            "creator_attribution": False,
-            "liquidity_custody": False,
-            "wash_trading": False,
+            "creator_attribution": bool(deployer_data.get("resolved")),
+            "liquidity_custody": lp_lock_data.get("state") != "custody_unverified",
+            "wash_trading": txn_total >= 5,
             "slot_anchor": bool(slot_anchor),
         }
         poq_scores = {
@@ -1134,15 +1457,10 @@ class SolanaPublicAnalyzer:
                     "txns_h24": txns_h24,
                     "price_change": price_change,
                 },
-                "lp_lock": {
-                    "state": "custody_unverified",
-                    "amm_version": (pair or {}).get("dexId") or "unknown",
-                    "method": "generic_solana_pool_custody_unresolved",
-                    "locked": False,
-                    "withdrawal_verified": False,
-                    "withdrawable_pct": None,
-                },
+                "lp_lock": lp_lock_data,
                 "holder_concentration": concentration,
+                "deployer": deployer_data,
+                "creator": creator_data,
                 "execution_evidence": execution,
                 "source_code": {
                     "is_verified": None,

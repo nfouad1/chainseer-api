@@ -1619,12 +1619,16 @@ export default function Home() {
             <div className="analysis-disclosure-body">
               <p>
                 Robinhood Chain and Base share the same full twelve-factor
-                engine described above. Solana mints currently get a
-                general-purpose check -- mint and freeze authority, liquidity,
-                holder concentration, and a real Jupiter buy/sell round trip --
-                rather than chain-specific deployer history, since that
-                requires launch provenance this public lookup doesn&rsquo;t yet
-                verify for an arbitrary address.
+                engine described above. Solana mints get the same twelve
+                dimensions, with one honest caveat: creator/deployer history
+                and pool-custody verification require the mint to resolve to
+                a real, on-chain-verified Pump.fun launch -- true for most
+                new Solana tokens, but not every arbitrary SPL mint. When
+                that provenance can&rsquo;t be established, those specific
+                checks report unknown rather than guessing, the same
+                principle described above. Wash-trading and every other
+                dimension are evaluated the same way regardless of launch
+                platform.
               </p>
             </div>
           </details>

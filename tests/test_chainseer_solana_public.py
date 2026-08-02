@@ -1,6 +1,9 @@
+import base64
+import struct
 import time
 import unittest
 
+from chainseer_pumpfun_provenance import PUMP_AMM_PROGRAM_ID, PUMP_PROGRAM_ID, _b58encode
 from chainseer_solana_public import (
     SolanaMintError,
     SolanaPublicAnalyzer,
@@ -12,14 +15,82 @@ from chainseer_solana_public import (
 MINT = "So11111111111111111111111111111111111111112"
 
 
+def b58_bytes(seed: int) -> bytes:
+    return bytes([seed]) * 32
+
+
+def borsh_string(value: str) -> bytes:
+    raw = value.encode()
+    return struct.pack("<I", len(raw)) + raw
+
+
+def create_event_payload(
+    *, mint: bytes, creator: bytes, symbol: str = "FARM", block_time: int
+) -> str:
+    """Encodes a Pump.fun CreateEvent -- the inverse of
+    chainseer_pumpfun_provenance.decode_create_event(), for building
+    FakeRPC transaction fixtures. Only the fields provenance scanning
+    actually reads are meaningful; the rest are structurally valid
+    placeholders."""
+    from chainseer_pumpfun_provenance import PUMP_CREATE_EVENT_DISCRIMINATOR
+
+    raw = (
+        PUMP_CREATE_EVENT_DISCRIMINATOR
+        + borsh_string("Farm Token")
+        + borsh_string(symbol)
+        + borsh_string("https://example.invalid/meta.json")
+        + mint
+        + b58_bytes(200)  # bonding_curve, unused by provenance scanning
+        + b58_bytes(201)  # user, unused by provenance scanning
+        + creator
+        + struct.pack("<q", block_time)
+        + struct.pack("<Q", 1_073_000_000_000_000)
+        + struct.pack("<Q", 30_000_000_000)
+        + struct.pack("<Q", 793_100_000_000_000)
+        + struct.pack("<Q", 1_000_000_000_000_000)
+        + b58_bytes(202)  # token_program, unused by provenance scanning
+        + b"\0\0"
+    )
+    return base64.b64encode(raw).decode()
+
+
+def signature_row(signature: str, *, slot: int, block_time: int, err=None) -> dict:
+    return {"signature": signature, "slot": slot, "blockTime": block_time, "err": err}
+
+
+def create_transaction(*, program_data_b64: str) -> dict:
+    return {
+        "transaction": {
+            "message": {"accountKeys": [{"pubkey": PUMP_PROGRAM_ID}]}
+        },
+        "meta": {
+            "err": None,
+            "logMessages": ["Program data: " + program_data_b64],
+        },
+    }
+
+
 class FakeRPC:
-    def __init__(self, *, mint_authority=None):
+    def __init__(self, *, mint_authority=None, pool_owner=None):
         self.mint_authority = mint_authority
+        # Empty by default -- resolve_genesis_creator() then correctly
+        # falls back to "no verified Pump.fun provenance" for every test
+        # that doesn't explicitly populate these, preserving the
+        # pre-existing unresolved/unknown expectations.
+        self.signatures: list[dict] = []
+        self.transactions: dict[str, dict] = {}
+        self.creator_token_accounts: list[dict] = []
+        # Only used when get_account_info is called with encoding="base64"
+        # (the lp_lock pool-custody check) -- the mint-info lookup always
+        # uses jsonParsed, so the two never collide on the same fixture.
+        self.pool_owner = pool_owner
 
     def get_slot(self):
         return 321
 
     def get_account_info(self, address, *, encoding="jsonParsed"):
+        if encoding == "base64":
+            return {"context": {"slot": 322}, "value": {"owner": self.pool_owner}}
         return {
             "context": {"slot": 322},
             "value": {
@@ -75,6 +146,22 @@ class FakeRPC:
             ],
         }
 
+    def get_signatures_for_address(self, address, *, limit=25, before=None):
+        rows = self.signatures
+        if before:
+            index = next(
+                (i for i, row in enumerate(rows) if row.get("signature") == before),
+                None,
+            )
+            rows = rows[index + 1:] if index is not None else []
+        return rows[:limit]
+
+    def get_transaction(self, signature):
+        return self.transactions.get(signature)
+
+    def get_token_accounts_by_owner(self, owner, mint):
+        return {"value": self.creator_token_accounts}
+
 
 class FakeDexScreener:
     def token_pairs(self, mint):
@@ -100,6 +187,48 @@ class FakeDexScreener:
                 "volume": {"h24": 65000},
                 "pairCreatedAt": int((time.time() - 10 * 86400) * 1000),
                 "txns": {"h24": {"buys": 120, "sells": 100}},
+                "priceChange": {"h24": 3.5},
+            }
+        ]
+
+
+class ConfigurableDexScreener:
+    def __init__(
+        self,
+        *,
+        dex_id="pumpswap",
+        pair_address="pool-1",
+        buys=120,
+        sells=100,
+        volume_h24=65_000.0,
+        liquidity_usd=150_000.0,
+    ):
+        self.dex_id = dex_id
+        self.pair_address = pair_address
+        self.buys = buys
+        self.sells = sells
+        self.volume_h24 = volume_h24
+        self.liquidity_usd = liquidity_usd
+
+    def token_pairs(self, mint):
+        return [
+            {
+                "chainId": "solana",
+                "dexId": self.dex_id,
+                "pairAddress": self.pair_address,
+                "url": "https://dexscreener.com/solana/" + self.pair_address,
+                "baseToken": {"address": mint, "name": "Example", "symbol": "EX"},
+                "quoteToken": {
+                    "address": "quote",
+                    "name": "USD Coin",
+                    "symbol": "USDC",
+                },
+                "priceUsd": "0.25",
+                "marketCap": 2_500_000,
+                "liquidity": {"usd": self.liquidity_usd},
+                "volume": {"h24": self.volume_h24},
+                "pairCreatedAt": int((time.time() - 10 * 86400) * 1000),
+                "txns": {"h24": {"buys": self.buys, "sells": self.sells}},
                 "priceChange": {"h24": 3.5},
             }
         ]
@@ -310,6 +439,231 @@ class SolanaPublicAnalyzerTests(unittest.TestCase):
             agent.poq_module.kwargs["extra_payload"][
                 "live_execution_enabled"
             ]
+        )
+
+
+class ProvenanceScoringTests(unittest.TestCase):
+    """Solana's public analyzer used to hardcode creator_risk/deployer/
+    lp_lock/wash_trading at a flat 50.0 -- these exercise the real checks
+    that replaced those stubs, matching chainseer.py's EVM engine having
+    genuine implementations for the same four dimensions."""
+
+    def test_clean_creator_scores_well_and_clears_unknowns(self):
+        now = int(time.time())
+        mint_addr = _b58encode(b58_bytes(50))
+        creator_bytes = b58_bytes(99)
+        creator_addr = _b58encode(creator_bytes)
+        genesis_block_time = now - 3600
+
+        rpc = FakeRPC()
+        rpc.signatures = [
+            signature_row("genesis", slot=1, block_time=genesis_block_time)
+        ]
+        rpc.transactions["genesis"] = create_transaction(
+            program_data_b64=create_event_payload(
+                mint=b58_bytes(50),
+                creator=creator_bytes,
+                symbol="TARGET",
+                block_time=genesis_block_time,
+            )
+        )
+        rpc.creator_token_accounts = [
+            {
+                "account": {
+                    "data": {
+                        "parsed": {
+                            "info": {"tokenAmount": {"amount": "1000"}}
+                        }
+                    }
+                }
+            }
+        ]
+
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=FakeDexScreener(),
+            jupiter=FakeJupiter(),
+        ).analyze_token(mint_addr)
+
+        scores = report["analysis"]["component_scores"]
+        self.assertEqual(scores["deployer"], 85.0)
+        self.assertEqual(scores["creator_risk"], 80.0)
+        self.assertNotIn("deployer", report["analysis"]["uncertain_components"])
+        self.assertNotIn(
+            "creator_risk", report["analysis"]["uncertain_components"]
+        )
+        self.assertEqual(
+            report["data"]["deployer"]["creator"], creator_addr
+        )
+        self.assertTrue(report["coverage"]["creator_attribution"])
+
+    def test_deployer_hard_stops_on_industrialized_cadence(self):
+        now = int(time.time())
+        mint_bytes = b58_bytes(50)
+        mint_addr = _b58encode(mint_bytes)
+        creator_bytes = b58_bytes(99)
+
+        rows = []
+        rpc = FakeRPC()
+        for i in range(11):
+            sig = f"farm-{i}"
+            block_time = now - 60 * (i + 1)
+            rows.append(signature_row(sig, slot=1000 + i, block_time=block_time))
+            rpc.transactions[sig] = create_transaction(
+                program_data_b64=create_event_payload(
+                    mint=b58_bytes(60 + i),
+                    creator=creator_bytes,
+                    symbol=f"FARM{i}",
+                    block_time=block_time,
+                )
+            )
+        genesis_block_time = now - 3600
+        rows.append(signature_row("genesis", slot=1, block_time=genesis_block_time))
+        rpc.transactions["genesis"] = create_transaction(
+            program_data_b64=create_event_payload(
+                mint=mint_bytes,
+                creator=creator_bytes,
+                symbol="TARGET",
+                block_time=genesis_block_time,
+            )
+        )
+        rpc.signatures = rows
+
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=FakeDexScreener(),
+            jupiter=FakeJupiter(),
+        ).analyze_token(mint_addr)
+
+        self.assertEqual(report["analysis"]["component_scores"]["deployer"], 10.0)
+        red_flags = report["analysis"]["red_flags"]
+        self.assertTrue(
+            any("industrialized" in flag.lower() for flag in red_flags), red_flags
+        )
+        self.assertEqual(report["analysis"]["risk_level"], "High")
+
+    def test_creator_risk_flags_high_supply_concentration(self):
+        now = int(time.time())
+        mint_bytes = b58_bytes(50)
+        mint_addr = _b58encode(mint_bytes)
+        creator_bytes = b58_bytes(99)
+        genesis_block_time = now - 3600
+
+        rpc = FakeRPC()
+        rpc.signatures = [
+            signature_row("genesis", slot=1, block_time=genesis_block_time)
+        ]
+        rpc.transactions["genesis"] = create_transaction(
+            program_data_b64=create_event_payload(
+                mint=mint_bytes,
+                creator=creator_bytes,
+                symbol="TARGET",
+                block_time=genesis_block_time,
+            )
+        )
+        # Mint fixture's supply is 1_000_000_000_000_000 raw -- 6% of it.
+        rpc.creator_token_accounts = [
+            {
+                "account": {
+                    "data": {
+                        "parsed": {
+                            "info": {
+                                "tokenAmount": {"amount": "60000000000000"}
+                            }
+                        }
+                    }
+                }
+            }
+        ]
+
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=FakeDexScreener(),
+            jupiter=FakeJupiter(),
+        ).analyze_token(mint_addr)
+
+        self.assertEqual(
+            report["analysis"]["component_scores"]["creator_risk"], 20.0
+        )
+        self.assertTrue(
+            any(
+                "holds" in flag and "%" in flag
+                for flag in report["analysis"]["yellow_flags"]
+            )
+        )
+
+    def test_lp_lock_verifies_program_owned_pumpswap_pool(self):
+        rpc = FakeRPC(pool_owner=PUMP_AMM_PROGRAM_ID)
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=ConfigurableDexScreener(pair_address="pool-good"),
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertEqual(
+            report["data"]["lp_lock"]["state"], "protocol_secured"
+        )
+        self.assertEqual(report["analysis"]["component_scores"]["lp_lock"], 95.0)
+        self.assertTrue(report["coverage"]["liquidity_custody"])
+        self.assertTrue(
+            any("protocol secured" in flag for flag in report["analysis"]["green_flags"])
+        )
+
+    def test_lp_lock_flags_unexpected_pool_owner(self):
+        rpc = FakeRPC(pool_owner=TOKEN_PROGRAM_ID)
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=ConfigurableDexScreener(pair_address="pool-bad"),
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertEqual(report["analysis"]["component_scores"]["lp_lock"], 15.0)
+        red_flags = report["analysis"]["red_flags"]
+        self.assertTrue(
+            any("not owned by the canonical" in flag for flag in red_flags),
+            red_flags,
+        )
+
+    def test_wash_trading_flags_tiny_balanced_trades(self):
+        rpc = FakeRPC()
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=ConfigurableDexScreener(
+                buys=100, sells=100, volume_h24=50.0
+            ),
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertEqual(
+            report["analysis"]["component_scores"]["wash_trading"], 20.0
+        )
+        self.assertTrue(
+            any(
+                "wash trading" in flag.lower()
+                for flag in report["analysis"]["yellow_flags"]
+            )
+        )
+
+    def test_wash_trading_healthy_pattern_scores_well(self):
+        rpc = FakeRPC()
+        report = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=rpc,
+            dexscreener=FakeDexScreener(),  # buys=120 sells=100 volume=65000
+            jupiter=FakeJupiter(),
+        ).analyze_token(MINT)
+
+        self.assertEqual(
+            report["analysis"]["component_scores"]["wash_trading"], 70.0
+        )
+        self.assertNotIn(
+            "wash_trading", report["analysis"]["uncertain_components"]
         )
 
 
