@@ -1,0 +1,56 @@
+app = "chainseer-api"
+primary_region = "fra"
+
+[build]
+  dockerfile = "Dockerfile.api"
+
+[env]
+  CHAINSEER_ENVIRONMENT = "production"
+  CHAINSEER_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
+  CHAINSEER_SOLANA_RPC_URL = "https://api.mainnet-beta.solana.com"
+  CHAINSEER_CHAIN_ROOT = "/data/chainseer_chain"
+  CHAINSEER_SKILL_DIR = "/opt/cypher-tempre-self-model"
+  CHAINSEER_ALLOWED_ORIGINS = "https://usechainseer.com,https://www.usechainseer.com"
+  CHAINSEER_ALLOWED_HOSTS = "*.fly.dev,api.usechainseer.com"
+  CHAINSEER_QUEUE_SIZE = "20"
+  CHAINSEER_RATE_LIMIT_PER_MINUTE = "6"
+  CHAINSEER_GLOBAL_RATE_LIMIT_PER_MINUTE = "60"
+  CHAINSEER_SCAN_CACHE_TTL_SECONDS = "300"
+  CHAINSEER_RESULT_TTL_SECONDS = "600"
+  CHAINSEER_SHUTDOWN_GRACE_SECONDS = "20"
+  CHAINSEER_WATCHER_ENABLED = "1"
+  CHAINSEER_WATCHER_INTERVAL_SECONDS = "60"
+  CHAINSEER_WATCHER_CONFIRMATIONS = "2"
+  CHAINSEER_BENCHMARK_CAPTURE_ENABLED = "1"
+  CHAINSEER_BENCHMARK_ROOT = "/data/benchmark"
+  CHAINSEER_BENCHMARK_ROBINHOOD_COHORT = "robinhood_public_analysis"
+  CHAINSEER_BENCHMARK_SOLANA_COHORT = "solana_public_analysis"
+  CHAINSEER_BENCHMARK_BASE_COHORT = "base_public_analysis"
+  CT_AUTOGROW = "1"
+  CT_PROMOTE_AT = "1"
+  CT_AUTOGROW_MIN_SALIENCE = "170"
+  CT_SEMANTIC_GAP = "1"
+  CT_IMMUNE_FAILCLOSED = "1"
+  CT_AUTO_QUARANTINE = "1"
+
+[[mounts]]
+  source = "chainseer_timechain"
+  destination = "/data"
+
+[http_service]
+  internal_port = 8000
+  force_https = true
+  auto_stop_machines = false
+  auto_start_machines = true
+  min_machines_running = 1
+
+  [[http_service.checks]]
+    grace_period = "30s"
+    interval = "15s"
+    timeout = "5s"
+    method = "GET"
+    path = "/health/ready"
+
+[[vm]]
+  size = "shared-cpu-1x"
+  memory = "1024mb"
