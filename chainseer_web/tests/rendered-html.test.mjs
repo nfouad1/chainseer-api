@@ -99,6 +99,13 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, /entity_graph/);
   assert.match(page, /EntityEvidenceGraph/);
   assert.match(page, /Entity &amp; insider evidence/);
+  assert.match(page, /What Chainseer actually checks, and how/);
+  assert.match(page, /external-provider\s+responses are timestamped and hash-committed/);
+  assert.match(page, /An &ldquo;unlocked&rdquo; label by\s+itself is not enough/);
+  assert.match(page, /Solana\s+wash-trading is currently a lightweight DexScreener market\s+heuristic/);
+  assert.match(page, /public scanner does not hold a wallet key/);
+  assert.doesNotMatch(page, /real buy-then-sell round trip actually completes/);
+  assert.doesNotMatch(page, /twelve independent dimensions/);
   assert.match(page, /Provider-attested/);
   assert.match(page, /graph_hash/);
   assert.match(page, /<details className="live-factors analysis-disclosure">/);

@@ -215,11 +215,11 @@ const factorDescriptions: Record<string, string> = {
   security:
     "Whether privileged contract functions -- mint authority, ownership, upgradability, pause or blacklist controls -- are still active and could change the rules after you buy.",
   honeypot_safety:
-    "Whether a real buy-then-sell round trip actually completes and returns a reasonable amount back, not just that a buy alone looks fine.",
+    "Whether provider evidence and chain-specific simulations or route quotes indicate that buying and selling are possible without prohibitive restrictions. The public scan does not execute a funded trade.",
   liquidity:
     "How much capital is actually sitting in the trading pool relative to typical trade sizes. Thin liquidity means even a modest sell can move the price sharply.",
   lp_lock:
-    "Whether the liquidity backing the pool is locked or can otherwise be pulled out from under holders.",
+    "Who controls the primary liquidity: whether custody is burned, timelocked, framework-controlled, creator-withdrawable, or still unverified. An unlocked label alone is not treated as proof of danger.",
   holder_distribution:
     "How concentrated the circulating supply is among the largest wallets, with pool and program vaults excluded so they don't distort the picture.",
   volume:
@@ -858,32 +858,39 @@ export default function Home() {
   const [monitorNotice, setMonitorNotice] = useState("");
 
   useEffect(() => {
-    try {
-      const stored = JSON.parse(
-        window.localStorage.getItem(MONITOR_STORAGE_KEY) || "[]",
-      );
-      if (Array.isArray(stored)) {
-        setMonitors(
-          stored
-            .filter(
-              (item): item is TokenMonitor =>
-                item &&
-                typeof item === "object" &&
-                (item.network === "robinhood" ||
-                  item.network === "base" ||
-                  item.network === "solana") &&
-                typeof item.address === "string" &&
-                typeof item.key === "string" &&
-                typeof item.cursor === "string",
-            )
-            .slice(0, MAX_DEVICE_MONITORS),
+    let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      try {
+        const stored = JSON.parse(
+          window.localStorage.getItem(MONITOR_STORAGE_KEY) || "[]",
         );
+        if (Array.isArray(stored)) {
+          setMonitors(
+            stored
+              .filter(
+                (item): item is TokenMonitor =>
+                  item &&
+                  typeof item === "object" &&
+                  (item.network === "robinhood" ||
+                    item.network === "base" ||
+                    item.network === "solana") &&
+                  typeof item.address === "string" &&
+                  typeof item.key === "string" &&
+                  typeof item.cursor === "string",
+              )
+              .slice(0, MAX_DEVICE_MONITORS),
+          );
+        }
+      } catch {
+        window.localStorage.removeItem(MONITOR_STORAGE_KEY);
+      } finally {
+        if (active) setMonitorsLoaded(true);
       }
-    } catch {
-      window.localStorage.removeItem(MONITOR_STORAGE_KEY);
-    } finally {
-      setMonitorsLoaded(true);
-    }
+    });
+    return () => {
+      active = false;
+    };
   }, []);
 
   useEffect(() => {
@@ -1526,9 +1533,12 @@ export default function Home() {
               <p>
                 Every report is built from direct evidence, not a single
                 third-party score. On Robinhood Chain and Base that means
-                GoPlus Security, DexScreener, Blockscout, and direct RPC calls
-                pinned to a specific block. On Solana it means direct Solana
-                RPC calls, Jupiter route quotes, and DexScreener market data.
+                GoPlus Security, DexScreener, Blockscout, and direct RPC calls.
+                RPC reads are pinned to a specific block; external-provider
+                responses are timestamped and hash-committed when collected,
+                but are not historical reads at that block. On Solana, RPC
+                evidence is anchored to a confirmed slot and supplemented by
+                bounded Jupiter route quotes and DexScreener market data.
               </p>
               <p>
                 That evidence runs through four stages: <strong>Observe</strong>{" "}
@@ -1553,7 +1563,7 @@ export default function Home() {
             </summary>
             <div className="analysis-disclosure-body">
               <p>
-                Each report scores twelve independent dimensions from 0-100,
+                Each report scores twelve risk dimensions from 0-100,
                 higher is safer, shown on every report&rsquo;s Risk dimensions
                 panel:
               </p>
@@ -1578,9 +1588,13 @@ export default function Home() {
             <div className="analysis-disclosure-body">
               <p>
                 A <strong>hard stop</strong> is a deterministic, evidence-backed
-                condition -- an active mint authority, a failed round-trip sell,
-                unlocked liquidity -- that blocks a positive verdict outright,
-                regardless of how the other eleven dimensions score. A{" "}
+                condition -- for example a confirmed honeypot, a blocked sell,
+                verified creator-withdrawable primary V2 liquidity, extreme
+                non-AMM holder concentration, or an unverified proxy
+                implementation -- that blocks a positive verdict regardless of
+                how the other dimensions score. An &ldquo;unlocked&rdquo; label by
+                itself is not enough: Chainseer requires verified custody and
+                withdrawal evidence before liquidity becomes a hard stop. A{" "}
                 <strong>warning</strong> (a yellow flag) is material but not
                 disqualifying on its own: worth weighing, not automatically
                 fatal. An <strong>unknown</strong> means a piece of evidence
@@ -1618,17 +1632,16 @@ export default function Home() {
             </summary>
             <div className="analysis-disclosure-body">
               <p>
-                Robinhood Chain and Base share the same full twelve-factor
-                engine described above. Solana mints get the same twelve
-                dimensions, with one honest caveat: creator/deployer history
-                and pool-custody verification require the mint to resolve to
-                a real, on-chain-verified Pump.fun launch -- true for most
-                new Solana tokens, but not every arbitrary SPL mint. When
-                that provenance can&rsquo;t be established, those specific
-                checks report unknown rather than guessing, the same
-                principle described above. Wash-trading and every other
-                dimension are evaluated the same way regardless of launch
-                platform.
+                Robinhood Chain and Base share the same EVM analysis engine.
+                Solana uses the same report schema and dimension labels, but
+                the evidence method is chain-specific. Creator/deployer history
+                and supported pool-custody verification require the mint to
+                resolve to an on-chain-verified Pump.fun launch. Solana
+                wash-trading is currently a lightweight DexScreener market
+                heuristic; EVM analysis uses transfer-window evidence. When
+                provenance or coverage cannot be established, the affected
+                checks report unknown rather than borrowing confidence from a
+                different chain or launch platform.
               </p>
             </div>
           </details>
@@ -1649,6 +1662,26 @@ export default function Home() {
                 after an analysis is sealed, which is exactly why every report
                 is pinned to a specific block and timestamped rather than
                 presented as a standing truth.
+              </p>
+            </div>
+          </details>
+
+          <details className="analysis-disclosure faq-item">
+            <summary className="panel-head analysis-disclosure-trigger">
+              <div>
+                <span className="panel-index">07</span>
+                <h3>Does a public risk scan execute a trade or guarantee sellability?</h3>
+              </div>
+            </summary>
+            <div className="analysis-disclosure-body">
+              <p>
+                No. The public scanner does not hold a wallet key, sign a
+                transaction, broadcast a transaction, or place a funded trade.
+                EVM sellability uses provider evidence and read-only on-chain
+                checks; Solana uses a bounded Jupiter buy-and-sell route quote.
+                These checks can expose important restrictions, but they cannot
+                guarantee that the same route, price, or token state will still
+                exist when a user later trades.
               </p>
             </div>
           </details>
