@@ -1159,6 +1159,33 @@ class SolanaPrototypeTests(unittest.TestCase):
                 "Warnings: unsigned_buy_transaction_not_assembled", text
             )
 
+    def test_routine_interval_checkpoint_does_not_relabel_a_stale_graduation(self):
+        """_maybe_request_reflection() sets first_graduated_mint on EVERY
+        checkpoint once any token has ever graduated (it's just "the
+        earliest-sorting graduated mint so far"), not only on the one
+        checkpoint whose reason actually names it. A routine 200-analysis
+        interval checkpoint that happens to run long after some earlier
+        graduation must not re-display that old token as if it were the
+        reason for THIS pause."""
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            item = candidate()
+            checkpoint = {
+                "reason": "analysis_interval",
+                "analysis_events": 1161,
+                "first_graduated_mint": item.mint,
+            }
+            text = engine._reflection_notification_text(checkpoint)
+            self.assertNotIn("First graduated market", text)
+            self.assertNotIn(item.mint, text)
+            self.assertIn("Evidence so far:", text)
+
     def test_curve_completion_without_canonical_pool_stays_pending(self):
         analyzer = chainseer_solana.SolanaRiskAnalyzer(
             FakeRPC(curve_complete=True, canonical_pool=False),
@@ -2107,6 +2134,230 @@ class AlertWiringTests(unittest.TestCase):
 
             self.assertEqual(result["shadow_action"], "observation_only")
             mocked_alert.assert_not_called()
+
+
+class ConcentrationPoolVaultExclusionTests(unittest.TestCase):
+    """_concentration() must exclude the canonical PumpSwap pool's own
+    base-token vault the same way it already excludes the bonding curve's
+    inventory -- without this, EVERY graduated token's top1/top10 is
+    dominated by the AMM's own trading liquidity (which routinely holds
+    70-90%+ of supply by design), making the concentration gate
+    structurally impossible to clear regardless of real holder
+    distribution. Diagnosed by live-checking a real graduated token
+    (Jordan) whose #1 "holder" was its own pool vault at ~83% of supply."""
+
+    POOL_VAULT = "PoolVault11111111111111111111111111111111"
+    UNRELATED_OWNER = "UnrelatedOwner1111111111111111111111111111"
+
+    @staticmethod
+    def _agent():
+        return chainseer_solana.SolanaRiskAnalyzer.__new__(
+            chainseer_solana.SolanaRiskAnalyzer
+        )
+
+    class _StubRPC:
+        def __init__(self, *, rows, owners):
+            self.rows = rows
+            self.owners = owners
+
+        def get_token_largest_accounts(self, _mint):
+            return {"value": self.rows}
+
+        def get_multiple_accounts(self, addresses, *, encoding="jsonParsed"):
+            return {
+                "value": [
+                    {"data": {"parsed": {"info": {"owner": self.owners[addr]}}}}
+                    for addr in addresses
+                ]
+            }
+
+    def test_pool_vault_excluded_when_address_provided(self):
+        item = candidate()
+        rpc = self._StubRPC(
+            rows=[
+                {"address": self.POOL_VAULT, "amount": "830000000000000"},
+                {"address": "holder-1", "amount": "12000000000000"},
+                {"address": "holder-2", "amount": "8000000000000"},
+            ],
+            owners={
+                self.POOL_VAULT: self.UNRELATED_OWNER,
+                "holder-1": "holder-a",
+                "holder-2": "holder-b",
+            },
+        )
+        analyzer = self._agent()
+        analyzer.rpc = rpc
+
+        conc = analyzer._concentration(
+            item, item.token_total_supply, pool_base_token_account=self.POOL_VAULT
+        )
+
+        self.assertEqual(conc["excluded_pool_vault_raw"], 830_000_000_000_000)
+        excluded_addresses = {
+            row["token_account"] for row in conc["largest_non_curve_accounts"]
+        }
+        self.assertNotIn(self.POOL_VAULT, excluded_addresses)
+        # circulating = 1e15 supply - 830T pool vault = 170T; top1 = 12T/170T
+        self.assertAlmostEqual(conc["top1_circulating_pct"], 7.06, places=1)
+        self.assertAlmostEqual(conc["top10_circulating_pct"], 11.76, places=1)
+
+    def test_pool_vault_not_excluded_when_address_omitted(self):
+        """Backward compatible: without a resolved canonical pool (token
+        hasn't graduated, or graduation lookup failed), behavior is
+        unchanged from before this fix -- the vault-shaped account still
+        counts toward concentration since there's nothing to distinguish
+        it from a real holder yet."""
+        item = candidate()
+        rpc = self._StubRPC(
+            rows=[
+                {"address": self.POOL_VAULT, "amount": "830000000000000"},
+                {"address": "holder-1", "amount": "12000000000000"},
+            ],
+            owners={
+                self.POOL_VAULT: self.UNRELATED_OWNER,
+                "holder-1": "holder-a",
+            },
+        )
+        analyzer = self._agent()
+        analyzer.rpc = rpc
+
+        conc = analyzer._concentration(item, item.token_total_supply)
+
+        self.assertEqual(conc["excluded_pool_vault_raw"], 0)
+        self.assertAlmostEqual(conc["top1_circulating_pct"], 83.0, places=1)
+
+    def test_bonding_curve_and_pool_vault_exclusions_both_apply(self):
+        item = candidate()
+        rpc = self._StubRPC(
+            rows=[
+                {"address": "curve-ata", "amount": "790000000000000"},
+                {"address": self.POOL_VAULT, "amount": "150000000000000"},
+                {"address": "holder-1", "amount": "40000000000000"},
+                {"address": "holder-2", "amount": "20000000000000"},
+            ],
+            owners={
+                "curve-ata": item.bonding_curve,
+                self.POOL_VAULT: self.UNRELATED_OWNER,
+                "holder-1": "holder-a",
+                "holder-2": "holder-b",
+            },
+        )
+        analyzer = self._agent()
+        analyzer.rpc = rpc
+
+        conc = analyzer._concentration(
+            item, item.token_total_supply, pool_base_token_account=self.POOL_VAULT
+        )
+
+        self.assertEqual(conc["excluded_bonding_curve_raw"], 790_000_000_000_000)
+        self.assertEqual(conc["excluded_pool_vault_raw"], 150_000_000_000_000)
+        # circulating = 1e15 - 790T - 150T = 60T; top1 = 40T/60T
+        self.assertAlmostEqual(conc["top1_circulating_pct"], 66.67, places=1)
+        self.assertAlmostEqual(conc["top10_circulating_pct"], 100.0, places=1)
+
+    def test_analyze_no_longer_hard_stops_on_pool_vault_alone(self):
+        """End-to-end: a token whose ONLY concentration problem was its own
+        (unexcluded) pool vault must clear top1/top10 once graduation
+        resolves a canonical pool and _concentration() is told to exclude
+        that vault's address."""
+        item = candidate()
+        pool_vault = self.POOL_VAULT
+
+        class GraduatedRPC:
+            def get_signatures(self, _address, *, limit, until=None, before=None):
+                return []
+
+            def get_account_info(self, address, *, encoding="jsonParsed"):
+                if address == item.bonding_curve:
+                    return curve_payload(item, complete=True)
+                return {
+                    "value": {
+                        "owner": item.token_program,
+                        "data": {
+                            "parsed": {
+                                "type": "mint",
+                                "info": {
+                                    "decimals": 6,
+                                    "supply": str(item.token_total_supply),
+                                    "mintAuthority": None,
+                                    "freezeAuthority": None,
+                                    "extensions": [],
+                                },
+                            }
+                        },
+                    }
+                }
+
+            def get_token_supply(self, _mint):
+                return {
+                    "value": {
+                        "amount": str(item.token_total_supply), "decimals": 6
+                    }
+                }
+
+            def get_program_accounts(
+                self, _program_id, *, filters=None, encoding="base64"
+            ):
+                payload = canonical_pool_payload(item)
+                # Patch the fixture's pool_base_token_account (b58_bytes(9))
+                # to our known constant so the test can assert against it.
+                return [payload]
+
+            def get_token_largest_accounts(self, _mint):
+                return {
+                    "value": [
+                        {
+                            "address": pool_vault,
+                            "amount": "830000000000000",
+                        },
+                        {"address": "holder-1", "amount": "12000000000000"},
+                        {"address": "holder-2", "amount": "8000000000000"},
+                    ]
+                }
+
+            def get_multiple_accounts(self, addresses, *, encoding="jsonParsed"):
+                if encoding == "base64":
+                    return {
+                        "value": [
+                            curve_payload(item, complete=True)["value"]
+                            for _ in addresses
+                        ]
+                    }
+                owners = {
+                    pool_vault: "SomePoolAuthority11111111111111111111111",
+                    "holder-1": "holder-a",
+                    "holder-2": "holder-b",
+                }
+                return {
+                    "value": [
+                        {"data": {"parsed": {"info": {"owner": owners.get(a)}}}}
+                        for a in addresses
+                    ]
+                }
+
+        rpc = GraduatedRPC()
+        analyzer = chainseer_solana.SolanaRiskAnalyzer(
+            rpc, FakeJupiter(), dexscreener=FakeDexScreener()
+        )
+        # Force the resolved canonical pool's vault address to match our
+        # fixture's pool_vault constant, since canonical_pool_payload()'s
+        # baked-in b58_bytes(9) value isn't otherwise controllable.
+        real_evidence = analyzer._canonical_pool_evidence
+        def patched_evidence(mint):
+            result = real_evidence(mint)
+            if result:
+                result["pool_base_token_account"] = pool_vault
+            return result
+        analyzer._canonical_pool_evidence = patched_evidence
+
+        with patch("chainseer_solana.time.time", return_value=1_700_000_120):
+            decision = analyzer.analyze(item)
+
+        self.assertNotIn("top1_circulating_concentration_high", decision.hard_stops)
+        self.assertNotIn("top10_circulating_concentration_high", decision.hard_stops)
+        self.assertEqual(
+            decision.concentration["excluded_pool_vault_raw"], 830_000_000_000_000
+        )
 
 
 if __name__ == "__main__":

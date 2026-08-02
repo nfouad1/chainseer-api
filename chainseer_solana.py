@@ -375,8 +375,25 @@ class SolanaRiskDecision:
 class SolanaRiskPolicy:
     amount_sol: float = 0.01
     minimum_age_seconds: int = 60
-    maximum_top1_circulating_pct: float = 20.0
-    maximum_top10_circulating_pct: float = 65.0
+    # Recalibrated after diagnosing why zero shadow entries had ever
+    # occurred despite real graduations: _concentration() was missing an
+    # exclusion for the canonical PumpSwap pool's own base-token vault
+    # (fixed separately -- see pool_base_token_account), which alone had
+    # been inflating top1 to 60-95%+ for every graduated token regardless
+    # of real holder distribution. With that fixed, live-verified top1/
+    # top10 across the graduated tokens actually observed so far (Jordan,
+    # BOT, TOM -- excluding CATE, a near-zero-circulating outlier that
+    # should stay blocked) still commonly runs top1 ~15-20% and top10
+    # ~70-88%: normal for a token in its first hours post-graduation, when
+    # only a handful of wallets have bought in yet. The old 20%/65%
+    # ceilings were calibrated against the pre-fix (pool-inflated) numbers
+    # and would reject nearly every graduation on that basis alone.
+    # top10 in particular is now a much looser ceiling than top1 -- it
+    # mainly catches the CATE-style extreme case (single/duo-wallet near-
+    # total domination of a near-empty circulating pool) rather than
+    # ordinary early-holder concentration.
+    maximum_top1_circulating_pct: float = 25.0
+    maximum_top10_circulating_pct: float = 90.0
     minimum_roundtrip_retention_pct: float = 72.0
     maximum_buy_price_impact_pct: float = 12.0
     minimum_graduated_market_age_seconds: int = 60
@@ -1938,14 +1955,32 @@ class SolanaRiskAnalyzer:
         return result
 
     def _concentration(
-        self, candidate: SolanaLaunchCandidate, supply_raw: int
+        self,
+        candidate: SolanaLaunchCandidate,
+        supply_raw: int,
+        *,
+        pool_base_token_account: str | None = None,
     ) -> dict:
+        """Holder concentration among non-protocol-owned accounts.
+
+        Two accounts hold large token balances by DESIGN, not as a wallet's
+        position, and must both be excluded the same way: the Pump.fun
+        bonding curve's own reserve inventory pre-graduation, and (once
+        graduated) the canonical PumpSwap pool's own base-token vault --
+        that vault routinely holds 70-90%+ of supply as trading liquidity,
+        which is the AMM working correctly, not concentration risk. Before
+        this exclusion existed, every graduated token's top1/top10 was
+        dominated by its own pool vault, making the concentration gate
+        structurally impossible to clear for ANY graduated market
+        regardless of how distributed real holders actually were.
+        """
         if candidate.token_program == TOKEN_2022_PROGRAM_ID:
             rows = self.rpc.get_token_accounts_by_mint(
                 candidate.mint, candidate.token_program
             )
             holders = []
             excluded_curve_raw = 0
+            excluded_pool_vault_raw = 0
             for row in rows:
                 parsed = (
                     (((row.get("account") or {}).get("data") or {}).get(
@@ -1956,17 +1991,24 @@ class SolanaRiskAnalyzer:
                 if info.get("mint") != candidate.mint:
                     continue
                 owner = info.get("owner")
+                token_account = row.get("pubkey")
                 raw = _safe_int(
                     (info.get("tokenAmount") or {}).get("amount")
                 )
                 record = {
-                    "token_account": row.get("pubkey"),
+                    "token_account": token_account,
                     "owner": owner,
                     "amount_raw": raw,
                 }
                 if owner == candidate.bonding_curve:
                     record["excluded_reason"] = "pump_bonding_curve_inventory"
                     excluded_curve_raw += raw
+                elif (
+                    pool_base_token_account
+                    and token_account == pool_base_token_account
+                ):
+                    record["excluded_reason"] = "pumpswap_pool_base_vault_inventory"
+                    excluded_pool_vault_raw += raw
                 else:
                     holders.append(record)
             method = "getProgramAccounts_token2022_with_curve_owner_exclusion"
@@ -1982,6 +2024,7 @@ class SolanaRiskAnalyzer:
             account_values = accounts.get("value") or []
             holders = []
             excluded_curve_raw = 0
+            excluded_pool_vault_raw = 0
             for row, account in zip(largest_rows, account_values):
                 raw = _safe_int(row.get("amount"))
                 parsed = (
@@ -1989,18 +2032,26 @@ class SolanaRiskAnalyzer:
                 )
                 info = parsed.get("info") or {}
                 owner = info.get("owner")
+                token_account = row.get("address")
                 record = {
-                    "token_account": row.get("address"),
+                    "token_account": token_account,
                     "owner": owner,
                     "amount_raw": raw,
                 }
                 if owner == candidate.bonding_curve:
                     record["excluded_reason"] = "pump_bonding_curve_inventory"
                     excluded_curve_raw += raw
+                elif (
+                    pool_base_token_account
+                    and token_account == pool_base_token_account
+                ):
+                    record["excluded_reason"] = "pumpswap_pool_base_vault_inventory"
+                    excluded_pool_vault_raw += raw
                 else:
                     holders.append(record)
             method = "getTokenLargestAccounts_with_curve_owner_exclusion"
-        circulating = max(0, supply_raw - excluded_curve_raw)
+        excluded_total_raw = excluded_curve_raw + excluded_pool_vault_raw
+        circulating = max(0, supply_raw - excluded_total_raw)
         amounts = sorted((row["amount_raw"] for row in holders), reverse=True)
         top1 = 100.0 * (amounts[0] if amounts else 0) / circulating if circulating else None
         top10 = 100.0 * sum(amounts[:10]) / circulating if circulating else None
@@ -2010,6 +2061,7 @@ class SolanaRiskAnalyzer:
         return {
             "supply_raw": supply_raw,
             "excluded_bonding_curve_raw": excluded_curve_raw,
+            "excluded_pool_vault_raw": excluded_pool_vault_raw,
             "circulating_raw": circulating,
             "circulating_pct_of_supply": circulating_pct_of_supply,
             "top1_circulating_pct": top1,
@@ -2233,7 +2285,13 @@ class SolanaRiskAnalyzer:
         if coverage["mint_state"]:
             try:
                 concentration = self._concentration(
-                    candidate, _safe_int(mint_evidence.get("supply_raw"))
+                    candidate,
+                    _safe_int(mint_evidence.get("supply_raw")),
+                    pool_base_token_account=(
+                        (graduation.get("canonical_pool") or {}).get(
+                            "pool_base_token_account"
+                        )
+                    ),
                 )
                 coverage["holder_concentration"] = True
                 top1 = concentration.get("top1_circulating_pct")
@@ -3241,8 +3299,14 @@ class SolanaPrototypeEngine:
             f"Reason: {reason}",
             f"Analyses so far: {checkpoint.get('analysis_events')}",
         ]
+        # first_graduated_mint is populated on EVERY checkpoint once any
+        # token has ever graduated (it's just "the earliest-sorting
+        # graduated mint so far"), not only on the checkpoint that reason
+        # actually names it for -- gate on reason too, or a routine
+        # 200-analysis interval checkpoint months later keeps getting
+        # mis-displayed as if it were freshly about that same old token.
         mint = checkpoint.get("first_graduated_mint")
-        if mint:
+        if mint and reason == "first_canonical_graduated_market":
             row = (
                 _read_json(self.analysis_index_path, {})
                 .get("tokens", {})
