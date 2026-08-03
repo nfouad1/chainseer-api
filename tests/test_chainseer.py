@@ -5,6 +5,7 @@ import sys
 import tempfile
 import types
 import unittest
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import ExitStack, redirect_stdout
 from io import StringIO
 from pathlib import Path
@@ -505,6 +506,47 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             payload = rpc._session.calls[0][1]
             self.assertEqual(payload["params"][1], hex(12345))
             self.assertEqual(ledger.to_dict()["fact_count"], 1)
+            self.assertTrue(ledger.verify())
+
+    def test_provenance_ledger_dedups_concurrent_identical_writes(self):
+        """Phase 1's fetches now run on a thread pool and all write through
+        the same ledger. Many threads recording the exact same fact must
+        collapse to exactly one entry, not one per thread."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = chainseer.ProvenanceLedger(Path(temp_dir) / "evidence")
+            ledger.block_pin = 100
+
+            def _record():
+                return ledger.record(
+                    "http", {"url": "https://same.invalid"}, {"v": 1}
+                )
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                fact_ids = list(pool.map(lambda _: _record(), range(64)))
+
+            self.assertEqual(len(set(fact_ids)), 1)
+            self.assertEqual(ledger.to_dict()["fact_count"], 1)
+            self.assertTrue(ledger.verify())
+
+    def test_provenance_ledger_assigns_unique_ids_under_concurrency(self):
+        """Distinct facts recorded concurrently must never collide on
+        fact_id -- the citation system depends on fact_id uniqueness."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            ledger = chainseer.ProvenanceLedger(Path(temp_dir) / "evidence")
+            ledger.block_pin = 100
+
+            def _record(index):
+                return ledger.record(
+                    "http", {"url": f"https://distinct-{index}.invalid"},
+                    {"v": index},
+                )
+
+            with ThreadPoolExecutor(max_workers=16) as pool:
+                fact_ids = list(pool.map(_record, range(64)))
+
+            self.assertEqual(len(fact_ids), 64)
+            self.assertEqual(len(set(fact_ids)), 64)
+            self.assertEqual(ledger.to_dict()["fact_count"], 64)
             self.assertTrue(ledger.verify())
 
     def test_http_cache_preserves_provenance_for_each_scan(self):

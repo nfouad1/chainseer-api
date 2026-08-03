@@ -882,6 +882,79 @@ class SolanaPrototypeTests(unittest.TestCase):
         self.assertTrue(decision.graduation["secondary_market_observed"])
         self.assertEqual(dex.calls, 1)
 
+    def test_momentum_gate_blocks_entry_for_low_organic_sell_dominant_market(self):
+        class LowOrganicJupiter(FakeJupiter):
+            def token_info(self, mint):
+                info = super().token_info(mint)
+                info["organicScoreLabel"] = "low"
+                return info
+
+        class SellDominantDexScreener(FakeDexScreener):
+            def token_pairs(self, mint):
+                pairs = super().token_pairs(mint)
+                pairs[0]["txns"]["h6"] = {"buys": 1, "sells": 9}
+                return pairs
+
+        analyzer = chainseer_solana.SolanaRiskAnalyzer(
+            FakeRPC(curve_complete=True),
+            LowOrganicJupiter(),
+            dexscreener=SellDominantDexScreener(),
+        )
+        with patch("chainseer_solana.time.time", return_value=1_700_000_120):
+            decision = analyzer.analyze(candidate())
+        self.assertEqual(decision.admission_state, "graduated_market_ready")
+        self.assertFalse(decision.shadow_entry_allowed)
+        self.assertTrue(decision.market_momentum["entry_blocked"])
+        self.assertTrue(decision.market_momentum["sell_dominant"])
+        self.assertEqual(decision.market_momentum["organic_score_label"], "low")
+        self.assertIn(
+            "low_organic_score_sell_dominant_market", decision.warnings
+        )
+        # Custody safety must stay a separate axis: the gate never becomes a
+        # hard-stop or relabels risk_level as danger.
+        self.assertFalse(decision.hard_stops)
+        self.assertEqual(decision.risk_level, "Medium")
+
+    def test_momentum_gate_ignores_missing_organic_score(self):
+        class SellDominantDexScreener(FakeDexScreener):
+            def token_pairs(self, mint):
+                pairs = super().token_pairs(mint)
+                pairs[0]["txns"]["h6"] = {"buys": 1, "sells": 9}
+                return pairs
+
+        analyzer = chainseer_solana.SolanaRiskAnalyzer(
+            FakeRPC(curve_complete=True),
+            FakeJupiter(),
+            dexscreener=SellDominantDexScreener(),
+        )
+        with patch("chainseer_solana.time.time", return_value=1_700_000_120):
+            decision = analyzer.analyze(candidate())
+        self.assertTrue(decision.shadow_entry_allowed)
+        self.assertFalse(decision.market_momentum["entry_blocked"])
+
+    def test_momentum_gate_ignores_thin_trade_volume(self):
+        class LowOrganicJupiter(FakeJupiter):
+            def token_info(self, mint):
+                info = super().token_info(mint)
+                info["organicScoreLabel"] = "low"
+                return info
+
+        class ThinDexScreener(FakeDexScreener):
+            def token_pairs(self, mint):
+                pairs = super().token_pairs(mint)
+                pairs[0]["txns"]["h6"] = {"buys": 0, "sells": 2}
+                return pairs
+
+        analyzer = chainseer_solana.SolanaRiskAnalyzer(
+            FakeRPC(curve_complete=True),
+            LowOrganicJupiter(),
+            dexscreener=ThinDexScreener(),
+        )
+        with patch("chainseer_solana.time.time", return_value=1_700_000_120):
+            decision = analyzer.analyze(candidate())
+        self.assertTrue(decision.shadow_entry_allowed)
+        self.assertFalse(decision.market_momentum["entry_blocked"])
+
     def test_graduation_probe_backlinks_only_persisted_pump_launches(self):
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)
@@ -925,6 +998,116 @@ class SolanaPrototypeTests(unittest.TestCase):
                 ],
                 100.0,
             )
+
+    def test_stranded_probe_recovers_ready_candidate_with_no_shadow_position(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            item = candidate()
+            (root / "analysis_index.json").write_text(
+                json.dumps(
+                    {
+                        "tokens": {
+                            item.mint: {
+                                "candidate": item.to_dict(),
+                                "decision": {
+                                    "evidence_state": "complete_safe",
+                                    "admission_state": "graduated_market_ready",
+                                    "analyzed_at": "2026-08-03T16:52:44+00:00",
+                                },
+                            }
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(curve_complete=True),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            selected = engine._probe_stranded_ready_candidates(limit=3)
+            self.assertEqual([value.mint for value in selected], [item.mint])
+
+    def test_stranded_probe_excludes_candidates_with_any_shadow_position(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            open_item = candidate(mint=chainseer_solana._b58encode(b58_bytes(11)))
+            closed_item = candidate(mint=chainseer_solana._b58encode(b58_bytes(12)))
+            (root / "analysis_index.json").write_text(
+                json.dumps(
+                    {
+                        "tokens": {
+                            open_item.mint: {
+                                "candidate": open_item.to_dict(),
+                                "decision": {
+                                    "evidence_state": "complete_safe",
+                                    "admission_state": "graduated_market_ready",
+                                    "analyzed_at": "2026-08-03T16:52:44+00:00",
+                                },
+                            },
+                            closed_item.mint: {
+                                "candidate": closed_item.to_dict(),
+                                "decision": {
+                                    "evidence_state": "complete_safe",
+                                    "admission_state": "graduated_market_ready",
+                                    "analyzed_at": "2026-08-03T16:53:44+00:00",
+                                },
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(curve_complete=True),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            engine.trader.state["positions"][open_item.mint] = {"status": "open"}
+            engine.trader.state["positions"][closed_item.mint] = {"status": "closed"}
+            selected = engine._probe_stranded_ready_candidates(limit=3)
+            self.assertEqual(selected, [])
+
+    def test_stranded_probe_orders_oldest_first_and_respects_limit(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            older = candidate(mint=chainseer_solana._b58encode(b58_bytes(21)))
+            newer = candidate(mint=chainseer_solana._b58encode(b58_bytes(22)))
+            (root / "analysis_index.json").write_text(
+                json.dumps(
+                    {
+                        "tokens": {
+                            newer.mint: {
+                                "candidate": newer.to_dict(),
+                                "decision": {
+                                    "evidence_state": "complete_safe",
+                                    "admission_state": "graduated_market_ready",
+                                    "analyzed_at": "2026-08-03T18:00:00+00:00",
+                                },
+                            },
+                            older.mint: {
+                                "candidate": older.to_dict(),
+                                "decision": {
+                                    "evidence_state": "complete_safe",
+                                    "admission_state": "graduated_market_ready",
+                                    "analyzed_at": "2026-08-03T16:00:00+00:00",
+                                },
+                            },
+                        }
+                    }
+                ),
+                encoding="utf-8",
+            )
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(curve_complete=True),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            selected = engine._probe_stranded_ready_candidates(limit=1)
+            self.assertEqual([value.mint for value in selected], [older.mint])
 
     def test_recovery_prioritizes_nearest_graduation_after_migrations(self):
         with tempfile.TemporaryDirectory() as temp:
