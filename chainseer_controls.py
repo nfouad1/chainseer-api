@@ -23,6 +23,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable
 
+from chainseer_governance import assess_calibration_change
+from chainseer_outcome_ledger import verify_outcome_record
+
 
 CONTROL_SCHEMA_VERSION = "1.0"
 PERMIT_VERSION = "1.0"
@@ -1302,10 +1305,18 @@ class OutcomeCollector:
             outcome = self.outcomes(
                 baseline, current, horizon_seconds=horizon
             )
+            outcome_provenance = current_report.get("provenance") or {}
+            evidence_fact_ids = [
+                str(fact.get("fact_id"))
+                for fact in outcome_provenance.get("facts") or []
+                if isinstance(fact, dict) and fact.get("fact_id")
+            ]
             reflection = agent.reflect_on_analysis(
                 int(baseline["analysis_ring"]),
                 outcome,
+                evidence_fact_ids=evidence_fact_ids,
                 observed_at=utc_now_iso(now),
+                outcome_provenance=outcome_provenance,
             )
             completed.add(key)
             emitted.append(
@@ -1371,15 +1382,34 @@ class CalibrationEngine:
 
     @staticmethod
     def summarize(rings: list[dict[str, Any]]) -> dict[str, Any]:
+        rings_by_index = {ring.get("index"): ring for ring in rings}
         outcomes = [
             ring
             for ring in rings
             if ring.get("ring_type") == "analysis_outcome"
         ]
+        invalid_records = 0
+        evidence_ineligible = 0
+        legacy_unbound = 0
         # A later horizon supersedes an earlier label for the same analysis.
         latest: dict[int, dict[str, Any]] = {}
         for ring in outcomes:
             payload = ring.get("payload") or {}
+            record = payload.get("outcome_record")
+            if record is None:
+                legacy_unbound += 1
+                continue
+            reference = record.get("analysis_reference") or {}
+            ok, _reason = verify_outcome_record(
+                record,
+                rings_by_index.get(reference.get("ring")),
+            )
+            if not ok:
+                invalid_records += 1
+                continue
+            if not (record.get("learning") or {}).get("eligible"):
+                evidence_ineligible += 1
+                continue
             analysis_ring = _safe_int(payload.get("analysis_ring"), -1)
             if analysis_ring < 0:
                 continue
@@ -1438,6 +1468,9 @@ class CalibrationEngine:
             ),
             "market_return_samples": len(market_returns),
             "security_and_market_labels_separated": True,
+            "invalid_outcome_records_excluded": invalid_records,
+            "evidence_ineligible_outcomes_excluded": evidence_ineligible,
+            "legacy_unbound_outcomes_excluded": legacy_unbound,
         }
 
     def propose(self, rings: list[dict[str, Any]]) -> dict[str, Any]:
@@ -1496,34 +1529,16 @@ class CalibrationEngine:
         proposed = CalibrationPolicy.from_dict(
             proposal.get("proposed_policy") or {}
         )
-        if proposed.min_trade_score < current.min_trade_score:
-            raise ValueError("calibration adoption cannot loosen min_trade_score")
-        if not set(proposed.allowed_risk_levels).issubset(
-            set(current.allowed_risk_levels)
-        ):
-            raise ValueError("calibration adoption cannot broaden allowed risks")
-        # propose() never touches these fields, but adopt() takes an
-        # arbitrary proposal file path (not something bound to propose()'s
-        # own output), so a hand-edited proposal must still be rejected if it
-        # loosens any dimension TradePermitGuard relies on for freshness or
-        # data-quality, not just the two fields checked above.
-        if proposed.max_false_negative_rate > current.max_false_negative_rate:
-            raise ValueError(
-                "calibration adoption cannot raise max_false_negative_rate"
+        governance = assess_calibration_change(
+            asdict(current), asdict(proposed)
+        )
+        if not governance.automatic_activation_allowed:
+            violations = list(governance.relaxing_changes) + list(
+                governance.unknown_changes
             )
-        if proposed.min_outcomes < current.min_outcomes:
-            raise ValueError("calibration adoption cannot lower min_outcomes")
-        if proposed.max_permit_block_drift > current.max_permit_block_drift:
             raise ValueError(
-                "calibration adoption cannot raise max_permit_block_drift"
-            )
-        if proposed.max_quote_age_blocks > current.max_quote_age_blocks:
-            raise ValueError(
-                "calibration adoption cannot raise max_quote_age_blocks"
-            )
-        if proposed.permit_ttl_seconds > current.permit_ttl_seconds:
-            raise ValueError(
-                "calibration adoption cannot raise permit_ttl_seconds"
+                "calibration adoption violates the hard tighten-only policy: "
+                + "; ".join(violations)
             )
         metrics = proposal.get("metrics") or {}
         if _safe_int(metrics.get("sample_size")) < current.min_outcomes:
@@ -1549,6 +1564,7 @@ class CalibrationEngine:
                 "policy": asdict(proposed),
                 "metrics": metrics,
                 "proposal_hash": canonical_hash(proposal),
+                "governance": governance.to_dict(),
             },
         )
         if ring is None:
@@ -1561,6 +1577,7 @@ class CalibrationEngine:
             "ring": ring.get("index"),
             "ring_hash": ring.get("ring_hash"),
             "verdict": verdict,
+            "governance": governance.to_dict(),
         }
 
 

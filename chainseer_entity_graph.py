@@ -15,7 +15,7 @@ from collections import defaultdict
 from typing import Any, Iterable
 
 
-GRAPH_SCHEMA_VERSION = "1.0"
+GRAPH_SCHEMA_VERSION = "1.1"
 EVM_ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 EVM_TX_HASH_RE = re.compile(r"^0x[a-fA-F0-9]{64}$")
 # Base58 (Bitcoin alphabet: excludes 0, O, I, l), 32-44 chars covers every
@@ -117,6 +117,10 @@ class _Graph:
         self.edges: dict[str, dict[str, Any]] = {}
         self.signals: dict[str, dict[str, Any]] = {}
         self.limitations: list[str] = []
+        # Per-relationship coverage is part of the signed graph snapshot so a
+        # temporal projection can distinguish an actual disappearance from a
+        # provider/RPC observation gap.
+        self.relationship_coverage: dict[str, str] = {}
         self.root_entity_id = self.add_node(
             "token",
             token_address,
@@ -330,6 +334,9 @@ class _Graph:
             "edges": edges,
             "signals": ordered_signals,
             "limitations": sorted(set(self.limitations)),
+            "relationship_coverage": dict(
+                sorted(self.relationship_coverage.items())
+            ),
         }
         graph["graph_hash"] = canonical_hash(graph)
         return graph
@@ -367,6 +374,40 @@ def build_robinhood_entity_graph(
     dex = data.get("dex_pairs") or {}
     lp = data.get("lp_lock") or {}
     source = data.get("source_code") or {}
+    graph.relationship_coverage.update({
+        # Creation is an historical fact. A later provider omission does not
+        # undo it, so temporal consumers retain the positive relationship.
+        "deployed": "historical_static",
+        "controls_contract": (
+            "complete"
+            if isinstance(goplus, dict)
+            and not goplus.get("error")
+            and "owner_address" in goplus
+            else "unavailable"
+        ),
+        "market_for": (
+            "complete"
+            if isinstance(dex, dict) and dex and not dex.get("error")
+            else "unavailable"
+        ),
+        "controls_liquidity": (
+            "complete"
+            if isinstance(lp, dict)
+            and not lp.get("error")
+            and "state" in lp
+            else "unavailable"
+        ),
+        "implementation_for": (
+            "complete"
+            if isinstance(source, dict)
+            and not source.get("error")
+            and "implementations" in source
+            else "unavailable"
+        ),
+        # Top-holder endpoints are bounded samples, never an exhaustive list
+        # of every current holder.
+        "holds": "partial" if holders and not holders.get("error") else "unavailable",
+    })
     external_refs = _claim_refs(claim_evidence, "external_apis")
     holder_refs = _claim_refs(
         claim_evidence, "activity_and_holders"
@@ -707,6 +748,30 @@ def build_solana_entity_graph(
     basic = data.get("basic_info") or {}
     holders = data.get("holder_concentration") or {}
     dex = data.get("dex_pairs") or {}
+    mint_coverage = (
+        "complete"
+        if isinstance(basic, dict)
+        and not basic.get("error")
+        and "mint_authority" in basic
+        and "freeze_authority" in basic
+        else "unavailable"
+    )
+    holder_coverage = (
+        "partial"
+        if isinstance(holders, dict) and holders and not holders.get("error")
+        else "unavailable"
+    )
+    graph.relationship_coverage.update({
+        "can_mint": mint_coverage,
+        "can_freeze": mint_coverage,
+        "market_for": (
+            "complete"
+            if isinstance(dex, dict) and dex and not dex.get("error")
+            else "unavailable"
+        ),
+        "controls_token_account": holder_coverage,
+        "holds": holder_coverage,
+    })
     fact_ids = [
         str(item.get("fact_id"))
         for item in facts
@@ -862,6 +927,12 @@ def verify_entity_graph(graph: dict[str, Any]) -> tuple[bool, str]:
     }
     if graph.get("root_entity_id") not in node_ids:
         return False, "root_entity_missing"
+    coverage = graph.get("relationship_coverage") or {}
+    if not isinstance(coverage, dict) or any(
+        value not in {"complete", "partial", "unavailable", "historical_static"}
+        for value in coverage.values()
+    ):
+        return False, "relationship_coverage_invalid"
     for edge in graph.get("edges") or []:
         if not isinstance(edge, dict):
             return False, "edge_not_object"

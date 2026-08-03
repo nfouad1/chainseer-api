@@ -38,6 +38,11 @@ from chainseer import (
     _load_timechain_module,
     ensure_utf8_runtime,
 )
+from chainseer_outcome_ledger import (
+    analysis_evidence_binding,
+    build_outcome_record,
+)
+from chainseer_temporal_graph import refresh_temporal_projection
 
 
 BASE_CHAIN_ID = 8453
@@ -854,7 +859,8 @@ class BaseTimechainRecorder:
         skill_dir = _get_skill_dir()
         tc_module = _load_timechain_module(skill_dir)
         self.poq_module = _load_skill_module(skill_dir, "poq")
-        self.tc = tc_module.Timechain(root=Path(chain_root))
+        self.chain_root = Path(chain_root)
+        self.tc = tc_module.Timechain(root=self.chain_root)
         if self.tc.height() == 0:
             self.tc.genesis(name="Chainseer")
         ok, report = self.tc.verify()
@@ -885,6 +891,11 @@ class BaseTimechainRecorder:
             f"{decision.risk_level} risk with score {decision.score}/100; "
             f"paper entry {'allowed' if decision.paper_entry_allowed else 'refused'} and live entry disabled."
         )
+        evidence_binding = analysis_evidence_binding(
+            decision.provenance,
+            anchor_type="block_pin",
+            anchor_value=decision.block_pin,
+        )
         verdict, ring = self.poq_module.gate_and_seal(
             self.tc,
             summary,
@@ -901,9 +912,16 @@ class BaseTimechainRecorder:
             frame="assertion",
             evidence_texts=[_canonical_json(decision.provenance), _canonical_json(decision.canonicality)],
             extra_payload={
+                "network": "base",
                 "chain_id": BASE_CHAIN_ID,
                 "candidate": candidate.to_dict(),
                 "decision": decision.to_dict(),
+                **evidence_binding,
+                "evidence_state": (
+                    "infrastructure_indeterminate"
+                    if decision.risk_level == "Unknown"
+                    else "token_evidence"
+                ),
                 "idempotency_key": idempotency_key,
                 "paper_only": True,
                 "live_execution_enabled": False,
@@ -912,6 +930,12 @@ class BaseTimechainRecorder:
         if ring is None:
             raise RuntimeError(f"PoQ refused Base analysis seal: {verdict.get('decision')}")
         decision.timechain_ring = ring["index"]
+        refresh_temporal_projection(
+            self.tc,
+            self.chain_root,
+            network="base",
+            subject=candidate.token_address,
+        )
         return ring["index"]
 
     def seal_outcome(self, project_id: int, candidate: BaseLaunchCandidate,
@@ -920,8 +944,44 @@ class BaseTimechainRecorder:
         existing = self.find_idempotency_ring(idempotency_key)
         if existing is not None:
             return existing["index"]
+        chain_ok, chain_report = self.tc.verify()
+        if not chain_ok:
+            raise RuntimeError(
+                f"Timechain verification failed before Base outcome link: {chain_report}"
+            )
         original = self._ring_by_index(analysis_ring)
-        relevant = [original] if original else None
+        if original is None:
+            raise ValueError("analysis_ring must reference an existing analysis ring")
+        relevant = [original]
+        observed_at = str(
+            outcome.get("observed_at") or datetime.now(timezone.utc).isoformat()
+        )
+        evidence_fact_ids = [
+            str(fact.get("fact_id"))
+            for fact in decision.provenance.get("facts") or []
+            if isinstance(fact, dict) and fact.get("fact_id")
+        ]
+        outcome_record = build_outcome_record(
+            original,
+            outcome,
+            observed_at=observed_at,
+            outcome_provenance={
+                **decision.provenance,
+                "block_pin": decision.block_pin,
+                "anchor_type": "block_pin",
+            },
+            evidence_fact_ids=evidence_fact_ids,
+            calibration={
+                "analysis_version": "base-prototype-v1",
+                "original_risk_level": (
+                    (original.get("payload") or {}).get("decision") or {}
+                ).get("risk_level"),
+                "original_legitimacy_score": (
+                    (original.get("payload") or {}).get("decision") or {}
+                ).get("score"),
+            },
+        )
+        analysis_reference = outcome_record["analysis_reference"]
         summary = (
             f"Base learning checkpoint {horizon} for project {project_id} ({candidate.symbol}): "
             f"{decision.risk_level} risk, price source {outcome.get('price_source') or 'unavailable'}, "
@@ -942,11 +1002,22 @@ class BaseTimechainRecorder:
                 "idempotency_key": idempotency_key,
                 "project_id": project_id,
                 "analysis_ring": analysis_ring,
-                "analysis_ring_hash": original.get("ring_hash") if original else None,
+                "analysis_ring_hash": original.get("ring_hash"),
+                "original_evidence_hash": analysis_reference[
+                    "original_evidence_hash"
+                ],
+                "anchor_type": analysis_reference["anchor_type"],
+                "anchor_value": analysis_reference["anchor_value"],
                 "horizon": horizon,
                 "candidate": candidate.to_dict(),
                 "decision": decision.to_dict(),
                 "outcome": outcome,
+                "outcome_ledger_schema_version": outcome_record[
+                    "schema_version"
+                ],
+                "outcome_record_hash": outcome_record["record_hash"],
+                "learning_eligible": outcome_record["learning"]["eligible"],
+                "outcome_record": outcome_record,
                 "paper_only": True,
                 "live_execution_enabled": False,
             },

@@ -38,6 +38,8 @@ test("server-renders the Chainseer product page", async () => {
   assert.match(html, /SPL · slot-anchored/);
   assert.match(html, /Timechain-sealed/);
   assert.match(html, /Powered by Cypher Tempre/);
+  assert.match(html, /Timechain Memory Core/);
+  assert.match(html, /Query &amp; Recall Engine/);
   assert.match(html, /Fictional report preview · not sealed/);
   assert.match(html, /Sentinel Demo/);
   assert.match(html, /Available after a real token scan/);
@@ -87,10 +89,11 @@ test("publishes robots and sitemap metadata", async () => {
 });
 
 test("keeps secrets server-side and removes the starter preview", async () => {
-  const [page, apiRoute, watchRoute, styles, packageJson] = await Promise.all([
+  const [page, apiRoute, watchRoute, memoryRoute, styles, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/analyses/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/watch/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/memory/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
     readFile(new URL("../package.json", import.meta.url), "utf8"),
   ]);
@@ -119,6 +122,10 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(page, /Cognitive trace/);
   assert.match(page, /Trusted structured evidence only/);
   assert.match(page, /faculties cannot sign\s+or broadcast transactions/);
+  assert.match(page, /MemoryCoreDashboard/);
+  assert.match(page, /Timechain Memory Core/);
+  assert.match(page, /100% citation policy/);
+  assert.match(page, /Tighten-only is enforced/);
   assert.match(page, /<details className="analysis-disclosure">/);
   assert.match(page, /analysis-disclosure-trigger/);
   assert.match(page, /data-network=\{network\}/);
@@ -143,6 +150,8 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(styles, /\.analysis-disclosure-trigger::after/);
   assert.match(styles, /\.cognitive-overview/);
   assert.match(styles, /\.cognitive-chips/);
+  assert.match(styles, /\.memory-core/);
+  assert.match(styles, /\.memory-pillar-grid/);
   assert.match(page, /SAMPLE DATA · NOT LIVE/);
   assert.match(page, /nothing was sealed/);
   assert.match(page, /const demoReport: PublicReport/);
@@ -166,6 +175,9 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.match(watchRoute, /chainseer_monitor_device/);
   assert.match(watchRoute, /httpOnly: true/);
   assert.match(watchRoute, /\/v1\/watch\/alerts/);
+  assert.match(memoryRoute, /\/v1\/memory\/status/);
+  assert.match(memoryRoute, /CHAINSEER_API_TOKEN/);
+  assert.doesNotMatch(memoryRoute, /NEXT_PUBLIC_CHAINSEER/);
   assert.doesNotMatch(page, /CHAINSEER_API_TOKEN|NEXT_PUBLIC_CHAINSEER/);
   assert.match(packageJson, /"name": "chainseer-web"/);
   assert.doesNotMatch(packageJson, /react-loading-skeleton/);

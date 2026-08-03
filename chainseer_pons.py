@@ -48,6 +48,13 @@ from chainseer_base import (
     LiveExecutionDisabledError,
     PaperTradeLedger,
 )
+from chainseer_governance import (
+    TIGHTEN_ONLY_POLICY_VERSION,
+    cognitive_only_effect_manifest,
+    migrate_cognitive_faculty_governance,
+    register_faculty_governance,
+    verify_governance_registry,
+)
 
 
 PONS_CHAIN_ID = 4663
@@ -3987,8 +3994,20 @@ class PonsCognitiveLoop:
             self.root, registry_root=self.root
         )
         self.immune = self.immune_module.Immune(self.root)
+        ok, report = self.epochs_module.check_epoch(self.root)
+        if not ok:
+            raise RuntimeError(
+                "Pons faculty registry integrity failed before governance "
+                "migration: " + "; ".join(report)
+            )
+        migration = migrate_cognitive_faculty_governance(self.root)
         self.epochs_module.seal_epoch(
-            self.root, reason="Chainseer Pons faculty bootstrap"
+            self.root,
+            reason=(
+                "Chainseer Pons tighten-only faculty governance migration"
+                if migration.get("changed")
+                else "Chainseer Pons faculty bootstrap"
+            ),
         )
         self.verify_registry()
 
@@ -3997,6 +4016,12 @@ class PonsCognitiveLoop:
         if not ok:
             raise RuntimeError(
                 "Pons faculty registry integrity failed: " + "; ".join(report)
+            )
+        governance_ok, governance_report = verify_governance_registry(self.root)
+        if not governance_ok:
+            raise RuntimeError(
+                "Pons faculty governance failed: "
+                + "; ".join(governance_report)
             )
 
     @staticmethod
@@ -4101,6 +4126,8 @@ class PonsCognitiveLoop:
                 "covenant": screened.get("covenant"),
             },
             "growth": [],
+            "authority": "cognitive_advisory_only",
+            "tighten_only_policy": TIGHTEN_ONLY_POLICY_VERSION,
         }
         if not cognition["senses"] and not cognition["modalities"]:
             raise RuntimeError("Pons cognitive loop produced no active faculties")
@@ -4151,6 +4178,35 @@ class PonsCognitiveLoop:
             }
             for item in (growth or [])
         ]
+        promoted_identities = {
+            (
+                (item.get("faculty") or {}).get("kind"),
+                (item.get("faculty") or {}).get("name"),
+            )
+            for item in (growth or [])
+            if item.get("action") == "promoted"
+        }
+        if promoted_identities:
+            grown = json.loads(
+                (self.root / "registry" / "grown.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            promoted_definitions = []
+            for key, kind in (("senses", "sense"), ("modalities", "modality")):
+                for definition in grown.get(key) or []:
+                    if (kind, definition.get("name")) in promoted_identities:
+                        promoted_definitions.append({**definition, "kind": kind})
+            if len(promoted_definitions) != len(promoted_identities):
+                raise RuntimeError(
+                    "A promoted Pons faculty lacks an active registry definition"
+                )
+            register_faculty_governance(
+                self.root,
+                promoted_definitions,
+                source=f"pons_cambium_after_analysis:{analysis_ring['index']}",
+                default_manifest=cognitive_only_effect_manifest(),
+            )
         if any(
             item.get("action") in {"born", "promoted", "woken"}
             for item in (growth or [])

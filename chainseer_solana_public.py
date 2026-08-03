@@ -38,6 +38,8 @@ from chainseer_meteora_provenance import (
     resolve_genesis_creator as meteora_resolve_genesis_creator,
 )
 from chainseer_wallet_convergence import WalletConvergenceTracker
+from chainseer_outcome_ledger import analysis_evidence_binding
+from chainseer_temporal_graph import refresh_temporal_projection
 
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -786,12 +788,24 @@ class SolanaPublicAnalyzer:
         cognition = agent.cognitive_loop.prepare(report)
         analysis = report["analysis"]
         poq = report["poq_scores"]
+        evidence_binding = analysis_evidence_binding(
+            report.get("provenance") or {},
+            anchor_type="slot_pin",
+            anchor_value=(report.get("provenance") or {}).get("block_pin"),
+        )
+        report["analysis_evidence_hash"] = evidence_binding["evidence_hash"]
         entity_graph = (report.get("data") or {}).get("entity_graph") or {}
         sealed_entity_graph = {
             "graph_hash": entity_graph.get("graph_hash"),
             "summary": entity_graph.get("summary") or {},
             "signals": entity_graph.get("signals") or [],
         }
+        evidence_state = (
+            "infrastructure_indeterminate"
+            if report.get("infrastructure_indeterminate")
+            or analysis.get("risk_level") == "Unknown"
+            else "token_evidence"
+        )
         safe_context = {
             "network": "solana",
             "mint": report["token_address"],
@@ -835,9 +849,12 @@ class SolanaPublicAnalyzer:
                 "network": "solana",
                 "mint": report["token_address"],
                 "slot_anchor": (report.get("provenance") or {}).get("block_pin"),
+                **evidence_binding,
+                "evidence_state": evidence_state,
                 "analysis": safe_context["analysis"],
                 "coverage": report.get("coverage") or {},
                 "entity_graph": sealed_entity_graph,
+                "entity_graph_snapshot": entity_graph,
                 "cognition": cognition,
                 "live_execution_enabled": False,
             },
@@ -851,6 +868,19 @@ class SolanaPublicAnalyzer:
         report["analysis_ring_hash"] = ring["ring_hash"]
         report["poq_verdict"] = verdict
         agent.cognitive_loop.finalize(report, ring)
+        try:
+            report["temporal_entity_graph"] = refresh_temporal_projection(
+                agent.tc,
+                agent.chain_root,
+                network="solana",
+                subject=report["token_address"],
+            )
+        except Exception as exc:
+            report["temporal_entity_graph"] = {
+                "available": False,
+                "reason": "temporal_projection_refresh_failed",
+                "error_type": type(exc).__name__,
+            }
 
     def analyze_token(self, mint: str) -> dict:
         mint = validate_solana_mint(mint)

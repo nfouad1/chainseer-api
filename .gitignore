@@ -17,6 +17,7 @@ venv/
 # Runtime / generated state (chains, ledgers, learning data, logs, caches)
 chainseer_chain/
 chainseer_chain_archive_corrupted/
+chainseer_backups/
 benchmark_data/
 base_learning/
 base_prototype/

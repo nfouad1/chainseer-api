@@ -19,7 +19,8 @@
       "category": "integrity",
       "seed_terms": ["liquidity_custody_state", "lp_lock", "creator_withdrawable", "custody_unverified", "locked", "burned", "primary_amm_version", "liquidity_usd"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "modality",
@@ -28,7 +29,8 @@
       "category": "integrity",
       "seed_terms": ["custody", "withdrawal", "amm", "lock", "burn", "uncertainty", "creator_withdrawable", "custody_unverified"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "sense",
@@ -37,7 +39,8 @@
       "category": "integrity",
       "seed_terms": ["holder_count", "largest_non_amm_holder_pct", "top10_non_amm_holder_pct", "concentration_basis", "concentration_complete", "pool_exclusions", "vault_exclusions", "extreme_concentration"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "modality",
@@ -46,7 +49,8 @@
       "category": "integrity",
       "seed_terms": ["concentration", "denominator", "supply", "pool", "vault", "sample", "coverage", "hard_stop"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "sense",
@@ -55,7 +59,8 @@
       "category": "integrity",
       "seed_terms": ["ownership_renounced", "owner_check_failed", "mint_authority_active", "freeze_authority_active", "blacklist_control", "pause_control", "hidden_owner", "authority"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "modality",
@@ -64,7 +69,8 @@
       "category": "temporal",
       "seed_terms": ["owner", "mint", "freeze", "pause", "blacklist", "revoked", "authority", "drift"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "sense",
@@ -73,7 +79,8 @@
       "category": "temporal",
       "seed_terms": ["is_proxy", "proxy_type", "implementation_verified", "implementation_address", "contract_upgraded", "upgrade_authority", "unverified_proxy", "upgrade"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "modality",
@@ -82,7 +89,8 @@
       "category": "temporal",
       "seed_terms": ["proxy", "implementation", "verified", "upgradeability", "upgrade", "drift", "pinned", "reanalyze"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "sense",
@@ -91,7 +99,8 @@
       "category": "integrity",
       "seed_terms": ["is_honeypot", "cannot_buy", "cannot_sell_all", "buy_tax_pct", "sell_tax_pct", "route_quote_available", "simulation_status", "sell_restricted"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "modality",
@@ -100,7 +109,8 @@
       "category": "integrity",
       "seed_terms": ["sellability", "provider", "bytecode", "taxes", "route", "simulation", "infrastructure", "non_funded"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "sense",
@@ -109,7 +119,8 @@
       "category": "integrity",
       "seed_terms": ["uncertain_components", "infrastructure_indeterminate", "unavailable", "timeout", "rate_limit", "stale", "block_pin", "slot_anchor"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     },
     {
       "kind": "modality",
@@ -118,8 +129,9 @@
       "category": "integrity",
       "seed_terms": ["token", "infrastructure", "indeterminacy", "source", "anchor", "provenance", "hard_stop", "confidence"],
       "status": "reviewed-production",
-      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true}
+      "provenance": {"origin": "designed:chainseer-production-risk-lenses@1.0.0", "reviewed": true},
+      "governance": {"schema_version": "1.0", "declared_effect": "observability_only", "authority": "cognitive_advisory_only", "score_effect": "none", "hard_stop_effect": "none", "admission_effect": "none", "execution_effect": "none", "threshold_changes": []}
     }
   ],
-  "pack_sha256": "f754cd6a17da16b389ae7e350bd4deedfd2e394256f2b6a5a3f585e4cd6020df"
+  "pack_sha256": "e02afe94b95343d3c2732189a96f633bf8fb8500667b842a1596489bf4100db8"
 }

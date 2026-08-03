@@ -193,6 +193,45 @@ type CriticalAlert = {
   };
 };
 
+type MemoryPillar = {
+  ok?: boolean;
+  ring_count?: number;
+  head_index?: number;
+  subject_count?: number;
+  analysis_ring_count?: number;
+  faculty_count?: number;
+  pattern_count?: number;
+  canonical_records?: number;
+  learning_eligible?: number;
+  citation_policy?: string;
+  tighten_only?: boolean;
+};
+
+type MemoryCoreStatus = {
+  schema_version: string;
+  status: "healthy" | "degraded";
+  checked_at: string;
+  status_hash: string;
+  pillars: Record<string, MemoryPillar>;
+  recovery?: {
+    last_drill?: {
+      status?: string;
+      completed_at?: string;
+      recovery?: {
+        rpo_rings?: number;
+        rto_seconds?: number;
+        deterministic_rebuild?: boolean;
+      };
+    } | null;
+    last_drill_freshness?: {
+      current_head_index?: number;
+      drill_head_index?: number;
+      rings_behind?: number;
+      current_head_match?: boolean;
+    };
+  };
+};
+
 const MONITOR_STORAGE_KEY = "chainseer-critical-monitors-v1";
 const MAX_DEVICE_MONITORS = 10;
 
@@ -327,6 +366,150 @@ function titleCase(value: string) {
 function shortAddress(value: string) {
   if (!value) return "Address unavailable";
   return value.length > 20 ? `${value.slice(0, 8)}…${value.slice(-6)}` : value;
+}
+
+const memoryPillarLabels: Record<string, { index: string; title: string; description: string }> = {
+  timechain_ledger: {
+    index: "01",
+    title: "Timechain Ledger",
+    description: "Immutable, hash-linked analysis and reflection history.",
+  },
+  entity_knowledge_graph: {
+    index: "02",
+    title: "Entity Knowledge Graph",
+    description: "Temporal relationships and risk evolution rebuilt from Rings.",
+  },
+  pattern_faculty_store: {
+    index: "03",
+    title: "Pattern & Faculty Store",
+    description: "Governed learning with an enforced tighten-only activation gate.",
+  },
+  outcome_ledger: {
+    index: "04",
+    title: "Outcome Ledger",
+    description: "Ground truth bound to the original Ring, evidence hash, and pin.",
+  },
+  query_recall_engine: {
+    index: "05",
+    title: "Query & Recall Engine",
+    description: "Subject-scoped answers with exact evidence citations or no claim.",
+  },
+};
+
+function MemoryCoreDashboard() {
+  const [status, setStatus] = useState<MemoryCoreStatus | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    async function loadStatus() {
+      try {
+        const response = await fetch("/api/memory", { cache: "no-store" });
+        const body = await response.json().catch(() => null);
+        if (!active) return;
+        if (!response.ok || !body?.pillars) {
+          setUnavailable(true);
+          return;
+        }
+        setStatus(body as MemoryCoreStatus);
+        setUnavailable(false);
+      } catch {
+        if (active) setUnavailable(true);
+      }
+    }
+    void loadStatus();
+    const timer = window.setInterval(() => void loadStatus(), 60_000);
+    return () => {
+      active = false;
+      window.clearInterval(timer);
+    };
+  }, []);
+
+  const lastDrill = status?.recovery?.last_drill;
+  const drillFreshness = status?.recovery?.last_drill_freshness;
+  return (
+    <section className="memory-core" id="memory-core" aria-labelledby="memory-core-title">
+      <div className="section-heading memory-core-heading">
+        <div>
+          <div className="eyebrow">Persistent · verifiable · self-improving</div>
+          <h2 id="memory-core-title">Timechain Memory Core</h2>
+        </div>
+        <p>
+          Five linked layers turn individual scans into auditable intelligence.
+          Derived views can be deleted and rebuilt; the verified Timechain remains
+          the source of truth.
+        </p>
+      </div>
+      <div className="memory-integrity-bar">
+        <div>
+          <span className={`memory-status-dot ${status?.status === "healthy" ? "is-healthy" : ""}`} />
+          <strong>
+            {status
+              ? status.status === "healthy"
+                ? "Memory integrity verified"
+                : "Memory integrity needs attention"
+              : unavailable
+                ? "Live integrity status unavailable"
+                : "Checking Memory Core…"}
+          </strong>
+        </div>
+        <code>
+          {status?.status_hash ? `${status.status_hash.slice(0, 12)}…` : "STATUS PENDING"}
+        </code>
+      </div>
+      <div className="memory-pillar-grid">
+        {Object.entries(memoryPillarLabels).map(([key, label]) => {
+          const pillar = status?.pillars?.[key];
+          let metric = "Verifiable by design";
+          if (key === "timechain_ledger" && pillar?.ring_count !== undefined) {
+            metric = `${pillar.ring_count.toLocaleString()} Rings`;
+          } else if (key === "entity_knowledge_graph" && pillar?.subject_count !== undefined) {
+            metric = `${pillar.subject_count.toLocaleString()} subjects`;
+          } else if (key === "pattern_faculty_store" && pillar?.faculty_count !== undefined) {
+            metric = `${pillar.faculty_count} faculties · ${pillar.pattern_count ?? 0} patterns`;
+          } else if (key === "outcome_ledger" && pillar?.canonical_records !== undefined) {
+            metric = `${pillar.canonical_records} canonical · ${pillar.learning_eligible ?? 0} eligible`;
+          } else if (key === "query_recall_engine") {
+            metric = "100% citation policy";
+          }
+          return (
+            <article key={key}>
+              <div className="memory-pillar-head">
+                <span>{label.index}</span>
+                <i className={pillar?.ok === false ? "is-degraded" : "is-verified"}>
+                  {pillar?.ok === false ? "CHECK" : "VERIFIED"}
+                </i>
+              </div>
+              <h3>{label.title}</h3>
+              <p>{label.description}</p>
+              <strong>{metric}</strong>
+            </article>
+          );
+        })}
+      </div>
+      <div className="memory-operations">
+        <div>
+          <span>Recovery proof</span>
+          <strong>
+            {lastDrill?.status === "passed" ? "Last isolated drill passed" : "Drill evidence pending"}
+          </strong>
+          <small>
+            {lastDrill?.recovery
+              ? `RPO ${lastDrill.recovery.rpo_rings ?? "—"} Rings · RTO ${lastDrill.recovery.rto_seconds ?? "—"}s · deterministic rebuild ${lastDrill.recovery.deterministic_rebuild ? "verified" : "not verified"} · ${drillFreshness?.current_head_match ? "current head" : `${drillFreshness?.rings_behind ?? "—"} Rings behind`}`
+              : "Backups and rebuilds are verified outside the live Timechain before recovery is trusted."}
+          </small>
+        </div>
+        <div>
+          <span>Autonomy boundary</span>
+          <strong>Tighten-only is enforced</strong>
+          <small>
+            Learned faculties cannot lower risk thresholds, remove hard stops,
+            sign, broadcast, or enable live capital.
+          </small>
+        </div>
+      </div>
+    </section>
+  );
 }
 
 function nodePriority(node: EntityGraphNode, graph: EntityGraph) {
@@ -1507,6 +1690,7 @@ export default function Home() {
           <a href="#report">Demo report</a>
           <a href="#method">Method</a>
           <a href="#faq">Q&amp;A</a>
+          <a href="#memory-core">Memory Core</a>
           <a href="#timechain">Timechain</a>
           <a href="#evidence" onClick={() => setShowExample(true)}>Evidence</a>
         </nav>
@@ -1919,6 +2103,8 @@ export default function Home() {
           </details>
         </div>
       </section>
+
+      <MemoryCoreDashboard />
 
       <section className="timechain-section" id="timechain">
         <div className="timechain-orbit" aria-hidden="true">

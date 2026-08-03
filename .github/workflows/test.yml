@@ -19,10 +19,12 @@ jobs:
         with:
           python-version: "3.13"
           cache: pip
-          cache-dependency-path: requirements-api.txt
+          cache-dependency-path: |
+            requirements-api.txt
+            requirements-test.txt
 
-      - name: Install Python dependencies
-        run: python -m pip install -r requirements-api.txt
+      - name: Install Python test dependencies
+        run: python -m pip install -r requirements-test.txt
 
       - name: Install pinned Cypher Tempre runtime
         env:

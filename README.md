@@ -26,7 +26,13 @@ broadcast path.
   and Base contracts
 - one-time pre-trade authorization artifacts with block freshness and
   executable-route guardrails—without signing or executing a trade
-- append-only outcome collection and tighten-only calibration proposals
+- a canonical Outcome Ledger that binds each follow-up observation to the
+  exact analysis ring, original evidence hash, and block/slot pin
+- an authenticated, subject-scoped recall API that refuses uncited claims and
+  binds every answer to exact Ring, evidence-hash, and anchor citations
+- a five-pillar Timechain Memory Core dashboard plus manifest-verified,
+  nondestructive backup/rebuild/restore drills
+- tighten-only calibration proposals that exclude unverified outcome evidence
 - automatic, version-pinned production benchmark capture
 
 ## How an analysis flows
@@ -40,6 +46,7 @@ flowchart LR
     E --> F["Investor-oriented public report"]
     F --> G["Immutable benchmark observation"]
     F --> H["Optional confirmed-block monitoring"]
+    H --> I["Provenance-bound Outcome Ledger ring"]
 ```
 
 The deterministic analyzer owns the score and hard-stop decision. The
@@ -135,10 +142,56 @@ The graph is deliberately conservative:
 - Solana AMM/program vaults remain unresolved until independently identified
 - graph v1 is evidence-only and does not silently change the legitimacy score
 
-The canonical graph hash, summary, and signals are included in Timechain
-sealing. The authenticated API returns the bounded nodes and edges for future
-visualization. See [`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) for the schema,
-relationship semantics, signal definitions, and limitations.
+The canonical graph hash, summary, signals, and complete bounded graph snapshot
+are included in Timechain sealing. The authenticated API returns the current
+nodes/edges plus a longitudinal view of relationship and score changes. See
+[`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) for the schema, relationship semantics,
+temporal lifecycle, signal definitions, and limitations.
+
+## Temporal entity and risk memory
+
+The Timechain now functions as an event source for a persistent temporal
+knowledge graph. Each analysis preserves when a relationship was first seen,
+last confirmed, semantically changed, became unconfirmed, defensibly
+disappeared, or reappeared. Every event carries the exact analysis ring/hash,
+evidence-manifest hash, timestamp, and original block or slot pin.
+
+Risk evolution is recorded on the same axis: score, risk level, component
+scores, hard stops, and per-analysis deltas remain tied to their evidence
+snapshot. Infrastructure-indeterminate observations stay visible but are
+excluded from the usable token-evidence score trajectory. Historical rings
+that never sealed full graph snapshots are labeled legacy rather than
+retroactively reconstructed.
+
+`chainseer_chain/temporal_entity_graph-v1.json` is an atomic, hash-verified read
+model. It is never authoritative and can be rebuilt from Timechain rings.
+Exact-address equality can reveal the same deployer, authority, holder, or
+market across analyzed tokens; no behavior-based identity or beneficial
+ownership is inferred.
+
+## Timechain Memory Core
+
+Chainseer’s persistent intelligence is organized as five linked layers:
+
+1. the immutable **Timechain Ledger**;
+2. the temporal **Entity Knowledge Graph**;
+3. the tighten-only governed **Pattern & Faculty Store**;
+4. the provenance-bound **Outcome Ledger**; and
+5. the evidence-citing **Query & Recall Engine**.
+
+The authenticated recall API returns subject-specific assessment, risk,
+relationship, and outcome claims only when every claim can cite the exact
+verified Ring and original evidence hash. It does not expose raw Ring payloads
+or provider requests. Legacy analyses whose evidence manifest was not sealed
+in the original Ring are visible as exclusions, not upgraded into facts.
+
+The operator dashboard reports all five pillars, projection integrity,
+governance state, and the latest recovery proof. Backups contain only the
+authoritative `chain/` and epoch-covered `registry/` paths. Recovery always
+restores to an isolated new/empty root, verifies the snapshot, deterministically
+rebuilds projections, and never overwrites the live Timechain. See
+[`TIMECHAIN_MEMORY_CORE.md`](TIMECHAIN_MEMORY_CORE.md) for API schemas,
+commands, recovery drills, and honest scope boundaries.
 
 ## Timechain cognitive provenance
 
@@ -169,11 +222,50 @@ When a genuine capability gap is detected, Cambium may grow a constrained
 primitive faculty and seal a new registry epoch. Growth is fail-closed and
 cannot silently change deterministic scoring policy.
 
+The boundary is now executable rather than documentary. Every installed or
+Cambium-grown faculty is fingerprinted with a `cognitive_advisory_only` effect
+contract inside the epoch-covered registry. Learned patterns follow
+candidate -> shadow -> held-out/outcome validation -> active. A common gate
+recomputes every score, hard-stop, threshold, admission, and execution effect.
+Only observability-only or genuinely tighten-only changes can activate
+automatically. A potentially relaxing pattern needs an exact proposal-bound
+human approval receipt and a new registry epoch; live execution, signing, and
+broadcast expansion are non-overridable. See
+[`CHAINSEER_GOVERNANCE.md`](CHAINSEER_GOVERNANCE.md).
+
 The public report exposes an expandable **Cognitive trace** with the active
 senses, reasoning modalities, bounded recall references, growth events, PoQ
 completion state, and cognitive ring. This is provenance and observability,
 not a second scoring engine: deterministic evidence and hard-stop rules remain
 authoritative, and the cognitive layer has no signing or broadcast capability.
+
+## Canonical Outcome Ledger
+
+Real-world feedback is appended as a new Timechain ring; the original analysis
+is never edited. Every canonical outcome record contains a cryptographically
+checked analysis reference with:
+
+- the exact analysis ring index, full ring hash, ring type, and timestamp
+- the original evidence-manifest hash sealed by that analysis
+- the original `block_pin` or `slot_pin`
+- the analyzed network and token/mint
+- separately classified security, market, infrastructure, and other outcomes
+- a record hash covering the complete outcome document
+
+The original evidence manifest is an ordered digest of fact identifiers,
+query hashes, response hashes, and their observation pins. Follow-up evidence
+gets its own manifest hash. An outcome with missing or incomplete follow-up
+evidence remains in history but is marked ineligible for calibration, so an
+unsupported label cannot train the agent. Before calibration, canonical records
+are revalidated against the referenced analysis ring and tampered or mismatched
+records are excluded.
+
+Timechain rings are the source of truth. Future databases, graph projections,
+and dashboards are derived indexes that must be rebuildable from those rings;
+they never become an independent authority. The schema and verification logic
+live in [`chainseer_outcome_ledger.py`](chainseer_outcome_ledger.py).
+Outcome rings created before schema v1 remain visible as `legacy_unbound`; they
+are not silently rewritten or treated as canonical training evidence.
 
 ## Monitoring and pre-trade controls
 
@@ -194,6 +286,9 @@ authoritative, and the cognitive layer has no signing or broadcast capability.
   identities are one-way hashes and raw watcher state is not exposed
 - outcome checks at 1 hour, 6 hours, 24 hours, 7 days, and 30 days
 - calibration proposals that can only tighten the adopted pre-trade policy
+- governed faculty and learned-pattern promotion with effect manifests,
+  held-out Outcome Ledger validation, explicit human override receipts for
+  risk relaxation, and registry-epoch anchoring
 - short-lived, one-time `TradePermit` artifacts bound to the current block,
   token, canonical pair, input amount, recipient, and executable quote
 - slippage, price-impact, route, MEV, expiry, replay, and hard-stop rejection
@@ -288,10 +383,12 @@ Prerequisites:
 - `CHAINSEER_SKILL_DIR` pointing to that skill directory
 - HTTPS RPC endpoints for the networks you want to analyze
 
-Install the API dependencies and run the test suite:
+Install the test dependencies and run the complete test suite. The test
+requirements include bot-only packages that are intentionally absent from the
+production API image:
 
 ```bash
-python -X utf8 -m pip install -r requirements-api.txt
+python -X utf8 -m pip install -r requirements-test.txt
 python -X utf8 -m unittest discover -s tests -v
 ```
 
@@ -342,7 +439,10 @@ Deployment, secrets, backups, health checks, and domain setup are covered in
 | [`chainseer_api.py`](chainseer_api.py) | Authenticated FastAPI service, queue, cache, watcher integration, and production benchmark capture |
 | [`chainseer_controls.py`](chainseer_controls.py) | Monitoring, outcomes, calibration, MEV checks, and TradePermit boundary |
 | [`chainseer_benchmark.py`](chainseer_benchmark.py) | Immutable case bank and deterministic benchmark evaluator |
+| [`chainseer_outcome_ledger.py`](chainseer_outcome_ledger.py) | Canonical outcome schema, evidence/pin binding, record hashing, and ledger verification |
 | [`chainseer_entity_graph.py`](chainseer_entity_graph.py) | Deterministic entity relationships, insider-exposure signals, and graph verification |
+| [`chainseer_temporal_graph.py`](chainseer_temporal_graph.py) | Timechain-derived relationship lifecycle, cross-analysis exact-address identity, risk-score evolution, and projection verification |
+| [`chainseer_memory.py`](chainseer_memory.py) | Evidence-citing subject recall, sanitized citation proofs, five-pillar integrity status, and nondestructive backup/rebuild/restore drills |
 | [`CHAINSEER_CONTROLS.md`](CHAINSEER_CONTROLS.md) | Monitoring and pre-trade control operations |
 | [`BENCHMARK.md`](BENCHMARK.md) | Benchmark schema, workflow, metrics, and caveats |
 | [`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) | Entity graph schema, evidence semantics, signals, and inference limits |

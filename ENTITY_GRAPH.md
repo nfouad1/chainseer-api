@@ -18,7 +18,7 @@ Every fresh analysis exposes `entity_graph` in the public report:
 
 ```json
 {
-  "schema_version": "1.0",
+  "schema_version": "1.1",
   "network": "robinhood",
   "root_entity_id": "entity-...",
   "anchor": {"type": "block_pin", "value": 123456},
@@ -39,6 +39,10 @@ Every fresh analysis exposes `entity_graph` in the public report:
   "edges": [],
   "signals": [],
   "limitations": [],
+  "relationship_coverage": {
+    "controls_contract": "complete",
+    "holds": "partial"
+  },
   "graph_hash": "..."
 }
 ```
@@ -46,6 +50,13 @@ Every fresh analysis exposes `entity_graph` in the public report:
 The canonical SHA-256 `graph_hash` covers every field except itself. Graph
 verification also rejects a missing root entity, a dangling edge, or a signal
 that references an unknown node.
+
+`relationship_coverage` is signed into the snapshot. Its values are
+`complete`, `partial`, `unavailable`, or `historical_static`. This is the
+temporal truth boundary: absence under complete comparable coverage may close
+a relationship; absence under partial/unavailable coverage may only mark it
+unconfirmed. Historical facts such as deployment are never undone by a later
+provider omission.
 
 ## Nodes
 
@@ -155,6 +166,38 @@ This separation allows the benchmark to collect graph observations before any
 new graph-based scoring policy is proposed. Future score changes must be
 versioned, independently tested, and benchmarked against matured outcomes.
 
+## Temporal entity and risk history
+
+Each new analysis ring seals the complete verified graph snapshot, not only
+its summary. Chainseer derives
+`chainseer_chain/temporal_entity_graph-v1.json` from those rings. The file is a
+hash-checked read model, never a second source of truth: deleting and rebuilding
+it from the verified Timechain produces the same projection hash.
+
+For every subject, the projection records:
+
+- first and last observation with exact analysis ring, full ring hash,
+  timestamp, evidence-manifest hash, and block/slot pin
+- score, risk level, component scores, hard stops, and deltas at every analysis
+- risk evolution computed only from explicit `token_evidence`; infrastructure-
+  indeterminate and legacy observations remain visible but cannot distort the
+  usable score trajectory
+- relationship lifecycle events: `appeared`, `reaffirmed`, `changed`,
+  `not_observed`, `disappeared`, and `reappeared`
+- entity roles as they were first added and exact-address reuse across analyzed
+  tokens
+
+Relationship identity ignores per-scan fact IDs but includes network, source,
+target, and relationship type. A semantic revision is emitted when confidence,
+evidence status, or bounded relationship attributes change. Exact public
+address equality is the only cross-analysis identity join; Chainseer does not
+infer common ownership from behavior or similarity.
+
+Older analysis rings that sealed only graph hashes/summaries are retained as
+`legacy_graph_summary_only`. They can contribute a clearly labeled score
+observation, but Chainseer does not fabricate historical relationship events
+that were never sealed.
+
 ## Timechain and API
 
 Before sealing:
@@ -162,13 +205,16 @@ Before sealing:
 1. Chainseer builds the graph from structured analysis evidence.
 2. The canonical hash and graph references are verified.
 3. The cognitive intake receives only bounded summary fields and signal codes.
-4. The Timechain analysis ring seals the graph hash, summary, and signals.
-5. The authenticated public API returns bounded nodes, edges, signals,
-   limitations, and the same graph hash.
+4. The Timechain analysis ring seals the graph hash, bounded cognitive summary,
+   and the full verified snapshot used by the temporal projection.
+5. The projection is rebuilt atomically and verified against the Timechain.
+6. The authenticated public API returns bounded nodes, edges, signals,
+   limitations, the same graph hash, and bounded temporal risk/relationship
+   history.
 
-The public report schema is `1.2`. Benchmark capture accepts both historical
-schema `1.1` reports and graph-enabled `1.2` reports, so existing observations
-remain valid.
+The public report schema is `1.3`. Benchmark capture accepts historical schema
+`1.1`, graph-enabled `1.2`, and temporal graph `1.3` reports, so existing
+observations remain valid.
 
 ## Explicit limitations
 
