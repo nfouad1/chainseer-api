@@ -56,6 +56,7 @@ import shutil
 import sys
 import threading
 import time
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -904,6 +905,12 @@ class ProvenanceLedger:
         self._facts = []
         self._block_pin = None  # set once at scan start
         self._dedup = {}
+        # Phase 1's independent HTTP fetches run on a thread pool; every one
+        # of them calls record(). Guards the fact_id-assign/append/dedup-
+        # write sequence below so concurrent callers can never be handed the
+        # same fact_id or silently duplicate a fact -- the citation system
+        # this class exists for depends on fact_id being unique.
+        self._lock = threading.Lock()
         self.evidence_dir = Path(evidence_dir) if evidence_dir else None
         if self.evidence_dir:
             self.evidence_dir.mkdir(parents=True, exist_ok=True)
@@ -942,9 +949,15 @@ class ProvenanceLedger:
             json.dumps({"source": source, "query": query}, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
         dedup_key = (query_hash, resp_hash)
-        if dedup_key in self._dedup:
-            return self._dedup[dedup_key]
+        with self._lock:
+            if dedup_key in self._dedup:
+                return self._dedup[dedup_key]
 
+        # Evidence-file write stays outside the lock: unique temp names
+        # (pid + thread id) plus atomic os.replace already make it safe for
+        # concurrent callers, and the write is content-addressed by
+        # resp_hash, so two threads racing on the same fact write identical
+        # bytes -- no need to serialize disk I/O behind the in-memory lock.
         evidence_path = None
         if self.evidence_dir:
             evidence_file = self.evidence_dir / f"{resp_hash}.json"
@@ -955,21 +968,28 @@ class ProvenanceLedger:
                 temp_file.write_text(canonical, encoding="utf-8")
                 os.replace(temp_file, evidence_file)
             evidence_path = str(evidence_file)
-        fact_id = f"F{len(self._facts):04d}"
-        self._facts.append({
-            "fact_id": fact_id,
-            "source": source,
-            "query": query,
-            "response_hash": resp_hash,
-            "response_hash_short": resp_hash[:16],
-            "block": self._block_pin,
-            "query_hash": query_hash,
-            "evidence_path": evidence_path,
-            "cache_hit": cache_hit,
-            "fetched_at": datetime.fromtimestamp(fetched_at or time.time(), tz=timezone.utc).isoformat(),
-        })
-        self._dedup[dedup_key] = fact_id
-        return fact_id
+
+        with self._lock:
+            # Re-check: another thread may have recorded this exact fact
+            # while the (unlocked) evidence write above was in flight.
+            existing = self._dedup.get(dedup_key)
+            if existing is not None:
+                return existing
+            fact_id = f"F{len(self._facts):04d}"
+            self._facts.append({
+                "fact_id": fact_id,
+                "source": source,
+                "query": query,
+                "response_hash": resp_hash,
+                "response_hash_short": resp_hash[:16],
+                "block": self._block_pin,
+                "query_hash": query_hash,
+                "evidence_path": evidence_path,
+                "cache_hit": cache_hit,
+                "fetched_at": datetime.fromtimestamp(fetched_at or time.time(), tz=timezone.utc).isoformat(),
+            })
+            self._dedup[dedup_key] = fact_id
+            return fact_id
 
     def absorb(self, other: "ProvenanceLedger") -> list[str]:
         """Merge an isolated ledger while assigning deterministic local IDs."""
@@ -1746,42 +1766,23 @@ class Chainseer:
             return {"error": "Not a contract", "address": token}
 
         # ── Phase 1: Gather data ────────────────────────────────────────────
+        # These six fetches share no data dependency -- each is an
+        # independent HTTP round-trip keyed only on `token`/`pin_block` -- so
+        # they run on a thread pool instead of back-to-back. The GIL
+        # releases during each blocking requests call, so real wall-clock
+        # time is saved. ProvenanceLedger.record() is lock-protected
+        # specifically so these concurrent writers can never collide on a
+        # fact_id (see ProvenanceLedger.__init__).
         print(" Phase 1/8: External APIs (GoPlus + DexScreener + Blockscout)...")
         checkpoint = self.ledger.checkpoint()
         data = {}
-        data["goplus_security"] = _fetch_goplus_security(
-            token,
-            ledger=self.ledger,
-            chain_id=self.chain_id,
-        )
-        data["dexscreener"] = _fetch_dexscreener_token(token, ledger=self.ledger)
-        data["blockscout_address"] = _fetch_blockscout_address(
-            token,
-            ledger=self.ledger,
-            blockscout_base=self.network.blockscout_base,
-        )
-        data["blockscout_token"] = _fetch_blockscout_token(
-            token,
-            ledger=self.ledger,
-            blockscout_base=self.network.blockscout_base,
-        )
-        data["source_code"] = _fetch_blockscout_source(
-            token,
-            ledger=self.ledger,
-            blockscout_base=self.network.blockscout_base,
-        )
-        for key, provider in (
-            ("cross_chain_flow_records", self.cross_chain_provider),
-            ("social_kol_records", self.social_kol_provider),
-        ):
+
+        def _run_adapter(key: str, provider):
             if provider is None:
-                data[key] = []
-                continue
+                return [], None
             try:
                 adapter_value = provider(token, pin_block)
-                data[key] = (
-                    adapter_value if isinstance(adapter_value, list) else []
-                )
+                value = adapter_value if isinstance(adapter_value, list) else []
                 self.ledger.record(
                     source="adapter",
                     query={
@@ -1789,11 +1790,48 @@ class Chainseer:
                         "token_address": token,
                         "block_pin": pin_block,
                     },
-                    response_raw=data[key],
+                    response_raw=value,
                 )
+                return value, None
             except Exception as exc:
-                data[key] = []
-                data[f"{key}_error"] = str(exc)
+                return [], str(exc)
+
+        with ThreadPoolExecutor(max_workers=7) as pool:
+            futures = {
+                "goplus_security": pool.submit(
+                    _fetch_goplus_security, token,
+                    ledger=self.ledger, chain_id=self.chain_id,
+                ),
+                "dexscreener": pool.submit(
+                    _fetch_dexscreener_token, token, ledger=self.ledger,
+                ),
+                "blockscout_address": pool.submit(
+                    _fetch_blockscout_address, token, ledger=self.ledger,
+                    blockscout_base=self.network.blockscout_base,
+                ),
+                "blockscout_token": pool.submit(
+                    _fetch_blockscout_token, token, ledger=self.ledger,
+                    blockscout_base=self.network.blockscout_base,
+                ),
+                "source_code": pool.submit(
+                    _fetch_blockscout_source, token, ledger=self.ledger,
+                    blockscout_base=self.network.blockscout_base,
+                ),
+                "cross_chain_flow_records": pool.submit(
+                    _run_adapter, "cross_chain_flow_records", self.cross_chain_provider,
+                ),
+                "social_kol_records": pool.submit(
+                    _run_adapter, "social_kol_records", self.social_kol_provider,
+                ),
+            }
+            for key in ("goplus_security", "dexscreener", "blockscout_address",
+                        "blockscout_token", "source_code"):
+                data[key] = futures[key].result()
+            for key in ("cross_chain_flow_records", "social_kol_records"):
+                value, error = futures[key].result()
+                data[key] = value
+                if error is not None:
+                    data[f"{key}_error"] = error
         claim_evidence["external_apis"] = self.ledger.fact_ids_since(checkpoint)
 
         print(" Phase 2/8: On-chain reads...")
