@@ -447,7 +447,7 @@ Deployment, secrets, backups, health checks, and domain setup are covered in
 | [`BENCHMARK.md`](BENCHMARK.md) | Benchmark schema, workflow, metrics, and caveats |
 | [`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) | Entity graph schema, evidence semantics, signals, and inference limits |
 | [`API_DEPLOYMENT.md`](API_DEPLOYMENT.md) | Fly.io deployment and production operations |
-| [`render.yaml`](render.yaml) | Render Blueprint |
+| [`fly.toml`](fly.toml) | Authoritative Fly.io application, volume, health-check, and singleton configuration |
 | [`Dockerfile.api`](Dockerfile.api) | Reproducible API container |
 
 ## Safety and interpretation
