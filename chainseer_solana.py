@@ -428,6 +428,7 @@ class SolanaRiskDecision:
     graduation: dict = field(default_factory=dict)
     cohort: str = "launch_observation"
     admission_state: str = "graduation_pending"
+    market_momentum: dict = field(default_factory=dict)
     analyzed_at: str = field(default_factory=_utc_now)
     timechain_ring: int | None = None
 
@@ -495,6 +496,16 @@ class SolanaRiskPolicy:
     creator_history_warning_count: int = 5
     creator_history_hard_stop_count: int = 10
     creator_history_hard_stop_window_hours: float = 24.0
+    # Custody/rug-mechanics checks (hard_stops, concentration, creator
+    # history) say nothing about whether a market is still organically
+    # trading. A contract can be perfectly clean and also already dead --
+    # Jupiter's own organicScoreLabel plus a sell-dominant recent window is
+    # a directly observed, auditable signal for that, kept deliberately
+    # separate from hard_stops/risk_level so it gates entry timing without
+    # relabeling a custody-safe token as dangerous.
+    momentum_gate_organic_score_label: str = "low"
+    momentum_gate_minimum_h6_trades: int = 5
+    momentum_gate_sell_ratio_threshold: float = 0.65
 
     def __post_init__(self):
         if self.amount_sol <= 0:
@@ -518,6 +529,10 @@ class SolanaRiskPolicy:
                 "creator_history_warning_count must be in "
                 "(0, creator_history_hard_stop_count)"
             )
+        if self.momentum_gate_minimum_h6_trades < 0:
+            raise ValueError("momentum_gate_minimum_h6_trades must be non-negative")
+        if not 0 < self.momentum_gate_sell_ratio_threshold <= 1:
+            raise ValueError("momentum_gate_sell_ratio_threshold must be in (0, 1]")
 
 
 @dataclass(frozen=True)
@@ -2888,10 +2903,40 @@ class SolanaRiskAnalyzer:
             admission_state = "market_age_pending"
         else:
             admission_state = "graduated_market_ready"
+        jupiter_info = market.get("jupiter_token_info") or {}
+        organic_label = jupiter_info.get("organicScoreLabel")
+        h6_txns = (dex_market.get("txns") or {}).get("h6") or {}
+        h6_buys = _safe_int(h6_txns.get("buys")) or 0
+        h6_sells = _safe_int(h6_txns.get("sells")) or 0
+        h6_total = h6_buys + h6_sells
+        sell_dominant = (
+            h6_total >= self.policy.momentum_gate_minimum_h6_trades
+            and h6_sells / h6_total >= self.policy.momentum_gate_sell_ratio_threshold
+        )
+        # Custody safety and market momentum are deliberately kept as
+        # separate, non-conflated axes (same discipline as evidence_state
+        # vs admission_state): a low-organic, sell-dominant market blocks
+        # entry timing via shadow_entry_allowed without being folded into
+        # hard_stops or relabeling risk_level, which have always meant
+        # custody/rug-mechanics danger in this codebase, not trade timing.
+        momentum_entry_blocked = (
+            organic_label == self.policy.momentum_gate_organic_score_label
+            and sell_dominant
+        )
+        market_momentum = {
+            "organic_score_label": organic_label,
+            "h6_buys": h6_buys,
+            "h6_sells": h6_sells,
+            "sell_dominant": sell_dominant,
+            "entry_blocked": momentum_entry_blocked,
+        }
+        if momentum_entry_blocked:
+            warnings.append("low_organic_score_sell_dominant_market")
         allowed = (
             evidence_state == "complete_safe"
             and admission_state == "graduated_market_ready"
             and age_seconds >= self.policy.minimum_age_seconds
+            and not momentum_entry_blocked
         )
         score = max(
             0.0,
@@ -2935,6 +2980,7 @@ class SolanaRiskAnalyzer:
             graduation=graduation,
             cohort=cohort,
             admission_state=admission_state,
+            market_momentum=market_momentum,
         )
 
 
@@ -4216,6 +4262,41 @@ class SolanaPrototypeEngine:
         stats["selected"] = len(selected)
         return selected, stats
 
+    def _probe_stranded_ready_candidates(
+        self, *, limit: int, exclude_mints: set[str] | None = None
+    ) -> list[SolanaLaunchCandidate]:
+        """Sweep up graduated_market_ready candidates that never got a
+        shadow-entry attempt.
+
+        _probe_graduation_candidates() only re-probes admission states that
+        are still pending -- it drops a candidate the moment it reaches
+        graduated_market_ready. A candidate can also reach that state via the
+        plain observe path (shadow_enter=False), which never calls
+        trader.enter() at all. Without this lane such a candidate is
+        permanently stranded: fully graded and admission-ready, but never
+        given a shot at a paper entry. No RPC curve-probe is needed here --
+        completion is already recorded in the stored decision.
+        """
+        if limit <= 0:
+            return []
+        exclude = exclude_mints or set()
+        positions = self.trader.state.get("positions") or {}
+        analyses = _read_json(self.analysis_index_path, {}).get("tokens", {})
+        stranded: list[tuple[str, SolanaLaunchCandidate]] = []
+        for mint, row in analyses.items():
+            if mint in exclude or mint in positions:
+                continue
+            decision = row.get("decision") or {}
+            if decision.get("admission_state") != "graduated_market_ready":
+                continue
+            try:
+                candidate = SolanaLaunchCandidate.from_dict(row["candidate"])
+            except (KeyError, TypeError):
+                continue
+            stranded.append((str(decision.get("analyzed_at") or ""), candidate))
+        stranded.sort(key=lambda item: item[0])
+        return [candidate for _analyzed_at, candidate in stranded[:limit]]
+
     @staticmethod
     def _recovery_sort_key(row: dict):
         return (
@@ -4528,6 +4609,7 @@ class SolanaPrototypeEngine:
         signature_limit: int = 100,
         recovery_limit: int = 3,
         graduation_limit: int = 3,
+        stranded_limit: int = 3,
         slot_span: int | None = None,
         max_pages: int = 10,
     ) -> dict:
@@ -4561,6 +4643,13 @@ class SolanaPrototypeEngine:
             candidate.mint: candidate
             for candidate in discovered[-limit:] + meteora_discovered[-limit:]
             if candidate.mint not in recovered_mints
+        })
+        stranded_candidates = self._probe_stranded_ready_candidates(
+            limit=max(0, stranded_limit),
+            exclude_mints=recovered_mints | set(candidate_map),
+        )
+        candidate_map.update({
+            candidate.mint: candidate for candidate in stranded_candidates
         })
         for position in self.trader.open_positions():
             candidate = self._candidate_by_mint(position["mint"])
@@ -4624,6 +4713,7 @@ class SolanaPrototypeEngine:
                     for result in recovered
                 ),
                 "recovery_seeded": recovery_seeded,
+                "stranded_ready_recovered": len(stranded_candidates),
                 "shadow_events": shadow_events,
                 "shadow_open": len(self.trader.open_positions()),
                 "shadow_closed": sum(
@@ -5718,6 +5808,14 @@ def main() -> None:
                 help="Maximum confirmed Pump launches selected by the bounded "
                 "curve-completion discovery lane for full analysis.",
             )
+            command.add_argument(
+                "--stranded-limit",
+                type=int,
+                default=3,
+                help="Maximum graduated_market_ready candidates that never "
+                "received a shadow-entry attempt (e.g. graded via the plain "
+                "observe path) to re-evaluate with shadow_enter=True per cycle.",
+            )
     dashboard = subparsers.add_parser("dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8767)
@@ -5756,6 +5854,7 @@ def main() -> None:
                     signature_limit=args.signature_limit,
                     recovery_limit=args.recovery_limit,
                     graduation_limit=args.graduation_limit,
+                    stranded_limit=args.stranded_limit,
                     slot_span=args.slot_span,
                     max_pages=args.max_pages,
                 ),
