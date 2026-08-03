@@ -42,8 +42,10 @@ method. A TradePermit is an authorization artifact, not a transaction.
   to a Timechain root.
 - Outcome labels are separated into security correctness and market
   performance. Correlated refreshes do not all become calibration baselines.
-- Calibration proposals can only tighten the pre-trade policy. Adoption is a
-  separate, PoQ-gated command.
+- Calibration proposals can only tighten the complete pre-trade policy:
+  minimum score, allowed-risk set, false-negative tolerance, evidence sample
+  floor, block drift, quote age, and permit lifetime. The shared governance
+  assessor rejects a relaxation before the separate PoQ-gated adoption step.
 - Social/KOL and cross-chain context cannot trigger a green safety verdict or
   override a hard stop.
 - MEV is evaluated from the executable quote and affects only execution
@@ -145,7 +147,11 @@ must pause the API or run monitoring inside the same single-writer service.
 ## Outcome calibration
 
 The watcher collects append-only outcomes at 1 hour, 6 hours, 24 hours, 7 days,
-and 30 days. It automatically refreshes:
+and 30 days. Each `analysis_outcome` ring carries a canonical Outcome Ledger
+record bound to the exact original analysis ring/hash, its evidence-manifest
+hash, and its block or slot pin. The follow-up scan has a separate evidence
+manifest; incomplete follow-up evidence is retained for audit but excluded
+from calibration. It automatically refreshes:
 
 ```text
 chainseer_chain/controls/calibration_proposal.json
@@ -176,7 +182,10 @@ python -X utf8 chainseer_controls.py \
 ```
 
 Insufficient data never changes policy. Adoption cannot reduce the minimum
-trade score or broaden the allowed risk levels.
+trade score, broaden allowed risks, increase false-negative tolerance, lower
+the outcome sample floor, widen block or quote drift, or lengthen permit life.
+This automated path has no human-override option. General faculty and learned
+pattern lifecycle rules are documented in `CHAINSEER_GOVERNANCE.md`.
 
 ## TradePermit
 

@@ -9,6 +9,7 @@ from pydantic import ValidationError
 from chainseer_api import (
     AnalysisService,
     AnalyzeRequest,
+    MemoryQueryRequest,
     Settings,
     SingleProcessLease,
     SlidingWindowRateLimiter,
@@ -242,11 +243,27 @@ class AnalyzeRequestTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             AnalyzeRequest(network="solana", address=TOKEN)
 
+    def test_memory_query_is_subject_scoped_and_topic_bounded(self):
+        request = MemoryQueryRequest(
+            network="base",
+            address=TOKEN,
+            topics=["latest_assessment", "outcomes", "outcomes"],
+            limit=10,
+        )
+        self.assertEqual(request.network, "base")
+        self.assertEqual(request.topics, ["latest_assessment", "outcomes"])
+        with self.assertRaises(ValidationError):
+            MemoryQueryRequest(
+                network="base",
+                address=TOKEN,
+                topics=["raw_rings"],
+            )
+
 
 class PublicReportTests(unittest.TestCase):
     def test_public_schema_omits_raw_queries(self):
         public = build_public_report(sample_internal_report())
-        self.assertEqual(public["schema_version"], "1.2")
+        self.assertEqual(public["schema_version"], "1.3")
         self.assertEqual(public["timechain"]["ring"], 42)
         self.assertEqual(public["timechain"]["cognitive_ring"], 43)
         self.assertEqual(public["timechain"]["cognition"]["status"], "complete")
@@ -327,6 +344,34 @@ class PublicReportTests(unittest.TestCase):
         self.assertFalse(
             public["holders"]["pool_and_program_vaults_excluded"]
         )
+
+    def test_public_schema_exposes_bounded_temporal_history(self):
+        report = sample_internal_report()
+        report["temporal_entity_graph"] = {
+            "available": True,
+            "schema_version": "1.0",
+            "projection_hash": "d" * 64,
+            "source_chain": {"head_index": 42, "head_hash": "f" * 64},
+            "analysis_count": 2,
+            "risk_evolution": {"total_score_delta": -5},
+            "risk_timeline": [
+                {"analysis_ring": {"index": index}, "score": 80 - index}
+                for index in range(25)
+            ],
+            "relationship_events": [
+                {"event": "reaffirmed", "relationship_id": str(index)}
+                for index in range(45)
+            ],
+            "shared_entities": [
+                {"identity_id": str(index)} for index in range(25)
+            ],
+        }
+        temporal = build_public_report(report)["entity_graph"]["temporal"]
+        self.assertTrue(temporal["available"])
+        self.assertEqual(temporal["analysis_count"], 2)
+        self.assertEqual(len(temporal["risk_timeline"]), 20)
+        self.assertEqual(len(temporal["relationship_events"]), 40)
+        self.assertEqual(len(temporal["shared_entities"]), 20)
 
     def test_public_schema_does_not_mislabel_holder_sample_as_count(self):
         report = sample_internal_report()
@@ -474,6 +519,15 @@ class SettingsTests(unittest.TestCase):
                 Settings().benchmark_analyzer_version,
                 "abc123def456",
             )
+
+    def test_memory_backup_root_cannot_be_inside_timechain(self):
+        chain_root = Path.cwd().resolve() / "chainseer_chain"
+        settings = Settings(
+            chain_root=str(chain_root),
+            memory_backup_root=str(chain_root / "backups"),
+        )
+        with self.assertRaises(RuntimeError):
+            settings.validate()
 
 
 class TrustedHostCheckTests(unittest.TestCase):
@@ -643,6 +697,35 @@ class ServiceTests(unittest.TestCase):
                 {"base": {"message": "temporary"}},
             )
             self.assertFalse(health["benchmark_capture"]["enabled"])
+
+    def test_memory_facade_delegates_without_exposing_execution(self):
+        class FakeMemory:
+            def query(self, network, address, *, topics, limit):
+                return {
+                    "subject": {"network": network, "address": address},
+                    "topics": topics,
+                    "limit": limit,
+                    "execution": False,
+                }
+
+            def status(self):
+                return {"status": "healthy"}
+
+            def citation(self, ring):
+                return {"ring": ring, "payload": None}
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            service._memory = FakeMemory()
+            result = service.memory_query(
+                "robinhood",
+                TOKEN,
+                topics=["latest_assessment"],
+                limit=1,
+            )
+            self.assertFalse(result["execution"])
+            self.assertEqual(service.memory_status()["status"], "healthy")
+            self.assertEqual(service.memory_citation(7)["ring"], 7)
 
     def test_worker_routes_solana_and_keeps_network_cache_separate(self):
         with tempfile.TemporaryDirectory() as root:

@@ -35,7 +35,10 @@ RUN python -m zipfile -e /tmp/cypher-tempre.zip /tmp/cypher-tempre \
 
 COPY chainseer.py chainseer_controls.py chainseer_base_public.py \
     chainseer_solana_public.py chainseer_benchmark.py \
-    chainseer_entity_graph.py chainseer_alerts.py chainseer_core.py \
+    chainseer_entity_graph.py chainseer_governance.py \
+    chainseer_outcome_ledger.py chainseer_temporal_graph.py \
+    chainseer_memory.py \
+    chainseer_alerts.py chainseer_core.py \
     chainseer_pumpfun_provenance.py chainseer_meteora_provenance.py \
     chainseer_wallet_convergence.py chainseer_api.py ./
 COPY faculties/chainseer-production-v1.json \

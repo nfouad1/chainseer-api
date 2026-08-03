@@ -23,7 +23,7 @@ from typing import Any, Iterable
 
 BENCHMARK_SCHEMA_VERSION = "1.0"
 CASEBANK_SCHEMA_VERSION = "1.0"
-SUPPORTED_PUBLIC_REPORT_SCHEMAS = {"1.1", "1.2"}
+SUPPORTED_PUBLIC_REPORT_SCHEMAS = {"1.1", "1.2", "1.3"}
 MIN_BENIGN_OBSERVATION_SECONDS = 7 * 24 * 60 * 60
 NETWORKS = {"robinhood", "solana"}
 LABELS = {"adverse_security", "benign", "infrastructure_failure"}
@@ -229,6 +229,11 @@ def _validate_prediction_fields(
     if report_hash is not None and not HASH_RE.fullmatch(str(report_hash)):
         raise BenchmarkValidationError(
             f"{prefix}.report_hash must be a SHA-256 hex digest"
+        )
+    evidence_hash = prediction.get("analysis_evidence_hash")
+    if evidence_hash is not None and not HASH_RE.fullmatch(str(evidence_hash)):
+        raise BenchmarkValidationError(
+            f"{prefix}.analysis_evidence_hash must be a SHA-256 hex digest"
         )
 
 
@@ -489,6 +494,9 @@ def build_observation_from_report(
         "latency_ms": round(float(latency_ms), 3),
         "evidence_age_seconds": round(float(evidence_age_seconds), 3),
         "report_hash": canonical_hash(report),
+        "analysis_evidence_hash": (report.get("evidence") or {}).get(
+            "analysis_evidence_hash"
+        ),
         "captured_at": captured_text,
         "source_schema_version": report.get("schema_version"),
         "anchor_type": (report.get("evidence") or {}).get("anchor_type"),

@@ -77,6 +77,24 @@ from chainseer_entity_graph import (
     build_robinhood_entity_graph,
     verify_entity_graph,
 )
+from chainseer_governance import (
+    TIGHTEN_ONLY_POLICY_VERSION,
+    cognitive_only_effect_manifest,
+    migrate_cognitive_faculty_governance,
+    register_faculty_governance,
+    validate_faculty_pack_governance,
+    verify_governance_registry,
+)
+from chainseer_outcome_ledger import (
+    analysis_evidence_binding,
+    build_outcome_record,
+    partition_outcomes,
+    verify_outcome_rings,
+)
+from chainseer_temporal_graph import (
+    TemporalGraphStore,
+    refresh_temporal_projection,
+)
 
 CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
@@ -305,6 +323,13 @@ def install_curated_faculty_pack(
         raise RuntimeError("Configured faculty pack has an invalid faculty definition")
     if len(set(identities)) != len(identities):
         raise RuntimeError("Configured faculty pack contains duplicate faculty identities")
+    try:
+        governance_decision = validate_faculty_pack_governance(pack)
+    except ValueError as exc:
+        raise RuntimeError(
+            "Configured faculty pack failed the tighten-only governance gate: "
+            + str(exc)
+        ) from exc
 
     def registry_entries() -> dict[tuple[str, str], dict]:
         grown = cambium_module.load_grown(
@@ -333,13 +358,39 @@ def install_curated_faculty_pack(
                 "Faculty pack is present but registry epoch verification failed: "
                 + "; ".join(epoch_report)
             )
+        governance_changed = register_faculty_governance(
+            root,
+            definitions,
+            source=(
+                f"reviewed_pack:{pack.get('name')}@{pack.get('version')}"
+            ),
+        )
+        governance_epoch = None
+        if governance_changed:
+            governance_epoch = epochs_module.seal_epoch(
+                root,
+                reason=(
+                    f"tighten-only governance for reviewed Chainseer faculty pack "
+                    f"{pack.get('name')}@{pack.get('version')}"
+                ),
+            )
+            ok, epoch_report = epochs_module.check_epoch(root)
+            if not ok:
+                raise RuntimeError(
+                    "Faculty governance registry failed epoch verification: "
+                    + "; ".join(epoch_report)
+                )
         return {
-            "status": "verified",
+            "status": "governance_migrated" if governance_changed else "verified",
             "name": pack.get("name"),
             "version": pack.get("version"),
             "pack_sha256": expected_hash,
             "faculty_count": len(definitions),
             "imported_count": 0,
+            "governance": governance_decision,
+            "epoch_ring": (
+                governance_epoch.get("index") if governance_epoch else None
+            ),
         }
 
     pending_definitions = [
@@ -398,6 +449,12 @@ def install_curated_faculty_pack(
             + ", ".join(missing)
         )
 
+    register_faculty_governance(
+        root,
+        definitions,
+        source=f"reviewed_pack:{pack.get('name')}@{pack.get('version')}",
+    )
+
     epoch = epochs_module.seal_epoch(
         root,
         reason=(
@@ -428,6 +485,7 @@ def install_curated_faculty_pack(
         "covered_count": len(result.get("skipped_covered") or []),
         "import_ring": result.get("ring"),
         "epoch_ring": epoch.get("index") if epoch else None,
+        "governance": governance_decision,
     }
 
 
@@ -446,6 +504,24 @@ class ChainseerCognitiveLoop:
             self.root, registry_root=self.root
         )
         self.immune = self.immune_module.Immune(self.root)
+        # First prove the existing epoch.  Only then may a deliberate migration
+        # bind legacy cognitive faculties to the new application-level
+        # authority boundary and create a replacement epoch.
+        ok, report = self.epochs_module.check_epoch(self.root)
+        if not ok:
+            raise RuntimeError(
+                "Faculty registry integrity verification failed before "
+                "governance migration: " + "; ".join(report)
+            )
+        migration = migrate_cognitive_faculty_governance(self.root)
+        if migration.get("changed"):
+            self.epochs_module.seal_epoch(
+                self.root,
+                reason=(
+                    "Chainseer tighten-only governance migration for "
+                    f"{migration.get('faculty_count')} cognitive faculties"
+                ),
+            )
 
     def seal_bootstrap_epoch(self) -> dict | None:
         return self.epochs_module.seal_epoch(
@@ -458,6 +534,12 @@ class ChainseerCognitiveLoop:
             raise RuntimeError(
                 "Faculty registry integrity verification failed: "
                 + "; ".join(report)
+            )
+        governance_ok, governance_report = verify_governance_registry(self.root)
+        if not governance_ok:
+            raise RuntimeError(
+                "Faculty governance verification failed: "
+                + "; ".join(governance_report)
             )
 
     @staticmethod
@@ -660,6 +742,8 @@ class ChainseerCognitiveLoop:
                 "covenant": screened.get("covenant"),
             },
             "growth": [],
+            "authority": "cognitive_advisory_only",
+            "tighten_only_policy": TIGHTEN_ONLY_POLICY_VERSION,
         }
         if not cognition["senses"] and not cognition["modalities"]:
             raise RuntimeError("Cognitive loop produced no active faculties")
@@ -710,6 +794,33 @@ class ChainseerCognitiveLoop:
             }
             for item in (growth or [])
         ]
+        promoted_identities = {
+            (
+                (item.get("faculty") or {}).get("kind"),
+                (item.get("faculty") or {}).get("name"),
+            )
+            for item in (growth or [])
+            if item.get("action") == "promoted"
+        }
+        if promoted_identities:
+            grown_path = self.root / "registry" / "grown.json"
+            grown = json.loads(grown_path.read_text(encoding="utf-8"))
+            promoted_definitions = []
+            for key, kind in (("senses", "sense"), ("modalities", "modality")):
+                for definition in grown.get(key) or []:
+                    if (kind, definition.get("name")) in promoted_identities:
+                        promoted_definitions.append({**definition, "kind": kind})
+            if len(promoted_definitions) != len(promoted_identities):
+                raise RuntimeError(
+                    "A promoted faculty was not found in the active registry; "
+                    "refusing to seal an incomplete governance epoch"
+                )
+            register_faculty_governance(
+                self.root,
+                promoted_definitions,
+                source=f"cambium_after_analysis:{analysis_ring['index']}",
+                default_manifest=cognitive_only_effect_manifest(),
+            )
         if any(item.get("action") in {"born", "promoted", "woken"}
                for item in (growth or [])):
             self.epochs_module.seal_epoch(
@@ -3952,12 +4063,24 @@ class Chainseer:
         cognition = self.cognitive_loop.prepare(report)
         poq = report.get("poq_scores", {})
         analysis = report["analysis"]
+        evidence_binding = analysis_evidence_binding(
+            report.get("provenance") or {},
+            anchor_type="block_pin",
+            anchor_value=(report.get("provenance") or {}).get("block_pin"),
+        )
+        report["analysis_evidence_hash"] = evidence_binding["evidence_hash"]
         entity_graph = (report.get("data") or {}).get("entity_graph") or {}
         sealed_entity_graph = {
             "graph_hash": entity_graph.get("graph_hash"),
             "summary": entity_graph.get("summary") or {},
             "signals": entity_graph.get("signals") or [],
         }
+        evidence_state = (
+            "infrastructure_indeterminate"
+            if report.get("infrastructure_indeterminate")
+            or analysis.get("risk_level") == "Unknown"
+            else "token_evidence"
+        )
         candidate = (
             f"Token {report['token_address']} assessed as {analysis['risk_level']} risk "
             f"with legitimacy score {analysis['legitimacy_score']}/100. "
@@ -3998,6 +4121,8 @@ class Chainseer:
             extra_payload={
                 "token_address": report["token_address"],
                 "token_name": report.get("token_name"),
+                "network": self.network_key,
+                "chain_id": self.chain_id,
                 "analysis_version": report.get("analysis_version"),
                 "legitimacy_score": report["analysis"]["legitimacy_score"],
                 "risk_level": report["analysis"]["risk_level"],
@@ -4012,9 +4137,16 @@ class Chainseer:
                 "confidence_grade": report["analysis"].get("confidence_grade"),
                 "timestamp": report["timestamp"],
                 "block_pin": report["provenance"]["block_pin"],
+                **evidence_binding,
+                "evidence_state": evidence_state,
                 "provenance": report["provenance"],
                 "claim_evidence": report.get("claim_evidence", {}),
                 "entity_graph": sealed_entity_graph,
+                # Full verified snapshot makes relationship appearance,
+                # revision, and defensible disappearance reconstructible.
+                # The smaller entity_graph field above remains the bounded
+                # cognition/legacy surface.
+                "entity_graph_snapshot": entity_graph,
                 "uncertain_components": report["analysis"].get("uncertain_components", {}),
                 "cognitive_loop": cognition,
             },
@@ -4028,6 +4160,25 @@ class Chainseer:
         report["analysis_ring_hash"] = ring.get("ring_hash")
         report["poq_verdict"] = verdict
         self.cognitive_loop.finalize(report, ring)
+        try:
+            report["temporal_entity_graph"] = refresh_temporal_projection(
+                self.tc,
+                self.chain_root,
+                network=self.network_key,
+                subject=report["token_address"],
+            )
+        except Exception as exc:
+            # The analysis ring remains authoritative and usable if its
+            # rebuildable read model is temporarily unavailable.
+            report["temporal_entity_graph"] = {
+                "available": False,
+                "reason": "temporal_projection_refresh_failed",
+                "error_type": type(exc).__name__,
+            }
+            print(
+                "  WARNING: temporal entity projection refresh failed "
+                f"({type(exc).__name__})"
+            )
         print(f"  Sealed ring {ring.get('index', '?')} (hash: {ring.get('ring_hash', '?')[:16]}...)")
         print(f"  PoQ: coherence={poq['coherence']} relevance={poq['relevance']} "
               f"depth={poq['depth']} covenant={poq['covenant']}")
@@ -4042,31 +4193,37 @@ class Chainseer:
 
     def reflect_on_analysis(self, analysis_ring: int, outcomes: dict,
                             evidence_fact_ids: list = None,
-                            observed_at: str = None) -> dict:
+                            observed_at: str = None,
+                            outcome_provenance: dict = None) -> dict:
         """Append a real-world outcome without rewriting the original analysis.
 
         Security outcomes and market outcomes stay separate so price movement does
         not incorrectly train the agent to equate an unprofitable token with a rug.
         """
-        if not isinstance(outcomes, dict) or not outcomes:
-            raise ValueError("outcomes must be a non-empty mapping")
+        chain_ok, chain_report = self.tc.verify()
+        if not chain_ok:
+            raise RuntimeError(
+                f"Timechain verification failed before outcome link: {chain_report}"
+            )
         rings = self.tc.load()
         original = next((r for r in rings if r.get("index") == analysis_ring), None)
-        if original is None or original.get("ring_type") != "token_analysis":
-            raise ValueError("analysis_ring must reference a token_analysis ring")
+        if original is None:
+            raise ValueError("analysis_ring does not exist")
 
-        security_keys = {
-            "rug_pull", "liquidity_removed_pct", "honeypot_observed", "exploit",
-            "owner_privilege_used", "tax_changed", "contract_upgraded",
-        }
-        market_keys = {"price_return_pct", "max_drawdown_pct", "volatility_pct"}
-        security = {k: outcomes[k] for k in security_keys if k in outcomes}
-        market = {k: outcomes[k] for k in market_keys if k in outcomes}
-        other = {k: v for k, v in outcomes.items() if k not in security_keys | market_keys}
-        token = original.get("payload", {}).get("token_address")
-        original_risk = original.get("payload", {}).get("risk_level")
-        original_score = original.get("payload", {}).get("legitimacy_score")
-        analysis_version = original.get("payload", {}).get(
+        security, market, infrastructure, other = partition_outcomes(outcomes)
+        original_payload = original.get("payload", {})
+        token = (
+            original_payload.get("token_address")
+            or original_payload.get("mint")
+            or (original_payload.get("candidate") or {}).get("token_address")
+        )
+        original_risk = original_payload.get("risk_level") or (
+            original_payload.get("analysis") or {}
+        ).get("risk_level")
+        original_score = original_payload.get("legitimacy_score") or (
+            original_payload.get("analysis") or {}
+        ).get("legitimacy_score")
+        analysis_version = original_payload.get(
             "analysis_version", "pre-versioned"
         )
         adverse_security_event = any(bool(security.get(k)) for k in (
@@ -4079,6 +4236,16 @@ class Chainseer:
             "adverse_security_event": adverse_security_event,
             "dangerous_false_negative": adverse_security_event and original_risk in {"Low", "Medium"},
         }
+        observed_timestamp = observed_at or datetime.now(timezone.utc).isoformat()
+        outcome_record = build_outcome_record(
+            original,
+            outcomes,
+            observed_at=observed_timestamp,
+            outcome_provenance=outcome_provenance,
+            evidence_fact_ids=evidence_fact_ids or [],
+            calibration=calibration,
+        )
+        analysis_reference = outcome_record["analysis_reference"]
         candidate = (
             f"Observed outcome for token {token}, linked to analysis ring {analysis_ring}. "
             f"Adverse security event: {adverse_security_event}. "
@@ -4096,18 +4263,52 @@ class Chainseer:
             extra_payload={
                 "analysis_ring": analysis_ring,
                 "analysis_ring_hash": original.get("ring_hash"),
+                "original_evidence_hash": analysis_reference[
+                    "original_evidence_hash"
+                ],
+                "anchor_type": analysis_reference["anchor_type"],
+                "anchor_value": analysis_reference["anchor_value"],
                 "token_address": token,
-                "observed_at": observed_at or datetime.now(timezone.utc).isoformat(),
+                "observed_at": observed_timestamp,
                 "security_outcomes": security,
                 "market_outcomes": market,
+                "infrastructure_outcomes": infrastructure,
                 "other_outcomes": other,
                 "evidence_fact_ids": list(evidence_fact_ids or []),
                 "calibration": calibration,
+                "outcome_ledger_schema_version": outcome_record[
+                    "schema_version"
+                ],
+                "outcome_record_hash": outcome_record["record_hash"],
+                "learning_eligible": outcome_record["learning"]["eligible"],
+                "outcome_record": outcome_record,
             },
         )
         if ring is None:
             raise RuntimeError(f"PoQ refused outcome reflection: {verdict.get('decision')}")
-        return {"ring": ring, "verdict": verdict, "calibration": calibration}
+        return {
+            "ring": ring,
+            "verdict": verdict,
+            "calibration": calibration,
+            "outcome_record": outcome_record,
+        }
+
+    def verify_outcome_ledger(self) -> dict:
+        """Verify every canonical outcome record against its analysis ring."""
+        chain_ok, chain_report = self.tc.verify()
+        if not chain_ok:
+            return {
+                "ok": False,
+                "checked": 0,
+                "errors": [{"ring": None, "reason": str(chain_report)}],
+            }
+        return verify_outcome_rings(self.tc.load())
+
+    def verify_temporal_entity_graph(self) -> dict:
+        """Verify the derived temporal projection against every Timechain ring."""
+
+        ok, reason = TemporalGraphStore(self.chain_root).verify(self.tc.load())
+        return {"ok": ok, "reason": reason}
 
     # ── REPORT PRINTING ────────────────────────────────────────────────────
 

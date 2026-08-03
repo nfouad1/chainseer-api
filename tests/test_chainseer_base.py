@@ -7,6 +7,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 import chainseer_base
+from chainseer_outcome_ledger import verify_outcome_rings
 
 
 class FakeBaseRPC:
@@ -276,6 +277,9 @@ class BasePrototypeTests(unittest.TestCase):
             )
             self.assertLess(analysis_ring, outcome_ring)
             self.assertLess(outcome_ring, migration_ring)
+            ledger_status = verify_outcome_rings(recorder.tc.load())
+            self.assertTrue(ledger_status["ok"])
+            self.assertEqual(ledger_status["checked"], 1)
             ok, _ = recorder.tc.verify()
             self.assertTrue(ok)
 

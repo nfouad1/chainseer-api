@@ -62,6 +62,9 @@ class FakeTimechain:
     def load(self):
         return self._rings
 
+    def verify(self):
+        return True, "verified"
+
 
 class FakePoQ:
     def __init__(self):
@@ -1060,8 +1063,24 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         original = {
             "index": 7,
             "ring_type": "token_analysis",
-            "ring_hash": "original-hash",
-            "payload": {"token_address": "0x" + "2" * 40, "risk_level": "Low"},
+            "ring_hash": "d" * 64,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "payload": {
+                "token_address": "0x" + "2" * 40,
+                "risk_level": "Low",
+                "block_pin": 123,
+                "provenance": {
+                    "block_pin": 123,
+                    "fact_count": 1,
+                    "facts": [{
+                        "fact_id": "F0001",
+                        "source": "rpc",
+                        "query_hash": "a" * 64,
+                        "response_hash": "b" * 64,
+                        "block": 123,
+                    }],
+                },
+            },
         }
         agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
         agent.tc = FakeTimechain([original])
@@ -1077,7 +1096,14 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertTrue(result["calibration"]["dangerous_false_negative"])
         self.assertEqual(payload["security_outcomes"], {"rug_pull": True})
         self.assertEqual(payload["market_outcomes"], {"price_return_pct": -90})
-        self.assertEqual(payload["analysis_ring_hash"], "original-hash")
+        self.assertEqual(payload["analysis_ring_hash"], "d" * 64)
+        self.assertEqual(payload["anchor_type"], "block_pin")
+        self.assertEqual(payload["anchor_value"], 123)
+        self.assertEqual(len(payload["original_evidence_hash"]), 64)
+        self.assertEqual(
+            payload["outcome_record_hash"],
+            result["outcome_record"]["record_hash"],
+        )
 
 
 class AlertWiringTests(unittest.TestCase):

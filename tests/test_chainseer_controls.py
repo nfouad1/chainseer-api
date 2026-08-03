@@ -5,6 +5,10 @@ import unittest
 from pathlib import Path
 
 import chainseer_controls as controls
+from chainseer_outcome_ledger import (
+    analysis_evidence_binding,
+    build_outcome_record,
+)
 
 
 TOKEN = "0x" + "1" * 40
@@ -134,7 +138,8 @@ class FakeAgent:
         }
 
     def reflect_on_analysis(
-        self, analysis_ring, outcomes, evidence_fact_ids=None, observed_at=None
+        self, analysis_ring, outcomes, evidence_fact_ids=None, observed_at=None,
+        outcome_provenance=None,
     ):
         adverse = (
             outcomes.get("liquidity_removed_pct", 0) >= 50
@@ -722,25 +727,73 @@ class WatcherAndOutcomeTests(unittest.TestCase):
 
 class CalibrationTests(unittest.TestCase):
     @staticmethod
-    def outcome_ring(index, adverse):
-        return {
+    def outcome_rings(index, adverse):
+        analysis_index = index + 100
+        provenance = {
+            "block_pin": 1_000 + index,
+            "fact_count": 1,
+            "facts": [{
+                "fact_id": "F0000",
+                "source": "rpc",
+                "query_hash": f"{index + 1:064x}",
+                "response_hash": f"{index + 101:064x}",
+                "block": 1_000 + index,
+            }],
+        }
+        binding = analysis_evidence_binding(
+            provenance,
+            anchor_type="block_pin",
+            anchor_value=1_000 + index,
+        )
+        analysis = {
+            "index": analysis_index,
+            "ring_type": "token_analysis",
+            "ring_hash": f"{index + 201:064x}",
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "payload": {
+                "network": "robinhood",
+                "token_address": "0x" + f"{index + 1:040x}",
+                "risk_level": "Low",
+                "legitimacy_score": 80,
+                "provenance": provenance,
+                **binding,
+            },
+        }
+        calibration = {
+            "original_risk_level": "Low",
+            "adverse_security_event": adverse,
+        }
+        values = {
+            "horizon_seconds": 3600,
+            "rug_pull": adverse,
+            "price_return_pct": -10 if adverse else 5,
+        }
+        outcome_record = build_outcome_record(
+            analysis,
+            values,
+            observed_at="2026-01-02T00:00:00+00:00",
+            outcome_provenance={**provenance, "block_pin": 2_000 + index},
+            evidence_fact_ids=["F0000"],
+            calibration=calibration,
+        )
+        outcome = {
             "index": index,
             "ring_type": "analysis_outcome",
             "payload": {
-                "analysis_ring": index + 100,
-                "calibration": {
-                    "original_risk_level": "Low",
-                    "adverse_security_event": adverse,
-                },
+                "analysis_ring": analysis_index,
+                "calibration": calibration,
                 "other_outcomes": {"horizon_seconds": 3600},
                 "market_outcomes": {"price_return_pct": -10 if adverse else 5},
+                "outcome_record": outcome_record,
             },
         }
+        return [analysis, outcome]
 
     def test_calibration_proposes_tighten_only_after_enough_outcomes(self):
         rings = [
-            self.outcome_ring(index, adverse=index < 4)
+            ring
             for index in range(20)
+            for ring in self.outcome_rings(index, adverse=index < 4)
         ]
         with tempfile.TemporaryDirectory() as temp_dir:
             engine = controls.CalibrationEngine(temp_dir)
@@ -758,9 +811,25 @@ class CalibrationTests(unittest.TestCase):
     def test_calibration_does_not_change_policy_with_too_little_data(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             engine = controls.CalibrationEngine(temp_dir)
-            proposal = engine.propose([self.outcome_ring(1, True)])
+            proposal = engine.propose(self.outcome_rings(1, True))
             self.assertEqual(proposal["status"], "insufficient_data")
             self.assertFalse(engine.policy_path.exists())
+
+    def test_legacy_unbound_outcome_is_excluded_from_calibration(self):
+        legacy = {
+            "index": 1,
+            "ring_type": "analysis_outcome",
+            "payload": {
+                "analysis_ring": 100,
+                "calibration": {
+                    "original_risk_level": "Low",
+                    "adverse_security_event": True,
+                },
+            },
+        }
+        metrics = controls.CalibrationEngine.summarize([legacy])
+        self.assertEqual(metrics["sample_size"], 0)
+        self.assertEqual(metrics["legacy_unbound_outcomes_excluded"], 1)
 
     def _hand_edited_proposal(self, **overrides):
         # adopt() takes an arbitrary proposal file path, not something bound

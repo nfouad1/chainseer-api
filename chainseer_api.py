@@ -48,6 +48,7 @@ from chainseer_controls import (
     WatchConfig,
     credential_safe_error,
 )
+from chainseer_memory import MemoryCore, MemoryCoreError
 from chainseer_solana_public import (
     SolanaMintError,
     SolanaPublicAnalyzer,
@@ -236,6 +237,20 @@ class Settings:
             str(Path(__file__).resolve().parent / "benchmark_data"),
         )
     )
+    memory_backup_root: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_MEMORY_BACKUP_ROOT",
+            str(
+                Path(
+                    os.environ.get(
+                        "CHAINSEER_CHAIN_ROOT",
+                        str(Path(__file__).resolve().parent / "chainseer_chain"),
+                    )
+                ).parent
+                / "chainseer_backups"
+            ),
+        )
+    )
     benchmark_analyzer_version: str = field(
         default_factory=lambda: (
             os.environ.get("CHAINSEER_BENCHMARK_ANALYZER_VERSION", "").strip()
@@ -320,6 +335,10 @@ class Settings:
                 raise RuntimeError(
                     "CHAINSEER_CHAIN_ROOT must be absolute in production"
                 )
+            if not Path(self.memory_backup_root).is_absolute():
+                raise RuntimeError(
+                    "CHAINSEER_MEMORY_BACKUP_ROOT must be absolute in production"
+                )
             if not self.allowed_origins:
                 raise RuntimeError(
                     "CHAINSEER_ALLOWED_ORIGINS is required in production"
@@ -370,6 +389,12 @@ class Settings:
                     "CHAINSEER_BENCHMARK_ROOT must not be inside "
                     "CHAINSEER_CHAIN_ROOT"
                 )
+        backup_path = Path(self.memory_backup_root).resolve()
+        chain_path = Path(self.chain_root).resolve()
+        if backup_path == chain_path or chain_path in backup_path.parents:
+            raise RuntimeError(
+                "CHAINSEER_MEMORY_BACKUP_ROOT must be outside CHAINSEER_CHAIN_ROOT"
+            )
 
 
 class AnalyzeRequest(BaseModel):
@@ -416,6 +441,40 @@ class WatchRequest(BaseModel):
         else:
             validate_solana_mint(self.address)
         return self
+
+
+class MemoryQueryRequest(AnalyzeRequest):
+    topics: list[str] = Field(
+        default_factory=lambda: [
+            "latest_assessment",
+            "risk_history",
+            "entity_history",
+            "outcomes",
+        ],
+        min_length=1,
+        max_length=4,
+    )
+    limit: int = Field(default=20, ge=1, le=100)
+
+    @field_validator("topics")
+    @classmethod
+    def validate_topics(cls, value: list[str]) -> list[str]:
+        allowed = {
+            "latest_assessment",
+            "risk_history",
+            "entity_history",
+            "outcomes",
+        }
+        normalized = []
+        for item in value:
+            topic = str(item or "").strip().lower()
+            if topic not in allowed:
+                raise ValueError("unsupported memory topic")
+            if topic not in normalized:
+                normalized.append(topic)
+        if not normalized:
+            raise ValueError("at least one memory topic is required")
+        return normalized
 
 
 class JobAccepted(BaseModel):
@@ -694,6 +753,7 @@ class AnalysisService:
         self._agent: Chainseer | None = None
         self._base_agent: BasePublicAnalyzer | None = None
         self._solana_agent: SolanaPublicAnalyzer | None = None
+        self._memory: MemoryCore | None = None
         self._stopping = threading.Event()
         self._ready = threading.Event()
         self._watch_lock = threading.Lock()
@@ -719,6 +779,12 @@ class AnalysisService:
             self._agent = Chainseer(
                 rpc_url=self.settings.rpc_url,
                 chain_root=self.settings.chain_root,
+            )
+        if self._memory is None and hasattr(self._agent, "tc"):
+            self._memory = MemoryCore(
+                self._agent.tc,
+                self.settings.chain_root,
+                backup_root=self.settings.memory_backup_root,
             )
         if self._solana_agent is None:
             self._solana_agent = SolanaPublicAnalyzer(
@@ -910,6 +976,30 @@ class AnalysisService:
 
     def benchmark_status(self) -> dict[str, Any]:
         return self._benchmark.status()
+
+    def memory_query(
+        self,
+        network: str,
+        address: str,
+        *,
+        topics: list[str],
+        limit: int,
+    ) -> dict[str, Any]:
+        if self._memory is None:
+            raise RuntimeError("Timechain Memory Core is not initialized")
+        return self._memory.query(
+            network, address, topics=topics, limit=limit
+        )
+
+    def memory_status(self) -> dict[str, Any]:
+        if self._memory is None:
+            raise RuntimeError("Timechain Memory Core is not initialized")
+        return self._memory.status()
+
+    def memory_citation(self, ring_index: int) -> dict[str, Any]:
+        if self._memory is None:
+            raise RuntimeError("Timechain Memory Core is not initialized")
+        return self._memory.citation(ring_index)
 
     def health_status(self) -> dict[str, Any]:
         """Return cached worker health without loading watcher state from disk."""
@@ -1269,6 +1359,7 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
     cross_chain = extended.get("cross_chain") or {}
     mev_exposure = extended.get("mev_exposure") or {}
     entity_graph = data.get("entity_graph") or {}
+    temporal_graph = report.get("temporal_entity_graph") or {}
     provenance = report.get("provenance") or {}
     evidence_facts = provenance.get("facts") or []
     public_facts = [
@@ -1351,7 +1442,7 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         )
 
     return {
-        "schema_version": "1.2",
+        "schema_version": "1.3",
         "token": {
             "address": report.get("token_address"),
             "name": report.get("token_name") or basic.get("name"),
@@ -1444,6 +1535,25 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
             "signals": (entity_graph.get("signals") or [])[:30],
             "limitations": entity_graph.get("limitations") or [],
             "graph_hash": entity_graph.get("graph_hash"),
+            "temporal": {
+                "available": bool(temporal_graph.get("available")),
+                "schema_version": temporal_graph.get("schema_version"),
+                "projection_hash": temporal_graph.get("projection_hash"),
+                "source_chain": temporal_graph.get("source_chain") or {},
+                "first_observed": temporal_graph.get("first_observed"),
+                "last_observed": temporal_graph.get("last_observed"),
+                "analysis_count": temporal_graph.get("analysis_count", 0),
+                "risk_evolution": temporal_graph.get("risk_evolution") or {},
+                "risk_timeline": (temporal_graph.get("risk_timeline") or [])[-20:],
+                "relationship_summary": temporal_graph.get("relationship_summary") or {},
+                "relationship_events": (temporal_graph.get("relationship_events") or [])[-40:],
+                "shared_entities": (temporal_graph.get("shared_entities") or [])[:20],
+                "legacy_graph_observations": temporal_graph.get(
+                    "legacy_graph_observations", 0
+                ),
+                "limitations": temporal_graph.get("limitations") or [],
+                "reason": temporal_graph.get("reason"),
+            },
         },
         "liquidity_custody": {
             "state": liquidity_custody.get(
@@ -1495,6 +1605,7 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
             "infrastructure_indeterminate": (
                 report.get("infrastructure_indeterminate") or []
             ),
+            "analysis_evidence_hash": report.get("analysis_evidence_hash"),
             "ledger_hash": ledger_hash,
             "facts": public_facts,
         },
@@ -1728,6 +1839,75 @@ def get_analysis(job_id: str) -> dict[str, Any]:
             detail="analysis job not found",
         )
     return job.public()
+
+
+@app.post(
+    "/v1/memory/query",
+    dependencies=[Depends(require_api_token)],
+)
+def query_memory(
+    payload: MemoryQueryRequest,
+    request: Request,
+) -> dict[str, Any]:
+    if not LIMITER.allow(request_identity(request)):
+        raise HTTPException(
+            status_code=status.HTTP_429_TOO_MANY_REQUESTS,
+            detail="memory query rate limit exceeded",
+            headers={"Retry-After": "60"},
+        )
+    try:
+        return SERVICE.memory_query(
+            payload.network,
+            payload.address,
+            topics=payload.topics,
+            limit=payload.limit,
+        )
+    except MemoryCoreError as exc:
+        LOGGER.error("Memory query integrity gate refused output: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="verified memory recall is temporarily unavailable",
+        ) from exc
+
+
+@app.get(
+    "/v1/memory/status",
+    dependencies=[Depends(require_api_token)],
+)
+def get_memory_status() -> dict[str, Any]:
+    try:
+        return SERVICE.memory_status()
+    except (MemoryCoreError, RuntimeError) as exc:
+        LOGGER.error("Memory Core status unavailable: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="Timechain Memory Core status is unavailable",
+        ) from exc
+
+
+@app.get(
+    "/v1/memory/citations/{ring_index}",
+    dependencies=[Depends(require_api_token)],
+)
+def get_memory_citation(ring_index: int) -> dict[str, Any]:
+    if ring_index < 0:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="memory citation not found",
+        )
+    try:
+        return SERVICE.memory_citation(ring_index)
+    except KeyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_404_NOT_FOUND,
+            detail="memory citation not found",
+        ) from exc
+    except MemoryCoreError as exc:
+        LOGGER.error("Memory citation integrity gate refused output: %s", exc)
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="verified memory citation is temporarily unavailable",
+        ) from exc
 
 
 @app.get(
