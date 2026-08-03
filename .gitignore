@@ -54,6 +54,8 @@ ta_lead_lag_*.json
 ta_patterns_*.json
 ta_walkforward_*.json
 learning_summary.json
+*.pre-consolidation.bak
+scratch_test*.txt
 
 # Node
 node_modules/
