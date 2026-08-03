@@ -383,10 +383,12 @@ Prerequisites:
 - `CHAINSEER_SKILL_DIR` pointing to that skill directory
 - HTTPS RPC endpoints for the networks you want to analyze
 
-Install the API dependencies and run the test suite:
+Install the test dependencies and run the complete test suite. The test
+requirements include bot-only packages that are intentionally absent from the
+production API image:
 
 ```bash
-python -X utf8 -m pip install -r requirements-api.txt
+python -X utf8 -m pip install -r requirements-test.txt
 python -X utf8 -m unittest discover -s tests -v
 ```
 

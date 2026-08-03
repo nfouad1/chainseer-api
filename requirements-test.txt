@@ -1,0 +1,5 @@
+-r requirements-api.txt
+
+# Exercises the Telegram routing suite without adding bot-only packages to
+# the production API image.
+python-telegram-bot==22.8
