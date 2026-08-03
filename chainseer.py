@@ -949,32 +949,32 @@ class ProvenanceLedger:
             json.dumps({"source": source, "query": query}, sort_keys=True, default=str).encode("utf-8")
         ).hexdigest()
         dedup_key = (query_hash, resp_hash)
+        # The whole method is serialized, including the evidence-file write:
+        # an earlier version left that write unlocked on the assumption that
+        # unique temp names + atomic os.replace made concurrent writers to
+        # the SAME destination path safe. That holds on POSIX but not on
+        # Windows -- MoveFileEx can transiently fail with ERROR_ACCESS_DENIED
+        # when two threads os.replace() to the same target close together
+        # (reproduced directly: PermissionError under
+        # test_provenance_ledger_dedups_concurrent_identical_writes). The
+        # evidence write is a small, fast local write, so serializing it
+        # costs nothing meaningful next to the network calls it's paired
+        # with in Phase 1's thread pool.
         with self._lock:
             if dedup_key in self._dedup:
                 return self._dedup[dedup_key]
 
-        # Evidence-file write stays outside the lock: unique temp names
-        # (pid + thread id) plus atomic os.replace already make it safe for
-        # concurrent callers, and the write is content-addressed by
-        # resp_hash, so two threads racing on the same fact write identical
-        # bytes -- no need to serialize disk I/O behind the in-memory lock.
-        evidence_path = None
-        if self.evidence_dir:
-            evidence_file = self.evidence_dir / f"{resp_hash}.json"
-            if not evidence_file.exists():
-                temp_file = evidence_file.with_suffix(
-                    f".{os.getpid()}.{threading.get_ident()}.tmp"
-                )
-                temp_file.write_text(canonical, encoding="utf-8")
-                os.replace(temp_file, evidence_file)
-            evidence_path = str(evidence_file)
+            evidence_path = None
+            if self.evidence_dir:
+                evidence_file = self.evidence_dir / f"{resp_hash}.json"
+                if not evidence_file.exists():
+                    temp_file = evidence_file.with_suffix(
+                        f".{os.getpid()}.{threading.get_ident()}.tmp"
+                    )
+                    temp_file.write_text(canonical, encoding="utf-8")
+                    os.replace(temp_file, evidence_file)
+                evidence_path = str(evidence_file)
 
-        with self._lock:
-            # Re-check: another thread may have recorded this exact fact
-            # while the (unlocked) evidence write above was in flight.
-            existing = self._dedup.get(dedup_key)
-            if existing is not None:
-                return existing
             fact_id = f"F{len(self._facts):04d}"
             self._facts.append({
                 "fact_id": fact_id,
