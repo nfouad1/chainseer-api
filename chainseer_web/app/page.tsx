@@ -1335,6 +1335,7 @@ export default function Home() {
   const [address, setAddress] = useState("");
   const [notice, setNotice] = useState("");
   const [scanState, setScanState] = useState<ScanState>("idle");
+  const [scanProgress, setScanProgress] = useState(0);
   const [liveReport, setLiveReport] = useState<PublicReport | null>(null);
   const [showExample, setShowExample] = useState(false);
   const [monitors, setMonitors] = useState<TokenMonitor[]>([]);
@@ -1583,6 +1584,7 @@ export default function Home() {
     }
 
     setScanState("submitting");
+    setScanProgress(1);
     setLiveReport(null);
     setShowExample(false);
     setNotice("Submitting the token to the serialized analysis queue…");
@@ -1609,6 +1611,7 @@ export default function Home() {
       }
 
       setScanState("analyzing");
+      setScanProgress(2);
       setNotice(
         submissionBody.cached
           ? "Loading the recent sealed result…"
@@ -1631,9 +1634,21 @@ export default function Home() {
             errorMessage(job, "The analysis status could not be retrieved."),
           );
         }
+        if (
+          (job.status === "queued" || job.status === "running") &&
+          typeof job.progress_percent === "number"
+        ) {
+          setScanProgress(Math.max(0, Math.min(100, job.progress_percent)));
+          if (typeof job.stage_detail === "string" && job.stage_detail) {
+            setNotice(
+              `${job.stage_detail} · ${Math.round(job.progress_percent)}%`,
+            );
+          }
+        }
         if (job.status === "succeeded" && job.result) {
           setLiveReport(job.result as PublicReport);
           setScanState("succeeded");
+          setScanProgress(100);
           setNotice(
             `Analysis sealed to Timechain Ring ${job.result.timechain?.ring ?? "—"}.`,
           );
@@ -1654,6 +1669,7 @@ export default function Home() {
       throw new Error("The analysis is taking longer than expected. Try again shortly.");
     } catch (error) {
       setScanState("failed");
+      setScanProgress(0);
       setNotice(
         error instanceof Error
           ? error.message
@@ -1666,6 +1682,7 @@ export default function Home() {
     setShowExample(true);
     setNotice("Demo report opened. Its token, evidence, score, and Timechain proof are fictional.");
     setScanState("idle");
+    setScanProgress(0);
     setLiveReport(null);
     document.getElementById("report")?.scrollIntoView({ behavior: "smooth" });
   }
@@ -1677,6 +1694,7 @@ export default function Home() {
     setNotice("");
     setLiveReport(null);
     setScanState("idle");
+    setScanProgress(0);
   }
 
   return (
@@ -1810,6 +1828,18 @@ export default function Home() {
           <button type="button" onClick={loadExample}>Open demo report →</button>
         </div>
         {notice && <p className="scan-notice" role="status">{notice}</p>}
+        {(scanState === "submitting" || scanState === "analyzing") && (
+          <div
+            className="scan-progress"
+            role="progressbar"
+            aria-label="Analysis progress"
+            aria-valuemin={0}
+            aria-valuemax={100}
+            aria-valuenow={Math.round(scanProgress)}
+          >
+            <span style={{ width: `${scanProgress}%` }} />
+          </div>
+        )}
       </section>
 
       <section className="signal-strip" aria-label="Chainseer capabilities">

@@ -39,7 +39,7 @@ from chainseer_meteora_provenance import (
 )
 from chainseer_wallet_convergence import WalletConvergenceTracker
 from chainseer_outcome_ledger import analysis_evidence_binding
-from chainseer_temporal_graph import refresh_temporal_projection
+from chainseer_temporal_graph import append_temporal_projection
 
 
 BASE58_ALPHABET = "123456789ABCDEFGHJKLMNPQRSTUVWXYZabcdefghijkmnopqrstuvwxyz"
@@ -869,9 +869,9 @@ class SolanaPublicAnalyzer:
         report["poq_verdict"] = verdict
         agent.cognitive_loop.finalize(report, ring)
         try:
-            report["temporal_entity_graph"] = refresh_temporal_projection(
-                agent.tc,
+            report["temporal_entity_graph"] = append_temporal_projection(
                 agent.chain_root,
+                ring,
                 network="solana",
                 subject=report["token_address"],
             )

@@ -425,6 +425,16 @@ a { color: inherit; text-decoration: none; }
   padding: 11px 14px; background: rgba(255, 179, 71, 0.06);
   color: #c9b18d; font-size: 12px; text-align: left;
 }
+.scan-progress {
+  width: min(870px, calc(100% - 2px)); height: 3px; margin: 9px auto 0;
+  overflow: hidden; border-radius: 999px; background: var(--line);
+}
+.scan-progress span {
+  display: block; height: 100%; border-radius: inherit;
+  background: linear-gradient(90deg, var(--acid), var(--acid-soft));
+  box-shadow: 0 0 14px color-mix(in srgb, var(--acid) 55%, transparent);
+  transition: width 350ms ease;
+}
 
 .signal-strip {
   width: min(1180px, calc(100% - 40px)); margin: 0 auto;

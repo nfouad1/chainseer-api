@@ -329,7 +329,17 @@ metrics, and comparison rules are documented in
 
 The FastAPI service uses bearer authentication, per-client rate limits, a
 bounded single-worker queue, network-aware caching, request-size limits,
-trusted-host/CORS policy, and a single-process Timechain lease.
+trusted-host/CORS policy, and a single-process Timechain lease. Job polling
+includes a bounded stage, human-readable detail, and percentage. Successful
+reports are published before benchmark aggregation and rebuildable projection
+maintenance complete.
+
+Timechain integrity is fully verified at process startup and on a periodic
+background audit. Each request synchronously verifies only rings appended
+after that trusted head, including index/hash continuity, proof difficulty,
+and blockspace references. A failed audit makes readiness and new submissions
+fail closed. This preserves the verification boundary without replaying the
+entire growing ledger several times per scan.
 
 ### Submit an analysis
 

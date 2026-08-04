@@ -1,4 +1,5 @@
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -162,8 +163,15 @@ class FakeAgent:
     def __init__(self):
         self.calls = 0
 
-    def analyze_token(self, address, full_report=False):
+    def analyze_token(
+        self, address, full_report=False, progress_callback=None
+    ):
         self.calls += 1
+        if progress_callback:
+            progress_callback(
+                "collecting_external_evidence", 15, "Collecting evidence"
+            )
+            progress_callback("sealing_timechain", 90, "Sealing Timechain")
         report = sample_internal_report()
         report["token_address"] = address
         return report
@@ -578,6 +586,18 @@ class TrustedHostCheckTests(unittest.TestCase):
 
 
 class ServiceTests(unittest.TestCase):
+    def wait_for_benchmark(self, service, job_id, timeout=3):
+        deadline = time.time() + timeout
+        job = service.get(job_id)
+        while (
+            job
+            and (job.benchmark_capture or {}).get("status") == "queued"
+        ):
+            self.assertLess(time.time(), deadline)
+            time.sleep(0.01)
+            job = service.get(job_id)
+        return job
+
     def settings(
         self,
         root,
@@ -618,6 +638,10 @@ class ServiceTests(unittest.TestCase):
                     job = service.get(accepted.job_id)
                 self.assertIsNotNone(job)
                 self.assertEqual(job.status, "succeeded")
+                self.assertEqual(job.stage, "complete")
+                self.assertEqual(job.progress_percent, 100)
+                self.assertEqual(job.stage_detail, "Sealed analysis ready")
+                self.assertEqual(job.public()["progress_percent"], 100)
                 self.assertEqual(job.result["token"]["address"], TOKEN)
                 self.assertEqual(fake.calls, 1)
 
@@ -720,6 +744,41 @@ class ServiceTests(unittest.TestCase):
                 self.assertEqual(len(status["subscriptions"]), 1)
                 self.assertEqual(alerts, [])
             finally:
+                service.stop()
+
+    def test_slow_benchmark_capture_does_not_delay_sealed_report(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(
+                self.settings(root, benchmark_capture_enabled=True)
+            )
+            service._agent = FakeAgent()
+            capture_started = threading.Event()
+            release_capture = threading.Event()
+
+            def slow_capture(job, public_report):
+                capture_started.set()
+                release_capture.wait(timeout=2)
+                return {"status": "captured", "case_id": "test-case"}
+
+            service._benchmark.capture = slow_capture
+            service.start()
+            try:
+                accepted = service.submit(TOKEN)
+                deadline = time.time() + 2
+                job = service.get(accepted.job_id)
+                while job and job.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    job = service.get(accepted.job_id)
+                self.assertTrue(capture_started.wait(timeout=1))
+                self.assertEqual(job.status, "succeeded")
+                self.assertIsNotNone(job.result)
+                self.assertEqual(job.benchmark_capture, {"status": "queued"})
+                release_capture.set()
+                job = self.wait_for_benchmark(service, accepted.job_id)
+                self.assertEqual(job.benchmark_capture["status"], "captured")
+            finally:
+                release_capture.set()
                 service.stop()
 
     def test_watch_mutation_fails_fast_while_cycle_owns_lock(self):
@@ -858,6 +917,7 @@ class ServiceTests(unittest.TestCase):
                     self.assertLess(time.time(), deadline)
                     time.sleep(0.01)
                     job = service.get(accepted.job_id)
+                job = self.wait_for_benchmark(service, accepted.job_id)
                 self.assertEqual(job.status, "succeeded")
                 self.assertEqual(
                     job.benchmark_capture["status"],
@@ -941,6 +1001,9 @@ class ServiceTests(unittest.TestCase):
                         self.assertLess(time.time(), deadline)
                         time.sleep(0.01)
                         job = service.get(accepted.job_id)
+                    job = self.wait_for_benchmark(
+                        service, accepted.job_id
+                    )
                     self.assertEqual(job.status, "succeeded")
 
                 # Both captures landed on disk regardless of the throttle.
@@ -991,6 +1054,7 @@ class ServiceTests(unittest.TestCase):
                     self.assertLess(time.time(), deadline)
                     time.sleep(0.01)
                     job = service.get(accepted.job_id)
+                job = self.wait_for_benchmark(service, accepted.job_id)
                 self.assertEqual(job.status, "succeeded")
                 self.assertIsNotNone(job.result)
                 self.assertEqual(

@@ -60,6 +60,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
+from typing import Callable
 
 # ── Force UTF-8 stdout/stderr (Windows defaults to cp1252 which corrupts
 #    em-dashes, smart quotes, and emojis when written to the Timechain) ─────
@@ -93,7 +94,7 @@ from chainseer_outcome_ledger import (
 )
 from chainseer_temporal_graph import (
     TemporalGraphStore,
-    refresh_temporal_projection,
+    append_temporal_projection,
 )
 
 CHAINSEER_VERSION = "7.1"
@@ -494,6 +495,10 @@ class ChainseerCognitiveLoop:
 
     def __init__(self, chain_root: str | Path, skill_dir: str):
         self.root = Path(chain_root)
+        self.timechain_module = _load_timechain_module(skill_dir)
+        self._integrity_lock = threading.RLock()
+        self._trusted_head: tuple[int, str] | None = None
+        self._verified_registry_hashes: dict | None = None
         _bootstrap_faculty_registry(self.root, skill_dir)
         self.recall_module = _load_skill_module(skill_dir, "recall")
         self.cambium_module = _load_skill_module(skill_dir, "cambium")
@@ -529,6 +534,9 @@ class ChainseerCognitiveLoop:
         )
 
     def verify_registry(self) -> None:
+        current_hashes = self.epochs_module.registry_hashes(self.root)
+        if self._verified_registry_hashes == current_hashes:
+            return
         ok, report = self.epochs_module.check_epoch(self.root)
         if not ok:
             raise RuntimeError(
@@ -541,6 +549,162 @@ class ChainseerCognitiveLoop:
                 "Faculty governance verification failed: "
                 + "; ".join(governance_report)
             )
+        self._verified_registry_hashes = current_hashes
+
+    def establish_trust(self) -> dict:
+        """Anchor incremental checks after a successful full verification."""
+
+        tail = self.recall.tc.tail_rings(1)
+        with self._integrity_lock:
+            self._trusted_head = (
+                (int(tail[-1]["index"]), str(tail[-1]["ring_hash"]))
+                if tail
+                else None
+            )
+        return {
+            "status": "trusted",
+            "head_index": self._trusted_head[0] if self._trusted_head else None,
+            "head_hash": self._trusted_head[1] if self._trusted_head else None,
+        }
+
+    def verify_incremental(self, *, maximum_new_rings: int = 128) -> tuple[bool, list[str]]:
+        """Verify only rings appended after the startup-trusted head.
+
+        Chainseer owns an exclusive process lease for the ledger.  A full
+        verification establishes the initial trust anchor at startup; every
+        subsequent application append is then checked for index continuity,
+        previous-hash linkage, content hash, proof difficulty, and blockspace
+        integrity.  Periodic full audits remain an independent backstop.
+        """
+
+        with self._integrity_lock:
+            tail = self.recall.tc.tail_rings(1)
+            if not tail:
+                return self._trusted_head is None, ["empty chain"]
+            head = tail[-1]
+            head_identity = (int(head["index"]), str(head["ring_hash"]))
+            if self._trusted_head is None:
+                return False, ["incremental trust anchor is not established"]
+            if head_identity == self._trusted_head:
+                return True, [
+                    f"trusted head {head_identity[0]} unchanged"
+                ]
+            trusted_index, trusted_hash = self._trusted_head
+            delta = head_identity[0] - trusted_index
+            if delta <= 0:
+                return False, ["Timechain head regressed or changed in place"]
+            if delta > maximum_new_rings:
+                return False, [
+                    f"incremental append span {delta} exceeds safety bound "
+                    f"{maximum_new_rings}"
+                ]
+            appended = self.recall.tc.tail_rings(delta)
+            if len(appended) != delta:
+                return False, ["could not read the complete appended ring span"]
+            previous_hash = trusted_hash
+            expected_index = trusted_index + 1
+            for ring in appended:
+                if ring.get("index") != expected_index:
+                    return False, [
+                        f"ring {expected_index}: index mismatch "
+                        f"(got {ring.get('index')})"
+                    ]
+                if ring.get("prev_hash") != previous_hash:
+                    return False, [
+                        f"ring {expected_index}: previous hash mismatch"
+                    ]
+                recomputed = self.timechain_module.compute_ring_hash(ring)
+                if recomputed != ring.get("ring_hash"):
+                    return False, [
+                        f"ring {expected_index}: content hash mismatch"
+                    ]
+                difficulty = int(ring.get("difficulty") or 0)
+                if difficulty and not str(ring.get("ring_hash") or "").startswith(
+                    "0" * difficulty
+                ):
+                    return False, [
+                        f"ring {expected_index}: proof difficulty mismatch"
+                    ]
+                for reference in ring.get("blockspace_refs") or []:
+                    digest = reference.get("hash")
+                    if (
+                        not self.recall.tc.blockspace.has(digest)
+                        or not self.recall.tc.blockspace.verify_blob(digest)
+                    ):
+                        return False, [
+                            f"ring {expected_index}: blockspace reference invalid"
+                        ]
+                previous_hash = str(ring["ring_hash"])
+                expected_index += 1
+            self._trusted_head = head_identity
+            return True, [
+                f"incrementally verified {delta} ring(s) through "
+                f"head {head_identity[0]}"
+            ]
+
+    def _guard_ring(
+        self,
+        ring: dict,
+        *,
+        input_text: str,
+        lesson: str,
+    ) -> dict:
+        """Run an incremental integrity check and the existing semantic tripwire."""
+
+        ok, report = self.verify_incremental()
+        if not ok:
+            self.immune.lockdown()
+            return {
+                "action": "lockdown",
+                "reason": "incremental_chain_verify_failed",
+                "note": "; ".join(report),
+            }
+        tripwire = self.immune.tripwire(ring, input_text=input_text)
+        if not tripwire.get("compromised"):
+            return {
+                "action": "none",
+                "reason": tripwire.get("reason"),
+                "input_tainted": tripwire.get("input_tainted", False),
+            }
+        # The destructive recovery path is intentionally rare and retains the
+        # skill's exhaustive whole-chain diagnosis before any rollback.
+        return self.immune_module.guard_turn(
+            self.root,
+            ring["index"],
+            input_text=input_text,
+            lesson=lesson,
+        )
+
+    def _seal_registry_epoch(self, *, reason: str) -> dict | None:
+        """Seal a changed registry against the already-verified epoch anchor."""
+
+        hashes = self.epochs_module.registry_hashes(self.root)
+        if hashes == self._verified_registry_hashes:
+            return None
+        registry_dir = self.root / "registry"
+        files = [
+            str(registry_dir / name)
+            for name in self.epochs_module.REGISTRY_FILES
+            if (registry_dir / name).exists()
+        ]
+        ring = self.recall.tc.seal(
+            "epoch",
+            {
+                "summary": f"registry epoch: {reason}",
+                "registry_hashes": hashes,
+            },
+            files=files,
+        )
+        governance_ok, governance_report = verify_governance_registry(
+            self.root
+        )
+        if not governance_ok:
+            raise RuntimeError(
+                "Faculty governance verification failed after epoch seal: "
+                + "; ".join(governance_report)
+            )
+        self._verified_registry_hashes = hashes
+        return ring
 
     @staticmethod
     def _safe_input(report: dict) -> str:
@@ -755,9 +919,8 @@ class ChainseerCognitiveLoop:
         cognition = report.get("cognition") or {}
         if cognition.get("status") != "prepared":
             raise RuntimeError("Cognitive loop was not prepared before sealing")
-        guard = self.immune_module.guard_turn(
-            self.root,
-            analysis_ring["index"],
+        guard = self._guard_ring(
+            analysis_ring,
             input_text=report.pop("_cognitive_input", ""),
             lesson="Chainseer production analysis covenant guard",
         )
@@ -823,8 +986,8 @@ class ChainseerCognitiveLoop:
             )
         if any(item.get("action") in {"born", "promoted", "woken"}
                for item in (growth or [])):
-            self.epochs_module.seal_epoch(
-                self.root, reason=f"faculty change after analysis ring {analysis_ring['index']}"
+            self._seal_registry_epoch(
+                reason=f"faculty change after analysis ring {analysis_ring['index']}"
             )
         self.verify_registry()
         cognition["status"] = "complete"
@@ -850,9 +1013,8 @@ class ChainseerCognitiveLoop:
                 "covenant": 250,
             },
         )
-        completion_guard = self.immune_module.guard_turn(
-            self.root,
-            completion["index"],
+        completion_guard = self._guard_ring(
+            completion,
             input_text="Complete an evidence-bound Chainseer cognitive audit.",
             lesson="Chainseer cognitive completion covenant guard",
         )
@@ -860,12 +1022,6 @@ class ChainseerCognitiveLoop:
             raise RuntimeError(
                 "Cognitive completion guard rejected the analysis: "
                 + str(completion_guard.get("action"))
-            )
-        ok, verify_report = self.recall.tc.verify()
-        if not ok:
-            raise RuntimeError(
-                "Timechain failed after cognitive finalization: "
-                + "; ".join(verify_report)
             )
         report["cognitive_ring"] = completion["index"]
         report["cognitive_ring_hash"] = completion["ring_hash"]
@@ -1245,6 +1401,111 @@ class RobinhoodRPC:
                 f"RPC transport failed: {type(exc).__name__}", -3
             ) from exc
 
+    def _batch_call(self, calls: list[tuple[str, list]]) -> list[dict]:
+        """Execute independent JSON-RPC calls in one HTTP request.
+
+        Results retain per-call cache and provenance records.  Individual RPC
+        errors are returned beside successful results so holder enrichment can
+        remain conservative without discarding the entire batch.
+        """
+
+        results: list[dict | None] = [None] * len(calls)
+        pending: list[tuple[int, int, str, list, tuple]] = []
+        payload = []
+        for position, (method, params) in enumerate(calls):
+            call_params = params or []
+            cache_key = (
+                method,
+                json.dumps(call_params, sort_keys=True, default=str),
+            )
+            cached = (
+                self.context.rpc_cache.get(cache_key)
+                if self.context is not None
+                else None
+            )
+            if cached is not None:
+                if self.ledger is not None:
+                    self.ledger.record(
+                        "rpc",
+                        {"method": method, "params": call_params},
+                        cached,
+                        cache_hit=True,
+                    )
+                results[position] = {
+                    "result": cached.get("result"),
+                    "error": cached.get("error"),
+                }
+                continue
+            self._req_id += 1
+            request_id = self._req_id
+            pending.append(
+                (position, request_id, method, call_params, cache_key)
+            )
+            payload.append({
+                "jsonrpc": "2.0",
+                "method": method,
+                "params": call_params,
+                "id": request_id,
+            })
+        if not pending:
+            return [item or {} for item in results]
+
+        try:
+            response = self._session.post(
+                self.rpc_url,
+                json=payload,
+                timeout=self.timeout,
+            )
+            response.raise_for_status()
+            body = response.json()
+            if not isinstance(body, list):
+                raise RPCError("RPC endpoint rejected JSON-RPC batching", -4)
+            by_id = {
+                item.get("id"): item
+                for item in body
+                if isinstance(item, dict)
+            }
+            for position, request_id, method, call_params, cache_key in pending:
+                item = by_id.get(request_id)
+                if item is None:
+                    item = {
+                        "jsonrpc": "2.0",
+                        "id": request_id,
+                        "error": {
+                            "code": -4,
+                            "message": "RPC batch response omitted a call",
+                        },
+                    }
+                if self.context is not None:
+                    self.context.rpc_cache[cache_key] = item
+                if self.ledger is not None:
+                    self.ledger.record(
+                        "rpc",
+                        {"method": method, "params": call_params},
+                        item,
+                    )
+                results[position] = {
+                    "result": item.get("result"),
+                    "error": item.get("error"),
+                }
+        except requests.exceptions.ConnectionError as exc:
+            raise RPCError(f"Cannot connect to {self.rpc_url}", -1) from exc
+        except requests.exceptions.Timeout as exc:
+            raise RPCError(
+                f"RPC request timed out after {self.timeout}s", -2
+            ) from exc
+        except requests.exceptions.HTTPError as exc:
+            status = getattr(exc.response, "status_code", None)
+            raise RPCError(
+                f"RPC HTTP response failed ({status or 'unknown status'})",
+                -(int(status) if status else 3),
+            ) from exc
+        except requests.exceptions.RequestException as exc:
+            raise RPCError(
+                f"RPC transport failed: {type(exc).__name__}", -3
+            ) from exc
+        return [item or {} for item in results]
+
     def get_block_number(self) -> int:
         result = self._call("eth_blockNumber")
         return int(result, 16) if result else 0
@@ -1304,6 +1565,57 @@ class RobinhoodRPC:
         padded_addr = address.lower().replace("0x", "").zfill(64)
         raw = self.call(token, ABI_BALANCE_OF + padded_addr, block=block)
         return int(raw, 16) if raw else 0
+
+    def erc20_balances_of(
+        self,
+        token: str,
+        addresses: list[str],
+        block=None,
+    ) -> tuple[dict[str, int], dict[str, str]]:
+        """Read many balanceOf values through one batch, with safe fallback."""
+
+        block_tag = self._block_tag(block)
+        calls = []
+        normalized = []
+        for address in addresses:
+            normalized_address = address.lower()
+            normalized.append(normalized_address)
+            padded = normalized_address.replace("0x", "").zfill(64)
+            calls.append((
+                "eth_call",
+                [{"to": token, "data": ABI_BALANCE_OF + padded}, block_tag],
+            ))
+        try:
+            responses = self._batch_call(calls)
+        except RPCError:
+            balances: dict[str, int] = {}
+            failures: dict[str, str] = {}
+            for address in normalized:
+                try:
+                    balances[address] = self.erc20_balance_of(
+                        token, address, block=block
+                    )
+                except Exception as exc:
+                    failures[address] = type(exc).__name__
+            return balances, failures
+
+        balances = {}
+        failures = {}
+        for address, response in zip(normalized, responses):
+            error = response.get("error")
+            raw = response.get("result")
+            if error is not None or not isinstance(raw, str):
+                failures[address] = str(
+                    (error or {}).get("message")
+                    if isinstance(error, dict)
+                    else "invalid_rpc_result"
+                )
+                continue
+            try:
+                balances[address] = int(raw, 16) if raw else 0
+            except (TypeError, ValueError):
+                failures[address] = "invalid_rpc_result"
+        return balances, failures
 
     def pair_get_reserves(self, pair_address: str) -> dict:
         """Read Uniswap V2 pair reserves. Returns (reserve0, reserve1, blockTimestampLast)."""
@@ -1804,7 +2116,16 @@ class Chainseer:
                 self.chain_root, skill_dir
             )
             self.cognitive_loop.seal_bootstrap_epoch()
-        ok, verify_report = self.tc.verify()
+        if timechain_agent is None:
+            ok, verify_report = self.tc.verify()
+            if ok:
+                self.cognitive_loop.establish_trust()
+        else:
+            ok, verify_report = self.cognitive_loop.verify_incremental()
+            if not ok and "trust anchor" in "; ".join(verify_report):
+                ok, verify_report = self.tc.verify()
+                if ok:
+                    self.cognitive_loop.establish_trust()
         if not ok:
             raise RuntimeError(f"Timechain integrity verification failed: {verify_report}")
         self.cognitive_loop.verify_registry()
@@ -1825,6 +2146,7 @@ class Chainseer:
         token_address: str,
         full_report: bool = False,
         block_pin: int | None = None,
+        progress_callback: Callable[[str, int, str], None] | None = None,
     ) -> dict:
         """Full token analysis with GoPlus + DexScreener + on-chain RPC.
 
@@ -1839,9 +2161,22 @@ class Chainseer:
             block_pin: optional historical/current block for all RPC reads;
                        mutable HTTP evidence remains timestamped, not historical
         """
+        started_monotonic = time.monotonic()
+
+        def progress(stage: str, percent: int, detail: str) -> None:
+            if progress_callback is None:
+                return
+            try:
+                progress_callback(stage, percent, detail)
+            except Exception:
+                # Operational progress is explicitly non-authoritative and
+                # must never make a valid risk analysis fail.
+                pass
+
         token = token_address.strip()
         if not ADDRESS_RE.fullmatch(token):
             return {"error": "Invalid token address", "address": token}
+        progress("validating", 5, "Validating contract and pinning chain state")
         print(f" TOKEN ANALYSIS: {token}")
         print(f" Explorer: {self.network.explorer_token}{token}")
         print(f" Time: {datetime.now(timezone.utc).isoformat()}")
@@ -1885,6 +2220,7 @@ class Chainseer:
         # specifically so these concurrent writers can never collide on a
         # fact_id (see ProvenanceLedger.__init__).
         print(" Phase 1/8: External APIs (GoPlus + DexScreener + Blockscout)...")
+        progress("collecting_external_evidence", 15, "Collecting independent provider evidence")
         checkpoint = self.ledger.checkpoint()
         data = {}
 
@@ -1946,17 +2282,20 @@ class Chainseer:
         claim_evidence["external_apis"] = self.ledger.fact_ids_since(checkpoint)
 
         print(" Phase 2/8: On-chain reads...")
+        progress("reading_contract", 30, "Reading contract state at the pinned block")
         checkpoint = self.ledger.checkpoint()
         data["basic_info"] = self._fetch_basic_info(token)
         data["contract_audit"] = self._analyze_contract(token)
         claim_evidence["contract"] = self.ledger.fact_ids_since(checkpoint)
 
         print(" Phase 3/8: DEX pair reserves...")
+        progress("checking_markets", 40, "Verifying markets and on-chain reserves")
         checkpoint = self.ledger.checkpoint()
         data["dex_pairs"] = self._analyze_dex_pairs(token, data)
         claim_evidence["dex_pairs"] = self.ledger.fact_ids_since(checkpoint)
 
         print(" Phase 4/8: Liquidity custody verification...")
+        progress("checking_liquidity", 50, "Verifying liquidity custody")
         checkpoint = self.ledger.checkpoint()
         data["lp_lock"] = self._verify_lp_lock(
             token,
@@ -1966,12 +2305,21 @@ class Chainseer:
         claim_evidence["lp_lock"] = self.ledger.fact_ids_since(checkpoint)
 
         print(" Phase 5/8: Tax estimation...")
+        progress("checking_sellability", 56, "Estimating tax and sellability evidence")
         data["tax_estimate"] = self._estimate_tax_from_reserves(token, data["dex_pairs"])
 
         print(" Phase 6/8: Deployer + holders + wash trading...")
+        progress("checking_entities", 62, "Checking holders, deployer, and transfer behavior")
         checkpoint = self.ledger.checkpoint()
         latest_block = pin_block
-        data["transfer_activity"] = self._check_transfer_activity(token, latest_block)
+        transfer_snapshot = self._fetch_transfer_log_snapshot(
+            token, latest_block, window=1500
+        )
+        data["transfer_activity"] = self._check_transfer_activity(
+            token,
+            latest_block,
+            snapshot=transfer_snapshot,
+        )
         data["deployer"] = self._analyze_deployer_and_creation(token)
         data["blockscout_holders"] = self._analyze_holders_blockscout(
             token,
@@ -1980,10 +2328,15 @@ class Chainseer:
             ),
             total_supply_raw=data["basic_info"].get("total_supply_raw"),
         )
-        data["wash_trading"] = self._detect_wash_trading(token, latest_block)
+        data["wash_trading"] = self._detect_wash_trading(
+            token,
+            latest_block,
+            snapshot=transfer_snapshot,
+        )
         claim_evidence["activity_and_holders"] = self.ledger.fact_ids_since(checkpoint)
 
         print(" Phase 7/8: Trend analysis (historical rings)...")
+        progress("recalling_history", 78, "Recalling historical token evidence")
         data["trend"] = self._build_token_trend(token)
         from chainseer_controls import build_extended_evidence
 
@@ -2007,6 +2360,7 @@ class Chainseer:
                 f"Entity evidence graph verification failed: {graph_reason}"
             )
         print(" Running analysis...")
+        progress("scoring_risk", 84, "Reconciling evidence and applying hard-stop gates")
         analysis = self._analyze(data)
 
         # Best-effort push notification -- opt-in (CHAINSEER_ALERT_WEBHOOK_URL
@@ -2052,7 +2406,15 @@ class Chainseer:
         poq_scores = self._self_evaluate(report)
         report["poq_scores"] = poq_scores
 
+        progress("sealing_timechain", 90, "Running cognition, PoQ, and Timechain sealing")
         self._seal_report(report)
+        report["performance"] = {
+            "total_duration_seconds": round(
+                time.monotonic() - started_monotonic, 3
+            ),
+            "progress_schema_version": "1.0",
+        }
+        progress("complete", 100, "Sealed analysis is ready")
         print()
         if full_report:
             self._print_report(report)
@@ -2280,16 +2642,71 @@ class Chainseer:
 
         return result
 
-    def _check_transfer_activity(self, token: str, latest_block: int) -> dict:
-        from_block = max(0, latest_block - 1000)
+    def _fetch_transfer_log_snapshot(
+        self,
+        token: str,
+        latest_block: int,
+        *,
+        window: int = 1500,
+    ) -> dict:
+        """Fetch the widest transfer window once for all activity detectors."""
 
+        from_block = max(0, latest_block - window)
         try:
             logs = self.rpc.get_logs(
-                from_block=from_block, to_block=latest_block,
-                address=token, topics=[ERC20_TRANSFER_TOPIC],
+                from_block=from_block,
+                to_block=latest_block,
+                address=token,
+                topics=[ERC20_TRANSFER_TOPIC],
             )
-        except RPCError as e:
-            return {"error": str(e), "recent_transfers": 0, "sniping_score": 0}
+            return {
+                "logs": logs or [],
+                "from_block": from_block,
+                "to_block": latest_block,
+                "error": None,
+            }
+        except RPCError as exc:
+            return {
+                "logs": [],
+                "from_block": from_block,
+                "to_block": latest_block,
+                "error": str(exc),
+            }
+
+    @staticmethod
+    def _logs_in_window(
+        snapshot: dict,
+        from_block: int,
+        to_block: int,
+    ) -> list[dict]:
+        selected = []
+        for item in snapshot.get("logs") or []:
+            try:
+                block_number = int(item.get("blockNumber", "0x0"), 16)
+            except (AttributeError, TypeError, ValueError):
+                continue
+            if from_block <= block_number <= to_block:
+                selected.append(item)
+        return selected
+
+    def _check_transfer_activity(
+        self,
+        token: str,
+        latest_block: int,
+        *,
+        snapshot: dict | None = None,
+    ) -> dict:
+        snapshot = snapshot or self._fetch_transfer_log_snapshot(
+            token, latest_block, window=1000
+        )
+        if snapshot.get("error"):
+            return {
+                "error": snapshot["error"],
+                "recent_transfers": 0,
+                "sniping_score": 0,
+            }
+        from_block = max(0, latest_block - 1000)
+        logs = self._logs_in_window(snapshot, from_block, latest_block)
 
         total_transfers = len(logs)
         transfers_by_block = {}
@@ -2418,25 +2835,56 @@ class Chainseer:
         eip7702_count = 0
         unclassified_contracts = []
 
+        holder_addresses = [
+            str(holder.get("address") or "").lower()
+            for holder in holders
+            if ADDRESS_RE.fullmatch(
+                str(holder.get("address") or "").lower()
+            )
+        ]
+        if hasattr(self.rpc, "erc20_balances_of"):
+            pinned_balances, pinned_balance_errors = (
+                self.rpc.erc20_balances_of(
+                    token,
+                    holder_addresses,
+                    block=pin_block,
+                )
+            )
+        else:
+            # Lightweight test/custom RPC adapters written before batching
+            # remain compatible. Production RobinhoodRPC takes the single
+            # HTTP-batch path above.
+            pinned_balances = {}
+            pinned_balance_errors = {}
+            for address in holder_addresses:
+                try:
+                    pinned_balances[address] = self.rpc.erc20_balance_of(
+                        token,
+                        address,
+                        block=pin_block,
+                    )
+                except Exception as exc:
+                    pinned_balance_errors[address] = type(exc).__name__
+
         for h in holders:
             indexed_bal = _safe_int(h.get("balance_raw", "0"))
             bal = indexed_bal
             addr = str(h.get("address") or "").lower()
             if ADDRESS_RE.fullmatch(addr):
                 valid_holder_addresses += 1
-                try:
-                    bal = self.rpc.erc20_balance_of(
-                        token, addr, block=pin_block
-                    )
+                if addr in pinned_balances:
+                    bal = pinned_balances[addr]
                     rpc_balance_verified += 1
                     h["indexed_balance_raw"] = str(indexed_bal)
                     h["rpc_balance_raw"] = str(bal)
                     h["balance_source"] = "pinned_rpc_balanceOf"
                     if bal != indexed_bal:
                         indexed_balance_mismatches += 1
-                except Exception:
+                else:
                     rpc_balance_failures += 1
                     h["balance_source"] = "blockscout_index_unverified"
+                    if addr in pinned_balance_errors:
+                        h["rpc_balance_error"] = pinned_balance_errors[addr]
             else:
                 rpc_balance_failures += 1
                 h["balance_source"] = "blockscout_index_unverified"
@@ -3058,18 +3506,24 @@ class Chainseer:
 
     # ── NEW: Wash Trading Detection ──────────────────────────────────────────
 
-    def _scan_wash_window(self, token: str, from_block: int, to_block: int) -> dict:
+    def _scan_wash_window(
+        self,
+        token: str,
+        from_block: int,
+        to_block: int,
+        *,
+        snapshot: dict | None = None,
+    ) -> dict:
         """Core wash trading scan over a single block window.
 
         Returns raw counts: ping_pong_pairs, circular_transfers, same_block_coordination.
         """
-        try:
-            logs = self.rpc.get_logs(
-                from_block=from_block, to_block=to_block,
-                address=token, topics=[ERC20_TRANSFER_TOPIC],
-            )
-        except RPCError:
+        snapshot = snapshot or self._fetch_transfer_log_snapshot(
+            token, to_block, window=max(0, to_block - from_block)
+        )
+        if snapshot.get("error"):
             return {"ping_pong_pairs": [], "circular_transfers": [], "same_block_coordination": []}
+        logs = self._logs_in_window(snapshot, from_block, to_block)
 
         if not logs or len(logs) < 5:
             return {"ping_pong_pairs": [], "circular_transfers": [], "same_block_coordination": []}
@@ -3173,7 +3627,13 @@ class Chainseer:
         score += len(scan_result.get("circular_transfers", [])) * 25
         return min(100, score)
 
-    def _detect_wash_trading(self, token: str, latest_block: int) -> dict:
+    def _detect_wash_trading(
+        self,
+        token: str,
+        latest_block: int,
+        *,
+        snapshot: dict | None = None,
+    ) -> dict:
         """Multi-window wash trading detection with stabilized scoring.
 
         Runs 3 independent scans over different block windows (500/1000/1500)
@@ -3182,12 +3642,26 @@ class Chainseer:
         """
         windows = [500, 1000, 1500]
         window_results = []
+        snapshot = snapshot or self._fetch_transfer_log_snapshot(
+            token, latest_block, window=max(windows)
+        )
+        if snapshot.get("error"):
+            return {
+                "available": False,
+                "error": snapshot["error"],
+                "windows_analyzed": 0,
+            }
 
         for scan_size in windows:
             if latest_block < scan_size:
                 continue
             from_block = latest_block - scan_size
-            scan = self._scan_wash_window(token, from_block, latest_block)
+            scan = self._scan_wash_window(
+                token,
+                from_block,
+                latest_block,
+                snapshot=snapshot,
+            )
             score = self._compute_wash_score(scan)
             window_results.append({"blocks": scan_size, "score": score, "scan": scan})
 
@@ -4161,9 +4635,9 @@ class Chainseer:
         report["poq_verdict"] = verdict
         self.cognitive_loop.finalize(report, ring)
         try:
-            report["temporal_entity_graph"] = refresh_temporal_projection(
-                self.tc,
+            report["temporal_entity_graph"] = append_temporal_projection(
                 self.chain_root,
+                ring,
                 network=self.network_key,
                 subject=report["token_address"],
             )

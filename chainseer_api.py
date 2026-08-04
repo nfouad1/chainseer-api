@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import hashlib
 import hmac
+import inspect
 import json
 import logging
 import os
@@ -54,6 +55,7 @@ from chainseer_solana_public import (
     SolanaPublicAnalyzer,
     validate_solana_mint,
 )
+from chainseer_temporal_graph import refresh_temporal_projection
 from chainseer_wallet_convergence import WalletConvergenceTracker
 
 LOGGER = logging.getLogger("chainseer.api")
@@ -277,6 +279,14 @@ class Settings:
             "base_public_analysis",
         ).strip()
     )
+    full_audit_interval_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "CHAINSEER_FULL_AUDIT_INTERVAL_SECONDS",
+            900,
+            60,
+            86400,
+        )
+    )
 
     def validate(self) -> None:
         if self.environment not in {"development", "test", "production"}:
@@ -490,9 +500,14 @@ class Job:
     address: str
     network: str = "robinhood"
     status: str = "queued"
+    stage: str = "queued"
+    stage_detail: str = "Waiting for the analysis worker"
+    progress_percent: int = 0
     created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
     started_at: float | None = None
     finished_at: float | None = None
+    analysis_latency_ms: float | None = None
     result: dict[str, Any] | None = None
     benchmark_capture: dict[str, Any] | None = None
     error_code: str | None = None
@@ -504,7 +519,11 @@ class Job:
             "address": self.address,
             "network": self.network,
             "status": self.status,
+            "stage": self.stage,
+            "stage_detail": self.stage_detail,
+            "progress_percent": self.progress_percent,
             "created_at": _iso(self.created_at),
+            "updated_at": _iso(self.updated_at),
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
             "result": self.result,
@@ -612,9 +631,13 @@ class BenchmarkCaptureRecorder:
             "solana": self.settings.benchmark_solana_cohort,
         }[job.network]
         split = deterministic_benchmark_split(job.network, job.address)
-        latency_ms = max(
-            0.0,
-            (time.time() - (job.started_at or time.time())) * 1000,
+        latency_ms = (
+            max(0.0, float(job.analysis_latency_ms))
+            if job.analysis_latency_ms is not None
+            else max(
+                0.0,
+                (time.time() - (job.started_at or time.time())) * 1000,
+            )
         )
         try:
             with self._lock:
@@ -740,6 +763,16 @@ class SlidingWindowRateLimiter:
             return True
 
 
+@dataclass
+class MaintenanceTask:
+    job_id: str
+    network: str
+    address: str
+    report: dict[str, Any]
+    public_report: dict[str, Any]
+    benchmark_done: bool = False
+
+
 class AnalysisService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -751,12 +784,24 @@ class AnalysisService:
         )
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
+        self._maintenance_worker: threading.Thread | None = None
+        self._maintenance_work: queue.Queue[MaintenanceTask | None] = (
+            queue.Queue(maxsize=max(4, settings.queue_size * 2))
+        )
+        self._analysis_active = threading.Event()
+        self._timechain_lock = threading.RLock()
         self._agent: Chainseer | None = None
         self._base_agent: BasePublicAnalyzer | None = None
         self._solana_agent: SolanaPublicAnalyzer | None = None
         self._memory: MemoryCore | None = None
         self._stopping = threading.Event()
         self._ready = threading.Event()
+        self._integrity_status: dict[str, Any] = {
+            "status": "initializing",
+            "last_full_audit_at": None,
+            "last_full_audit_duration_seconds": None,
+            "last_error": None,
+        }
         self._watch_lock = threading.Lock()
         self._watcher: ChainseerWatcher | None = None
         self._base_watcher: ChainseerWatcher | None = None
@@ -835,7 +880,19 @@ class AnalysisService:
             name="chainseer-analysis-worker",
             daemon=True,
         )
+        self._maintenance_worker = threading.Thread(
+            target=self._run_maintenance,
+            name="chainseer-maintenance-worker",
+            daemon=True,
+        )
         self._worker.start()
+        self._maintenance_worker.start()
+        self._integrity_status = {
+            "status": "verified",
+            "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
+            "last_full_audit_duration_seconds": None,
+            "last_error": None,
+        }
         self._ready.set()
 
     def stop(self) -> bool:
@@ -845,11 +902,25 @@ class AnalysisService:
             self.work.put_nowait(None)
         except queue.Full:
             pass
+        try:
+            self._maintenance_work.put_nowait(None)
+        except queue.Full:
+            pass
         if self._worker:
             self._worker.join(
                 timeout=self.settings.shutdown_grace_seconds
             )
-        return not bool(self._worker and self._worker.is_alive())
+        if self._maintenance_worker:
+            self._maintenance_worker.join(
+                timeout=self.settings.shutdown_grace_seconds
+            )
+        return not bool(
+            (self._worker and self._worker.is_alive())
+            or (
+                self._maintenance_worker
+                and self._maintenance_worker.is_alive()
+            )
+        )
 
     @property
     def ready(self) -> bool:
@@ -857,12 +928,19 @@ class AnalysisService:
             self._ready.is_set()
             and self._worker
             and self._worker.is_alive()
+            and self._maintenance_worker
+            and self._maintenance_worker.is_alive()
+            and self._integrity_status.get("status") != "failed"
             and not self._stopping.is_set()
         )
 
     def submit(
         self, address: str, network: str = "robinhood"
     ) -> JobAccepted:
+        if self._integrity_status.get("status") == "failed":
+            raise IntegrityUnavailableError(
+                "Timechain integrity audit failed; analysis is paused"
+            )
         normalized_address = (
             address.lower() if network in EVM_NETWORKS else address
         )
@@ -1012,6 +1090,8 @@ class AnalysisService:
         return {
             "watcher_last_error": watcher_status.get("last_error"),
             "benchmark_capture": self._benchmark.health_status(),
+            "timechain_integrity": dict(self._integrity_status),
+            "maintenance_queue_depth": self._maintenance_work.qsize(),
             "faculty_pack": (
                 dict(getattr(self._agent, "faculty_pack_status", {}) or {})
                 if self._agent is not None
@@ -1116,7 +1196,7 @@ class AnalysisService:
             "solana": None,
         }
         errors: dict[str, Any] = {}
-        with self._watch_lock:
+        with self._timechain_lock, self._watch_lock:
             for network, watcher in (
                 ("robinhood", self._watcher),
                 ("base", self._base_watcher),
@@ -1159,6 +1239,177 @@ class AnalysisService:
         for address in expired_cache:
             self.cache.pop(address, None)
 
+    def _set_job_progress(
+        self,
+        job_id: str,
+        stage: str,
+        percent: int,
+        detail: str,
+    ) -> None:
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if job is None or job.status in {"succeeded", "failed"}:
+                return
+            job.stage = str(stage)[:80]
+            job.stage_detail = str(detail)[:240]
+            job.progress_percent = max(0, min(100, int(percent)))
+            job.updated_at = time.time()
+
+    def _enqueue_maintenance(self, job: Job, report: dict[str, Any]) -> None:
+        task = MaintenanceTask(
+            job_id=job.id,
+            network=job.network,
+            address=job.address,
+            report=report,
+            public_report=job.result or {},
+        )
+        try:
+            self._maintenance_work.put_nowait(task)
+        except queue.Full:
+            with self._lock:
+                job.benchmark_capture = {
+                    "status": "deferred_queue_full"
+                }
+
+    def _run_full_audit(self) -> None:
+        if self._agent is None or not hasattr(self._agent, "tc"):
+            self._integrity_status = {
+                "status": "unsupported",
+                "last_full_audit_at": None,
+                "last_full_audit_duration_seconds": None,
+                "last_error": None,
+            }
+            return
+        if self._analysis_active.is_set():
+            return
+        if not self._timechain_lock.acquire(blocking=False):
+            return
+        if not self._watch_lock.acquire(blocking=False):
+            self._timechain_lock.release()
+            return
+        started = time.monotonic()
+        try:
+            ok, report = self._agent.tc.verify()
+            if not ok:
+                self._integrity_status = {
+                    "status": "failed",
+                    "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
+                    "last_full_audit_duration_seconds": round(
+                        time.monotonic() - started, 3
+                    ),
+                    "last_error": "; ".join(report)[:500],
+                }
+                return
+            self._agent.cognitive_loop.verify_registry()
+            self._agent.cognitive_loop.establish_trust()
+            self._integrity_status = {
+                "status": "verified",
+                "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
+                "last_full_audit_duration_seconds": round(
+                    time.monotonic() - started, 3
+                ),
+                "last_error": None,
+            }
+        except Exception as exc:
+            LOGGER.exception("Background Timechain audit failed")
+            self._integrity_status = {
+                "status": "failed",
+                "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
+                "last_full_audit_duration_seconds": round(
+                    time.monotonic() - started, 3
+                ),
+                "last_error": credential_safe_error(exc),
+            }
+        finally:
+            self._watch_lock.release()
+            self._timechain_lock.release()
+
+    def _run_maintenance(self) -> None:
+        next_audit = (
+            time.monotonic() + self.settings.full_audit_interval_seconds
+        )
+        while not self._stopping.is_set():
+            timeout = max(
+                0.1,
+                min(1.0, next_audit - time.monotonic()),
+            )
+            task: MaintenanceTask | None
+            try:
+                task = self._maintenance_work.get(timeout=timeout)
+            except queue.Empty:
+                task = None
+            if task is not None:
+                if not task.benchmark_done:
+                    with self._lock:
+                        benchmark_job = self.jobs.get(task.job_id)
+                    capture = self._benchmark.capture(
+                        benchmark_job
+                        or Job(
+                            id=task.job_id,
+                            address=task.address,
+                            network=task.network,
+                        ),
+                        task.public_report,
+                    )
+                    task.benchmark_done = True
+                    with self._lock:
+                        job = self.jobs.get(task.job_id)
+                        if job is not None:
+                            job.benchmark_capture = capture
+                            job.updated_at = time.time()
+                temporal = task.report.get("temporal_entity_graph") or {}
+                needs_rebuild = not temporal.get("available", False)
+                if needs_rebuild and self._analysis_active.is_set():
+                    try:
+                        self._maintenance_work.put_nowait(task)
+                    except queue.Full:
+                        pass
+                    self._stopping.wait(0.1)
+                elif (
+                    needs_rebuild
+                    and self._agent is not None
+                    and hasattr(self._agent, "tc")
+                    and hasattr(self._agent, "cognitive_loop")
+                ):
+                    acquired = self._timechain_lock.acquire(blocking=False)
+                    if not acquired:
+                        try:
+                            self._maintenance_work.put_nowait(task)
+                        except queue.Full:
+                            pass
+                        self._stopping.wait(0.1)
+                    else:
+                        try:
+                            task.report["temporal_entity_graph"] = (
+                                refresh_temporal_projection(
+                                    self._agent.tc,
+                                    self.settings.chain_root,
+                                    network=task.network,
+                                    subject=task.address,
+                                )
+                            )
+                            self._agent.cognitive_loop.establish_trust()
+                            refreshed = build_public_report(task.report)
+                            with self._lock:
+                                job = self.jobs.get(task.job_id)
+                                if job is not None:
+                                    job.result = refreshed
+                                    job.updated_at = time.time()
+                        except Exception:
+                            LOGGER.exception(
+                                "Deferred temporal projection rebuild failed",
+                                extra={"job_id": task.job_id},
+                            )
+                        finally:
+                            self._timechain_lock.release()
+                self._maintenance_work.task_done()
+            if time.monotonic() >= next_audit:
+                self._run_full_audit()
+                next_audit = (
+                    time.monotonic()
+                    + self.settings.full_audit_interval_seconds
+                )
+
     def _run(self) -> None:
         next_watch = (
             time.monotonic() + self.settings.watcher_interval_seconds
@@ -1181,44 +1432,99 @@ class AnalysisService:
             with self._lock:
                 job = self.jobs.get(job_id)
                 if not job:
+                    self.work.task_done()
                     continue
                 job.status = "running"
+                job.stage = "initializing"
+                job.stage_detail = "Preparing a block-pinned analysis"
+                job.progress_percent = 2
                 job.started_at = time.time()
+                job.updated_at = job.started_at
 
+            self._analysis_active.set()
             try:
+                if self._integrity_status.get("status") == "failed":
+                    raise PublicAnalysisError(
+                        "timechain_integrity_failed",
+                        "Timechain integrity audit failed; analysis is paused",
+                    )
                 if self._agent is None:
                     raise RuntimeError("analysis worker has no Chainseer agent")
+
+                def progress(stage: str, percent: int, detail: str) -> None:
+                    self._set_job_progress(
+                        job.id, stage, percent, detail
+                    )
+
                 if job.network == "solana":
                     if self._solana_agent is None:
                         raise RuntimeError(
                             "analysis worker has no Solana analyzer"
                         )
-                    report = self._solana_agent.analyze_token(job.address)
+                    progress(
+                        "collecting_external_evidence",
+                        18,
+                        "Reading mint controls, markets, holders, and routes",
+                    )
+                    with self._timechain_lock:
+                        report = self._solana_agent.analyze_token(job.address)
                 elif job.network == "base":
                     if self._base_agent is None:
                         raise RuntimeError(
                             "analysis worker has no Base analyzer"
                         )
-                    report = self._base_agent.analyze_token(
-                        job.address, full_report=False
-                    )
+                    method = self._base_agent.analyze_token
+                    kwargs: dict[str, Any] = {"full_report": False}
+                    try:
+                        if (
+                            "progress_callback"
+                            in inspect.signature(method).parameters
+                        ):
+                            kwargs["progress_callback"] = progress
+                    except (TypeError, ValueError):
+                        pass
+                    with self._timechain_lock:
+                        report = method(job.address, **kwargs)
                 else:
-                    report = self._agent.analyze_token(
-                        job.address, full_report=False
-                    )
+                    method = self._agent.analyze_token
+                    kwargs = {"full_report": False}
+                    try:
+                        if (
+                            "progress_callback"
+                            in inspect.signature(method).parameters
+                        ):
+                            kwargs["progress_callback"] = progress
+                    except (TypeError, ValueError):
+                        pass
+                    with self._timechain_lock:
+                        report = method(job.address, **kwargs)
                 if report.get("error"):
                     raise PublicAnalysisError(
                         "analysis_rejected", str(report["error"])
                     )
-                public_report = build_public_report(report)
-                benchmark_capture = self._benchmark.capture(
-                    job,
-                    public_report,
+                progress(
+                    "publishing",
+                    98,
+                    "Preparing the privacy-safe sealed report",
                 )
+                public_report = build_public_report(report)
                 with self._lock:
                     job.result = public_report
-                    job.benchmark_capture = benchmark_capture
+                    job.benchmark_capture = (
+                        {"status": "queued"}
+                        if self._benchmark.enabled
+                        else {"status": "disabled"}
+                    )
                     job.status = "succeeded"
+                    job.stage = "complete"
+                    job.stage_detail = "Sealed analysis ready"
+                    job.progress_percent = 100
+                    job.updated_at = time.time()
+                    job.analysis_latency_ms = max(
+                        0.0,
+                        (job.updated_at - (job.started_at or job.updated_at))
+                        * 1000,
+                    )
                     if self.settings.cache_ttl_seconds:
                         cache_address = (
                             job.address.lower()
@@ -1230,14 +1536,21 @@ class AnalysisService:
                             + self.settings.cache_ttl_seconds,
                             job.id,
                         )
+                self._enqueue_maintenance(job, report)
             except PublicAnalysisError as exc:
                 with self._lock:
                     job.status = "failed"
+                    job.stage = "failed"
+                    job.stage_detail = exc.message
+                    job.updated_at = time.time()
                     job.error_code = exc.code
                     job.error_message = exc.message
             except SolanaMintError as exc:
                 with self._lock:
                     job.status = "failed"
+                    job.stage = "failed"
+                    job.stage_detail = exc.message
+                    job.updated_at = time.time()
                     job.error_code = exc.code
                     job.error_message = exc.message
             except Exception:
@@ -1247,14 +1560,21 @@ class AnalysisService:
                 )
                 with self._lock:
                     job.status = "failed"
+                    job.stage = "failed"
+                    job.stage_detail = (
+                        "Analysis stopped before a report was published"
+                    )
+                    job.updated_at = time.time()
                     job.error_code = "analysis_failed"
                     job.error_message = (
                         "The analysis could not be completed. "
                         "No result was published."
                     )
             finally:
+                self._analysis_active.clear()
                 with self._lock:
                     job.finished_at = time.time()
+                    job.updated_at = job.finished_at
                     self.active_by_address.pop(
                         (
                             f"{job.network}:"
@@ -1279,6 +1599,10 @@ class AnalysisService:
 
 
 class QueueFullError(Exception):
+    pass
+
+
+class IntegrityUnavailableError(Exception):
     pass
 
 
@@ -1817,6 +2141,8 @@ async def ready() -> dict[str, Any]:
         "base_rpc_configured": bool(SETTINGS.base_rpc_url),
         "solana_rpc_configured": bool(SETTINGS.solana_rpc_url),
         "benchmark_capture": health["benchmark_capture"],
+        "timechain_integrity": health["timechain_integrity"],
+        "maintenance_queue_depth": health["maintenance_queue_depth"],
         "faculty_pack": health["faculty_pack"],
     }
 
@@ -1838,6 +2164,12 @@ async def create_analysis(
         )
     try:
         return SERVICE.submit(payload.address, payload.network)
+    except IntegrityUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "60"},
+        ) from exc
     except QueueFullError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

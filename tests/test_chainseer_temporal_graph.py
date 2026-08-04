@@ -9,6 +9,7 @@ from chainseer_entity_graph import (
     canonical_hash as graph_hash,
 )
 from chainseer_temporal_graph import (
+    TemporalGraphError,
     TemporalGraphStore,
     build_temporal_projection,
     subject_temporal_view,
@@ -244,6 +245,38 @@ class TemporalEntityGraphTests(unittest.TestCase):
                 incremental["projection_hash"], rebuilt["projection_hash"]
             )
             self.assertEqual(store.verify([first, second]), (True, "verified"))
+
+    def test_trusted_single_ring_append_matches_full_projection(self):
+        first = ring(0, TOKEN_A, evm_graph(TOKEN_A, pin=100), pin=100)
+        second = ring(
+            3,
+            TOKEN_A,
+            evm_graph(TOKEN_A, pin=101),
+            score=70,
+            pin=101,
+        )
+        with tempfile.TemporaryDirectory() as temporary:
+            store = TemporalGraphStore(temporary)
+            store.rebuild([first])
+            incremental = store.append_analysis_ring(second)
+            rebuilt = build_temporal_projection([first, second])
+            self.assertEqual(
+                incremental["projection_hash"], rebuilt["projection_hash"]
+            )
+            self.assertEqual(
+                incremental["source_chain"]["analysis_ring_count"], 2
+            )
+            self.assertEqual(incremental["source_chain"]["head_index"], 3)
+
+    def test_trusted_append_refuses_missing_projection(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            store = TemporalGraphStore(temporary)
+            with self.assertRaisesRegex(
+                TemporalGraphError, "projection_missing_or_invalid"
+            ):
+                store.append_analysis_ring(
+                    ring(0, TOKEN_A, evm_graph(TOKEN_A, pin=100), pin=100)
+                )
 
 
 if __name__ == "__main__":

@@ -616,6 +616,17 @@ def _finalize_projection(
             "head_hash": None,
             "ring_count": 0,
         })
+    return _seal_projection(projection)
+
+
+def _seal_projection(projection: dict[str, Any]) -> dict[str, Any]:
+    """Recompute the deterministic summary and hash for a projection.
+
+    Keeping this independent from a complete ring list lets the online path
+    append one already-verified analysis ring in O(1).  Full rebuilds remain
+    available for startup recovery and periodic integrity audits.
+    """
+
     projection["summary"] = {
         "subject_count": len(projection["subjects"]),
         "entity_count": len(projection["entities"]),
@@ -842,6 +853,50 @@ class TemporalGraphStore:
         self.write(projection)
         return projection
 
+    def append_analysis_ring(self, ring: dict[str, Any]) -> dict[str, Any]:
+        """Append one trusted analysis ring without replaying the Timechain.
+
+        The caller must first verify the ring against the trusted Timechain
+        head.  This projection is rebuildable and non-authoritative, so any
+        missing/stale cursor is surfaced rather than repaired on the request
+        path; a maintenance worker can perform the full rebuild later.
+        """
+
+        fields = _analysis_fields(ring)
+        if fields is None:
+            raise TemporalGraphError("ring is not an analysis ring")
+        existing = self.load()
+        if existing is None:
+            raise TemporalGraphError("projection_missing_or_invalid")
+        source = existing.get("source_chain") or {}
+        cursor_index = source.get("head_index")
+        cursor_hash = source.get("head_hash")
+        ring_index = int(ring["index"])
+        ring_hash = str(ring["ring_hash"])
+        if cursor_index == ring_index:
+            if cursor_hash != ring_hash:
+                raise TemporalGraphError("projection_cursor_hash_mismatch")
+            return existing
+        if cursor_index is not None and (
+            isinstance(cursor_index, bool)
+            or not isinstance(cursor_index, int)
+            or cursor_index >= ring_index
+        ):
+            raise TemporalGraphError("projection_cursor_out_of_order")
+
+        projection = copy.deepcopy(existing)
+        projection.pop("projection_hash", None)
+        projection.pop("summary", None)
+        _apply_analysis_ring(projection, ring)
+        projection["source_chain"].update({
+            "head_index": ring_index,
+            "head_hash": ring_hash,
+            "ring_count": int(source.get("ring_count") or 0) + 1,
+        })
+        projection = _seal_projection(projection)
+        self.write(projection)
+        return projection
+
     def verify(self, rings: Iterable[dict[str, Any]]) -> tuple[bool, str]:
         projection = self.load()
         if projection is None:
@@ -866,4 +921,18 @@ def refresh_temporal_projection(
     rings = timechain.load()
     store = TemporalGraphStore(chain_root)
     projection = store.refresh(rings)
+    return subject_temporal_view(projection, network, subject)
+
+
+def append_temporal_projection(
+    chain_root: str | Path,
+    ring: dict[str, Any],
+    *,
+    network: str,
+    subject: str,
+) -> dict[str, Any]:
+    """Update the derived temporal graph from one integrity-checked ring."""
+
+    store = TemporalGraphStore(chain_root)
+    projection = store.append_analysis_ring(ring)
     return subject_temporal_view(projection, network, subject)

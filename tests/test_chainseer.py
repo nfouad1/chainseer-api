@@ -55,6 +55,24 @@ class FakeSession:
         return FakeResponse(self.data)
 
 
+class EchoBatchSession:
+    def __init__(self):
+        self.headers = {}
+        self.calls = []
+
+    def post(self, url, json=None, timeout=None):
+        self.calls.append((url, json, timeout))
+        payload = json if isinstance(json, list) else [json]
+        return FakeResponse([
+            {
+                "jsonrpc": "2.0",
+                "id": item["id"],
+                "result": hex(index + 10),
+            }
+            for index, item in enumerate(payload)
+        ])
+
+
 class FakeTimechain:
     def __init__(self, rings):
         self._rings = rings
@@ -154,6 +172,43 @@ class OwnershipCheckFallbackTests(unittest.TestCase):
 
 
 class ChainseerInfrastructureTests(unittest.TestCase):
+    def test_holder_balances_use_one_json_rpc_batch(self):
+        rpc = chainseer.RobinhoodRPC("https://rpc.example.invalid")
+        rpc._session = EchoBatchSession()
+        addresses = ["0x" + str(index) * 40 for index in range(1, 4)]
+        balances, failures = rpc.erc20_balances_of(
+            "0x" + "a" * 40,
+            addresses,
+            block=123,
+        )
+        self.assertEqual(len(rpc._session.calls), 1)
+        self.assertIsInstance(rpc._session.calls[0][1], list)
+        self.assertEqual(list(balances.values()), [10, 11, 12])
+        self.assertEqual(failures, {})
+
+    def test_transfer_detectors_share_one_widest_log_snapshot(self):
+        calls = []
+
+        def get_logs(**kwargs):
+            calls.append(kwargs)
+            return []
+
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.rpc = types.SimpleNamespace(get_logs=get_logs)
+        snapshot = agent._fetch_transfer_log_snapshot(
+            "0x" + "a" * 40, 2_000, window=1_500
+        )
+        agent._check_transfer_activity(
+            "0x" + "a" * 40, 2_000, snapshot=snapshot
+        )
+        wash = agent._detect_wash_trading(
+            "0x" + "a" * 40, 2_000, snapshot=snapshot
+        )
+        self.assertEqual(len(calls), 1)
+        self.assertEqual(calls[0]["from_block"], 500)
+        self.assertTrue(wash["available"])
+        self.assertEqual(wash["windows_analyzed"], 3)
+
     def test_version_dead_code_and_verification_scope_are_honest(self):
         source = Path(chainseer.__file__).read_text(encoding="utf-8")
         http_source = inspect.getsource(chainseer._http_get_json)
@@ -1143,6 +1198,10 @@ class AlertWiringTests(unittest.TestCase):
             ("_analyze_dex_pairs", {}),
             ("_verify_lp_lock", {}),
             ("_estimate_tax_from_reserves", {"available": False}),
+            (
+                "_fetch_transfer_log_snapshot",
+                {"logs": [], "from_block": 0, "to_block": 0, "error": None},
+            ),
             ("_check_transfer_activity", {}),
             ("_analyze_deployer_and_creation", {}),
             ("_analyze_holders_blockscout", {}),

@@ -78,11 +78,27 @@ to a declared deployed source revision. Token addresses are assigned
 deterministically to `train` (60%), `validation` (20%), or `test` (20%); every
 observation for the same token stays in the same split.
 
-The API job response exposes `benchmark_capture` with the case ID, observation
-hash, split, cohort, and analyzer version. `/health/ready` exposes aggregate
-capture state and ledger hashes without exposing scanned token addresses.
+The API job response initially exposes `benchmark_capture.status=queued`, then
+the maintenance worker replaces it with the case ID, observation hash, split,
+cohort, and analyzer version. The sealed public report does not wait for this
+rebuildable bookkeeping. `/health/ready` exposes aggregate capture state and
+ledger hashes without exposing scanned token addresses.
 Storage or validation failures set capture state to `degraded` but do not
 discard an otherwise successful analysis.
+
+## Scalable integrity verification
+
+Production performs one full Timechain and faculty-registry verification at
+startup. Online sealing then checks only the append span from that trusted
+head, while `CHAINSEER_FULL_AUDIT_INTERVAL_SECONDS` schedules a full background
+audit (900 seconds by default). The audit never overlaps an analysis or watcher
+write. A failed audit changes readiness to HTTP 503 and rejects queued or new
+analysis work until an operator repairs the integrity issue and a subsequent
+full audit passes (or the service restarts and verifies cleanly).
+
+`GET /v1/analyses/{job_id}` also returns `stage`, `stage_detail`, and
+`progress_percent`; these are non-authoritative operational hints. The report's
+ring/hash and evidence anchors remain the authoritative completion proof.
 
 Automatic capture does not assign outcomes. Reviewers append those later with
 the `chainseer_benchmark.py label` command described in `BENCHMARK.md`. Back up
