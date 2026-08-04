@@ -41,6 +41,12 @@ from chainseer_temporal_graph import (
 MEMORY_SCHEMA_VERSION = "1.0"
 BACKUP_SCHEMA_VERSION = "1.0"
 RECOVERY_STATUS_FILENAME = "memory_recovery_status-v1.json"
+# A learning producer that has silently stopped must not keep reporting
+# healthy. Distinguish "never produced an outcome yet" (a legitimately empty
+# corpus) from "produced outcomes, then went quiet" (a stalled producer) --
+# only the latter is a fault. Generous enough that ordinary gaps between
+# due checkpoints never trip it.
+STALE_OUTCOME_SECONDS = 48 * 3600
 ALLOWED_TOPICS = {
     "latest_assessment",
     "risk_history",
@@ -994,9 +1000,17 @@ class MemoryCore:
                     "result_hash": None,
                 }
             source = rebuilt.get("source_chain") or {}
+            learning_freshness = self._outcome_freshness(outcomes)
             response = {
                 "schema_version": MEMORY_SCHEMA_VERSION,
-                "status": "healthy" if all((chain_ok, epoch_ok, outcomes.get("ok"), projection_ok, governance_ok)) else "degraded",
+                "status": (
+                    "healthy"
+                    if all((
+                        chain_ok, epoch_ok, outcomes.get("ok"),
+                        projection_ok, governance_ok,
+                    )) and learning_freshness["state"] != "stalled"
+                    else "degraded"
+                ),
                 "checked_at": _utc_now(),
                 "pillars": {
                     "timechain_ledger": {
@@ -1030,6 +1044,7 @@ class MemoryCore:
                         "learning_eligible": outcomes.get("learning_eligible", 0),
                         "legacy_unbound": outcomes.get("legacy_unbound", 0),
                         "invalid_records": len(outcomes.get("errors") or []),
+                        "freshness": learning_freshness,
                     },
                     "query_recall_engine": {
                         "ok": chain_ok,
@@ -1057,6 +1072,48 @@ class MemoryCore:
             response["status_hash"] = canonical_hash(response)
             self._status_cache = (now, signature, response)
             return json.loads(json.dumps(response))
+
+    @staticmethod
+    def _outcome_freshness(
+        outcomes: dict[str, Any], *, now: float | None = None
+    ) -> dict[str, Any]:
+        """Report whether outcome production has silently stopped.
+
+        Three distinct states, deliberately not collapsed into one boolean:
+        ``no_outcomes_yet`` (an empty corpus, which is not a fault),
+        ``current`` (producing), and ``stalled`` (produced before, then went
+        quiet past the threshold). Only ``stalled`` is a fault -- a system
+        that has never recorded an outcome is empty, not broken, and saying
+        otherwise would fail a fresh install for the wrong reason.
+        """
+        latest = outcomes.get("latest_outcome_at")
+        result: dict[str, Any] = {
+            "latest_outcome_at": latest,
+            "latest_outcome_ring": outcomes.get("latest_outcome_ring"),
+            "age_seconds": None,
+            "stale_after_seconds": STALE_OUTCOME_SECONDS,
+            "state": "no_outcomes_yet",
+        }
+        if not latest:
+            return result
+        reference = (
+            datetime.fromtimestamp(now, tz=timezone.utc)
+            if now is not None
+            else datetime.now(timezone.utc)
+        )
+        try:
+            observed = datetime.fromisoformat(str(latest))
+        except ValueError:
+            result["state"] = "unparsable_timestamp"
+            return result
+        if observed.tzinfo is None:
+            observed = observed.replace(tzinfo=timezone.utc)
+        age = max(0.0, (reference - observed).total_seconds())
+        result["age_seconds"] = round(age, 3)
+        result["state"] = (
+            "stalled" if age > STALE_OUTCOME_SECONDS else "current"
+        )
+        return result
 
     def recovery_manager(self) -> MemoryRecoveryManager:
         return MemoryRecoveryManager(

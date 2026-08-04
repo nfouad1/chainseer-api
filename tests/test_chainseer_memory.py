@@ -243,3 +243,44 @@ class MemoryCoreTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutcomeFreshnessTests(unittest.TestCase):
+    """A learning producer that silently stops must not keep reporting
+    healthy -- the failure mode that hid a 12-day Base learning stall."""
+
+    NOW = datetime(2026, 8, 4, 12, 0, 0, tzinfo=timezone.utc).timestamp()
+
+    def _freshness(self, latest_outcome_at, ring=7):
+        return MemoryCore._outcome_freshness(
+            {
+                "latest_outcome_at": latest_outcome_at,
+                "latest_outcome_ring": ring,
+            },
+            now=self.NOW,
+        )
+
+    def test_empty_corpus_is_not_reported_as_stalled(self):
+        result = self._freshness(None, ring=None)
+        self.assertEqual(result["state"], "no_outcomes_yet")
+        self.assertIsNone(result["age_seconds"])
+
+    def test_recent_outcome_is_current(self):
+        result = self._freshness("2026-08-04T11:00:00+00:00")
+        self.assertEqual(result["state"], "current")
+        self.assertAlmostEqual(result["age_seconds"], 3600.0, places=1)
+
+    def test_long_silence_is_stalled(self):
+        # The real incident: newest outcome 2026-07-23, checked 2026-08-04.
+        result = self._freshness("2026-07-23T12:42:38+00:00")
+        self.assertEqual(result["state"], "stalled")
+        self.assertGreater(result["age_seconds"], 11 * 24 * 3600)
+
+    def test_naive_timestamp_is_treated_as_utc_not_crash(self):
+        result = self._freshness("2026-08-04T11:00:00")
+        self.assertEqual(result["state"], "current")
+
+    def test_unparsable_timestamp_degrades_honestly(self):
+        result = self._freshness("not-a-timestamp")
+        self.assertEqual(result["state"], "unparsable_timestamp")
+        self.assertIsNone(result["age_seconds"])
