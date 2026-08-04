@@ -21,7 +21,7 @@ import threading
 import time
 import uuid
 from collections import OrderedDict, deque
-from contextlib import asynccontextmanager
+from contextlib import asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -60,6 +60,7 @@ LOGGER = logging.getLogger("chainseer.api")
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 SUPPORTED_NETWORKS = {"robinhood", "base", "solana"}
 EVM_NETWORKS = {"robinhood", "base"}
+WATCH_MUTATION_LOCK_TIMEOUT_SECONDS = 0.25
 
 
 def deterministic_benchmark_split(network: str, address: str) -> str:
@@ -920,59 +921,63 @@ class AnalysisService:
         self,
         subscriber: str | None = None,
     ) -> dict[str, Any]:
-        with self._watch_lock:
-            robinhood_state = (
-                self._watcher.store.load()
-                if self._watcher is not None
-                else {"subscriptions": {}}
+        # Watch stores use atomic file replacement, so a read observes either
+        # the previous complete cycle or the next complete cycle. It does not
+        # need the cycle/mutation lock. Holding request threads on that lock
+        # while run_once() performs minutes of RPC work can exhaust FastAPI's
+        # shared thread pool and make analyses and health checks unreachable.
+        robinhood_state = (
+            self._watcher.store.load()
+            if self._watcher is not None
+            else {"subscriptions": {}}
+        )
+        base_state = (
+            self._base_watcher.store.load()
+            if self._base_watcher is not None
+            else {"subscriptions": {}}
+        )
+        solana_state = (
+            self._solana_watcher.store.load()
+            if self._solana_watcher is not None
+            else {"subscriptions": {}}
+        )
+        subscriptions = []
+        for value in robinhood_state.get("subscriptions", {}).values():
+            if subscriber and subscriber not in (
+                value.get("subscribers") or []
+            ):
+                continue
+            subscriptions.append(
+                self._watcher.store.public_subscription(value)
             )
-            base_state = (
-                self._base_watcher.store.load()
-                if self._base_watcher is not None
-                else {"subscriptions": {}}
+        for value in solana_state.get("subscriptions", {}).values():
+            if subscriber and subscriber not in (
+                value.get("subscribers") or []
+            ):
+                continue
+            subscriptions.append(
+                self._solana_watcher.store.public_subscription(value)
             )
-            solana_state = (
-                self._solana_watcher.store.load()
-                if self._solana_watcher is not None
-                else {"subscriptions": {}}
+        for value in base_state.get("subscriptions", {}).values():
+            if subscriber and subscriber not in (
+                value.get("subscribers") or []
+            ):
+                continue
+            subscriptions.append(
+                self._base_watcher.store.public_subscription(value)
             )
-            subscriptions = []
-            for value in robinhood_state.get("subscriptions", {}).values():
-                if subscriber and subscriber not in (
-                    value.get("subscribers") or []
-                ):
-                    continue
-                subscriptions.append(
-                    self._watcher.store.public_subscription(value)
-                )
-            for value in solana_state.get("subscriptions", {}).values():
-                if subscriber and subscriber not in (
-                    value.get("subscribers") or []
-                ):
-                    continue
-                subscriptions.append(
-                    self._solana_watcher.store.public_subscription(value)
-                )
-            for value in base_state.get("subscriptions", {}).values():
-                if subscriber and subscriber not in (
-                    value.get("subscribers") or []
-                ):
-                    continue
-                subscriptions.append(
-                    self._base_watcher.store.public_subscription(value)
-                )
-            network_counts = {
-                network: sum(
-                    item.get("network") == network
-                    for item in subscriptions
-                )
-                for network in ("robinhood", "base", "solana")
-            }
-            return {
-                **self._watcher_status,
-                "subscriptions": subscriptions,
-                "subscription_counts": network_counts,
-            }
+        network_counts = {
+            network: sum(
+                item.get("network") == network
+                for item in subscriptions
+            )
+            for network in ("robinhood", "base", "solana")
+        }
+        return {
+            **self._watcher_status,
+            "subscriptions": subscriptions,
+            "subscription_counts": network_counts,
+        }
 
     def benchmark_status(self) -> dict[str, Any]:
         return self._benchmark.status()
@@ -1014,13 +1019,25 @@ class AnalysisService:
             ),
         }
 
+    @contextmanager
+    def _watch_mutation(self):
+        acquired = self._watch_lock.acquire(
+            timeout=WATCH_MUTATION_LOCK_TIMEOUT_SECONDS
+        )
+        if not acquired:
+            raise WatcherBusyError
+        try:
+            yield
+        finally:
+            self._watch_lock.release()
+
     def watch_subscribe(
         self,
         address: str,
         network: str = "robinhood",
         subscriber: str | None = None,
     ) -> dict[str, Any]:
-        with self._watch_lock:
+        with self._watch_mutation():
             if network == "solana":
                 if self._solana_watcher is None:
                     raise RuntimeError("Solana watcher is not initialized")
@@ -1046,7 +1063,7 @@ class AnalysisService:
         network: str = "robinhood",
         subscriber: str | None = None,
     ) -> bool:
-        with self._watch_lock:
+        with self._watch_mutation():
             if network == "solana":
                 if self._solana_watcher is None:
                     raise RuntimeError("Solana watcher is not initialized")
@@ -1072,22 +1089,23 @@ class AnalysisService:
         after: str | None = None,
         limit: int = 50,
     ) -> list[dict[str, Any]]:
-        with self._watch_lock:
-            watcher = {
-                "robinhood": self._watcher,
-                "base": self._base_watcher,
-                "solana": self._solana_watcher,
-            }.get(network)
-            if watcher is None:
-                raise RuntimeError(f"{network} watcher is not initialized")
-            if not watcher.store.is_subscribed(address, subscriber):
-                raise KeyError("watch subscription not found")
-            return watcher.store.read_alerts(
-                address,
-                after=after,
-                limit=limit,
-                critical_only=True,
-            )
+        # Atomic state/append-only alert files make these reads safe without
+        # waiting for the long-running watcher cycle lock.
+        watcher = {
+            "robinhood": self._watcher,
+            "base": self._base_watcher,
+            "solana": self._solana_watcher,
+        }.get(network)
+        if watcher is None:
+            raise RuntimeError(f"{network} watcher is not initialized")
+        if not watcher.store.is_subscribed(address, subscriber):
+            raise KeyError("watch subscription not found")
+        return watcher.store.read_alerts(
+            address,
+            after=after,
+            limit=limit,
+            critical_only=True,
+        )
 
     def _run_watcher_cycle(self) -> None:
         if not self.settings.watcher_enabled:
@@ -1261,6 +1279,10 @@ class AnalysisService:
 
 
 class QueueFullError(Exception):
+    pass
+
+
+class WatcherBusyError(Exception):
     pass
 
 
@@ -1636,7 +1658,7 @@ LIMITER = SlidingWindowRateLimiter(
 LEASE = SingleProcessLease(SETTINGS.chain_root)
 
 
-def require_api_token(
+async def require_api_token(
     authorization: str | None = Header(default=None),
 ) -> None:
     if not SETTINGS.api_token and SETTINGS.environment != "production":
@@ -1773,12 +1795,12 @@ async def security_headers(request: Request, call_next):
 
 
 @app.get("/health/live")
-def live() -> dict[str, str]:
+async def live() -> dict[str, str]:
     return {"status": "ok"}
 
 
 @app.get("/health/ready")
-def ready() -> dict[str, Any]:
+async def ready() -> dict[str, Any]:
     if not SERVICE.ready:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
@@ -1805,7 +1827,9 @@ def ready() -> dict[str, Any]:
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_api_token)],
 )
-def create_analysis(payload: AnalyzeRequest, request: Request) -> JobAccepted:
+async def create_analysis(
+    payload: AnalyzeRequest, request: Request
+) -> JobAccepted:
     if not LIMITER.allow(request_identity(request)):
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
@@ -1826,7 +1850,7 @@ def create_analysis(payload: AnalyzeRequest, request: Request) -> JobAccepted:
     "/v1/analyses/{job_id}",
     dependencies=[Depends(require_api_token)],
 )
-def get_analysis(job_id: str) -> dict[str, Any]:
+async def get_analysis(job_id: str) -> dict[str, Any]:
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
@@ -1924,13 +1948,19 @@ def get_watch_status(request: Request) -> dict[str, Any]:
 )
 def create_watch(payload: WatchRequest, request: Request) -> dict[str, Any]:
     identity = request_identity(request)
+    try:
+        subscription = SERVICE.watch_subscribe(
+            payload.address, payload.network, identity
+        )
+    except WatcherBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="watcher state is busy; retry shortly",
+            headers={"Retry-After": "5"},
+        ) from exc
     return {
         "enabled": SETTINGS.watcher_enabled,
-        "subscription": SERVICE.watch_subscribe(
-            payload.address,
-            payload.network,
-            identity,
-        ),
+        "subscription": subscription,
     }
 
 
@@ -2025,12 +2055,18 @@ def delete_watch(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="watch subscription not found",
         )
+    try:
+        removed = SERVICE.watch_unsubscribe(
+            address, network, request_identity(request)
+        )
+    except WatcherBusyError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail="watcher state is busy; retry shortly",
+            headers={"Retry-After": "5"},
+        ) from exc
     return {
-        "removed": SERVICE.watch_unsubscribe(
-            address,
-            network,
-            request_identity(request),
-        ),
+        "removed": removed,
         "address": address,
         "network": network,
     }

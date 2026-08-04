@@ -13,6 +13,7 @@ from chainseer_api import (
     Settings,
     SingleProcessLease,
     SlidingWindowRateLimiter,
+    WatcherBusyError,
     WatchRequest,
     _server_port,
     build_public_report,
@@ -697,6 +698,46 @@ class ServiceTests(unittest.TestCase):
                 {"base": {"message": "temporary"}},
             )
             self.assertFalse(health["benchmark_capture"]["enabled"])
+
+    def test_watch_reads_do_not_wait_for_long_running_cycle_lock(self):
+        subscriber = "a" * 64
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            service._agent = FakeAgent()
+            service.start()
+            try:
+                service.watch_subscribe(TOKEN, "robinhood", subscriber)
+                service._watch_lock.acquire()
+                started = time.monotonic()
+                try:
+                    status = service.watch_status(subscriber)
+                    alerts = service.watch_alerts(
+                        TOKEN, "robinhood", subscriber
+                    )
+                finally:
+                    service._watch_lock.release()
+                self.assertLess(time.monotonic() - started, 1.0)
+                self.assertEqual(len(status["subscriptions"]), 1)
+                self.assertEqual(alerts, [])
+            finally:
+                service.stop()
+
+    def test_watch_mutation_fails_fast_while_cycle_owns_lock(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            service._agent = FakeAgent()
+            service.start()
+            try:
+                service._watch_lock.acquire()
+                started = time.monotonic()
+                try:
+                    with self.assertRaises(WatcherBusyError):
+                        service.watch_subscribe(TOKEN)
+                finally:
+                    service._watch_lock.release()
+                self.assertLess(time.monotonic() - started, 1.0)
+            finally:
+                service.stop()
 
     def test_memory_facade_delegates_without_exposing_execution(self):
         class FakeMemory:
