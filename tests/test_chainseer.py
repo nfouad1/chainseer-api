@@ -1327,3 +1327,80 @@ class AlertWiringTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class FacultyGovernanceActivationTests(unittest.TestCase):
+    """Governance registration and registry-epoch sealing must key off the
+    SAME activation action set.
+
+    When they drifted apart, a faculty with action "born" or "woken" was
+    written into grown.json and had an epoch sealed around it, but never
+    received a governance record -- so verify_governance_registry() then
+    failed with "faculty lacks governance record" and the Memory Core
+    reported degraded. Observed live: 2 of 36 grown faculties ungoverned.
+    """
+
+    def test_activation_actions_cover_born_and_woken_not_just_promoted(self):
+        self.assertEqual(
+            chainseer._REGISTRY_ACTIVATING_ACTIONS,
+            frozenset({"born", "promoted", "woken"}),
+        )
+
+    def test_chainseer_governs_every_activating_action(self):
+        source = inspect.getsource(
+            chainseer.ChainseerCognitiveLoop.finalize
+        )
+        # Both the governance filter and the epoch-seal guard must reference
+        # the shared constant; a bare == "promoted" governance filter is the
+        # exact regression this guards.
+        self.assertEqual(source.count("_REGISTRY_ACTIVATING_ACTIONS"), 2)
+        self.assertNotIn('action") == "promoted"', source)
+
+    def test_pons_governs_every_activating_action(self):
+        import chainseer_pons
+
+        source = inspect.getsource(chainseer_pons.PonsCognitiveLoop.finalize)
+        self.assertEqual(source.count("_REGISTRY_ACTIVATING_ACTIONS"), 2)
+        self.assertNotIn('action") == "promoted"', source)
+        self.assertEqual(
+            chainseer_pons._REGISTRY_ACTIVATING_ACTIONS,
+            chainseer._REGISTRY_ACTIVATING_ACTIONS,
+        )
+
+    def test_migration_heals_an_ungoverned_born_faculty(self):
+        from chainseer_governance import (
+            migrate_cognitive_faculty_governance,
+            verify_governance_registry,
+        )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            root = Path(temp_dir)
+            (root / "registry").mkdir(parents=True)
+            (root / "registry" / "grown.json").write_text(
+                json.dumps(
+                    {
+                        "senses": [
+                            {
+                                "id": 1,
+                                "name": "Born-Ungoverned Sensing",
+                                "function": "detect something",
+                                "category": "data",
+                            }
+                        ],
+                        "modalities": [],
+                    }
+                ),
+                encoding="utf-8",
+            )
+            ok, report = verify_governance_registry(root)
+            self.assertFalse(ok)
+            self.assertTrue(
+                any("lacks governance record" in line for line in report)
+            )
+
+            result = migrate_cognitive_faculty_governance(root)
+            self.assertTrue(result["changed"])
+            self.assertEqual(result["faculty_count"], 1)
+
+            ok, _ = verify_governance_registry(root)
+            self.assertTrue(ok)

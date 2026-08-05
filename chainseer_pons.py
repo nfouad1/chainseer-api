@@ -58,6 +58,10 @@ from chainseer_governance import (
 
 
 PONS_CHAIN_ID = 4663
+#: Cambium actions that place a faculty into the ACTIVE registry. Governance
+#: registration and registry-epoch sealing must both key off this same set
+#: (mirrors chainseer._REGISTRY_ACTIVATING_ACTIONS).
+_REGISTRY_ACTIVATING_ACTIONS = frozenset({"born", "promoted", "woken"})
 PONS_RPC_URL = os.environ.get(
     "CHAINSEER_PONS_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"
 )
@@ -4178,37 +4182,41 @@ class PonsCognitiveLoop:
             }
             for item in (growth or [])
         ]
-        promoted_identities = {
+        # Same invariant as chainseer.py: governance registration and epoch
+        # sealing must key off the SAME activation action set, or born/woken
+        # faculties get sealed into an epoch with no governance record and
+        # fail verification afterwards.
+        governed_identities = {
             (
                 (item.get("faculty") or {}).get("kind"),
                 (item.get("faculty") or {}).get("name"),
             )
             for item in (growth or [])
-            if item.get("action") == "promoted"
+            if item.get("action") in _REGISTRY_ACTIVATING_ACTIONS
         }
-        if promoted_identities:
+        if governed_identities:
             grown = json.loads(
                 (self.root / "registry" / "grown.json").read_text(
                     encoding="utf-8"
                 )
             )
-            promoted_definitions = []
+            governed_definitions = []
             for key, kind in (("senses", "sense"), ("modalities", "modality")):
                 for definition in grown.get(key) or []:
-                    if (kind, definition.get("name")) in promoted_identities:
-                        promoted_definitions.append({**definition, "kind": kind})
-            if len(promoted_definitions) != len(promoted_identities):
+                    if (kind, definition.get("name")) in governed_identities:
+                        governed_definitions.append({**definition, "kind": kind})
+            if len(governed_definitions) != len(governed_identities):
                 raise RuntimeError(
-                    "A promoted Pons faculty lacks an active registry definition"
+                    "An activated Pons faculty lacks an active registry definition"
                 )
             register_faculty_governance(
                 self.root,
-                promoted_definitions,
+                governed_definitions,
                 source=f"pons_cambium_after_analysis:{analysis_ring['index']}",
                 default_manifest=cognitive_only_effect_manifest(),
             )
         if any(
-            item.get("action") in {"born", "promoted", "woken"}
+            item.get("action") in _REGISTRY_ACTIVATING_ACTIONS
             for item in (growth or [])
         ):
             self.epochs_module.seal_epoch(
