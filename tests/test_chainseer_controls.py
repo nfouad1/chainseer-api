@@ -771,7 +771,12 @@ class CalibrationTests(unittest.TestCase):
         outcome_record = build_outcome_record(
             analysis,
             values,
-            observed_at="2026-01-02T00:00:00+00:00",
+            # Must actually match the declared 1h horizon. This fixture used
+            # to observe 24h after the analysis while still labelling itself
+            # horizon_seconds=3600 -- exactly the mislabelling the outcome
+            # timeliness gate now rejects, so it would no longer be
+            # learning-eligible and calibration would see no usable data.
+            observed_at="2026-01-01T01:00:00+00:00",
             outcome_provenance={**provenance, "block_pin": 2_000 + index},
             evidence_fact_ids=["F0000"],
             calibration=calibration,

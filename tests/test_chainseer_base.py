@@ -1327,3 +1327,75 @@ class BasePrototypeTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class BaseOutcomeHorizonTests(unittest.TestCase):
+    """Base must seal the horizon its outcome claims to measure.
+
+    Without horizon_seconds in the sealed record, an observation carries no
+    idea what interval it represents -- a checkpoint drained days late looks
+    identical to an on-time one, and the outcome-timeliness gate has nothing
+    to judge. The label alone lives in SQLite, which the ring cannot see.
+    Measured live: 264 of 366 canonical records had >2 days elapsed.
+    """
+
+    def test_every_learning_horizon_maps_to_seconds(self):
+        mapping = dict(chainseer_base.LEARNING_HORIZONS)
+        self.assertEqual(
+            mapping,
+            {"5m": 300, "1h": 3600, "6h": 21600,
+             "24h": 86400, "7d": 604800, "30d": 2592000},
+        )
+
+    def test_seal_outcome_injects_horizon_seconds(self):
+        import inspect
+        source = inspect.getsource(chainseer_base.BaseTimechainRecorder.seal_outcome)
+        self.assertIn("horizon_seconds", source)
+        self.assertIn("LEARNING_HORIZONS", source)
+
+    def test_horizon_seconds_makes_a_late_outcome_ineligible(self):
+        """End-to-end: with the horizon sealed, a late observation is
+        correctly excluded from learning instead of passing silently."""
+        from chainseer_outcome_ledger import (
+            analysis_evidence_binding,
+            build_outcome_record,
+        )
+        prov = {
+            "block_pin": 500,
+            "fact_count": 1,
+            "facts": [{
+                "fact_id": "F0000", "source": "rpc",
+                "query_hash": "a" * 64, "response_hash": "b" * 64,
+                "block": 500,
+            }],
+        }
+        binding = analysis_evidence_binding(
+            prov, anchor_type="block_pin", anchor_value=500
+        )
+        analysis = {
+            "index": 3, "ring_type": "token_analysis",
+            "ring_hash": "c" * 64, "timestamp": "2026-01-01T00:00:00+00:00",
+            "payload": {
+                "network": "base", "chain_id": 8453,
+                "token_address": "0x" + "9" * 40,
+                "provenance": prov, **binding,
+            },
+        }
+        on_time = build_outcome_record(
+            analysis, {"horizon_seconds": 3600, "price_return_pct": 4},
+            observed_at="2026-01-01T01:00:00+00:00",
+            outcome_provenance={**prov, "block_pin": 600},
+            evidence_fact_ids=["F0000"],
+        )
+        late = build_outcome_record(
+            analysis, {"horizon_seconds": 3600, "price_return_pct": 4},
+            observed_at="2026-01-13T00:00:00+00:00",
+            outcome_provenance={**prov, "block_pin": 600},
+            evidence_fact_ids=["F0000"],
+        )
+        self.assertTrue(on_time["learning"]["eligible"])
+        self.assertFalse(late["learning"]["eligible"])
+        self.assertEqual(
+            late["learning"]["reason"],
+            "outcome_observed_too_late_for_its_horizon",
+        )

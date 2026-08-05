@@ -161,3 +161,75 @@ class OutcomeLedgerTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class OutcomeTimelinessTests(unittest.TestCase):
+    """An outcome is only evidence for the horizon it CLAIMS to measure.
+
+    Measured on the live Base ledger: 264 of 785 completed checkpoints (34%)
+    were observed more than a day late after a stalled learner was restarted
+    and its backlog drained -- the worst 12.32 days late while still labelled
+    horizon=1h. Nothing downstream could distinguish those from on-time
+    records, because learning eligibility only checked evidence hashes.
+    """
+
+    ANALYSIS_TIME = "2026-01-01T00:00:02+00:00"
+
+    def _record(self, horizon_seconds, observed_at):
+        return build_outcome_record(
+            evm_analysis_ring(),
+            {"price_return_pct": -12, "horizon_seconds": horizon_seconds},
+            observed_at=observed_at,
+            outcome_provenance=provenance(456),
+            evidence_fact_ids=["F0000", "F0001"],
+        )
+
+    def test_on_time_outcome_is_learning_eligible(self):
+        # 1h horizon observed ~1h after the analysis ring.
+        record = self._record(3600, "2026-01-01T01:00:02+00:00")
+        self.assertTrue(record["learning"]["eligible"])
+        self.assertTrue(record["timing"]["within_tolerance"])
+        self.assertAlmostEqual(record["timing"]["lateness_seconds"], 0.0, places=1)
+
+    def test_slightly_late_outcome_is_still_eligible(self):
+        # 5 minutes past a 1h horizon: ordinary scheduler jitter.
+        record = self._record(3600, "2026-01-01T01:05:02+00:00")
+        self.assertTrue(record["learning"]["eligible"])
+        self.assertTrue(record["timing"]["within_tolerance"])
+
+    def test_badly_late_outcome_is_excluded_from_learning(self):
+        # The real incident: labelled 1h, observed 12.32 days later.
+        record = self._record(3600, "2026-01-13T07:40:02+00:00")
+        self.assertFalse(record["learning"]["eligible"])
+        self.assertEqual(
+            record["learning"]["reason"], "outcome_observed_too_late_for_its_horizon"
+        )
+        self.assertFalse(record["timing"]["within_tolerance"])
+        self.assertGreater(record["timing"]["lateness_seconds"], 11 * 86400)
+
+    def test_long_horizon_tolerance_scales_and_does_not_fail_on_jitter(self):
+        # 6h late on a 7d horizon is proportionally trivial and must pass.
+        record = self._record(7 * 86400, "2026-01-08T06:00:02+00:00")
+        self.assertTrue(record["learning"]["eligible"])
+        self.assertTrue(record["timing"]["within_tolerance"])
+
+    def test_record_is_still_sealed_and_verifiable_when_late(self):
+        """Late outcomes stay in the ledger -- excluded from learning, not
+        discarded, so the history remains auditable."""
+        analysis = evm_analysis_ring()
+        record = self._record(3600, "2026-01-13T07:40:02+00:00")
+        ok, reason = verify_outcome_record(record, analysis)
+        self.assertTrue(ok, reason)
+
+    def test_outcome_without_declared_horizon_is_not_penalised(self):
+        """Lateness is unknowable without a nominal horizon -- report None
+        rather than silently passing it off as on time or failing it."""
+        record = build_outcome_record(
+            evm_analysis_ring(),
+            {"rug_pull": True},
+            observed_at="2026-02-01T00:00:00+00:00",
+            outcome_provenance=provenance(456),
+            evidence_fact_ids=["F0000", "F0001"],
+        )
+        self.assertIsNone(record["timing"]["within_tolerance"])
+        self.assertTrue(record["learning"]["eligible"])
