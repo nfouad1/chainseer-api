@@ -284,3 +284,67 @@ class OutcomeFreshnessTests(unittest.TestCase):
         result = self._freshness("not-a-timestamp")
         self.assertEqual(result["state"], "unparsable_timestamp")
         self.assertIsNone(result["age_seconds"])
+
+
+class MemoryCoreDocumentationTests(unittest.TestCase):
+    """Keep documented Memory Core coverage aligned with executable code."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.doc = (
+            Path(__file__).resolve().parent.parent
+            / "TIMECHAIN_MEMORY_CORE.md"
+        ).read_text(encoding="utf-8")
+
+    def test_every_supported_ring_type_is_documented(self):
+        from chainseer_outcome_ledger import SUPPORTED_ANALYSIS_RING_TYPES
+
+        for ring_type in SUPPORTED_ANALYSIS_RING_TYPES:
+            self.assertIn(
+                ring_type,
+                self.doc,
+                f"{ring_type} is supported in code but missing from the "
+                "documented coverage list",
+            )
+
+    def test_uncovered_ring_types_are_named_and_still_uncovered(self):
+        from chainseer_outcome_ledger import SUPPORTED_ANALYSIS_RING_TYPES
+
+        for ring_type in ("solana_launch_analysis", "pons_launch_analysis"):
+            self.assertIn(ring_type, self.doc)
+            self.assertNotIn(
+                ring_type,
+                SUPPORTED_ANALYSIS_RING_TYPES,
+                f"{ring_type} is now covered in code; the documented "
+                "coverage boundary needs updating",
+            )
+
+    def test_documented_schema_versions_match_the_code(self):
+        import chainseer_governance
+        import chainseer_memory
+        import chainseer_outcome_ledger
+        import chainseer_temporal_graph
+
+        for name, value in (
+            ("MEMORY_SCHEMA_VERSION", chainseer_memory.MEMORY_SCHEMA_VERSION),
+            ("BACKUP_SCHEMA_VERSION", chainseer_memory.BACKUP_SCHEMA_VERSION),
+            (
+                "OUTCOME_LEDGER_SCHEMA_VERSION",
+                chainseer_outcome_ledger.OUTCOME_LEDGER_SCHEMA_VERSION,
+            ),
+            (
+                "TEMPORAL_GRAPH_SCHEMA_VERSION",
+                chainseer_temporal_graph.TEMPORAL_GRAPH_SCHEMA_VERSION,
+            ),
+            (
+                "GOVERNANCE_SCHEMA_VERSION",
+                chainseer_governance.GOVERNANCE_SCHEMA_VERSION,
+            ),
+        ):
+            self.assertIn(name, self.doc)
+            self.assertIn(
+                f"| `{name}` |",
+                self.doc,
+                f"{name} is not in the documented schema-version table",
+            )
+            self.assertIn(f"`{value}`", self.doc)
