@@ -69,7 +69,17 @@ PONS_POSITION_MANAGER = "0x73991a25C818Bf1f1128dEAaB1492D45638DE0D3"
 PONS_QUOTER_V2 = "0x33e885eD0Ec9bF04EcfB19341582aADCb4c8A9E7"
 PONS_POOL_FEE = 10_000
 PONS_FIXED_SUPPLY_RAW = 1_000_000_000 * 10**18
-PONS_RUN_LOCK_STALE_SECONDS = 6 * 60
+# A full learn-once cycle was measured at ~290s and grows with the catalog,
+# so a 6-minute stale window was already 82% consumed. Once a live cycle
+# outlives the window every overlapping guard pass tries to reclaim a lock
+# whose holder is still running -- needless work at best, and on Windows it
+# used to crash outright. Keep the window comfortably above the longest
+# real cycle.
+PONS_RUN_LOCK_STALE_SECONDS = 20 * 60
+# How long a cycle will wait for a busy lock before giving up. The guard
+# pass runs ~53s, so this covers the common collision without letting a
+# caller queue indefinitely behind a genuinely long run.
+PONS_RUN_LOCK_WAIT_SECONDS = 90
 ZERO_ADDRESS = "0x" + "0" * 40
 DEAD_ADDRESS = "0x000000000000000000000000000000000000dead"
 
@@ -5095,6 +5105,12 @@ class PonsPrototypeEngine:
         with LearningRunLock(
             self.root / ".learn_once.lock",
             stale_seconds=PONS_RUN_LOCK_STALE_SECONDS,
+            # Only the learn cycle waits. It runs every ~10 minutes, so a
+            # skipped attempt costs real discovery and admission work,
+            # whereas the guard re-runs within 2 minutes and can cheaply
+            # skip. Making the guard wait instead would just queue it
+            # behind a ~290s learn cycle for no benefit.
+            wait_seconds=PONS_RUN_LOCK_WAIT_SECONDS,
         ):
             # Reconcile any operational events left unsealed by an interrupted
             # prior cycle. seal_trade_event is idempotent by event hash.

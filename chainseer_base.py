@@ -1207,12 +1207,46 @@ class LearningRunLockedError(RuntimeError):
 
 
 class LearningRunLock:
-    def __init__(self, path: str | Path, stale_seconds: int = LEARNING_LOCK_STALE_SECONDS):
+    """Single-writer guard for one learning root.
+
+    The lock is deliberately shared by every cycle that mutates a root --
+    guard passes as well as full learn-once cycles -- because they all seal
+    into the SAME Timechain, and ``_append`` derives ``prev_hash`` from the
+    chain tail at write time. Two concurrent writers there produce duplicate
+    indices and a broken ``prev_hash``, so the shared lock is not
+    over-broad: it is the single-writer guarantee.
+
+    ``wait_seconds`` lets a caller wait briefly for a busy lock instead of
+    failing immediately. A short guard pass and a long learn-once cycle
+    otherwise collide often enough to skip real work -- measured at ~12% of
+    Pons learn-once attempts -- even though the busy holder would have
+    finished within a minute.
+    """
+
+    def __init__(
+        self,
+        path: str | Path,
+        stale_seconds: int = LEARNING_LOCK_STALE_SECONDS,
+        wait_seconds: float = 0.0,
+        poll_seconds: float = 2.0,
+    ):
         self.path = Path(path)
         self.stale_seconds = stale_seconds
+        self.wait_seconds = max(0.0, float(wait_seconds))
+        self.poll_seconds = max(0.1, float(poll_seconds))
         self.fd: int | None = None
 
     def __enter__(self):
+        deadline = time.time() + self.wait_seconds
+        while True:
+            try:
+                return self._acquire()
+            except LearningRunLockedError:
+                if time.time() >= deadline:
+                    raise
+                time.sleep(min(self.poll_seconds, max(0.0, deadline - time.time())))
+
+    def _acquire(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(2):
             try:
