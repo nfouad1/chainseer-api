@@ -1,8 +1,10 @@
 import json
+import os
 import sqlite3
 import tempfile
 import time
 import unittest
+from unittest.mock import patch
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -154,6 +156,66 @@ class BasePrototypeTests(unittest.TestCase):
                 with self.assertRaises(chainseer_base.LearningRunLockedError):
                     with chainseer_base.LearningRunLock(path):
                         pass
+            self.assertFalse(path.exists())
+
+    def test_stale_lock_held_open_reports_locked_not_crash(self):
+        """Windows refuses to unlink a file another process holds open
+        (WinError 32); POSIX allows it. The stale-reclaim path must treat an
+        un-removable lock as still-held rather than letting a raw OSError
+        escape -- observed live as the Pons guard crashing with exit code 1
+        instead of skipping its cycle."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / ".learn_once.lock"
+            path.write_text("{}", encoding="utf-8")
+            # Make it look stale so reclaim is attempted.
+            old = time.time() - 3600
+            os.utime(path, (old, old))
+
+            real_unlink = Path.unlink
+
+            def refuse_unlink(self, *args, **kwargs):
+                if self == path:
+                    raise PermissionError(32, "in use by another process")
+                return real_unlink(self, *args, **kwargs)
+
+            with patch.object(Path, "unlink", refuse_unlink):
+                with self.assertRaises(chainseer_base.LearningRunLockedError):
+                    with chainseer_base.LearningRunLock(path, stale_seconds=1):
+                        pass
+            # The lock the live holder owns must survive our failed reclaim.
+            self.assertTrue(path.exists())
+
+    def test_stale_lock_that_is_removable_is_reclaimed(self):
+        """The normal stale-reclaim path must still work: an abandoned lock
+        no one holds open is removed and acquired."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / ".learn_once.lock"
+            path.write_text("{}", encoding="utf-8")
+            old = time.time() - 3600
+            os.utime(path, (old, old))
+            with chainseer_base.LearningRunLock(path, stale_seconds=1):
+                self.assertTrue(path.exists())
+            self.assertFalse(path.exists())
+
+    def test_lock_released_during_race_is_retried_not_reported_held(self):
+        """If the holder releases between our failed create and the stat,
+        the lock is free -- retry and acquire instead of reporting held."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / ".learn_once.lock"
+            path.write_text("{}", encoding="utf-8")
+            real_stat = Path.stat
+            seen = []
+
+            def vanishing_stat(self, *args, **kwargs):
+                if self == path and not seen:
+                    seen.append(1)
+                    os.unlink(path)  # holder released mid-race
+                    raise FileNotFoundError(2, "vanished")
+                return real_stat(self, *args, **kwargs)
+
+            with patch.object(Path, "stat", vanishing_stat):
+                with chainseer_base.LearningRunLock(path, stale_seconds=1):
+                    pass
             self.assertFalse(path.exists())
 
     def test_learning_store_refuses_silent_policy_change(self):

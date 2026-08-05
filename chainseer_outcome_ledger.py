@@ -446,15 +446,27 @@ def verify_outcome_rings(
     checked = 0
     eligible = 0
     legacy_unbound = 0
+    # Newest outcome ring of ANY kind -- canonical or legacy. A producer that
+    # has stopped emitting outcomes is otherwise indistinguishable from one
+    # that is simply quiet, which is how a 12-day learning stall once went
+    # unnoticed while every integrity check kept reporting healthy.
+    latest_outcome_at: str | None = None
+    latest_outcome_ring: int | None = None
     errors: list[dict[str, Any]] = []
     for ring in ring_list:
         payload = ring.get("payload") or {}
         record = payload.get("outcome_record")
+        is_outcome_ring = ring.get("ring_type") in {
+            "analysis_outcome",
+            "base_learning_outcome",
+        }
+        if is_outcome_ring or record is not None:
+            timestamp = ring.get("timestamp")
+            if timestamp:
+                latest_outcome_at = str(timestamp)
+                latest_outcome_ring = ring.get("index")
         if record is None:
-            if ring.get("ring_type") in {
-                "analysis_outcome",
-                "base_learning_outcome",
-            }:
+            if is_outcome_ring:
                 legacy_unbound += 1
             continue
         checked += 1
@@ -471,5 +483,7 @@ def verify_outcome_rings(
         "checked": checked,
         "learning_eligible": eligible,
         "legacy_unbound": legacy_unbound,
+        "latest_outcome_at": latest_outcome_at,
+        "latest_outcome_ring": latest_outcome_ring,
         "errors": errors,
     }

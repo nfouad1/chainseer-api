@@ -99,6 +99,11 @@ from chainseer_temporal_graph import (
 
 CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+#: Cambium actions that place a faculty into the ACTIVE registry. Governance
+#: registration and registry-epoch sealing must both key off this same set --
+#: when they drifted apart, born/woken faculties were sealed into an epoch
+#: with no governance record and failed verification afterwards.
+_REGISTRY_ACTIVATING_ACTIONS = frozenset({"born", "promoted", "woken"})
 ZERO_ADDRESS = "0x" + "0" * 40
 
 
@@ -957,34 +962,42 @@ class ChainseerCognitiveLoop:
             }
             for item in (growth or [])
         ]
-        promoted_identities = {
+        # Every action that puts a faculty into the ACTIVE registry needs a
+        # governance record -- not just "promoted". A faculty that is born or
+        # woken lands in grown.json and gets an epoch sealed around it (see
+        # the identical action set below), but registering governance for
+        # promotions alone left those ungoverned, so
+        # verify_governance_registry() then failed with "faculty lacks
+        # governance record" and the Memory Core reported degraded. The two
+        # action sets must stay in step.
+        governed_identities = {
             (
                 (item.get("faculty") or {}).get("kind"),
                 (item.get("faculty") or {}).get("name"),
             )
             for item in (growth or [])
-            if item.get("action") == "promoted"
+            if item.get("action") in _REGISTRY_ACTIVATING_ACTIONS
         }
-        if promoted_identities:
+        if governed_identities:
             grown_path = self.root / "registry" / "grown.json"
             grown = json.loads(grown_path.read_text(encoding="utf-8"))
-            promoted_definitions = []
+            governed_definitions = []
             for key, kind in (("senses", "sense"), ("modalities", "modality")):
                 for definition in grown.get(key) or []:
-                    if (kind, definition.get("name")) in promoted_identities:
-                        promoted_definitions.append({**definition, "kind": kind})
-            if len(promoted_definitions) != len(promoted_identities):
+                    if (kind, definition.get("name")) in governed_identities:
+                        governed_definitions.append({**definition, "kind": kind})
+            if len(governed_definitions) != len(governed_identities):
                 raise RuntimeError(
-                    "A promoted faculty was not found in the active registry; "
+                    "An activated faculty was not found in the active registry; "
                     "refusing to seal an incomplete governance epoch"
                 )
             register_faculty_governance(
                 self.root,
-                promoted_definitions,
+                governed_definitions,
                 source=f"cambium_after_analysis:{analysis_ring['index']}",
                 default_manifest=cognitive_only_effect_manifest(),
             )
-        if any(item.get("action") in {"born", "promoted", "woken"}
+        if any(item.get("action") in _REGISTRY_ACTIVATING_ACTIONS
                for item in (growth or [])):
             self._seal_registry_epoch(
                 reason=f"faculty change after analysis ring {analysis_ring['index']}"
