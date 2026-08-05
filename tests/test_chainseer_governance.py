@@ -252,7 +252,13 @@ class GovernedPatternLifecycleTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
-        self.epochs.seal_epoch(self.root, reason="legacy fixture")
+        # The fixture deliberately hand-writes a legacy registry, so re-anchoring
+        # it is the "manual re-anchor after human review" case that
+        # seal_epoch(accept_current=True) exists for. Production paths must NOT
+        # use this -- they authorize via begin_mutation() instead.
+        self.epochs.seal_epoch(
+            self.root, reason="legacy fixture", accept_current=True
+        )
         first = self.registry.migrate_cognitive_faculties()
         second = self.registry.migrate_cognitive_faculties()
         self.assertTrue(first["changed"])
