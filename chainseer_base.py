@@ -1222,9 +1222,26 @@ class LearningRunLock:
                 }).encode("utf-8"))
                 return self
             except FileExistsError:
-                age = time.time() - self.path.stat().st_mtime
+                try:
+                    age = time.time() - self.path.stat().st_mtime
+                except FileNotFoundError:
+                    # The holder released the lock between our failed create
+                    # and this stat. It is free now, so just retry rather
+                    # than reporting it as held.
+                    continue
                 if attempt == 0 and age > self.stale_seconds:
-                    self.path.unlink(missing_ok=True)
+                    try:
+                        self.path.unlink(missing_ok=True)
+                    except OSError:
+                        # Windows refuses to unlink a file another process
+                        # still holds open (WinError 32), unlike POSIX. An
+                        # un-removable lock therefore means the "stale"
+                        # holder is in fact alive and mid-run -- report it
+                        # as held instead of crashing the caller, which is
+                        # what this branch already means to communicate.
+                        raise LearningRunLockedError(
+                            f"learn-once is already running (lock: {self.path})"
+                        ) from None
                     continue
                 raise LearningRunLockedError(
                     f"learn-once is already running (lock: {self.path})"
