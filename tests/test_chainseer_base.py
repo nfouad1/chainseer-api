@@ -218,6 +218,57 @@ class BasePrototypeTests(unittest.TestCase):
                     pass
             self.assertFalse(path.exists())
 
+    def test_busy_lock_is_waited_for_then_acquired(self):
+        """A caller with wait_seconds must retry a busy lock rather than
+        failing immediately -- the fix for ~12% of Pons learn-once attempts
+        being skipped while the holder would have finished within a minute."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / ".learn_once.lock"
+            path.write_text("{}", encoding="utf-8")  # held by someone else
+            released = []
+            real_sleep = time.sleep
+
+            def release_on_first_poll(seconds):
+                if not released:
+                    released.append(1)
+                    os.unlink(path)  # holder finishes during our wait
+                real_sleep(0)
+
+            with patch.object(chainseer_base.time, "sleep", release_on_first_poll):
+                with chainseer_base.LearningRunLock(
+                    path, stale_seconds=3600, wait_seconds=30, poll_seconds=1
+                ):
+                    self.assertTrue(path.exists())
+            self.assertTrue(released)
+            self.assertFalse(path.exists())
+
+    def test_wait_gives_up_and_reports_locked_when_holder_persists(self):
+        """The wait must be bounded -- a holder that never releases still
+        yields LearningRunLockedError rather than hanging the caller."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / ".learn_once.lock"
+            path.write_text("{}", encoding="utf-8")
+            real_sleep = time.sleep
+            with patch.object(chainseer_base.time, "sleep", lambda s: real_sleep(0)):
+                with self.assertRaises(chainseer_base.LearningRunLockedError):
+                    with chainseer_base.LearningRunLock(
+                        path, stale_seconds=3600, wait_seconds=0.3, poll_seconds=0.1
+                    ):
+                        pass
+            self.assertTrue(path.exists())  # holder's lock untouched
+
+    def test_default_lock_does_not_wait(self):
+        """Callers that did not opt in (e.g. the fast guard) must keep the
+        original fail-fast behaviour so they skip instead of queueing."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            path = Path(temp_dir) / ".learn_once.lock"
+            with chainseer_base.LearningRunLock(path):
+                start = time.time()
+                with self.assertRaises(chainseer_base.LearningRunLockedError):
+                    with chainseer_base.LearningRunLock(path):
+                        pass
+                self.assertLess(time.time() - start, 1.0)
+
     def test_learning_store_refuses_silent_policy_change(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             store = chainseer_base.BaseLearningStore(Path(temp_dir) / "learning.sqlite3")
