@@ -17,6 +17,18 @@ from typing import Any, Iterable
 
 
 OUTCOME_LEDGER_SCHEMA_VERSION = "1.0"
+# An outcome is only meaningful as evidence for the horizon it CLAIMS to
+# measure. A checkpoint labelled "1h" but observed twelve days late records
+# twelve days of movement under a one-hour label, and nothing downstream can
+# tell it apart from an on-time record. Measured on the live Base ledger:
+# 264 of 785 completed checkpoints (34%) were observed more than a day late
+# after a stalled learner was restarted and its backlog drained.
+#
+# Tolerance is proportional with an absolute floor, so a short horizon is
+# judged strictly while a long one is not failed for ordinary scheduling
+# jitter: 1h -> 15m, 6h -> 90m, 24h -> 6h, 7d -> 42h.
+OUTCOME_LATENESS_FLOOR_SECONDS = 15 * 60
+OUTCOME_LATENESS_FRACTION = 0.25
 EVIDENCE_MANIFEST_SCHEMA_VERSION = "1.0"
 HASH_RE = re.compile(r"^[a-f0-9]{64}$")
 
@@ -293,6 +305,48 @@ def partition_outcomes(
     return security, market, infrastructure, other
 
 
+def _outcome_timing(
+    outcomes: dict[str, Any],
+    analysis_timestamp: Any,
+    observed: datetime,
+) -> dict[str, Any]:
+    """Describe how faithfully an outcome measures the horizon it claims.
+
+    ``within_tolerance`` is None when the outcome declares no nominal
+    horizon -- lateness is then unknowable rather than acceptable, so it is
+    reported honestly instead of silently passing as on time.
+    """
+    horizon = outcomes.get("horizon_seconds") if isinstance(outcomes, dict) else None
+    result: dict[str, Any] = {
+        "nominal_horizon_seconds": None,
+        "elapsed_seconds": None,
+        "lateness_seconds": None,
+        "tolerance_seconds": None,
+        "within_tolerance": None,
+    }
+    if analysis_timestamp:
+        try:
+            elapsed = (
+                observed - _parse_iso(analysis_timestamp, "analysis ring timestamp")
+            ).total_seconds()
+            result["elapsed_seconds"] = round(elapsed, 3)
+        except OutcomeLedgerError:
+            return result
+    if isinstance(horizon, bool) or not isinstance(horizon, (int, float)):
+        return result
+    if horizon <= 0 or result["elapsed_seconds"] is None:
+        return result
+    tolerance = max(
+        OUTCOME_LATENESS_FLOOR_SECONDS, OUTCOME_LATENESS_FRACTION * float(horizon)
+    )
+    lateness = result["elapsed_seconds"] - float(horizon)
+    result["nominal_horizon_seconds"] = float(horizon)
+    result["lateness_seconds"] = round(lateness, 3)
+    result["tolerance_seconds"] = round(tolerance, 3)
+    result["within_tolerance"] = lateness <= tolerance
+    return result
+
+
 def build_outcome_record(
     analysis_ring: dict[str, Any],
     outcomes: dict[str, Any],
@@ -330,11 +384,21 @@ def build_outcome_record(
         outcome_manifest and outcome_manifest.get("complete_fact_hashes")
     )
     analysis_evidence_complete = bool(analysis_ref.get("evidence_complete"))
-    learning_eligible = analysis_evidence_complete and outcome_evidence_complete
+    timing = _outcome_timing(outcomes, analysis_timestamp, observed)
+    # An outcome observed far past the horizon it claims to measure is not
+    # evidence about that horizon. Excluding it from learning keeps it in the
+    # ledger -- still sealed, still auditable -- without letting it train
+    # anything under a label it does not honour.
+    timely = timing["within_tolerance"] is not False
+    learning_eligible = (
+        analysis_evidence_complete and outcome_evidence_complete and timely
+    )
     if not analysis_evidence_complete:
         learning_reason = "analysis_evidence_incomplete"
     elif not outcome_evidence_complete:
         learning_reason = "outcome_evidence_incomplete"
+    elif not timely:
+        learning_reason = "outcome_observed_too_late_for_its_horizon"
     else:
         learning_reason = "analysis_and_outcome_evidence_hashes_complete"
     record = {
@@ -359,6 +423,7 @@ def build_outcome_record(
             "eligible": learning_eligible,
             "reason": learning_reason,
         },
+        "timing": timing,
         "calibration": dict(calibration or {}),
     }
     identity = {
@@ -422,8 +487,18 @@ def verify_outcome_record(
             raise OutcomeLedgerError(
                 "outcome evidence hash cannot exist without its manifest"
             )
-        expected_eligibility = bool(reference.get("evidence_complete")) and bool(
-            outcome_manifest and outcome_manifest.get("complete_fact_hashes")
+        # Timeliness is part of eligibility, so the verifier must apply the
+        # same rule the builder did -- otherwise a correctly-excluded late
+        # outcome would be rejected here as "inconsistent". A record with no
+        # timing block predates the gate and is judged on evidence alone.
+        timing = record.get("timing")
+        timely = True
+        if isinstance(timing, dict):
+            timely = timing.get("within_tolerance") is not False
+        expected_eligibility = (
+            bool(reference.get("evidence_complete"))
+            and bool(outcome_manifest and outcome_manifest.get("complete_fact_hashes"))
+            and timely
         )
         if bool((record.get("learning") or {}).get("eligible")) != expected_eligibility:
             raise OutcomeLedgerError("outcome learning eligibility is inconsistent")
@@ -438,6 +513,27 @@ def verify_outcome_record(
         return False, str(exc)
 
 
+def _record_is_timely(record: dict[str, Any]) -> bool:
+    """Was this outcome observed close enough to the horizon it claims?
+
+    Uses the record's stored timing block when present; otherwise derives it
+    from fields every record already carries (analysis ring timestamp,
+    observed_at, and the declared horizon), so records sealed before the
+    gate existed are still judged honestly rather than counted as clean.
+    """
+    timing = record.get("timing")
+    if isinstance(timing, dict) and timing.get("within_tolerance") is not None:
+        return bool(timing["within_tolerance"])
+    reference = record.get("analysis_reference") or {}
+    horizon = (record.get("other_outcomes") or {}).get("horizon_seconds")
+    derived = _outcome_timing(
+        {"horizon_seconds": horizon},
+        reference.get("ring_timestamp"),
+        _parse_iso(record.get("observed_at"), "observed_at"),
+    )
+    return derived["within_tolerance"] is not False
+
+
 def verify_outcome_rings(
     rings: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
@@ -446,6 +542,7 @@ def verify_outcome_rings(
     checked = 0
     eligible = 0
     legacy_unbound = 0
+    stale_horizon = 0
     # Newest outcome ring of ANY kind -- canonical or legacy. A producer that
     # has stopped emitting outcomes is otherwise indistinguishable from one
     # that is simply quiet, which is how a 12-day learning stall once went
@@ -476,13 +573,23 @@ def verify_outcome_rings(
         if not ok:
             errors.append({"ring": ring.get("index"), "reason": reason})
         elif (record.get("learning") or {}).get("eligible"):
-            eligible += 1
+            # Records sealed before the timeliness gate carry no timing
+            # block, but their lateness is still derivable from data they
+            # already hold. Recompute it here so the corpus-quality figure
+            # is honest, WITHOUT failing verification on them -- they were
+            # built correctly under the rule of their day, and their rings
+            # are immutable.
+            if _record_is_timely(record):
+                eligible += 1
+            else:
+                stale_horizon += 1
     return {
         "ok": not errors,
         "schema_version": OUTCOME_LEDGER_SCHEMA_VERSION,
         "checked": checked,
         "learning_eligible": eligible,
         "legacy_unbound": legacy_unbound,
+        "stale_horizon_excluded": stale_horizon,
         "latest_outcome_at": latest_outcome_at,
         "latest_outcome_ring": latest_outcome_ring,
         "errors": errors,

@@ -961,6 +961,17 @@ class BaseTimechainRecorder:
             for fact in decision.provenance.get("facts") or []
             if isinstance(fact, dict) and fact.get("fact_id")
         ]
+        # Seal the horizon this outcome claims to measure, in seconds. Without
+        # it the record carries an observation with no idea what interval it
+        # was supposed to represent, so a checkpoint drained days late is
+        # indistinguishable from an on-time one and the outcome-timeliness
+        # gate has nothing to judge. The label alone lives in SQLite, which
+        # the sealed ring cannot see.
+        horizon_seconds = dict(LEARNING_HORIZONS).get(horizon)
+        outcome = {
+            **outcome,
+            **({"horizon_seconds": horizon_seconds} if horizon_seconds else {}),
+        }
         outcome_record = build_outcome_record(
             original,
             outcome,
