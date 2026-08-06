@@ -834,6 +834,7 @@ class AnalysisService:
             "last_error": None,
         }
         self._benchmark = BenchmarkCaptureRecorder(settings)
+        self._base_analysis_idempotency_keys: set[str] | None = None
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -1120,6 +1121,12 @@ class AnalysisService:
         out a batch import. The next organic seal (the watcher runs every
         60s in production) brings the index back to head incrementally via
         its own staleness check, so nothing needs to be reindexed here.
+
+        The idempotency-key set is scanned from the full chain once per
+        process lifetime and cached on self, not rescanned every call --
+        at production scale (thousands of unrecognized-type rings this
+        endpoint must still stream past to find its own) a fresh full scan
+        per request was itself slow enough to time out a small batch.
         """
         if self._agent is None or not hasattr(self._agent, "tc"):
             raise RuntimeError("Timechain is not initialized")
@@ -1129,12 +1136,14 @@ class AnalysisService:
         with self._timechain_lock:
             os.environ["CT_AUTOINDEX"] = "0"
             try:
-                seen_keys = {
-                    (ring.get("payload") or {}).get("idempotency_key")
-                    for ring in tc.iter_rings()
-                    if ring.get("ring_type") == "base_launch_analysis"
-                    and (ring.get("payload") or {}).get("idempotency_key")
-                }
+                if self._base_analysis_idempotency_keys is None:
+                    self._base_analysis_idempotency_keys = {
+                        (ring.get("payload") or {}).get("idempotency_key")
+                        for ring in tc.iter_rings()
+                        if ring.get("ring_type") == "base_launch_analysis"
+                        and (ring.get("payload") or {}).get("idempotency_key")
+                    }
+                seen_keys = self._base_analysis_idempotency_keys
                 for item in items:
                     payload = item["payload"]
                     key = payload.get("idempotency_key")
