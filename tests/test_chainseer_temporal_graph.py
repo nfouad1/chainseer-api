@@ -11,6 +11,8 @@ from chainseer_entity_graph import (
 from chainseer_temporal_graph import (
     TemporalGraphError,
     TemporalGraphStore,
+    _risk_evolution,
+    _risk_evolution_step,
     build_temporal_projection,
     subject_temporal_view,
     verify_temporal_projection,
@@ -277,6 +279,67 @@ class TemporalEntityGraphTests(unittest.TestCase):
                 store.append_analysis_ring(
                     ring(0, TOKEN_A, evm_graph(TOKEN_A, pin=100), pin=100)
                 )
+
+
+class RiskEvolutionEquivalenceTests(unittest.TestCase):
+    """The incremental evolution must equal the full recomputation exactly.
+
+    _risk_evolution used to run over the whole timeline on every append, making
+    a rebuild quadratic in observations per subject -- solana_chain took over 8
+    seconds. The incremental form is O(1) per append, but the projection hash
+    is verified against a full rebuild, so ANY divergence becomes projection
+    drift rather than a slightly wrong number.
+    """
+
+    def _timeline(self, scores, **kw):
+        graph = evm_graph(TOKEN_A)
+        rings = [
+            ring(index, TOKEN_A, graph, score=score, **kw)
+            for index, score in enumerate(scores)
+        ]
+        projection = build_temporal_projection(rings)
+        subject = next(iter(projection["subjects"].values()))
+        return subject["risk_timeline"], subject["risk_evolution"]
+
+    def _assert_equivalent(self, scores, **kw):
+        timeline, incremental = self._timeline(scores, **kw)
+        self.assertEqual(_risk_evolution(timeline), incremental)
+
+    def test_single_observation(self):
+        self._assert_equivalent([80])
+
+    def test_rising_and_falling_scores(self):
+        self._assert_equivalent([80, 95, 40, 65, 90])
+
+    def test_risk_level_and_hard_stop_transitions(self):
+        # Crossing 70 flips risk_level and adds/removes a hard stop, which are
+        # the fields measured over timeline[1:] rather than the whole list.
+        self._assert_equivalent([80, 40, 85, 30, 90])
+
+    def test_legacy_and_indeterminate_evidence_states_are_counted(self):
+        for state in ("unknown_legacy", "infrastructure_indeterminate"):
+            with self.subTest(state=state):
+                self._assert_equivalent([80, 60, 90], evidence_state=state)
+
+    def test_step_from_empty_matches_full_on_one_point(self):
+        timeline, _ = self._timeline([75])
+        self.assertEqual(
+            _risk_evolution_step(None, timeline[0]), _risk_evolution(timeline)
+        )
+
+    def test_long_timeline_stays_equivalent(self):
+        # 60 observations on one subject: the shape that made the old
+        # implementation quadratic.
+        self._assert_equivalent([50 + (i * 7) % 50 for i in range(60)])
+
+    def test_projection_hash_still_verifies_against_a_full_rebuild(self):
+        graph = evm_graph(TOKEN_A)
+        rings = [
+            ring(i, TOKEN_A, graph, score=50 + (i * 13) % 50) for i in range(40)
+        ]
+        projection = build_temporal_projection(rings)
+        ok, report = verify_temporal_projection(projection, rings)
+        self.assertTrue(ok, report)
 
 
 if __name__ == "__main__":

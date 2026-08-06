@@ -189,7 +189,7 @@ Measured on a live chain, not extrapolated:
 | --- | --- | --- | --- | --- |
 | `chainseer_chain` | 1,901 | 291 | 269 | 0.07–0.10 s |
 | `pons_chain` | 6,515 | 1,612 | 775 | 0.20–0.24 s |
-| `solana_chain` | 5,603 | 5,300 | 581 | 8.0–8.7 s |
+| `solana_chain` | 5,603 | 5,300 | 581 | 0.60–0.65 s |
 
 Rebuild cost tracks the number of *recognised analysis rings*, not total
 ring count. It also tracks observations **per subject**, which is the
@@ -197,10 +197,14 @@ figure that actually bites: `solana_chain` averages ~9 analyses per mint
 against ~2 for `pons_chain`, and that ratio — not the ring count — is why
 it is the slowest of the three.
 
-`_risk_evolution` is recomputed over a subject's whole timeline on every
-append, so a rebuild is quadratic in observations per subject. That is why
-`solana_chain` costs over 8 seconds despite having fewer rings than
-`pons_chain`.
+`_risk_evolution` was originally recomputed over a subject's whole
+timeline on every append, making a rebuild quadratic in observations per
+subject. That was invisible while every recognised chain had few analyses
+per subject; recognising `solana_launch_analysis` pushed a full rebuild
+over 8 seconds. It is now advanced incrementally in constant time per
+observation, which is exactly equivalent (the projection hash is verified
+against a full rebuild, so any divergence would surface as projection
+drift) and brings the same rebuild to ~0.6 s.
 
 A full rebuild at these sizes stays cheap enough to run on demand, which
 is why `TemporalGraphStore` can fall back to a full rebuild whenever its

@@ -361,6 +361,89 @@ def _risk_evolution(timeline: list[dict[str, Any]]) -> dict[str, Any]:
     return result
 
 
+def _risk_evolution_step(
+    previous: dict[str, Any] | None, point: dict[str, Any]
+) -> dict[str, Any]:
+    """Advance the risk evolution by one observation, in constant time.
+
+    Every field in _risk_evolution is a running aggregate, so recomputing the
+    whole timeline on each append made a rebuild quadratic in observations per
+    subject. That stayed invisible while no chain had many analyses per
+    subject; solana_chain has ~9, and a full rebuild took over 8 seconds.
+
+    This must stay exactly equivalent to _risk_evolution -- the projection hash
+    is verified against a full rebuild, so any divergence surfaces as
+    projection drift. RiskEvolutionEquivalenceTests pins that on real data.
+    """
+    usable = bool(point.get("score_usable"))
+    score = _number(point.get("score")) if usable else None
+    if previous is None:
+        return {
+            "observation_count": 1,
+            "scored_observation_count": 1 if point.get("score") is not None else 0,
+            "usable_score_count": 1 if usable else 0,
+            "infrastructure_indeterminate_count": int(
+                point.get("evidence_state") == "infrastructure_indeterminate"
+            ),
+            "legacy_evidence_state_count": int(
+                point.get("evidence_state") == "unknown_legacy"
+            ),
+            "first_score": score,
+            "current_score": score,
+            "minimum_score": score,
+            "maximum_score": score,
+            "total_score_delta": None,
+            # These are measured over timeline[1:], so the first observation
+            # contributes nothing to them by construction.
+            "risk_level_change_count": 0,
+            "hard_stop_addition_count": 0,
+            "hard_stop_removal_count": 0,
+            "calibration_scope": "token_evidence_only",
+        }
+
+    usable_count = previous["usable_score_count"] + (1 if usable else 0)
+    first_score = previous["first_score"]
+    current_score = previous["current_score"]
+    minimum_score = previous["minimum_score"]
+    maximum_score = previous["maximum_score"]
+    if usable and score is not None:
+        if first_score is None:
+            first_score = score
+        current_score = score
+        minimum_score = score if minimum_score is None else min(minimum_score, score)
+        maximum_score = score if maximum_score is None else max(maximum_score, score)
+    return {
+        "observation_count": previous["observation_count"] + 1,
+        "scored_observation_count": previous["scored_observation_count"]
+        + (1 if point.get("score") is not None else 0),
+        "usable_score_count": usable_count,
+        "infrastructure_indeterminate_count": previous[
+            "infrastructure_indeterminate_count"
+        ]
+        + int(point.get("evidence_state") == "infrastructure_indeterminate"),
+        "legacy_evidence_state_count": previous["legacy_evidence_state_count"]
+        + int(point.get("evidence_state") == "unknown_legacy"),
+        "first_score": first_score,
+        "current_score": current_score,
+        "minimum_score": minimum_score,
+        "maximum_score": maximum_score,
+        "total_score_delta": (
+            round(current_score - first_score, 6)
+            if usable_count >= 2
+            and current_score is not None
+            and first_score is not None
+            else None
+        ),
+        "risk_level_change_count": previous["risk_level_change_count"]
+        + int(bool(point.get("risk_level_changed"))),
+        "hard_stop_addition_count": previous["hard_stop_addition_count"]
+        + len(point.get("hard_stops_added") or []),
+        "hard_stop_removal_count": previous["hard_stop_removal_count"]
+        + len(point.get("hard_stops_removed") or []),
+        "calibration_scope": "token_evidence_only",
+    }
+
+
 def _event(
     event_type: str,
     relationship_id: str,
@@ -615,8 +698,11 @@ def _apply_analysis_ring(
         return
     subject = _ensure_subject(projection, fields)
     previous = subject["risk_timeline"][-1] if subject["risk_timeline"] else None
-    subject["risk_timeline"].append(_risk_point(fields, previous))
-    subject["risk_evolution"] = _risk_evolution(subject["risk_timeline"])
+    point = _risk_point(fields, previous)
+    subject["risk_timeline"].append(point)
+    subject["risk_evolution"] = _risk_evolution_step(
+        subject.get("risk_evolution") or None, point
+    )
     subject["analysis_count"] += 1
     subject["last_observed"] = _observation_ref(fields)
     _apply_graph(projection, subject, fields)
