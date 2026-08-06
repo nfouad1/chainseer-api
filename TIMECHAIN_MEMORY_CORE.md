@@ -136,22 +136,50 @@ these types are recognised (`SUPPORTED_ANALYSIS_RING_TYPES`):
 - `base_launch_analysis` — Base (`chainseer_base.py`)
 - `solana_token_analysis` — the public on-demand Solana analyser
   (`chainseer_solana_public.py`)
-
-Two production ring types are **not** covered today, and their histories
-are therefore absent from the Outcome Ledger, the temporal Entity Graph,
-and recall:
-
 - `solana_launch_analysis` — the Solana autotrader (`chainseer_solana.py`),
   sealed into its own `solana_chain` root
 - `pons_launch_analysis` — Pons (`chainseer_pons.py`), sealed into its own
   `pons_chain` root
 
-These are separate authoritative Timechains with separate faculty
-registries by design. Nothing federates them into a shared Outcome Ledger
-or Entity Graph yet: there is no cross-chain evidence-signing or citation
-scheme, so a claim cannot cite a ring from a chain other than the one it
-was recalled from. Treat cross-system memory as unbuilt, not as implied by
-the five pillars.
+### Subject namespaces
+
+Recognition is by ring type, but subjects are keyed by `(network,
+subject)`, and the launch adapters deliberately share namespaces with the
+on-demand analysers rather than forming their own:
+
+| Ring type | Network | Subject |
+| --- | --- | --- |
+| `token_analysis` | `robinhood` | token address |
+| `pons_launch_analysis` | `robinhood` | token address |
+| `base_launch_analysis` | `base` | token address |
+| `solana_token_analysis` | `solana` | mint |
+| `solana_launch_analysis` | `solana` | mint |
+
+Pons runs *on* Robinhood Chain (chain id 4663), so a token it analyses is
+the same subject a `token_analysis` ring would name. Splitting them would
+hide exactly the cross-system agreement the Memory Core exists to surface.
+The same holds for a mint seen by both the public Solana analyser and the
+autotrader.
+
+Measured today, that overlap is **empty**: 775 Pons subjects and 13
+`token_analysis` subjects share no token, and only one producer has ever
+written to the `solana` namespace. The namespaces are shared so the
+agreement is *visible when it happens*, not because it is happening now.
+
+### What recognition does and does not do
+
+Recognition is read-side only: it makes these rings citable, recallable,
+and visible to the Entity Graph. It does not make them trainable. All
+6,912 pre-existing launch rings predate evidence manifests, so they
+resolve with `binding_state: derived_from_legacy_analysis_ring` and
+`evidence_complete: false`. They are honestly labelled legacy evidence,
+not laundered into looking sealed-at-analysis.
+
+These remain separate authoritative Timechains with separate faculty
+registries by design. Nothing federates them into a *shared* Outcome
+Ledger or Entity Graph yet: there is no cross-chain evidence-signing or
+citation scheme, so a claim still cannot cite a ring from a chain other
+than the one it was recalled from. Treat cross-chain memory as unbuilt.
 
 ## Expected scale
 
@@ -159,14 +187,25 @@ Measured on a live chain, not extrapolated:
 
 | Chain | Rings | Analysis rings | Subjects | Projection rebuild |
 | --- | --- | --- | --- | --- |
-| `chainseer_chain` | 1,395 | 189 | 168 | 0.06–0.16 s |
+| `chainseer_chain` | 1,901 | 291 | 269 | 0.07–0.10 s |
+| `pons_chain` | 6,515 | 1,612 | 775 | 0.20–0.24 s |
+| `solana_chain` | 5,603 | 5,300 | 581 | 8.0–8.7 s |
 
 Rebuild cost tracks the number of *recognised analysis rings*, not total
-ring count: rebuilding over a 3,223-ring chain whose rings are all of an
-unrecognised type completes in ~0.02 s because nothing matches. A full
-rebuild at this size is cheap enough to run on demand, which is why
-`TemporalGraphStore` can fall back to a full rebuild whenever its
-incremental cursor fails validation.
+ring count. It also tracks observations **per subject**, which is the
+figure that actually bites: `solana_chain` averages ~9 analyses per mint
+against ~2 for `pons_chain`, and that ratio — not the ring count — is why
+it is the slowest of the three.
+
+`_risk_evolution` is recomputed over a subject's whole timeline on every
+append, so a rebuild is quadratic in observations per subject. That is why
+`solana_chain` costs over 8 seconds despite having fewer rings than
+`pons_chain`.
+
+A full rebuild at these sizes stays cheap enough to run on demand, which
+is why `TemporalGraphStore` can fall back to a full rebuild whenever its
+incremental cursor fails validation. Re-measure before assuming that holds
+at substantially larger per-subject depths.
 
 This has not been load-tested beyond the sizes above. Operators planning
 for a substantially larger corpus should re-measure before assuming the

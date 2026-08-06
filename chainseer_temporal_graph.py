@@ -30,6 +30,8 @@ ANALYSIS_RING_TYPES = {
     "token_analysis",
     "solana_token_analysis",
     "base_launch_analysis",
+    "pons_launch_analysis",
+    "solana_launch_analysis",
 }
 HASH_LENGTH = 64
 
@@ -96,6 +98,26 @@ def _analysis_fields(ring: dict[str, Any]) -> dict[str, Any] | None:
         score = analysis.get("score")
         hard_stops = analysis.get("hard_stops") or []
         component_scores = analysis.get("component_scores") or {}
+    elif ring_type == "solana_launch_analysis":
+        # Shares the "solana" namespace with solana_token_analysis: one mint
+        # is one subject regardless of which system looked at it.
+        network = "solana"
+        analysis = payload.get("decision") or {}
+        subject = analysis.get("mint") or (payload.get("candidate") or {}).get("mint")
+        score = analysis.get("score")
+        hard_stops = analysis.get("hard_stops") or []
+        component_scores = analysis.get("component_scores") or {}
+    elif ring_type == "pons_launch_analysis":
+        # Pons runs ON Robinhood Chain, so its subjects share the "robinhood"
+        # namespace with general token_analysis.
+        network = "robinhood"
+        analysis = payload.get("decision") or {}
+        subject = analysis.get("token_address") or (
+            payload.get("candidate") or {}
+        ).get("token_address")
+        score = analysis.get("score")
+        hard_stops = analysis.get("hard_stops") or []
+        component_scores = analysis.get("component_scores") or {}
     else:
         network = str(payload.get("network") or "").strip().lower()
         if not network:
@@ -117,6 +139,13 @@ def _analysis_fields(ring: dict[str, Any]) -> dict[str, Any] | None:
     anchor_value = pin.get("value", payload.get("anchor_value"))
     if anchor_value is None:
         anchor_value = payload.get("slot_anchor", payload.get("block_pin"))
+    if anchor_value is None:
+        # The launch adapters pin inside the decision (Pons) or on the
+        # candidate (Solana), not at the payload root.
+        decision = payload.get("decision") or {}
+        anchor_value = decision.get("block_pin")
+        if anchor_value is None:
+            anchor_value = (payload.get("candidate") or {}).get("slot")
     try:
         anchor_value = int(anchor_value) if anchor_value is not None else None
     except (TypeError, ValueError, OverflowError):
