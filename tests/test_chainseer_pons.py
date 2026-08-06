@@ -1265,3 +1265,74 @@ class PonsAdapterTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class PonsAnalysisEvidenceBindingTests(unittest.TestCase):
+    """A Pons analysis must seal its evidence identity INTO the ring.
+
+    An outcome can only ever bind to an analysis whose evidence manifest was
+    sealed at analysis time -- a hash attached afterwards proves nothing about
+    what was actually observed. Without this, every Pons analysis is
+    permanently analysis_evidence_incomplete: unrecallable, and unable to carry
+    a canonical outcome. Unbound rings cannot be retrofitted, so this has to be
+    sealed from the moment an analysis is written.
+    """
+
+    @staticmethod
+    def _provenance(block_pin=4242):
+        return {
+            "block_pin": block_pin,
+            "anchor_type": "block_pin",
+            "fact_count": 2,
+            "facts": [
+                {
+                    "fact_id": "F0000", "source": "rpc",
+                    "query_hash": "a" * 64, "response_hash": "b" * 64,
+                    "block": block_pin,
+                },
+                {
+                    "fact_id": "F0001", "source": "http",
+                    "query_hash": "c" * 64, "response_hash": "d" * 64,
+                    "block": block_pin,
+                },
+            ],
+        }
+
+    def test_seal_analysis_binds_evidence_in_the_ring(self):
+        import inspect
+
+        source = inspect.getsource(
+            chainseer_pons.PonsTimechainRecorder.seal_analysis
+            if hasattr(chainseer_pons, "PonsTimechainRecorder")
+            else chainseer_pons.PonsTimechain.seal_analysis
+        )
+        self.assertIn("analysis_evidence_binding", source)
+        # The subject/network must travel with it, or a reader cannot say
+        # WHICH token on WHICH system the evidence belongs to.
+        self.assertIn('"network": "pons"', source)
+        self.assertIn("token_address", source)
+
+    def test_binding_produces_a_complete_verifiable_manifest(self):
+        from chainseer_outcome_ledger import analysis_evidence_binding
+
+        binding = analysis_evidence_binding(
+            self._provenance(), anchor_type="block_pin", anchor_value=4242
+        )
+        self.assertTrue(binding["evidence_manifest"]["complete_fact_hashes"])
+        self.assertEqual(binding["anchor_type"], "block_pin")
+        self.assertEqual(binding["anchor_value"], 4242)
+        self.assertRegex(binding["evidence_hash"], r"^[a-f0-9]{64}$")
+
+    def test_incomplete_provenance_is_reported_not_silently_accepted(self):
+        """Missing fact hashes must mark the manifest incomplete rather than
+        producing a confident-looking hash over nothing."""
+        from chainseer_outcome_ledger import analysis_evidence_binding
+
+        thin = {
+            "block_pin": 7, "anchor_type": "block_pin", "fact_count": 1,
+            "facts": [{"fact_id": "F0000", "source": "rpc", "block": 7}],
+        }
+        binding = analysis_evidence_binding(
+            thin, anchor_type="block_pin", anchor_value=7
+        )
+        self.assertFalse(binding["evidence_manifest"]["complete_fact_hashes"])

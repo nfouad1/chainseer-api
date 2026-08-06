@@ -48,6 +48,7 @@ from chainseer_base import (
     LiveExecutionDisabledError,
     PaperTradeLedger,
 )
+from chainseer_outcome_ledger import analysis_evidence_binding
 from chainseer_governance import (
     TIGHTEN_ONLY_POLICY_VERSION,
     cognitive_only_effect_manifest,
@@ -4348,9 +4349,23 @@ class PonsTimechainRecorder:
             extra_payload={
                 "chain_id": PONS_CHAIN_ID,
                 "protocol": "pons",
+                "network": "pons",
+                "token_address": candidate.token_address,
                 "candidate": candidate.to_dict(),
                 "decision": decision.to_dict(),
                 "cognitive_loop": cognition,
+                # Seal the evidence identity INTO the ring, exactly as Base and
+                # Robinhood do. An outcome can only ever be bound to an analysis
+                # whose evidence manifest was sealed at analysis time -- a hash
+                # added later proves nothing about what was actually observed.
+                # Without this, every Pons analysis is permanently
+                # analysis_evidence_incomplete and can never become recallable
+                # or carry a canonical outcome.
+                **analysis_evidence_binding(
+                    decision.provenance,
+                    anchor_type="block_pin",
+                    anchor_value=decision.block_pin,
+                ),
                 "idempotency_key": idempotency_key,
                 "paper_only": True,
                 "live_execution_enabled": False,
