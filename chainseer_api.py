@@ -494,6 +494,24 @@ class JobAccepted(BaseModel):
     cached: bool = False
 
 
+class RingImportItem(BaseModel):
+    timestamp: str
+    payload: dict[str, Any]
+
+    @field_validator("timestamp")
+    @classmethod
+    def validate_timestamp(cls, value: str) -> str:
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as exc:
+            raise ValueError("invalid ring timestamp") from exc
+        return value
+
+
+class RingImportRequest(BaseModel):
+    rings: list[RingImportItem] = Field(min_length=1, max_length=50)
+
+
 @dataclass
 class Job:
     id: str
@@ -1083,6 +1101,48 @@ class AnalysisService:
         if self._memory is None:
             raise RuntimeError("Timechain Memory Core is not initialized")
         return self._memory.citation(ring_index)
+
+    def import_base_analysis_rings(
+        self, items: list[dict[str, Any]]
+    ) -> list[dict[str, Any]]:
+        """Backfill/forward-sync base_launch_analysis rings sealed elsewhere
+        (locally-run chainseer_base.py) onto this process's Timechain.
+
+        Runs under self._timechain_lock so the idempotency-key scan and the
+        seal it guards stay atomic against any other seal this process makes
+        concurrently; Timechain.seal()'s own file lock already keeps the
+        chain itself consistent, this lock just keeps the dedup check honest.
+        """
+        if self._agent is None or not hasattr(self._agent, "tc"):
+            raise RuntimeError("Timechain is not initialized")
+        tc = self._agent.tc
+        results: list[dict[str, Any]] = []
+        with self._timechain_lock:
+            seen_keys = {
+                (ring.get("payload") or {}).get("idempotency_key")
+                for ring in tc.iter_rings()
+                if ring.get("ring_type") == "base_launch_analysis"
+                and (ring.get("payload") or {}).get("idempotency_key")
+            }
+            for item in items:
+                payload = item["payload"]
+                key = payload.get("idempotency_key")
+                if key and key in seen_keys:
+                    results.append({"status": "duplicate", "idempotency_key": key})
+                    continue
+                try:
+                    ring = tc.seal(
+                        "base_launch_analysis",
+                        payload,
+                        timestamp=item["timestamp"],
+                    )
+                except Exception as exc:  # noqa: BLE001 - report per-item, never abort the batch
+                    results.append({"status": "error", "detail": str(exc)})
+                    continue
+                if key:
+                    seen_keys.add(key)
+                results.append({"status": "sealed", "index": ring["index"]})
+        return results
 
     def health_status(self) -> dict[str, Any]:
         """Return cached worker health without loading watcher state from disk."""
@@ -2049,6 +2109,7 @@ app.add_middleware(
 # so exempting only these two paths doesn't weaken Host validation for
 # anything that actually needs it.
 _HOST_CHECK_EXEMPT_PATHS = {"/health/live", "/health/ready"}
+ADMIN_IMPORT_MAX_REQUEST_BYTES = 3_000_000
 
 
 def _host_header_allowed(host_header: str, patterns: tuple[str, ...]) -> bool:
@@ -2077,6 +2138,17 @@ async def trusted_host_check(request: Request, call_next):
     return await call_next(request)
 
 
+def _max_request_bytes_for(path: str) -> int:
+    # The ring-import batch endpoint carries full historical analysis
+    # payloads (10-25KB each, up to 50 per batch) -- far past the
+    # anti-abuse-sized default meant for /v1/analyses-style requests. It's
+    # auth-gated the same as every other admin surface, so a higher,
+    # still-bounded cap here doesn't loosen the guard on public routes.
+    if path == "/v1/admin/rings/import":
+        return ADMIN_IMPORT_MAX_REQUEST_BYTES
+    return SETTINGS.max_request_bytes
+
+
 @app.middleware("http")
 async def security_headers(request: Request, call_next):
     request_id = request.headers.get("x-request-id") or secrets.token_hex(12)
@@ -2087,11 +2159,12 @@ async def security_headers(request: Request, call_next):
         response.headers["Cache-Control"] = "no-store"
         return response
 
+    limit = _max_request_bytes_for(request.url.path)
     content_length = request.headers.get("content-length")
     if content_length:
         try:
             length = int(content_length)
-            if length < 0 or length > SETTINGS.max_request_bytes:
+            if length < 0 or length > limit:
                 return finalize(
                     JSONResponse(
                         {"detail": "request body is too large"},
@@ -2107,7 +2180,7 @@ async def security_headers(request: Request, call_next):
             )
     elif request.method in {"POST", "PUT", "PATCH"}:
         body = await request.body()
-        if len(body) > SETTINGS.max_request_bytes:
+        if len(body) > limit:
             return finalize(
                 JSONResponse(
                     {"detail": "request body is too large"},
@@ -2264,6 +2337,23 @@ def get_memory_citation(ring_index: int) -> dict[str, Any]:
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             detail="verified memory citation is temporarily unavailable",
         ) from exc
+
+
+@app.post(
+    "/v1/admin/rings/import",
+    dependencies=[Depends(require_api_token)],
+)
+def import_rings(payload: RingImportRequest) -> dict[str, Any]:
+    try:
+        results = SERVICE.import_base_analysis_rings(
+            [item.model_dump() for item in payload.rings]
+        )
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+        ) from exc
+    return {"results": results}
 
 
 @app.get(
