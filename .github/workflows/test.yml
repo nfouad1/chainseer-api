@@ -28,7 +28,7 @@ jobs:
 
       - name: Install pinned Cypher Tempre runtime
         env:
-          CYPHER_TEMPRE_COMMIT: 5b7783f5c84706c5034273cc2772563d5d8fdb76
+          CYPHER_TEMPRE_COMMIT: 94e7dae2ac96aaa9878fa003bc884ea60e324398
         run: |
           curl --fail --silent --show-error --location \
             "https://github.com/cyberphysicsai/cypher-tempre-genesis/archive/${CYPHER_TEMPRE_COMMIT}.zip" \
