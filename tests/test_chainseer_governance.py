@@ -256,9 +256,16 @@ class GovernedPatternLifecycleTests(unittest.TestCase):
         # it is the "manual re-anchor after human review" case that
         # seal_epoch(accept_current=True) exists for. Production paths must NOT
         # use this -- they authorize via begin_mutation() instead.
-        self.epochs.seal_epoch(
-            self.root, reason="legacy fixture", accept_current=True
-        )
+        try:
+            self.epochs.seal_epoch(
+                self.root, reason="legacy fixture", accept_current=True
+            )
+        except TypeError:
+            # Skill builds predating the accept_current gate have no such
+            # kwarg -- and no mismatch guard needing satisfaction either. CI
+            # pins an older Cypher Tempre commit than a developer machine may
+            # have installed, so this fixture must work against both.
+            self.epochs.seal_epoch(self.root, reason="legacy fixture")
         first = self.registry.migrate_cognitive_faculties()
         second = self.registry.migrate_cognitive_faculties()
         self.assertTrue(first["changed"])
