@@ -1112,36 +1112,52 @@ class AnalysisService:
         seal it guards stay atomic against any other seal this process makes
         concurrently; Timechain.seal()'s own file lock already keeps the
         chain itself consistent, this lock just keeps the dedup check honest.
+
+        Suppresses Timechain's per-seal hippocampus reindex (CT_AUTOINDEX)
+        for the duration of the batch -- its own code comment names bulk
+        imports as exactly the case to disable it for, since a full-text
+        reindex on every large historical payload is what actually times
+        out a batch import. The next organic seal (the watcher runs every
+        60s in production) brings the index back to head incrementally via
+        its own staleness check, so nothing needs to be reindexed here.
         """
         if self._agent is None or not hasattr(self._agent, "tc"):
             raise RuntimeError("Timechain is not initialized")
         tc = self._agent.tc
         results: list[dict[str, Any]] = []
+        previous_autoindex = os.environ.get("CT_AUTOINDEX")
         with self._timechain_lock:
-            seen_keys = {
-                (ring.get("payload") or {}).get("idempotency_key")
-                for ring in tc.iter_rings()
-                if ring.get("ring_type") == "base_launch_analysis"
-                and (ring.get("payload") or {}).get("idempotency_key")
-            }
-            for item in items:
-                payload = item["payload"]
-                key = payload.get("idempotency_key")
-                if key and key in seen_keys:
-                    results.append({"status": "duplicate", "idempotency_key": key})
-                    continue
-                try:
-                    ring = tc.seal(
-                        "base_launch_analysis",
-                        payload,
-                        timestamp=item["timestamp"],
-                    )
-                except Exception as exc:  # noqa: BLE001 - report per-item, never abort the batch
-                    results.append({"status": "error", "detail": str(exc)})
-                    continue
-                if key:
-                    seen_keys.add(key)
-                results.append({"status": "sealed", "index": ring["index"]})
+            os.environ["CT_AUTOINDEX"] = "0"
+            try:
+                seen_keys = {
+                    (ring.get("payload") or {}).get("idempotency_key")
+                    for ring in tc.iter_rings()
+                    if ring.get("ring_type") == "base_launch_analysis"
+                    and (ring.get("payload") or {}).get("idempotency_key")
+                }
+                for item in items:
+                    payload = item["payload"]
+                    key = payload.get("idempotency_key")
+                    if key and key in seen_keys:
+                        results.append({"status": "duplicate", "idempotency_key": key})
+                        continue
+                    try:
+                        ring = tc.seal(
+                            "base_launch_analysis",
+                            payload,
+                            timestamp=item["timestamp"],
+                        )
+                    except Exception as exc:  # noqa: BLE001 - report per-item, never abort the batch
+                        results.append({"status": "error", "detail": str(exc)})
+                        continue
+                    if key:
+                        seen_keys.add(key)
+                    results.append({"status": "sealed", "index": ring["index"]})
+            finally:
+                if previous_autoindex is None:
+                    os.environ.pop("CT_AUTOINDEX", None)
+                else:
+                    os.environ["CT_AUTOINDEX"] = previous_autoindex
         return results
 
     def health_status(self) -> dict[str, Any]:
