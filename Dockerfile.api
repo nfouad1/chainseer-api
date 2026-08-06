@@ -18,11 +18,14 @@ RUN pip install --no-cache-dir -r requirements-api.txt
 # same reproducible Timechain implementation on every build. User chain data
 # is never copied into the image; it lives only on the persistent /data disk.
 ADD https://github.com/cyberphysicsai/cypher-tempre-genesis/archive/${CYPHER_TEMPRE_COMMIT}.zip /tmp/cypher-tempre.zip
+COPY scripts/patch_timechain_seal_timestamp.py /tmp/patch_timechain_seal_timestamp.py
 RUN python -m zipfile -e /tmp/cypher-tempre.zip /tmp/cypher-tempre \
     && cp -R \
       /tmp/cypher-tempre/cypher-tempre-genesis-${CYPHER_TEMPRE_COMMIT}/skills/codex/cypher-tempre-self-model \
       /opt/cypher-tempre-self-model \
     && rm -rf /tmp/cypher-tempre /tmp/cypher-tempre.zip \
+    && python /tmp/patch_timechain_seal_timestamp.py /opt/cypher-tempre-self-model/timechain.py \
+    && rm /tmp/patch_timechain_seal_timestamp.py \
     && test -f /opt/cypher-tempre-self-model/timechain.py \
     && test -f /opt/cypher-tempre-self-model/poq.py \
     && test -f /opt/cypher-tempre-self-model/recall.py \
