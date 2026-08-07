@@ -377,6 +377,31 @@ def _governance_state(grown: dict[str, Any]) -> dict[str, Any]:
     return state
 
 
+def seal_registry_mutation(epochs_module, root, reason: str, write):
+    """Authorize a registry mutation from a verified baseline, then commit it.
+
+    Cypher Tempre >=3.30 refuses to seal an epoch over a registry that already
+    differs from the last one, because a post-write snapshot cannot distinguish
+    a legitimate change from injected content -- it lets a tamper alarm
+    self-clear. The supported pattern is a preflight ticket from
+    ``begin_mutation()`` that validates the live registry BEFORE the write and
+    binds the later commit to that exact epoch, which also catches a registry
+    that changed underneath us mid-mutation.
+
+    ``write`` is a zero-argument callable performing the actual registry write.
+    Falls back to the pre-3.30 post-write seal when the installed skill has no
+    ``begin_mutation``, so the repo still runs against an older bundle.
+    """
+    begin = getattr(epochs_module, "begin_mutation", None)
+    ticket = begin(root) if callable(begin) else None
+    write()
+    if ticket is not None:
+        return epochs_module.seal_epoch(
+            root, reason=reason, expected_previous=ticket
+        )
+    return epochs_module.seal_epoch(root, reason=reason)
+
+
 def register_faculty_governance(
     root: str | Path,
     definitions: list[dict[str, Any]],
@@ -592,8 +617,22 @@ class GovernedPatternRegistry:
         reason: str,
         expected_epoch: int,
     ) -> dict[str, Any]:
+        # Authorize the mutation from a VERIFIED baseline before writing, then
+        # bind the commit to that exact ticket. Sealing after the write and
+        # snapshotting whatever is on disk cannot tell a legitimate change from
+        # injected content -- it makes a tamper alarm self-clear. The ticket
+        # also detects a registry that changed underneath us between authorize
+        # and commit. Falls back to the older post-write seal when running
+        # against a skill build that predates begin_mutation().
+        begin = getattr(self.epochs, "begin_mutation", None)
+        ticket = begin(self.root) if callable(begin) else None
         _atomic_write_grown(self.root, grown)
-        epoch = self.epochs.seal_epoch(self.root, reason=reason)
+        if ticket is not None:
+            epoch = self.epochs.seal_epoch(
+                self.root, reason=reason, expected_previous=ticket
+            )
+        else:
+            epoch = self.epochs.seal_epoch(self.root, reason=reason)
         if not epoch or epoch.get("index") != expected_epoch:
             raise GovernanceError("governance mutation did not create the expected registry epoch")
         ok, report = self.epochs.check_epoch(self.root)
@@ -791,15 +830,28 @@ class GovernedPatternRegistry:
         """One-time, integrity-checked migration for pre-governance registries."""
         self._assert_integrity()
         expected_epoch = int(self.tc.height())
-        result = migrate_cognitive_faculty_governance(self.root)
+        result: dict[str, Any] = {}
+
+        def _migrate():
+            result.update(migrate_cognitive_faculty_governance(self.root))
+
         epoch = None
+        # The ticket must be taken before the migration writes, so authorize
+        # and commit as one unit rather than snapshotting after the fact.
+        begin = getattr(self.epochs, "begin_mutation", None)
+        ticket = begin(self.root) if callable(begin) else None
+        _migrate()
         if result.get("changed"):
-            epoch = self.epochs.seal_epoch(
-                self.root,
-                reason=(
-                    "Chainseer tighten-only governance migration for "
-                    f"{result.get('faculty_count')} cognitive faculties"
-                ),
+            reason = (
+                "Chainseer tighten-only governance migration for "
+                f"{result.get('faculty_count')} cognitive faculties"
+            )
+            epoch = (
+                self.epochs.seal_epoch(
+                    self.root, reason=reason, expected_previous=ticket
+                )
+                if ticket is not None
+                else self.epochs.seal_epoch(self.root, reason=reason)
             )
             if not epoch or epoch.get("index") != expected_epoch:
                 raise GovernanceError(

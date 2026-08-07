@@ -1340,31 +1340,52 @@ class FacultyGovernanceActivationTests(unittest.TestCase):
     reported degraded. Observed live: 2 of 36 grown faculties ungoverned.
     """
 
-    def test_activation_actions_cover_born_and_woken_not_just_promoted(self):
+    def test_governed_and_epoch_action_sets_are_deliberately_different(self):
+        """Only promotion/waking put a faculty into grown.json and owe a
+        governance record; a birth lives in emergent.json alone but still
+        changes an epoch-covered file. Collapsing these into one set makes
+        one of them wrong -- demanding a governance record for a "born"
+        faculty raises on a faculty that is legitimately not in grown.json.
+        """
         self.assertEqual(
-            chainseer._REGISTRY_ACTIVATING_ACTIONS,
+            chainseer._REGISTRY_GOVERNED_ACTIONS, frozenset({"promoted", "woken"})
+        )
+        self.assertEqual(
+            chainseer._REGISTRY_EPOCH_ACTIONS,
             frozenset({"born", "promoted", "woken"}),
         )
-
-    def test_chainseer_governs_every_activating_action(self):
-        source = inspect.getsource(
-            chainseer.ChainseerCognitiveLoop.finalize
+        self.assertLess(
+            chainseer._REGISTRY_GOVERNED_ACTIONS,
+            chainseer._REGISTRY_EPOCH_ACTIONS,
         )
-        # Both the governance filter and the epoch-seal guard must reference
-        # the shared constant; a bare == "promoted" governance filter is the
-        # exact regression this guards.
-        self.assertEqual(source.count("_REGISTRY_ACTIVATING_ACTIONS"), 2)
+
+    def test_recurrence_is_governed_by_neither(self):
+        """A recurrence only bumps a counter -- no registry file changes."""
+        for s in (chainseer._REGISTRY_GOVERNED_ACTIONS,
+                  chainseer._REGISTRY_EPOCH_ACTIONS):
+            self.assertNotIn("recurrence", s)
+            self.assertNotIn("covered", s)
+
+    def test_chainseer_uses_the_right_set_at_each_call_site(self):
+        source = inspect.getsource(chainseer.ChainseerCognitiveLoop.finalize)
+        self.assertEqual(source.count("_REGISTRY_GOVERNED_ACTIONS"), 1)
+        self.assertEqual(source.count("_REGISTRY_EPOCH_ACTIONS"), 1)
         self.assertNotIn('action") == "promoted"', source)
 
-    def test_pons_governs_every_activating_action(self):
+    def test_pons_uses_the_right_set_at_each_call_site(self):
         import chainseer_pons
 
         source = inspect.getsource(chainseer_pons.PonsCognitiveLoop.finalize)
-        self.assertEqual(source.count("_REGISTRY_ACTIVATING_ACTIONS"), 2)
+        self.assertEqual(source.count("_REGISTRY_GOVERNED_ACTIONS"), 1)
+        self.assertEqual(source.count("_REGISTRY_EPOCH_ACTIONS"), 1)
         self.assertNotIn('action") == "promoted"', source)
         self.assertEqual(
-            chainseer_pons._REGISTRY_ACTIVATING_ACTIONS,
-            chainseer._REGISTRY_ACTIVATING_ACTIONS,
+            chainseer_pons._REGISTRY_GOVERNED_ACTIONS,
+            chainseer._REGISTRY_GOVERNED_ACTIONS,
+        )
+        self.assertEqual(
+            chainseer_pons._REGISTRY_EPOCH_ACTIONS,
+            chainseer._REGISTRY_EPOCH_ACTIONS,
         )
 
     def test_migration_heals_an_ungoverned_born_faculty(self):

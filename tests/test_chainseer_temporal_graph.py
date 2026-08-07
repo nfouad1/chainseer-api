@@ -248,6 +248,24 @@ class TemporalEntityGraphTests(unittest.TestCase):
             )
             self.assertEqual(store.verify([first, second]), (True, "verified"))
 
+    def test_malformed_analysis_ring_is_skipped_not_fatal(self):
+        good = ring(0, TOKEN_A, evm_graph(TOKEN_A, pin=100), pin=100)
+        malformed = {
+            "index": 1,
+            "ring_type": "base_launch_analysis",
+            "timestamp": "2026-01-01T00:01:00+00:00",
+            "ring_hash": "f" * 64,
+            "payload": {"summary": "no candidate/subject in this payload"},
+        }
+        projection = build_temporal_projection([good, malformed])
+        self.assertEqual(projection["summary"]["subject_count"], 1)
+        self.assertEqual(projection["source_chain"]["analysis_ring_count"], 1)
+        with tempfile.TemporaryDirectory() as temporary:
+            store = TemporalGraphStore(temporary)
+            store.rebuild([good])
+            refreshed = store.refresh([good, malformed])
+            self.assertEqual(refreshed["summary"]["subject_count"], 1)
+
     def test_trusted_single_ring_append_matches_full_projection(self):
         first = ring(0, TOKEN_A, evm_graph(TOKEN_A, pin=100), pin=100)
         second = ring(
