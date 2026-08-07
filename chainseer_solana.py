@@ -106,6 +106,22 @@ DEXSCREENER_API_URL = "https://api.dexscreener.com"
 PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMP_AMM_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 PUMP_PUBLIC_DOCS_COMMIT = "9c82f61cb711b044a17f770ab8ce9f9bdf78f333"
+
+_ECOSYSTEM_LABELS = {
+    "pump_fun": "Pump.fun",
+    "meteora_dbc": "Meteora DBC",
+}
+
+# Analysis rings sealed before this fix carry "ecosystem": "pump_fun"
+# unconditionally, including Meteora candidates. Rings are append-only and
+# tamper-evident, so the mislabel cannot be rewritten -- it is recorded here
+# instead. To recover a pre-fix ring's real venue, read
+# payload["candidate"]["launch_ecosystem"], which was always correct.
+SOLANA_ECOSYSTEM_MISLABEL_NOTE = (
+    "solana_launch_analysis rings sealed before 2026-08-08 set "
+    "payload['ecosystem'] to 'pump_fun' regardless of venue; "
+    "payload['candidate']['launch_ecosystem'] is authoritative for those."
+)
 TOKEN_PROGRAM_ID = "TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA"
 TOKEN_2022_PROGRAM_ID = "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb"
 WRAPPED_SOL_MINT = "So11111111111111111111111111111111111111112"
@@ -3320,8 +3336,11 @@ class SolanaTimechainRecorder:
         key += ":" + hashlib.sha256(
             (decision.analyzed_at + _canonical_json(decision.coverage)).encode("utf-8")
         ).hexdigest()[:16]
+        venue = _ECOSYSTEM_LABELS.get(
+            candidate.launch_ecosystem, candidate.launch_ecosystem or "Unknown"
+        )
         summary = (
-            f"Pump.fun launch {candidate.symbol} ({candidate.mint}) assessed as "
+            f"{venue} launch {candidate.symbol} ({candidate.mint}) assessed as "
             f"{decision.risk_level} with score {decision.score}/100; "
             f"shadow entry {'allowed' if decision.shadow_entry_allowed else 'refused'}."
         )
@@ -3352,7 +3371,11 @@ class SolanaTimechainRecorder:
             ],
             extra_payload={
                 "idempotency_key": key,
-                "ecosystem": "pump_fun",
+                # The candidate's OWN venue. This was hardcoded "pump_fun",
+                # which mislabelled every Meteora analysis in the sealed
+                # ledger -- and rings are immutable, so those cannot be
+                # corrected after the fact. See SOLANA_ECOSYSTEM_MISLABEL_NOTE.
+                "ecosystem": candidate.launch_ecosystem,
                 "pump_public_docs_commit": PUMP_PUBLIC_DOCS_COMMIT,
                 "candidate": candidate.to_dict(),
                 "decision": decision.to_dict(),
@@ -4925,7 +4948,9 @@ class SolanaPrototypeEngine:
         return {
             "schema_version": SCHEMA_VERSION,
             "generated_at": _utc_now(),
-            "ecosystem": "pump_fun",
+            # Calibration pools BOTH venues; labelling it pump_fun overstated
+            # what the sample represents.
+            "ecosystems": sorted(_ECOSYSTEM_LABELS),
             "paper_only": True,
             "live_execution_enabled": False,
             "status": "DESCRIPTIVE_NOT_VALIDATING",
@@ -5105,6 +5130,44 @@ def _solana_dashboard_cohort(trader: SolanaShadowTrader) -> dict:
     }
 
 
+def _solana_ecosystem_breakdown(
+    pump_catalog: dict, meteora_catalog: dict, analyses: list | dict | None
+) -> list[dict]:
+    """Per-venue discovery and analysis counts for the dashboard.
+
+    Analyses are attributed by the candidate's own launch_ecosystem, never by
+    the ring-level "ecosystem" field: that field was hardcoded to "pump_fun"
+    on every ring sealed before 2026-08-08, so counting it would report all
+    Meteora work as Pump.fun. See SOLANA_ECOSYSTEM_MISLABEL_NOTE.
+    """
+    catalogs = {
+        "pump_fun": pump_catalog,
+        "meteora_dbc": meteora_catalog,
+    }
+    analysed: dict[str, int] = {}
+    rows = analyses.values() if isinstance(analyses, dict) else (analyses or [])
+    for row in rows:
+        if not isinstance(row, dict):
+            continue
+        candidate = row.get("candidate")
+        venue = None
+        if isinstance(candidate, dict):
+            venue = candidate.get("launch_ecosystem")
+        venue = venue or row.get("launch_ecosystem")
+        if venue:
+            analysed[str(venue)] = analysed.get(str(venue), 0) + 1
+    out = []
+    for key, catalog in catalogs.items():
+        tokens = catalog.get("tokens")
+        out.append({
+            "ecosystem": key,
+            "label": _ECOSYSTEM_LABELS.get(key, key),
+            "discovered": len(tokens) if isinstance(tokens, dict) else 0,
+            "analysed": analysed.get(key, 0),
+        })
+    return out
+
+
 def _solana_dashboard_snapshot(
     engine: SolanaPrototypeEngine,
     learning_loop: LearningLoopController | None = None,
@@ -5115,6 +5178,7 @@ def _solana_dashboard_snapshot(
     observation_events = engine.observation_ledger.load()
     shadow_events = engine.shadow_ledger.load()
     catalog = _read_json(engine.root / "catalog.json", {})
+    meteora_catalog = _read_json(engine.root / "meteora_catalog.json", {})
     analysis_index = _read_json(engine.analysis_index_path, {})
     analyses = analysis_index.get("tokens", {})
     learning = _read_json(engine.root / "learning_summary.json", {})
@@ -5359,14 +5423,20 @@ def _solana_dashboard_snapshot(
     return {
         "schema_version": SCHEMA_VERSION,
         "generated_at": _utc_now(),
-        "ecosystem": "pump_fun",
+        # Both venues are observed and analysed, so the dashboard reports a
+        # breakdown rather than a single label. It previously said "pump_fun"
+        # while Meteora held the LARGER catalog, hiding it entirely.
+        "ecosystems": _solana_ecosystem_breakdown(catalog, meteora_catalog, analyses),
         "network": "solana_mainnet",
         "paper_only": True,
         "live_execution_enabled": False,
         "learning_loop": (
             learning_loop.status() if learning_loop is not None else None
         ),
-        "catalog_size": len(catalog.get("tokens", {})),
+        "catalog_size": (
+            len(catalog.get("tokens", {}))
+            + len(meteora_catalog.get("tokens", {}))
+        ),
         "analysis_count": len(analyses),
         "evidence_states": evidence_states,
         "admission_states": admission_states,
