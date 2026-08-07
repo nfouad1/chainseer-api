@@ -2150,6 +2150,84 @@ class SolanaPrototypeTests(unittest.TestCase):
         self.assertEqual(snapshot["scheduler"]["status"], "complete")
         self.assertTrue(snapshot["integrity"]["ok"])
 
+    def _serve_dashboard(self, root, *, read_only):
+        """Start the real HTTP server on an ephemeral port and return its URL."""
+        import threading
+
+        engine = chainseer_solana.SolanaPrototypeEngine(
+            root=root,
+            rpc=FakeRPC(),
+            jupiter=FakeJupiter(),
+            record_timechain=False,
+        )
+        holder = {}
+        original = chainseer_solana.ThreadingHTTPServer
+
+        def capture(address, handler):
+            server = original(("127.0.0.1", 0), handler)
+            holder["server"] = server
+            return server
+
+        chainseer_solana.ThreadingHTTPServer = capture
+        try:
+            thread = threading.Thread(
+                target=chainseer_solana.serve_solana_dashboard,
+                args=(engine,),
+                kwargs={"port": 0, "read_only": read_only},
+                daemon=True,
+            )
+            thread.start()
+            for _ in range(200):
+                if "server" in holder:
+                    break
+                time.sleep(0.02)
+            self.assertIn("server", holder, "dashboard server never started")
+        finally:
+            chainseer_solana.ThreadingHTTPServer = original
+        return holder["server"], f"http://127.0.0.1:{holder['server'].server_port}"
+
+    def test_read_only_dashboard_refuses_the_learn_start_endpoint(self):
+        """The learn loop must be refused at the transport, not hidden in the UI.
+
+        solana learn_once holds no LearningRunLock, so a dashboard-driven loop
+        and the scheduled task would write solana_chain concurrently with
+        nothing serialising them -- which has already corrupted that chain
+        once. A hidden button is still a live endpoint.
+        """
+        import urllib.error
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as temp:
+            server, base = self._serve_dashboard(Path(temp), read_only=True)
+            try:
+                for route in ("/api/learn/start", "/api/learn/stop"):
+                    request = urllib.request.Request(
+                        base + route,
+                        data=b"{}",
+                        headers={"Content-Type": "application/json"},
+                        method="POST",
+                    )
+                    with self.subTest(route=route):
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            urllib.request.urlopen(request, timeout=5)
+                        self.assertEqual(caught.exception.code, 403)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_read_only_dashboard_still_serves_the_view(self):
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as temp:
+            server, base = self._serve_dashboard(Path(temp), read_only=True)
+            try:
+                with urllib.request.urlopen(base + "/api/status", timeout=5) as r:
+                    self.assertEqual(r.status, 200)
+                    self.assertTrue(json.loads(r.read().decode("utf-8")))
+            finally:
+                server.shutdown()
+                server.server_close()
+
     def test_dashboard_asset_is_read_only_and_has_no_mock_data(self):
         html = (
             Path(chainseer_solana.__file__)
