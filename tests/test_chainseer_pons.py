@@ -1263,5 +1263,288 @@ class PonsAdapterTests(unittest.TestCase):
         self.assertFalse(pipeline["live_execution_enabled"])
 
 
+class PonsSecurityOutcomeCollectorTests(unittest.TestCase):
+    """The collector is only worth anything if a learn cycle actually runs it."""
+
+    def _engine(self, temp_dir):
+        return chainseer_pons.PonsPrototypeEngine(
+            root=temp_dir,
+            rpc=FakePonsRPC(),
+            http_get=fake_http,
+            record_timechain=False,
+        )
+
+    @staticmethod
+    def _candidate():
+        from datetime import datetime, timedelta, timezone
+        start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+
+        def obs(seconds, **kw):
+            item = {
+                "observed_at": (start + timedelta(seconds=seconds)).isoformat(),
+                "analysis_ring": 11,
+                "hard_stops": [],
+                "liquidity_usd": 100_000.0,
+                "risk_level": "Low",
+                "score": 80.0,
+            }
+            item.update(kw)
+            return item
+
+        return {
+            "observations": [
+                obs(0),
+                obs(360, hard_stops=["owner_can_mint"], liquidity_usd=1_000.0),
+            ]
+        }
+
+    def test_collector_seals_due_outcomes_and_records_completion(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = self._engine(temp_dir)
+            sealed = []
+
+            class Recorder:
+                def seal_security_outcome(self, ring, outcomes, **kw):
+                    sealed.append((ring, outcomes, kw))
+                    return 500 + len(sealed)
+
+            engine.timechain = Recorder()
+            engine.admission.state["candidates"] = {"t": self._candidate()}
+            result = engine.collect_security_outcomes()
+
+            self.assertEqual(result["sealed"], 1)
+            self.assertEqual(result["errors"], [])
+            ring, outcomes, kw = sealed[0]
+            self.assertEqual(ring, 11)
+            self.assertEqual(kw["horizon"], "5m")
+            self.assertIn("owner_can_mint", outcomes["new_hard_stop_codes"])
+            # Completion is persisted, so the next cycle does not re-seal it.
+            self.assertTrue(engine.admission.state["completed_outcomes"])
+            self.assertEqual(engine.collect_security_outcomes()["sealed"], 0)
+
+    def test_collector_without_a_timechain_is_a_no_op(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = self._engine(temp_dir)
+            engine.admission.state["candidates"] = {"t": self._candidate()}
+            self.assertEqual(engine.collect_security_outcomes()["sealed"], 0)
+
+    def test_one_failing_token_never_aborts_the_cycle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = self._engine(temp_dir)
+            calls = []
+
+            class Recorder:
+                def seal_security_outcome(self, ring, outcomes, **kw):
+                    calls.append(ring)
+                    if len(calls) == 1:
+                        raise RuntimeError("chain busy")
+                    return 501
+
+            engine.timechain = Recorder()
+            engine.admission.state["candidates"] = {
+                "a": self._candidate(),
+                "b": self._candidate(),
+            }
+            result = engine.collect_security_outcomes()
+            self.assertEqual(result["sealed"], 1)
+            self.assertEqual(len(result["errors"]), 1)
+            self.assertIn("chain busy", result["errors"][0])
+
+    def test_collector_does_not_clobber_admission_writes_from_the_same_cycle(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = self._engine(temp_dir)
+
+            class Recorder:
+                def seal_security_outcome(self, ring, outcomes, **kw):
+                    return 502
+
+            engine.timechain = Recorder()
+            engine.admission.state["candidates"] = {"t": self._candidate()}
+            engine.admission.state["candidates"]["t"]["marker"] = "set-earlier"
+            engine.collect_security_outcomes()
+            reloaded = engine.admission._load()
+            self.assertEqual(
+                reloaded["candidates"]["t"].get("marker"), "set-earlier"
+            )
+
+    def test_learn_once_reports_security_outcomes(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = self._engine(temp_dir)
+            sentinel = {"due": 3, "sealed": 2, "skipped_no_ring": 0, "errors": []}
+            engine.collect_security_outcomes = lambda **kw: sentinel
+            engine.observe = lambda *a, **kw: {"analyzed": 0}
+            engine.mark_positions = lambda *a, **kw: {
+                "marked": 0,
+                "events": [],
+                "errors": [],
+                "indeterminate": [],
+            }
+            engine._evaluate_policy_learning = lambda: {"recommendation": None}
+            engine.managed_portfolio.evaluate = lambda *a, **kw: {}
+            summary = engine.learn_once(limit=0, mark_limit=0)
+            self.assertEqual(summary["security_outcomes"], sentinel)
+
+
 if __name__ == "__main__":
     unittest.main()
+
+
+class PonsAnalysisEvidenceBindingTests(unittest.TestCase):
+    """A Pons analysis must seal its evidence identity INTO the ring.
+
+    An outcome can only ever bind to an analysis whose evidence manifest was
+    sealed at analysis time -- a hash attached afterwards proves nothing about
+    what was actually observed. Without this, every Pons analysis is
+    permanently analysis_evidence_incomplete: unrecallable, and unable to carry
+    a canonical outcome. Unbound rings cannot be retrofitted, so this has to be
+    sealed from the moment an analysis is written.
+    """
+
+    @staticmethod
+    def _provenance(block_pin=4242):
+        return {
+            "block_pin": block_pin,
+            "anchor_type": "block_pin",
+            "fact_count": 2,
+            "facts": [
+                {
+                    "fact_id": "F0000", "source": "rpc",
+                    "query_hash": "a" * 64, "response_hash": "b" * 64,
+                    "block": block_pin,
+                },
+                {
+                    "fact_id": "F0001", "source": "http",
+                    "query_hash": "c" * 64, "response_hash": "d" * 64,
+                    "block": block_pin,
+                },
+            ],
+        }
+
+    def test_seal_analysis_binds_evidence_in_the_ring(self):
+        import inspect
+
+        source = inspect.getsource(
+            chainseer_pons.PonsTimechainRecorder.seal_analysis
+            if hasattr(chainseer_pons, "PonsTimechainRecorder")
+            else chainseer_pons.PonsTimechain.seal_analysis
+        )
+        self.assertIn("analysis_evidence_binding", source)
+        # The subject/network must travel with it, or a reader cannot say
+        # WHICH token on WHICH system the evidence belongs to.
+        self.assertIn('"network": "pons"', source)
+        self.assertIn("token_address", source)
+
+    def test_binding_produces_a_complete_verifiable_manifest(self):
+        from chainseer_outcome_ledger import analysis_evidence_binding
+
+        binding = analysis_evidence_binding(
+            self._provenance(), anchor_type="block_pin", anchor_value=4242
+        )
+        self.assertTrue(binding["evidence_manifest"]["complete_fact_hashes"])
+        self.assertEqual(binding["anchor_type"], "block_pin")
+        self.assertEqual(binding["anchor_value"], 4242)
+        self.assertRegex(binding["evidence_hash"], r"^[a-f0-9]{64}$")
+
+    def test_incomplete_provenance_is_reported_not_silently_accepted(self):
+        """Missing fact hashes must mark the manifest incomplete rather than
+        producing a confident-looking hash over nothing."""
+        from chainseer_outcome_ledger import analysis_evidence_binding
+
+        thin = {
+            "block_pin": 7, "anchor_type": "block_pin", "fact_count": 1,
+            "facts": [{"fact_id": "F0000", "source": "rpc", "block": 7}],
+        }
+        binding = analysis_evidence_binding(
+            thin, anchor_type="block_pin", anchor_value=7
+        )
+        self.assertFalse(binding["evidence_manifest"]["complete_fact_hashes"])
+
+
+class PonsSecurityOutcomeTests(unittest.TestCase):
+    """Track A: security-horizon outcomes for EVERY analysis.
+
+    92% of Pons analyses never trade, so trade-shaped outcomes would leave the
+    admission gate -- Pons's defining feature -- permanently unvalidated. A rug
+    in a token Pons REFUSED is the strongest evidence the gate worked, and only
+    a security outcome can record it.
+    """
+
+    BASE = "2026-08-01T00:00:00+00:00"
+
+    @staticmethod
+    def _obs(offset_seconds, **kw):
+        from datetime import datetime, timedelta, timezone
+        start = datetime(2026, 8, 1, tzinfo=timezone.utc)
+        item = {
+            "observed_at": (start + timedelta(seconds=offset_seconds)).isoformat(),
+            "analysis_ring": 11,
+            "hard_stops": [],
+            "liquidity_usd": 100_000.0,
+            "risk_level": "Low",
+            "score": 80.0,
+        }
+        item.update(kw)
+        return item
+
+    # ---- horizon selection ----
+
+    def test_observation_must_actually_reach_the_horizon(self):
+        obs = [self._obs(0), self._obs(60)]          # only 1 min elapsed
+        self.assertEqual(chainseer_pons.pons_due_outcomes(obs, set()), [])
+
+    def test_first_observation_at_or_after_each_horizon_is_selected(self):
+        obs = [self._obs(0), self._obs(310), self._obs(3700)]
+        due = chainseer_pons.pons_due_outcomes(obs, set())
+        self.assertEqual([d["horizon"] for d in due], ["5m", "1h"])
+        self.assertEqual(due[0]["current"]["observed_at"], obs[1]["observed_at"])
+
+    def test_observation_far_past_the_horizon_is_refused(self):
+        """A 5m horizon measured 12 days late would be excluded by the outcome
+        ledger anyway -- emitting it manufactures an untrainable record."""
+        obs = [self._obs(0), self._obs(12 * 86400)]
+        due = chainseer_pons.pons_due_outcomes(obs, set())
+        self.assertNotIn("5m", [d["horizon"] for d in due])
+
+    def test_completed_horizons_are_not_reissued(self):
+        obs = [self._obs(0), self._obs(310)]
+        due = chainseer_pons.pons_due_outcomes(obs, {"11:5m"})
+        self.assertEqual(due, [])
+
+    def test_single_observation_yields_nothing(self):
+        self.assertEqual(chainseer_pons.pons_due_outcomes([self._obs(0)], set()), [])
+
+    def test_horizons_stop_at_the_maximum_hold(self):
+        names = [h for h, _ in chainseer_pons.PONS_OUTCOME_HORIZONS]
+        self.assertEqual(names, ["5m", "1h", "6h", "24h", "72h"])
+        self.assertNotIn("30d", names)   # would outlive every position
+        self.assertNotIn("7d", names)
+
+    # ---- outcome content ----
+
+    def test_new_hard_stops_and_liquidity_loss_are_recorded(self):
+        base = self._obs(0)
+        now = self._obs(3700, hard_stops=["HONEYPOT"], liquidity_usd=25_000.0)
+        out = chainseer_pons.pons_security_outcomes(base, now, horizon_seconds=3600)
+        self.assertEqual(out["new_hard_stop_codes"], ["HONEYPOT"])
+        self.assertTrue(out["honeypot_observed"])
+        self.assertAlmostEqual(out["liquidity_removed_pct"], 75.0, places=2)
+        self.assertEqual(out["horizon_seconds"], 3600)
+
+    def test_unmeasured_fields_are_omitted_not_reported_as_zero(self):
+        base = self._obs(0, liquidity_usd=None)
+        now = self._obs(3700, liquidity_usd=None)
+        out = chainseer_pons.pons_security_outcomes(base, now, horizon_seconds=3600)
+        self.assertNotIn("liquidity_removed_pct", out)
+        self.assertNotIn("new_hard_stop_codes", out)
+
+    def test_a_clean_token_produces_no_false_danger_signal(self):
+        out = chainseer_pons.pons_security_outcomes(
+            self._obs(0), self._obs(3700), horizon_seconds=3600
+        )
+        for danger in ("rug_pull", "honeypot_observed", "owner_privilege_used"):
+            self.assertNotIn(danger, out)
+        self.assertAlmostEqual(out["liquidity_removed_pct"], 0.0, places=6)
+
+    def test_unparsable_timestamp_is_treated_as_absent(self):
+        obs = [self._obs(0), self._obs(3700, observed_at="not-a-time")]
+        self.assertEqual(chainseer_pons.pons_due_outcomes(obs, set()), [])

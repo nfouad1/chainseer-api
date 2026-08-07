@@ -48,6 +48,10 @@ from chainseer_base import (
     LiveExecutionDisabledError,
     PaperTradeLedger,
 )
+from chainseer_outcome_ledger import (
+    analysis_evidence_binding,
+    build_outcome_record,
+)
 from chainseer_governance import (
     TIGHTEN_ONLY_POLICY_VERSION,
     cognitive_only_effect_manifest,
@@ -81,6 +85,139 @@ PONS_FIXED_SUPPLY_RAW = 1_000_000_000 * 10**18
 # whose holder is still running -- needless work at best, and on Windows it
 # used to crash outright. Keep the window comfortably above the longest
 # real cycle.
+# Security-outcome horizons for Pons. Deliberately NOT Base's set: Pons is a
+# high-frequency launch specialist whose positions are force-closed at
+# maximum_hold_hours (72h), so 7d and 30d checkpoints would schedule
+# measurements taken long after any position is gone -- the same lateness that
+# already mislabelled most of the existing outcome corpus. The last horizon
+# matches the maximum hold so the longest outcome still describes a window the
+# system actually acts within.
+PONS_OUTCOME_HORIZONS: tuple[tuple[str, int], ...] = (
+    ("5m", 5 * 60),
+    ("1h", 60 * 60),
+    ("6h", 6 * 60 * 60),
+    ("24h", 24 * 60 * 60),
+    ("72h", 72 * 60 * 60),
+)
+
+
+def _pons_observed_at(value) -> datetime | None:
+    """Parse an observation timestamp, treating an unusable one as absent.
+
+    An unparsable timestamp must not be silently coerced to "now" or to the
+    epoch: either would place the observation at a horizon it never measured.
+    """
+    text = str(value or "").strip()
+    if not text:
+        return None
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        return None
+    return parsed if parsed.tzinfo else parsed.replace(tzinfo=timezone.utc)
+
+
+def pons_security_outcomes(
+    baseline: dict, current: dict, *, horizon_seconds: int
+) -> dict:
+    """Diff two admission observations into a security-outcome record.
+
+    Security facts only: whether the TOKEN turned out dangerous, which holds
+    whether or not Pons ever traded it. That is the judgment worth validating
+    for an admission-gated specialist -- 92% of analyses never trade, and a rug
+    in a refused token is the strongest evidence the gate worked.
+
+    Absent evidence stays absent: a field neither observation measured is
+    omitted rather than reported as a benign zero.
+    """
+    result: dict = {"horizon_seconds": int(horizon_seconds)}
+    base_stops = set(baseline.get("hard_stops") or [])
+    now_stops = set(current.get("hard_stops") or [])
+    new_stops = sorted(now_stops - base_stops)
+    if new_stops:
+        result["new_hard_stop_codes"] = new_stops
+
+    base_liq = _safe_float(baseline.get("liquidity_usd"))
+    now_liq = _safe_float(current.get("liquidity_usd"))
+    if base_liq and base_liq > 0 and now_liq is not None:
+        removed = max(0.0, (1 - (now_liq / base_liq)) * 100)
+        result["liquidity_removed_pct"] = round(removed, 4)
+
+    lowered = {code.lower() for code in now_stops}
+    if any("honeypot" in code for code in lowered):
+        result["honeypot_observed"] = True
+    if any("rug" in code or "scam" in code for code in lowered):
+        result["rug_pull"] = True
+    if any("owner" in code or "authority" in code for code in lowered):
+        result["owner_privilege_used"] = True
+
+    base_holder = _safe_float(baseline.get("largest_real_holder_pct"))
+    now_holder = _safe_float(current.get("largest_real_holder_pct"))
+    if base_holder is not None and now_holder is not None:
+        result["largest_holder_delta_pct"] = round(now_holder - base_holder, 4)
+
+    result["observed_risk_level"] = current.get("risk_level")
+    result["observed_score"] = current.get("score")
+    return result
+
+
+def pons_due_outcomes(
+    observations: list[dict],
+    completed: set[str],
+    *,
+    horizons: tuple[tuple[str, int], ...] = PONS_OUTCOME_HORIZONS,
+    tolerance_fraction: float = 0.25,
+    tolerance_floor_seconds: int = 15 * 60,
+) -> list[dict]:
+    """Select observations that genuinely measure each horizon.
+
+    An observation is only evidence for the horizon it CLAIMS: it must fall at
+    or after the horizon, and no later than the outcome-ledger tolerance would
+    accept, or the sealed record would be excluded as observed-too-late anyway.
+    Emitting it regardless would manufacture records that can never train
+    anything.
+    """
+    ordered = [
+        item for item in sorted(
+            observations or [], key=lambda o: str(o.get("observed_at") or "")
+        )
+        if item.get("observed_at") and item.get("analysis_ring") is not None
+    ]
+    if len(ordered) < 2:
+        return []
+    baseline = ordered[0]
+    start = _pons_observed_at(baseline.get("observed_at"))
+    if start is None:
+        return []
+    due: list[dict] = []
+    for name, seconds in horizons:
+        key = f"{baseline.get('analysis_ring')}:{name}"
+        if key in completed:
+            continue
+        tolerance = max(
+            float(tolerance_floor_seconds), tolerance_fraction * float(seconds)
+        )
+        for candidate in ordered[1:]:
+            moment = _pons_observed_at(candidate.get("observed_at"))
+            if moment is None:
+                continue
+            elapsed = (moment - start).total_seconds()
+            if elapsed < seconds:
+                continue
+            if elapsed - seconds > tolerance:
+                break        # every later observation is later still
+            due.append({
+                "key": key,
+                "horizon": name,
+                "horizon_seconds": seconds,
+                "baseline": baseline,
+                "current": candidate,
+                "elapsed_seconds": round(elapsed, 3),
+            })
+            break
+    return due
+
+
 PONS_RUN_LOCK_STALE_SECONDS = 20 * 60
 # How long a cycle will wait for a busy lock before giving up. The guard
 # pass runs ~53s, so this covers the common collision without letting a
@@ -2180,6 +2317,13 @@ class PonsAdmissionQuarantine:
             "observed_at": _iso_from_seconds(now),
             "observed_timestamp": float(now),
             "block_pin": int(decision.get("block_pin") or 0),
+            # Carry the provenance this observation was derived from. Without
+            # it an outcome built from this observation has no evidence
+            # manifest, so it can be sealed and audited but never becomes
+            # learning-eligible. Like the analysis binding, it cannot be added
+            # afterwards -- a hash attached later proves nothing about what was
+            # observed at this block.
+            "provenance": decision.get("provenance") or {},
             "analysis_status": (
                 decision.get("analysis_status")
                 or (
@@ -4359,9 +4503,23 @@ class PonsTimechainRecorder:
             extra_payload={
                 "chain_id": PONS_CHAIN_ID,
                 "protocol": "pons",
+                "network": "pons",
+                "token_address": candidate.token_address,
                 "candidate": candidate.to_dict(),
                 "decision": decision.to_dict(),
                 "cognitive_loop": cognition,
+                # Seal the evidence identity INTO the ring, exactly as Base and
+                # Robinhood do. An outcome can only ever be bound to an analysis
+                # whose evidence manifest was sealed at analysis time -- a hash
+                # added later proves nothing about what was actually observed.
+                # Without this, every Pons analysis is permanently
+                # analysis_evidence_incomplete and can never become recallable
+                # or carry a canonical outcome.
+                **analysis_evidence_binding(
+                    decision.provenance,
+                    anchor_type="block_pin",
+                    anchor_value=decision.block_pin,
+                ),
                 "idempotency_key": idempotency_key,
                 "paper_only": True,
                 "live_execution_enabled": False,
@@ -4376,6 +4534,82 @@ class PonsTimechainRecorder:
             candidate, decision, safe_input, cognition, ring
         )
         return ring["index"]
+
+    def seal_security_outcome(
+        self,
+        analysis_ring_index: int,
+        outcomes: dict,
+        *,
+        observed_at: str,
+        outcome_provenance: dict | None,
+        horizon: str,
+    ) -> dict | None:
+        """Bind a later observation to the analysis that predicted it.
+
+        The original forecast is never rewritten -- the outcome is a NEW ring
+        citing the analysis ring, its sealed evidence hash, and its block pin.
+        Idempotent per (analysis ring, horizon) so a replayed cycle cannot
+        double-count the same measurement.
+        """
+        key = f"pons:outcome:{analysis_ring_index}:{horizon}"
+        existing = self._find(key)
+        if existing is not None:
+            return existing
+        original = next(
+            (
+                ring for ring in self.tc.iter_rings()
+                if ring.get("index") == analysis_ring_index
+            ),
+            None,
+        )
+        if original is None:
+            return None
+        record = build_outcome_record(
+            original,
+            outcomes,
+            observed_at=observed_at,
+            outcome_provenance=outcome_provenance,
+            calibration={
+                "analysis_version": "pons-adapter-v1",
+                "original_risk_level": (
+                    (original.get("payload") or {}).get("decision") or {}
+                ).get("risk_level"),
+                "original_score": (
+                    (original.get("payload") or {}).get("decision") or {}
+                ).get("score"),
+                # Pons is admission-gated: whether it REFUSED the token is the
+                # judgment this outcome validates, and 92% of analyses never
+                # trade, so this is usually the only signal available.
+                "paper_entry_allowed": (
+                    (original.get("payload") or {}).get("decision") or {}
+                ).get("paper_entry_allowed"),
+            },
+        )
+        reference = record["analysis_reference"]
+        summary = (
+            f"Pons {horizon} security outcome for analysis ring "
+            f"{analysis_ring_index}: "
+            f"{'adverse' if record.get('security_outcomes') else 'no adverse'} "
+            "security event observed; live execution remains disabled."
+        )
+        ring = self.tc.seal(
+            "pons_security_outcome",
+            {
+                "summary": summary,
+                "analysis_ring": analysis_ring_index,
+                "analysis_ring_hash": original.get("ring_hash"),
+                "original_evidence_hash": reference["original_evidence_hash"],
+                "anchor_type": reference["anchor_type"],
+                "anchor_value": reference["anchor_value"],
+                "horizon": horizon,
+                "observed_at": observed_at,
+                "outcome_record": record,
+                "idempotency_key": key,
+                "paper_only": True,
+                "live_execution_enabled": False,
+            },
+        )
+        return ring
 
     def seal_trade_event(self, event: dict, *, simulation: str) -> int:
         event_hash = str(event.get("event_hash") or "")
@@ -5112,6 +5346,67 @@ class PonsPrototypeEngine:
             _atomic_json(self.root / "guard_summary.json", summary)
             return summary
 
+    def collect_security_outcomes(self, *, limit: int = 25) -> dict:
+        """Seal security outcomes for analyses whose horizons have come due.
+
+        Track A of the Pons outcome design: every analysis gets security
+        outcomes, traded or not. Pons refuses ~92% of what it analyses, and
+        those refusals are exactly the decisions worth validating -- a rug in a
+        refused token is the strongest evidence the admission gate worked, and
+        no trade-shaped outcome could ever record it.
+        """
+        summary = {"due": 0, "sealed": 0, "skipped_no_ring": 0, "errors": []}
+        if not self.timechain:
+            return summary
+        # Use the LIVE in-memory state, not a fresh _load(). The store loads
+        # once in __init__ and _save() writes self.state, so re-loading here
+        # and assigning it back would discard admission changes made earlier
+        # in this same learn cycle.
+        state = self.admission.state
+        candidates = state.get("candidates") or {}
+        completed = set(state.get("completed_outcomes") or [])
+        changed = False
+        for record in candidates.values():
+            if summary["sealed"] >= max(0, int(limit)):
+                break
+            due = pons_due_outcomes(record.get("observations") or [], completed)
+            summary["due"] += len(due)
+            for item in due:
+                if summary["sealed"] >= max(0, int(limit)):
+                    break
+                baseline, current = item["baseline"], item["current"]
+                try:
+                    ring = self.timechain.seal_security_outcome(
+                        int(baseline["analysis_ring"]),
+                        pons_security_outcomes(
+                            baseline,
+                            current,
+                            horizon_seconds=item["horizon_seconds"],
+                        ),
+                        observed_at=str(current.get("observed_at")),
+                        outcome_provenance={
+                            **(current.get("provenance") or {}),
+                            "block_pin": current.get("block_pin"),
+                            "anchor_type": "block_pin",
+                        },
+                        horizon=item["horizon"],
+                    )
+                except Exception as exc:      # never abort a learn cycle
+                    summary["errors"].append(
+                        f"{item['key']}: {type(exc).__name__}: {exc}"[:200]
+                    )
+                    continue
+                if ring is None:
+                    summary["skipped_no_ring"] += 1
+                    continue
+                completed.add(item["key"])
+                summary["sealed"] += 1
+                changed = True
+        if changed:
+            state["completed_outcomes"] = sorted(completed)
+            self.admission._save()
+        return summary
+
     def learn_once(
         self,
         *,
@@ -5170,6 +5465,10 @@ class PonsPrototypeEngine:
                         managed_portfolio
                     )
                 )
+            # Track A: security-horizon outcomes for EVERY analysis, traded
+            # or not. Runs after observe() so it sees this cycle's fresh
+            # observations, and before summary() so its writes are included.
+            security_outcomes = self.collect_security_outcomes()
             admission_summary = self.admission.summary()
             summary = {
                 "protocol": "pons",
@@ -5233,6 +5532,7 @@ class PonsPrototypeEngine:
                 ],
                 "managed_portfolio": managed_portfolio,
                 "admission_scheduler": admission_summary["scheduler"],
+                "security_outcomes": security_outcomes,
                 "rpc_health": self._save_rpc_health(),
                 "analysis_pipeline": self.analysis_pipeline(),
                 "paper_only": True,
