@@ -187,13 +187,27 @@ class LaunchAdapterRingRecognitionTests(unittest.TestCase):
             },
         }
 
+    # Production shape: decision["mint"] is the mint ACCOUNT object, not the
+    # address. The original fixture used a string here, which is why the
+    # subject-extraction bug passed its tests while every real ring was keyed
+    # by a metadata blob.
+    MINT_ACCOUNT = {
+        "owner_program": "TokenzQdBNbLqP5VEhdkAS6EPFLC1PHnBqCXEpPxuEb",
+        "decimals": 6,
+        "supply_raw": 1000000000000000,
+        "mint_authority": None,
+        "freeze_authority": None,
+    }
+
     @staticmethod
     def _solana_ring(**payload_overrides):
         payload = {
             "candidate": {"mint": "81Z3jR9J9sNZMgot5zSnRNj4AcjH9WtcbG4qLERspump",
                           "slot": 777},
-            "decision": {"mint": "81Z3jR9J9sNZMgot5zSnRNj4AcjH9WtcbG4qLERspump",
-                         "risk_level": "High"},
+            "decision": {
+                "mint": LaunchAdapterRingRecognitionTests.MINT_ACCOUNT,
+                "risk_level": "High",
+            },
         }
         payload.update(payload_overrides)
         return {
@@ -235,7 +249,7 @@ class LaunchAdapterRingRecognitionTests(unittest.TestCase):
         launch = analysis_reference_from_ring(
             self._solana_ring(
                 candidate={"mint": mint, "slot": 5},
-                decision={"mint": mint},
+                decision={"mint": self.MINT_ACCOUNT},
             )
         )
         binding = analysis_evidence_binding(
@@ -251,6 +265,27 @@ class LaunchAdapterRingRecognitionTests(unittest.TestCase):
         })
         self.assertEqual(launch["network"], token["network"])
         self.assertEqual(launch["subject"], token["subject"])
+
+    def test_mint_account_object_is_never_used_as_the_subject(self):
+        """decision["mint"] is the mint ACCOUNT, not the address.
+
+        It is a dict and therefore truthy, so `decision.get("mint") or
+        candidate.get("mint")` silently keyed every one of 6,143 production
+        rings by a metadata blob instead of a mint address -- and they could
+        never unify with solana_token_analysis, which was the entire reason
+        for sharing the "solana" namespace.
+        """
+        reference = analysis_reference_from_ring(self._solana_ring())
+        self.assertIsInstance(reference["subject"], str)
+        self.assertEqual(
+            reference["subject"], "81Z3jR9J9sNZMgot5zSnRNj4AcjH9WtcbG4qLERspump"
+        )
+
+    def test_subject_is_absent_rather_than_a_blob_when_no_address_exists(self):
+        ring = self._solana_ring(
+            candidate={"slot": 5}, decision={"mint": self.MINT_ACCOUNT}
+        )
+        self.assertIsNone(analysis_reference_from_ring(ring)["subject"])
 
     def test_legacy_rings_are_labelled_legacy_not_sealed(self):
         # These 6,912 rings predate evidence manifests. Recognising them must
