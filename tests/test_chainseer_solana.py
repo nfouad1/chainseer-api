@@ -2228,6 +2228,90 @@ class SolanaPrototypeTests(unittest.TestCase):
                 server.shutdown()
                 server.server_close()
 
+    def test_meteora_analysis_seals_its_own_ecosystem_not_pump_fun(self):
+        """The ring must record the venue the candidate actually launched on.
+
+        payload["ecosystem"] was hardcoded "pump_fun", so every Meteora
+        analysis was mislabelled in an append-only, tamper-evident ledger --
+        2,160 of 6,407 production rings before this was caught.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=Path(temp),
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=True,
+                chain_root=Path(temp) / "chain",
+            )
+            seen = {}
+
+            def capture(tc, summary, **kwargs):
+                seen["summary"] = summary
+                seen["payload"] = kwargs.get("extra_payload") or {}
+                return ({"scores": {}}, {"index": 1})
+
+            engine.timechain.poq_module = types.SimpleNamespace(
+                gate_and_seal=capture
+            )
+            item = candidate(launch_ecosystem="meteora_dbc")
+            decision = engine.analyzer.analyze(item)
+            engine.timechain.seal_analysis(item, decision)
+
+            self.assertEqual(seen["payload"]["ecosystem"], "meteora_dbc")
+            self.assertIn("Meteora DBC launch", seen["summary"])
+            self.assertNotIn("Pump.fun", seen["summary"])
+
+    def test_pump_fun_analysis_still_seals_pump_fun(self):
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=Path(temp),
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=True,
+                chain_root=Path(temp) / "chain",
+            )
+            seen = {}
+            engine.timechain.poq_module = types.SimpleNamespace(
+                gate_and_seal=lambda tc, summary, **kw: (
+                    seen.update(payload=kw.get("extra_payload") or {},
+                                summary=summary),
+                    ({"scores": {}}, {"index": 1}),
+                )[1]
+            )
+            item = candidate()
+            engine.timechain.seal_analysis(item, engine.analyzer.analyze(item))
+            self.assertEqual(seen["payload"]["ecosystem"], "pump_fun")
+            self.assertIn("Pump.fun launch", seen["summary"])
+
+    def test_ecosystem_breakdown_counts_both_catalogs(self):
+        breakdown = chainseer_solana._solana_ecosystem_breakdown(
+            {"tokens": {"a": {}, "b": {}}},
+            {"tokens": {"c": {}, "d": {}, "e": {}}},
+            [
+                {"candidate": {"launch_ecosystem": "pump_fun"}},
+                {"candidate": {"launch_ecosystem": "meteora_dbc"}},
+                {"candidate": {"launch_ecosystem": "meteora_dbc"}},
+            ],
+        )
+        by_key = {row["ecosystem"]: row for row in breakdown}
+        self.assertEqual(by_key["pump_fun"]["discovered"], 2)
+        self.assertEqual(by_key["meteora_dbc"]["discovered"], 3)
+        self.assertEqual(by_key["pump_fun"]["analysed"], 1)
+        self.assertEqual(by_key["meteora_dbc"]["analysed"], 2)
+
+    def test_breakdown_ignores_the_mislabelled_ring_level_ecosystem(self):
+        # Pre-fix rings say ecosystem=pump_fun on Meteora candidates. Counting
+        # that field would report all Meteora work as Pump.fun.
+        breakdown = chainseer_solana._solana_ecosystem_breakdown(
+            {"tokens": {}},
+            {"tokens": {}},
+            [{"ecosystem": "pump_fun",
+              "candidate": {"launch_ecosystem": "meteora_dbc"}}],
+        )
+        by_key = {row["ecosystem"]: row for row in breakdown}
+        self.assertEqual(by_key["meteora_dbc"]["analysed"], 1)
+        self.assertEqual(by_key["pump_fun"]["analysed"], 0)
+
     def test_dashboard_asset_is_read_only_and_has_no_mock_data(self):
         html = (
             Path(chainseer_solana.__file__)
