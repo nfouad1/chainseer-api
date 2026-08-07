@@ -16,6 +16,10 @@ import logging
 import os
 import queue
 import re
+try:
+    import resource  # POSIX only -- unavailable on Windows dev/test hosts
+except ImportError:
+    resource = None
 import secrets
 import socket
 import threading
@@ -285,6 +289,14 @@ class Settings:
             900,
             60,
             86400,
+        )
+    )
+    memory_warning_mb: int = field(
+        default_factory=lambda: _env_int(
+            "CHAINSEER_MEMORY_WARNING_MB",
+            1536,
+            256,
+            16384,
         )
     )
 
@@ -835,6 +847,8 @@ class AnalysisService:
         }
         self._benchmark = BenchmarkCaptureRecorder(settings)
         self._base_analysis_idempotency_keys: set[str] | None = None
+        self._last_memory_rss_mb: float | None = None
+        self._memory_warning_active = False
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -1182,6 +1196,11 @@ class AnalysisService:
                 if self._agent is not None
                 else {"status": "not_initialized"}
             ),
+            "memory": {
+                "rss_mb": self._last_memory_rss_mb,
+                "warning_threshold_mb": self.settings.memory_warning_mb,
+                "warning": self._memory_warning_active,
+            },
         }
 
     @contextmanager
@@ -1356,6 +1375,32 @@ class AnalysisService:
                     "status": "deferred_queue_full"
                 }
 
+    def _check_memory_usage(self) -> None:
+        """Log an edge-triggered warning when RSS crosses the configured
+        threshold. A ring-import batch or a /v1/memory/status rebuild has
+        already OOM-killed this machine once (materializing the whole chain
+        into memory) -- this is the early signal so that's caught before
+        the kernel does it for us, not silent until the crash.
+        """
+        if resource is None:
+            return
+        # ru_maxrss is the process's peak RSS in KB on Linux (the platform
+        # this actually runs on) -- a high-water mark, not current usage, but
+        # that's the right semantic for "has this process ever gotten close
+        # to the OOM line", and it means a crossing is reported exactly once
+        # until settings.memory_warning_mb itself is exceeded again higher.
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        self._last_memory_rss_mb = round(rss_mb, 1)
+        over_threshold = rss_mb >= self.settings.memory_warning_mb
+        if over_threshold and not self._memory_warning_active:
+            self._memory_warning_active = True
+            LOGGER.error(
+                "Memory usage warning: RSS %.1fMB >= threshold %dMB "
+                "(prior OOM kill threshold is the machine's total memory)",
+                rss_mb,
+                self.settings.memory_warning_mb,
+            )
+
     def _run_full_audit(self) -> None:
         if self._agent is None or not hasattr(self._agent, "tc"):
             self._integrity_status = {
@@ -1423,6 +1468,7 @@ class AnalysisService:
                 task = self._maintenance_work.get(timeout=timeout)
             except queue.Empty:
                 task = None
+            self._check_memory_usage()
             if task is not None:
                 if not task.benchmark_done:
                     with self._lock:
@@ -2242,6 +2288,7 @@ async def ready() -> dict[str, Any]:
         "timechain_integrity": health["timechain_integrity"],
         "maintenance_queue_depth": health["maintenance_queue_depth"],
         "faculty_pack": health["faculty_pack"],
+        "memory": health["memory"],
     }
 
 
