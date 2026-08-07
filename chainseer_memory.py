@@ -913,9 +913,17 @@ class MemoryCore:
             if projection_present:
                 try:
                     persisted = json.loads(projection_path.read_text(encoding="utf-8"))
+                    # rings=None skips verify_temporal_projection's own internal
+                    # rebuild-and-compare -- `rebuilt` above already is that rebuild,
+                    # so drift is checked against it directly instead of paying for
+                    # a second full build_temporal_projection pass over every ring.
                     projection_ok, projection_reason = verify_temporal_projection(
-                        persisted, rings
+                        persisted, rings=None
                     )
+                    if projection_ok and rebuilt.get("projection_hash") != persisted.get(
+                        "projection_hash"
+                    ):
+                        projection_ok, projection_reason = False, "projection_drift"
                 except (OSError, UnicodeDecodeError, json.JSONDecodeError):
                     projection_reason = "projection_unreadable"
             governance_ok, governance_report = verify_governance_registry(
