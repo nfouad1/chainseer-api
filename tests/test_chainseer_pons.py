@@ -1291,10 +1291,13 @@ class PonsSecurityOutcomeCollectorTests(unittest.TestCase):
             item.update(kw)
             return item
 
+        # Spaced for the shortest SERVICEABLE horizon (6h). The old 360s
+        # spacing targeted the 5m horizon, which no longer exists.
         return {
             "observations": [
                 obs(0),
-                obs(360, hard_stops=["owner_can_mint"], liquidity_usd=1_000.0),
+                obs(6 * 3600 + 60,
+                    hard_stops=["owner_can_mint"], liquidity_usd=1_000.0),
             ]
         }
 
@@ -1316,7 +1319,7 @@ class PonsSecurityOutcomeCollectorTests(unittest.TestCase):
             self.assertEqual(result["errors"], [])
             ring, outcomes, kw = sealed[0]
             self.assertEqual(ring, 11)
-            self.assertEqual(kw["horizon"], "5m")
+            self.assertEqual(kw["horizon"], "6h")
             self.assertIn("owner_can_mint", outcomes["new_hard_stop_codes"])
             # Completion is persisted, so the next cycle does not re-seal it.
             self.assertTrue(engine.admission.state["completed_outcomes"])
@@ -1493,21 +1496,21 @@ class PonsSecurityOutcomeTests(unittest.TestCase):
         self.assertEqual(chainseer_pons.pons_due_outcomes(obs, set()), [])
 
     def test_first_observation_at_or_after_each_horizon_is_selected(self):
-        obs = [self._obs(0), self._obs(310), self._obs(3700)]
+        obs = [self._obs(0), self._obs(6 * 3600 + 60), self._obs(25 * 3600)]
         due = chainseer_pons.pons_due_outcomes(obs, set())
-        self.assertEqual([d["horizon"] for d in due], ["5m", "1h"])
+        self.assertEqual([d["horizon"] for d in due], ["6h", "24h"])
         self.assertEqual(due[0]["current"]["observed_at"], obs[1]["observed_at"])
 
     def test_observation_far_past_the_horizon_is_refused(self):
-        """A 5m horizon measured 12 days late would be excluded by the outcome
+        """A 6h horizon measured 12 days late would be excluded by the outcome
         ledger anyway -- emitting it manufactures an untrainable record."""
         obs = [self._obs(0), self._obs(12 * 86400)]
         due = chainseer_pons.pons_due_outcomes(obs, set())
-        self.assertNotIn("5m", [d["horizon"] for d in due])
+        self.assertNotIn("6h", [d["horizon"] for d in due])
 
     def test_completed_horizons_are_not_reissued(self):
-        obs = [self._obs(0), self._obs(310)]
-        due = chainseer_pons.pons_due_outcomes(obs, {"11:5m"})
+        obs = [self._obs(0), self._obs(6 * 3600 + 60)]
+        due = chainseer_pons.pons_due_outcomes(obs, {"11:6h"})
         self.assertEqual(due, [])
 
     def test_single_observation_yields_nothing(self):
@@ -1515,9 +1518,48 @@ class PonsSecurityOutcomeTests(unittest.TestCase):
 
     def test_horizons_stop_at_the_maximum_hold(self):
         names = [h for h, _ in chainseer_pons.PONS_OUTCOME_HORIZONS]
-        self.assertEqual(names, ["5m", "1h", "6h", "24h", "72h"])
+        self.assertEqual(names, ["6h", "24h", "72h"])
         self.assertNotIn("30d", names)   # would outlive every position
         self.assertNotIn("7d", names)
+
+    def test_no_declared_horizon_is_wildly_beyond_the_refresh_budget(self):
+        """A horizon the schedule can never revisit in time is a promise to
+        seal records the lateness gate must always exclude.
+
+        Required refresh rate per horizon, at ~950 tracked candidates on an
+        ~11-minute cycle: 72h needs ~2/cycle, 24h ~6, 6h ~23, 1h ~139, 5m ~522.
+        The configured budget is PONS_ADMISSION_REFRESH_LIMIT.
+
+        The allowance is 4x that budget rather than 1x, because the scheduler
+        does not round-robin -- it prioritises by freshness shortfall, so a
+        prioritised subset is revisited far faster than the mean. 6h sits at
+        ~3.9x and is therefore partially measurable. 1h (23x) and 5m (87x) are
+        not measurable under any prioritisation, which is why they were
+        removed; this guard is what stops them being reinstated.
+        """
+        tracked, cycle_minutes, headroom = 950, 11, 4
+        budget = chainseer_pons.PONS_ADMISSION_REFRESH_LIMIT
+        for name, seconds in chainseer_pons.PONS_OUTCOME_HORIZONS:
+            tolerance = max(15 * 60, 0.25 * seconds)
+            window_hours = (seconds + tolerance) / 3600
+            required = (tracked / window_hours) * (cycle_minutes / 60)
+            with self.subTest(horizon=name):
+                self.assertLessEqual(
+                    required,
+                    budget * headroom,
+                    f"{name} needs ~{required:.0f} refreshes/cycle against a "
+                    f"budget of {budget}; it cannot be graded",
+                )
+
+    def test_removed_horizons_would_fail_that_guard(self):
+        # Pins WHY 5m and 1h are gone, so the reason survives the next edit.
+        tracked, cycle_minutes = 950, 11
+        budget = chainseer_pons.PONS_ADMISSION_REFRESH_LIMIT
+        for name, seconds in (("5m", 300), ("1h", 3600)):
+            tolerance = max(15 * 60, 0.25 * seconds)
+            required = (tracked / ((seconds + tolerance) / 3600)) * (cycle_minutes / 60)
+            with self.subTest(horizon=name):
+                self.assertGreater(required, budget * 4)
 
     # ---- outcome content ----
 

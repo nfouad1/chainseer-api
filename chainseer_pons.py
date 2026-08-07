@@ -92,9 +92,25 @@ PONS_FIXED_SUPPLY_RAW = 1_000_000_000 * 10**18
 # already mislabelled most of the existing outcome corpus. The last horizon
 # matches the maximum hold so the longest outcome still describes a window the
 # system actually acts within.
+#
+# 5m and 1h were removed as UNSERVICEABLE, not as unimportant. An outcome is
+# only judgeable if a second observation of the same candidate lands within
+# horizon + tolerance, where tolerance is max(15 min, 25% of horizon). That
+# gives a 20-minute window for 5m and 75 minutes for 1h. Covering ~950 tracked
+# candidates at that cadence needs tens of thousands of admission refreshes per
+# day, which no plausible budget reaches. Sealing a record at a horizon the
+# schedule can never service manufactures rows the lateness gate is guaranteed
+# to exclude -- which is how the existing corpus became mostly ungradeable.
+# Declaring only what can be measured keeps the ledger honest.
+# Admission refreshes granted per learn cycle. This is what makes a horizon
+# measurable: an outcome is judgeable only if a SECOND observation of the same
+# candidate lands inside horizon + tolerance, so the revisit rate -- not the
+# discovery rate -- decides how much of the corpus can ever be graded. At 1
+# refresh per cycle the mean revisit across ~950 tracked candidates was ~175h,
+# wider than the widest horizon window (90h), so nothing was gradeable.
+PONS_ADMISSION_REFRESH_LIMIT = 6
+
 PONS_OUTCOME_HORIZONS: tuple[tuple[str, int], ...] = (
-    ("5m", 5 * 60),
-    ("1h", 60 * 60),
     ("6h", 6 * 60 * 60),
     ("24h", 24 * 60 * 60),
     ("72h", 72 * 60 * 60),
@@ -5098,7 +5114,7 @@ class PonsPrototypeEngine:
         enter: bool = False,
         shadow_enter: bool = False,
         max_chunks: int = 50,
-        admission_refresh_limit: int = 3,
+        admission_refresh_limit: int = PONS_ADMISSION_REFRESH_LIMIT,
         update_policy_learning: bool = True,
     ) -> list[dict]:
         now = time.time()
@@ -5413,7 +5429,7 @@ class PonsPrototypeEngine:
         limit: int = 10,
         mark_limit: int = 5,
         max_chunks: int = 50,
-        admission_refresh_limit: int = 3,
+        admission_refresh_limit: int = PONS_ADMISSION_REFRESH_LIMIT,
     ) -> dict:
         started = time.time()
         with LearningRunLock(

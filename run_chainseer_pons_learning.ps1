@@ -61,7 +61,7 @@ try {
             & $pythonPath -X utf8 $chainseerPath learn-once `
                 --limit 2 `
                 --mark-limit 1 `
-                --admission-refresh-limit 1 `
+                --admission-refresh-limit 6 `
                 --max-chunks 2 `
                 --amount-eth 0.01 `
                 --root $learningRoot `
