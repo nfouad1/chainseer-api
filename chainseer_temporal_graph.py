@@ -79,6 +79,16 @@ def _subject_key(network: str, subject: str) -> str:
     return f"{network}:{subject}"
 
 
+def _first_address(*values: Any) -> str | None:
+    """First value that is actually an address string. See the note in
+    chainseer_outcome_ledger: adapters nest metadata objects under keys that
+    elsewhere hold an address, and a truthy dict would become the subject."""
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _analysis_fields(ring: dict[str, Any]) -> dict[str, Any] | None:
     ring_type = str(ring.get("ring_type") or "")
     if ring_type not in ANALYSIS_RING_TYPES:
@@ -103,7 +113,13 @@ def _analysis_fields(ring: dict[str, Any]) -> dict[str, Any] | None:
         # is one subject regardless of which system looked at it.
         network = "solana"
         analysis = payload.get("decision") or {}
-        subject = analysis.get("mint") or (payload.get("candidate") or {}).get("mint")
+        # decision["mint"] is the mint ACCOUNT object, not the address; taking
+        # it would key the subject by a metadata blob.
+        subject = _first_address(
+            analysis.get("mint_address"),
+            (payload.get("candidate") or {}).get("mint"),
+            analysis.get("mint"),
+        )
         score = analysis.get("score")
         hard_stops = analysis.get("hard_stops") or []
         component_scores = analysis.get("component_scores") or {}
@@ -112,7 +128,10 @@ def _analysis_fields(ring: dict[str, Any]) -> dict[str, Any] | None:
         # namespace with general token_analysis.
         network = "robinhood"
         analysis = payload.get("decision") or {}
-        subject = analysis.get("token_address") or (
+        subject = _first_address(
+            analysis.get("token_address"),
+            (payload.get("candidate") or {}).get("token_address"),
+        ) or (
             payload.get("candidate") or {}
         ).get("token_address")
         score = analysis.get("score")

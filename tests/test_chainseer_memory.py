@@ -240,6 +240,31 @@ class MemoryCoreTests(unittest.TestCase):
             status["recovery"]["last_drill_freshness"]["current_head_match"]
         )
 
+    def test_status_still_detects_projection_drift_without_double_rebuild(self):
+        self.seal_analysis()
+        TemporalGraphStore = __import__(
+            "chainseer_temporal_graph", fromlist=["TemporalGraphStore"]
+        ).TemporalGraphStore
+        TemporalGraphStore(self.root).rebuild(self.tc.load())
+        # A ring sealed after the persisted projection was built makes that
+        # cache stale relative to the chain -- status() must still catch this
+        # from the rebuild it already pays for (rebuilt), not a second one.
+        self.seal_analysis(OTHER_TOKEN)
+        core = MemoryCore(
+            self.tc,
+            self.root,
+            backup_root=self.base / "backups",
+            timechain_module=self.timechain_module,
+            epochs_module=self.epochs_module,
+        )
+        status = core.status(cache_seconds=0)
+        self.assertEqual(status["status"], "degraded")
+        self.assertFalse(status["pillars"]["entity_knowledge_graph"]["ok"])
+        self.assertEqual(
+            status["pillars"]["entity_knowledge_graph"]["projection_reason"],
+            "projection_drift",
+        )
+
 
 if __name__ == "__main__":
     unittest.main()
