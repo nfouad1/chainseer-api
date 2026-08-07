@@ -1516,6 +1516,29 @@ class PonsSecurityOutcomeTests(unittest.TestCase):
     def test_single_observation_yields_nothing(self):
         self.assertEqual(chainseer_pons.pons_due_outcomes([self._obs(0)], set()), [])
 
+    def test_lock_wait_clears_the_longest_observed_guard_pass(self):
+        """The guard and the learn cycle share .learn_once.lock.
+
+        If the wait budget is shorter than a guard pass, the learn cycle gives
+        up while the guard is still legitimately working and exits 1. That is
+        not a deadlock or a stale lock -- it is the budget being wrong. At 90s
+        against observed guard runs of 145-232s, learn failed every time it
+        started during a guard pass.
+        """
+        self.assertGreater(
+            chainseer_pons.PONS_RUN_LOCK_WAIT_SECONDS,
+            chainseer_pons.PONS_OBSERVED_GUARD_SECONDS,
+            "learn would abandon a run the guard is still doing",
+        )
+
+    def test_lock_wait_stays_below_the_stale_threshold(self):
+        # Waiting longer than the staleness window would let a caller queue
+        # behind a lock the system has already decided is abandoned.
+        self.assertLess(
+            chainseer_pons.PONS_RUN_LOCK_WAIT_SECONDS,
+            chainseer_pons.PONS_RUN_LOCK_STALE_SECONDS,
+        )
+
     def test_horizons_stop_at_the_maximum_hold(self):
         names = [h for h, _ in chainseer_pons.PONS_OUTCOME_HORIZONS]
         self.assertEqual(names, ["6h", "24h", "72h"])

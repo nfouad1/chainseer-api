@@ -235,10 +235,21 @@ def pons_due_outcomes(
 
 
 PONS_RUN_LOCK_STALE_SECONDS = 20 * 60
-# How long a cycle will wait for a busy lock before giving up. The guard
-# pass runs ~53s, so this covers the common collision without letting a
-# caller queue indefinitely behind a genuinely long run.
-PONS_RUN_LOCK_WAIT_SECONDS = 90
+
+# Longest guard pass observed in production. The guard and the learn cycle
+# share .learn_once.lock, so this is the figure the wait budget has to clear.
+# It is NOT the old ~53s: the guard grew as the catalog did, and 53s was
+# measured back when it was being killed at a 2-minute scheduler limit before
+# it could finish -- so the old number was an artifact of truncation, not a
+# real runtime.
+PONS_OBSERVED_GUARD_SECONDS = 232
+
+# How long a cycle will wait for a busy lock before giving up. This must
+# exceed the longest guard pass, or the learn cycle gives up while the guard
+# is still legitimately working and exits 1. At 90s against guard runs of
+# 145-232s that is exactly what happened: learn failed repeatedly, ~110s in,
+# every time it started during a guard pass.
+PONS_RUN_LOCK_WAIT_SECONDS = 300
 ZERO_ADDRESS = "0x" + "0" * 40
 DEAD_ADDRESS = "0x000000000000000000000000000000000000dead"
 
