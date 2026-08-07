@@ -200,6 +200,20 @@ def _ring_payload_provenance(ring_type: str, payload: dict[str, Any]) -> dict[st
     return payload.get("provenance") or {}
 
 
+def _first_address(*values: Any) -> str | None:
+    """First value that is actually an address string.
+
+    Several adapters nest a metadata object under the same key that elsewhere
+    holds the address (Solana's decision["mint"] is the mint ACCOUNT). A bare
+    `a or b` chain accepts that dict because it is truthy, so the subject
+    becomes an unusable blob rather than an address.
+    """
+    for value in values:
+        if isinstance(value, str) and value.strip():
+            return value.strip()
+    return None
+
+
 def _ring_network_subject(
     ring_type: str, payload: dict[str, Any]
 ) -> tuple[str, str | None]:
@@ -213,9 +227,15 @@ def _ring_network_subject(
         # analysed by both the public product and the autotrader is ONE
         # subject, and splitting it would hide exactly the cross-system
         # agreement the Memory Core exists to surface.
+        #
+        # decision["mint"] is the mint ACCOUNT (authorities, decimals, supply),
+        # not the address. It is a dict, so a plain `or` chain would take it as
+        # the subject and key every ring by a metadata blob instead of a mint.
         decision = payload.get("decision") or {}
         candidate = payload.get("candidate") or {}
-        return "solana", decision.get("mint") or candidate.get("mint")
+        return "solana", _first_address(
+            decision.get("mint_address"), candidate.get("mint"), decision.get("mint")
+        )
     if ring_type == "pons_launch_analysis":
         # Pons runs ON Robinhood Chain (chain_id 4663), so its subjects share
         # the "robinhood" namespace with general token_analysis rings rather
