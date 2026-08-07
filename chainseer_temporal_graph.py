@@ -581,7 +581,16 @@ def _apply_graph(
 def _apply_analysis_ring(
     projection: dict[str, Any], ring: dict[str, Any]
 ) -> None:
-    fields = _analysis_fields(ring)
+    try:
+        fields = _analysis_fields(ring)
+    except TemporalGraphError:
+        # A recognized ring type with content too malformed to project (e.g.
+        # missing subject) is excluded the same way an unrecognized ring type
+        # already is -- tamper-evident on the chain, just not promoted into
+        # the projection. One bad ring must not abort the fold over every
+        # other ring, which is what building a whole status/recall response
+        # from this projection depends on.
+        return
     if fields is None:
         return
     subject = _ensure_subject(projection, fields)
