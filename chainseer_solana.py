@@ -5599,7 +5599,17 @@ def serve_solana_dashboard(
     *,
     host: str = "127.0.0.1",
     port: int = 8767,
+    read_only: bool = False,
 ) -> None:
+    """Serve the local Solana dashboard.
+
+    read_only refuses the learn start/stop endpoints outright. That matters
+    because solana learn_once, unlike the Pons and Base cycles, holds NO
+    LearningRunLock: a dashboard-driven loop and the scheduled task would write
+    solana_chain concurrently with nothing to serialise them, which has already
+    corrupted that chain once. Until the loop is lock-protected, read_only is
+    the only way to guarantee a single writer while the scheduler is enabled.
+    """
     if host not in {"127.0.0.1", "localhost", "::1"}:
         raise ValueError(
             "The Solana dashboard is local-only; bind to 127.0.0.1 or localhost"
@@ -5690,6 +5700,15 @@ def serve_solana_dashboard(
 
         def do_POST(self):
             route = urlparse(self.path).path
+            if read_only:
+                # Refused at the transport, not hidden in the UI: a hidden
+                # button is still a live endpoint for anything that can reach
+                # this port.
+                self._send(
+                    403, "application/json; charset=utf-8",
+                    b'{"error":"dashboard is running read-only"}',
+                )
+                return
             if route == "/api/learn/start":
                 body = self._read_json_body()
                 if body is None:
@@ -5733,7 +5752,13 @@ def serve_solana_dashboard(
 
     server = ThreadingHTTPServer((host, int(port)), DashboardHandler)
     print(f"Solana learn-once dashboard: http://{host}:{port}")
-    print("Read-only local view. Press Ctrl+C to stop.")
+    if read_only:
+        print("READ-ONLY: learn start/stop refused (403). Press Ctrl+C to stop.")
+    else:
+        # The old banner said "Read-only local view" while serving live
+        # start/stop endpoints. Say what is actually true.
+        print("Learn controls ENABLED -- starting a loop here writes to the")
+        print("chain. Press Ctrl+C to stop.")
     try:
         server.serve_forever(poll_interval=0.5)
     except KeyboardInterrupt:
@@ -5819,6 +5844,11 @@ def main() -> None:
     dashboard = subparsers.add_parser("dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8767)
+    dashboard.add_argument(
+        "--read-only",
+        action="store_true",
+        help="refuse the learn start/stop endpoints (403); view only",
+    )
     subparsers.add_parser("status")
     subparsers.add_parser("promotion")
     subparsers.add_parser("calibration")
@@ -5894,7 +5924,9 @@ def main() -> None:
             )
         )
     elif args.command == "dashboard":
-        serve_solana_dashboard(engine, host=args.host, port=args.port)
+        serve_solana_dashboard(
+            engine, host=args.host, port=args.port, read_only=args.read_only
+        )
     elif args.command == "verify":
         report = engine.verify()
         print(json.dumps(report, indent=2))
