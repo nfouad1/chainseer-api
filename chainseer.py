@@ -82,6 +82,7 @@ from chainseer_governance import (
     TIGHTEN_ONLY_POLICY_VERSION,
     cognitive_only_effect_manifest,
     migrate_cognitive_faculty_governance,
+    seal_registry_mutation,
     register_faculty_governance,
     validate_faculty_pack_governance,
     verify_governance_registry,
@@ -99,11 +100,19 @@ from chainseer_temporal_graph import (
 
 CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
-#: Cambium actions that place a faculty into the ACTIVE registry. Governance
-#: registration and registry-epoch sealing must both key off this same set --
-#: when they drifted apart, born/woken faculties were sealed into an epoch
-#: with no governance record and failed verification afterwards.
-_REGISTRY_ACTIVATING_ACTIONS = frozenset({"born", "promoted", "woken"})
+#: Cambium actions that put a faculty into the ACTIVE registry (grown.json),
+#: and therefore require a governance record. `promote()` writes grown.json;
+#: `wake()` flips a dormant grown.json entry back to active. A "born" faculty
+#: lives only in emergent.json until it is promoted, and "recurrence" only
+#: bumps a counter -- neither appears in grown.json, so demanding a governance
+#: record for them would raise on a faculty that is legitimately not there.
+_REGISTRY_GOVERNED_ACTIONS = frozenset({"promoted", "woken"})
+#: Actions that mutate ANY epoch-covered registry file and so require a fresh
+#: registry epoch. Broader than the governed set on purpose: a birth changes
+#: emergent.json, which the epoch covers even though no governance record is
+#: owed. These two sets are deliberately different -- collapsing them makes
+#: one of the two wrong.
+_REGISTRY_EPOCH_ACTIONS = frozenset({"born", "promoted", "woken"})
 ZERO_ADDRESS = "0x" + "0" * 40
 
 
@@ -364,22 +373,26 @@ def install_curated_faculty_pack(
                 "Faculty pack is present but registry epoch verification failed: "
                 + "; ".join(epoch_report)
             )
-        governance_changed = register_faculty_governance(
+        changed_box = {}
+        governance_epoch = seal_registry_mutation(
+            epochs_module,
             root,
-            definitions,
-            source=(
-                f"reviewed_pack:{pack.get('name')}@{pack.get('version')}"
+            reason=(
+                f"tighten-only governance for reviewed Chainseer faculty pack "
+                f"{pack.get('name')}@{pack.get('version')}"
+            ),
+            write=lambda: changed_box.update(
+                changed=register_faculty_governance(
+                    root,
+                    definitions,
+                    source=(
+                        f"reviewed_pack:{pack.get('name')}@{pack.get('version')}"
+                    ),
+                )
             ),
         )
-        governance_epoch = None
+        governance_changed = bool(changed_box.get("changed"))
         if governance_changed:
-            governance_epoch = epochs_module.seal_epoch(
-                root,
-                reason=(
-                    f"tighten-only governance for reviewed Chainseer faculty pack "
-                    f"{pack.get('name')}@{pack.get('version')}"
-                ),
-            )
             ok, epoch_report = epochs_module.check_epoch(root)
             if not ok:
                 raise RuntimeError(
@@ -455,17 +468,17 @@ def install_curated_faculty_pack(
             + ", ".join(missing)
         )
 
-    register_faculty_governance(
-        root,
-        definitions,
-        source=f"reviewed_pack:{pack.get('name')}@{pack.get('version')}",
-    )
-
-    epoch = epochs_module.seal_epoch(
+    epoch = seal_registry_mutation(
+        epochs_module,
         root,
         reason=(
             f"reviewed Chainseer faculty pack {pack.get('name')}@"
             f"{pack.get('version')}"
+        ),
+        write=lambda: register_faculty_governance(
+            root,
+            definitions,
+            source=f"reviewed_pack:{pack.get('name')}@{pack.get('version')}",
         ),
     )
     ok, epoch_report = epochs_module.check_epoch(root)
@@ -523,15 +536,15 @@ class ChainseerCognitiveLoop:
                 "Faculty registry integrity verification failed before "
                 "governance migration: " + "; ".join(report)
             )
-        migration = migrate_cognitive_faculty_governance(self.root)
-        if migration.get("changed"):
-            self.epochs_module.seal_epoch(
-                self.root,
-                reason=(
-                    "Chainseer tighten-only governance migration for "
-                    f"{migration.get('faculty_count')} cognitive faculties"
-                ),
-            )
+        migration: dict = {}
+        seal_registry_mutation(
+            self.epochs_module,
+            self.root,
+            reason="Chainseer tighten-only governance migration",
+            write=lambda: migration.update(
+                migrate_cognitive_faculty_governance(self.root)
+            ),
+        )
 
     def seal_bootstrap_epoch(self) -> dict | None:
         return self.epochs_module.seal_epoch(
@@ -976,7 +989,7 @@ class ChainseerCognitiveLoop:
                 (item.get("faculty") or {}).get("name"),
             )
             for item in (growth or [])
-            if item.get("action") in _REGISTRY_ACTIVATING_ACTIONS
+            if item.get("action") in _REGISTRY_GOVERNED_ACTIONS
         }
         if governed_identities:
             grown_path = self.root / "registry" / "grown.json"
@@ -997,7 +1010,7 @@ class ChainseerCognitiveLoop:
                 source=f"cambium_after_analysis:{analysis_ring['index']}",
                 default_manifest=cognitive_only_effect_manifest(),
             )
-        if any(item.get("action") in _REGISTRY_ACTIVATING_ACTIONS
+        if any(item.get("action") in _REGISTRY_EPOCH_ACTIONS
                for item in (growth or [])):
             self._seal_registry_epoch(
                 reason=f"faculty change after analysis ring {analysis_ring['index']}"

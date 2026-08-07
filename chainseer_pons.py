@@ -52,16 +52,18 @@ from chainseer_governance import (
     TIGHTEN_ONLY_POLICY_VERSION,
     cognitive_only_effect_manifest,
     migrate_cognitive_faculty_governance,
+    seal_registry_mutation,
     register_faculty_governance,
     verify_governance_registry,
 )
 
 
 PONS_CHAIN_ID = 4663
-#: Cambium actions that place a faculty into the ACTIVE registry. Governance
-#: registration and registry-epoch sealing must both key off this same set
-#: (mirrors chainseer._REGISTRY_ACTIVATING_ACTIONS).
-_REGISTRY_ACTIVATING_ACTIONS = frozenset({"born", "promoted", "woken"})
+#: Mirrors chainseer.py: only promotion/waking put a faculty into grown.json
+#: and owe a governance record, while a birth still changes emergent.json
+#: and so needs a fresh epoch. The two sets are deliberately different.
+_REGISTRY_GOVERNED_ACTIONS = frozenset({"promoted", "woken"})
+_REGISTRY_EPOCH_ACTIONS = frozenset({"born", "promoted", "woken"})
 PONS_RPC_URL = os.environ.get(
     "CHAINSEER_PONS_RPC_URL", "https://rpc.mainnet.chain.robinhood.com"
 )
@@ -4014,13 +4016,13 @@ class PonsCognitiveLoop:
                 "Pons faculty registry integrity failed before governance "
                 "migration: " + "; ".join(report)
             )
-        migration = migrate_cognitive_faculty_governance(self.root)
-        self.epochs_module.seal_epoch(
+        migration: dict = {}
+        seal_registry_mutation(
+            self.epochs_module,
             self.root,
-            reason=(
-                "Chainseer Pons tighten-only faculty governance migration"
-                if migration.get("changed")
-                else "Chainseer Pons faculty bootstrap"
+            reason="Chainseer Pons tighten-only faculty governance migration",
+            write=lambda: migration.update(
+                migrate_cognitive_faculty_governance(self.root)
             ),
         )
         self.verify_registry()
@@ -4170,6 +4172,12 @@ class PonsCognitiveLoop:
         salience = cognition.get("salience")
         if isinstance(salience, (int, float)):
             os.environ["CT_TURN_SALIENCE"] = str(int(salience))
+        # Authorize the registry mutation from the verified baseline BEFORE
+        # Cambium writes to it. Cambium owns the write, so the ticket has to be
+        # taken here; sealing afterwards would ask the epoch layer to bless a
+        # registry it has not seen change.
+        _begin = getattr(self.epochs_module, "begin_mutation", None)
+        growth_ticket = _begin(self.root) if callable(_begin) else None
         try:
             growth = self.cambium_module.fill_gap(
                 self.root,
@@ -4202,7 +4210,7 @@ class PonsCognitiveLoop:
                 (item.get("faculty") or {}).get("name"),
             )
             for item in (growth or [])
-            if item.get("action") in _REGISTRY_ACTIVATING_ACTIONS
+            if item.get("action") in _REGISTRY_GOVERNED_ACTIONS
         }
         if governed_identities:
             grown = json.loads(
@@ -4226,16 +4234,19 @@ class PonsCognitiveLoop:
                 default_manifest=cognitive_only_effect_manifest(),
             )
         if any(
-            item.get("action") in _REGISTRY_ACTIVATING_ACTIONS
+            item.get("action") in _REGISTRY_EPOCH_ACTIONS
             for item in (growth or [])
         ):
-            self.epochs_module.seal_epoch(
-                self.root,
-                reason=(
-                    "Pons faculty change after analysis ring "
-                    f"{analysis_ring['index']}"
-                ),
+            _reason = (
+                "Pons faculty change after analysis ring "
+                f"{analysis_ring['index']}"
             )
+            if growth_ticket is not None:
+                self.epochs_module.seal_epoch(
+                    self.root, reason=_reason, expected_previous=growth_ticket
+                )
+            else:
+                self.epochs_module.seal_epoch(self.root, reason=_reason)
         self.verify_registry()
         cognition["status"] = "complete"
         cognition["analysis_ring"] = analysis_ring["index"]
