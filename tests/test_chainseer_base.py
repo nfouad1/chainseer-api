@@ -1325,6 +1325,159 @@ class BasePrototypeTests(unittest.TestCase):
             self.assertIn("event_hash", reason)
 
 
+
+class BaseDashboardTests(unittest.TestCase):
+    """The Base dashboard must be read-only by construction.
+
+    The Solana dashboard shipped learn start/stop endpoints while its banner
+    claimed to be read-only, and solana learn_once takes no run lock -- so a
+    second writer was one request away, and that combination has already
+    corrupted solana_chain once. This server defines no do_POST at all.
+    """
+
+    def _engine(self, root):
+        return chainseer_base.BasePrototypeEngine(
+            root=root, record_timechain=False
+        )
+
+    def _serve(self, root):
+        import threading
+
+        engine = self._engine(root)
+        holder = {}
+        original = chainseer_base.ThreadingHTTPServer
+
+        def capture(address, handler):
+            server = original(("127.0.0.1", 0), handler)
+            holder["server"] = server
+            return server
+
+        chainseer_base.ThreadingHTTPServer = capture
+        try:
+            threading.Thread(
+                target=chainseer_base.serve_base_dashboard,
+                args=(engine,),
+                kwargs={"port": 0},
+                daemon=True,
+            ).start()
+            for _ in range(200):
+                if "server" in holder:
+                    break
+                time.sleep(0.02)
+            self.assertIn("server", holder, "dashboard server never started")
+        finally:
+            chainseer_base.ThreadingHTTPServer = original
+        server = holder["server"]
+        return server, f"http://127.0.0.1:{server.server_port}"
+
+    def test_snapshot_reports_real_state_and_declares_read_only(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            (root / "learning_summary.json").write_text(
+                json.dumps({
+                    "projects": 316,
+                    "checkpoints_complete": 1311,
+                    "checkpoints_pending": 585,
+                    "generated_at": "2026-08-08T00:00:00+00:00",
+                    "shadow_performance": {
+                        "modeled_return_pct": -4.36,
+                        "mark_coverage_pct": 100.0,
+                    },
+                }),
+                encoding="utf-8",
+            )
+            (root / "shadow_state.json").write_text(
+                json.dumps({"positions": {
+                    "a": {"status": "open"},
+                    "b": {"status": "closed"},
+                    "c": {"status": "open"},
+                }}),
+                encoding="utf-8",
+            )
+            snapshot = chainseer_base._base_dashboard_snapshot(self._engine(root))
+
+            self.assertTrue(snapshot["read_only"])
+            self.assertTrue(snapshot["paper_only"])
+            self.assertFalse(snapshot["live_execution_enabled"])
+            self.assertEqual(snapshot["projects"], 316)
+            self.assertEqual(snapshot["checkpoints_pending"], 585)
+            # Only OPEN positions count; a closed one must not inflate the tile.
+            self.assertEqual(snapshot["shadow_open_positions"], 2)
+            self.assertEqual(
+                snapshot["shadow_performance"]["modeled_return_pct"], -4.36
+            )
+
+    def test_snapshot_survives_a_missing_learning_store(self):
+        # A fresh root has no sqlite file; the view must still render.
+        with tempfile.TemporaryDirectory() as temp:
+            snapshot = chainseer_base._base_dashboard_snapshot(
+                self._engine(Path(temp))
+            )
+            self.assertEqual(snapshot["recent_runs"], [])
+            self.assertIsNone(snapshot["projects"])
+
+    def test_dashboard_exposes_no_write_endpoints(self):
+        import urllib.error
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as temp:
+            server, base = self._serve(Path(temp))
+            try:
+                for route in ("/api/learn/start", "/api/status", "/"):
+                    request = urllib.request.Request(
+                        base + route, data=b"{}", method="POST"
+                    )
+                    with self.subTest(route=route):
+                        with self.assertRaises(urllib.error.HTTPError) as caught:
+                            urllib.request.urlopen(request, timeout=5)
+                        # 501 is BaseHTTPRequestHandler refusing an unimplemented
+                        # method -- there is no POST handler to reach.
+                        self.assertIn(caught.exception.code, (404, 501))
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_serves_the_view_and_health(self):
+        import urllib.request
+
+        with tempfile.TemporaryDirectory() as temp:
+            server, base = self._serve(Path(temp))
+            try:
+                with urllib.request.urlopen(base + "/", timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+                    self.assertIn(b"Chainseer Base", response.read())
+                with urllib.request.urlopen(
+                    base + "/api/status", timeout=5
+                ) as response:
+                    self.assertEqual(response.status, 200)
+                    payload = json.loads(response.read().decode("utf-8"))
+                    self.assertTrue(payload["read_only"])
+                with urllib.request.urlopen(base + "/health", timeout=5) as response:
+                    self.assertEqual(response.status, 200)
+            finally:
+                server.shutdown()
+                server.server_close()
+
+    def test_dashboard_refuses_a_non_loopback_bind(self):
+        with tempfile.TemporaryDirectory() as temp:
+            with self.assertRaisesRegex(ValueError, "local-only"):
+                chainseer_base.serve_base_dashboard(
+                    self._engine(Path(temp)), host="0.0.0.0"
+                )
+
+    def test_dashboard_asset_states_its_guarantees(self):
+        html = (
+            Path(chainseer_base.__file__)
+            .with_name("base_dashboard.html")
+            .read_text(encoding="utf-8")
+        )
+        self.assertIn('fetch("/api/status"', html)
+        self.assertIn("LIVE LOCAL DATA", html)
+        self.assertIn("NO SIGNING", html)
+        self.assertIn("NO PRIVATE KEYS", html)
+        self.assertNotIn("mockData", html)
+
+
 if __name__ == "__main__":
     unittest.main()
 

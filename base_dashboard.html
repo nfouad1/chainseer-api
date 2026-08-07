@@ -1,0 +1,184 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Chainseer Base — learning view</title>
+<style>
+  :root {
+    color-scheme: light dark;
+    --bg: #0f1115; --panel: #171a21; --line: #262b36;
+    --ink: #e7eaf0; --muted: #99a2b3;
+    --ok: #4ade80; --warn: #fbbf24; --bad: #f87171; --accent: #60a5fa;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      --bg: #f6f7f9; --panel: #fff; --line: #e2e5ea;
+      --ink: #12151b; --muted: #5b6472;
+    }
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; padding: 24px; background: var(--bg); color: var(--ink);
+    font: 14px/1.5 ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  header { display: flex; flex-wrap: wrap; align-items: baseline; gap: 12px; margin-bottom: 4px; }
+  h1 { font-size: 18px; margin: 0; font-weight: 650; }
+  .tag {
+    font-size: 11px; letter-spacing: .04em; text-transform: uppercase;
+    padding: 3px 8px; border-radius: 999px; border: 1px solid var(--line);
+    color: var(--muted);
+  }
+  .tag.ro { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 45%, transparent); }
+  .sub { color: var(--muted); font-size: 12px; margin-bottom: 20px; }
+  .grid { display: grid; gap: 12px; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); }
+  .card { background: var(--panel); border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; }
+  .k { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; }
+  .v { font-size: 24px; font-weight: 600; margin-top: 6px; font-variant-numeric: tabular-nums; }
+  .v small { font-size: 12px; font-weight: 400; color: var(--muted); }
+  section { margin-top: 26px; }
+  h2 { font-size: 13px; text-transform: uppercase; letter-spacing: .06em; color: var(--muted); margin: 0 0 10px; }
+  .scroll { overflow-x: auto; border: 1px solid var(--line); border-radius: 10px; background: var(--panel); }
+  table { border-collapse: collapse; width: 100%; min-width: 720px; }
+  th, td { text-align: left; padding: 9px 12px; border-bottom: 1px solid var(--line); white-space: nowrap; }
+  th { color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .05em; font-weight: 500; }
+  tr:last-child td { border-bottom: 0; }
+  td.num { text-align: right; font-variant-numeric: tabular-nums; }
+  .ok { color: var(--ok); } .warn { color: var(--warn); } .bad { color: var(--bad); }
+  .err { color: var(--bad); font-size: 12px; white-space: normal; }
+  footer { margin-top: 26px; color: var(--muted); font-size: 12px; }
+  #stale { display: none; margin-bottom: 16px; padding: 10px 14px; border-radius: 8px;
+           border: 1px solid color-mix(in srgb, var(--warn) 45%, transparent); color: var(--warn); }
+</style>
+</head>
+<body>
+<header>
+  <h1>Chainseer Base</h1>
+  <span class="tag ro">Read-only</span>
+  <span class="tag">Paper only</span>
+  <span class="tag">LIVE LOCAL DATA</span>
+</header>
+<div class="sub" id="sub">Loading…</div>
+
+<div id="stale"></div>
+
+<div class="grid" id="tiles"></div>
+
+<section>
+  <h2>Shadow performance</h2>
+  <div class="grid" id="perf"></div>
+</section>
+
+<section>
+  <h2>Recent learn cycles</h2>
+  <div class="scroll"><table id="runs">
+    <thead><tr>
+      <th>Run</th><th>Started</th><th>Status</th>
+      <th class="num">Discovered</th><th class="num">New</th>
+      <th class="num">Outcomes</th><th class="num">Shadow</th><th>Errors</th>
+    </tr></thead>
+    <tbody></tbody>
+  </table></div>
+</section>
+
+<footer id="foot"></footer>
+
+<script>
+const NA = "—";
+function num(v) { return (v === null || v === undefined) ? NA : Number(v).toLocaleString(); }
+function pct(v) { return (v === null || v === undefined) ? NA : Number(v).toFixed(2) + "%"; }
+function mins(v) { return (v === null || v === undefined) ? NA : (Number(v) / 60).toFixed(1) + " min"; }
+function tile(k, v, cls) {
+  return '<div class="card"><div class="k">' + k + '</div><div class="v ' +
+         (cls || "") + '">' + v + "</div></div>";
+}
+
+async function refresh() {
+  let d;
+  try {
+    const r = await fetch("/api/status", { cache: "no-store" });
+    d = await r.json();
+    if (!r.ok || d.error) throw new Error(d.error || ("HTTP " + r.status));
+  } catch (e) {
+    document.getElementById("sub").textContent = "Cannot reach the local server: " + e.message;
+    return;
+  }
+
+  document.getElementById("sub").textContent =
+    d.network + " · source " + d.source + " · generated " + d.generated_at;
+
+  const chain = d.timechain || {};
+  const chainCls = chain.verified === true ? "ok" : (chain.verified === false ? "bad" : "");
+  const chainTxt = chain.height === null || chain.height === undefined
+    ? NA
+    : num(chain.height) + ' <small>' +
+      (chain.verified === true ? "verified" : chain.verified === false ? "FAILED" : "unverified") +
+      "</small>";
+
+  document.getElementById("tiles").innerHTML =
+    tile("Projects tracked", num(d.projects)) +
+    tile("Checkpoints complete", num(d.checkpoints_complete)) +
+    tile("Checkpoints pending", num(d.checkpoints_pending)) +
+    tile("Paper positions open", num(d.portfolio_open_positions)) +
+    tile("Shadow positions open", num(d.shadow_open_positions)) +
+    tile("Timechain", chainTxt, chainCls);
+
+  const p = d.shadow_performance || {};
+  const ret = p.modeled_return_pct;
+  document.getElementById("perf").innerHTML =
+    tile("Modeled return", pct(ret), ret === null || ret === undefined ? "" : (ret >= 0 ? "ok" : "bad")) +
+    tile("Mark coverage", pct(p.mark_coverage_pct)) +
+    tile("Stale open marks", num(p.stale_open_marks)) +
+    tile("p95 mark age", mins(p.p95_open_mark_age_seconds)) +
+    tile("Oldest mark", mins(p.oldest_open_mark_age_seconds));
+
+  const body = document.querySelector("#runs tbody");
+  body.innerHTML = "";
+  for (const run of (d.recent_runs || [])) {
+    const tr = document.createElement("tr");
+    if (run.error) {
+      tr.innerHTML = '<td colspan="8" class="err">' + run.error + "</td>";
+      body.appendChild(tr);
+      continue;
+    }
+    const cls = run.status === "complete" ? "ok"
+      : run.status === "running" ? ""
+      : run.status === "complete_with_errors" ? "warn" : "bad";
+    tr.innerHTML =
+      "<td>" + run.run_id + "</td>" +
+      "<td>" + (run.started_at || NA).replace("T", " ").slice(0, 19) + "</td>" +
+      '<td class="' + cls + '">' + run.status + "</td>" +
+      '<td class="num">' + num(run.discovered) + "</td>" +
+      '<td class="num">' + num(run.new_projects) + "</td>" +
+      '<td class="num">' + num(run.outcomes) + "</td>" +
+      '<td class="num">' + num(run.shadow_events) + "</td>" +
+      '<td class="err">' + (run.errors && run.errors.length ? run.errors.join("; ") : "") + "</td>";
+    body.appendChild(tr);
+  }
+
+  // The learners can be stopped while this page stays open. Say so, rather
+  // than showing figures that quietly stop moving.
+  const stale = document.getElementById("stale");
+  const cycleAt = Date.parse(d.cycle_generated_at || "");
+  if (!isNaN(cycleAt)) {
+    const ageMin = (Date.now() - cycleAt) / 60000;
+    if (ageMin > 15) {
+      stale.style.display = "block";
+      stale.textContent = "Last learn cycle wrote " + ageMin.toFixed(0) +
+        " minutes ago — the Base learner may be stopped.";
+    } else {
+      stale.style.display = "none";
+    }
+  }
+
+  document.getElementById("foot").textContent =
+    "Read-only view. No write endpoints exist on this server. " +
+    "NO SIGNING · NO PRIVATE KEYS · paper_only=" + d.paper_only +
+    " · live_execution_enabled=" + d.live_execution_enabled;
+}
+
+refresh();
+setInterval(refresh, 10000);
+</script>
+</body>
+</html>

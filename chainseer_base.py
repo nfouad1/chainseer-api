@@ -21,6 +21,8 @@ import sqlite3
 import sys
 import time
 from contextlib import contextmanager
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import urlparse
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from decimal import Decimal, localcontext
@@ -2105,6 +2107,191 @@ class ShadowPerformanceReporter:
         return report
 
 
+
+BASE_DASHBOARD_PORT = 8768
+
+
+def _base_dashboard_snapshot(engine: BasePrototypeEngine) -> dict:
+    """Read-only view of Base learning state.
+
+    Everything here is read from files the learn cycle already writes. The
+    dashboard never runs an analysis and never triggers a cycle, so it cannot
+    become a second writer -- which is what corrupted solana_chain when its
+    dashboard was able to start a learn loop.
+    """
+    summary = _read_json(engine.root / "learning_summary.json", {})
+    shadow_state = _read_json(engine.root / "shadow_state.json", {})
+    paper_state = _read_json(engine.root / "paper_state.json", {})
+    performance = summary.get("shadow_performance") or {}
+
+    runs: list[dict] = []
+    store_path = engine.root / "learning.sqlite3"
+    if store_path.is_file():
+        try:
+            connection = sqlite3.connect(f"file:{store_path}?mode=ro", uri=True)
+            try:
+                connection.row_factory = sqlite3.Row
+                rows = connection.execute(
+                    "SELECT run_id, started_at, completed_at, status, "
+                    "discovered, new_projects, outcomes, shadow_events, "
+                    "errors_json FROM learning_runs "
+                    "ORDER BY run_id DESC LIMIT 15"
+                ).fetchall()
+            finally:
+                connection.close()
+            for row in rows:
+                errors = []
+                raw = row["errors_json"]
+                if raw:
+                    try:
+                        errors = json.loads(raw) or []
+                    except (TypeError, ValueError):
+                        errors = ["unparsable errors_json"]
+                runs.append({
+                    "run_id": row["run_id"],
+                    "started_at": row["started_at"],
+                    "completed_at": row["completed_at"],
+                    "status": row["status"],
+                    "discovered": row["discovered"],
+                    "new_projects": row["new_projects"],
+                    "outcomes": row["outcomes"],
+                    "shadow_events": row["shadow_events"],
+                    "errors": [str(item)[:200] for item in errors],
+                })
+        except sqlite3.Error as exc:
+            # Degrade honestly rather than 500 the whole view because the learn
+            # cycle happens to hold the database open.
+            runs = [{"error": f"{type(exc).__name__}: {exc}"[:200]}]
+
+    def _open_positions(state) -> int:
+        positions = (state or {}).get("positions") or {}
+        return sum(
+            1 for item in positions.values()
+            if isinstance(item, dict) and item.get("status") == "open"
+        )
+
+    chain_height = None
+    chain_verified = None
+    if engine.timechain is not None:
+        try:
+            chain_height = engine.timechain.tc.height()
+            chain_verified = bool(engine.timechain.tc.verify()[0])
+        except Exception:                      # never fail the view on this
+            chain_height = None
+            chain_verified = None
+
+    return {
+        "schema_version": 1,
+        "generated_at": _utc_now(),
+        "network": "base_mainnet",
+        "source": "virtuals.io",
+        "paper_only": True,
+        "live_execution_enabled": False,
+        "read_only": True,
+        "projects": summary.get("projects"),
+        "checkpoints_complete": summary.get("checkpoints_complete"),
+        "checkpoints_pending": summary.get("checkpoints_pending"),
+        "portfolio_open_positions": _open_positions(paper_state),
+        "shadow_open_positions": _open_positions(shadow_state),
+        "shadow_performance": {
+            "modeled_return_pct": performance.get("modeled_return_pct"),
+            "mark_coverage_pct": performance.get("mark_coverage_pct"),
+            "stale_open_marks": performance.get("stale_open_marks"),
+            "p95_open_mark_age_seconds": performance.get(
+                "p95_open_mark_age_seconds"
+            ),
+            "oldest_open_mark_age_seconds": performance.get(
+                "oldest_open_mark_age_seconds"
+            ),
+        },
+        "latest_run": summary.get("latest_run"),
+        "recent_runs": runs,
+        "timechain": {"height": chain_height, "verified": chain_verified},
+        "cycle_generated_at": summary.get("generated_at"),
+    }
+
+
+def serve_base_dashboard(
+    engine: BasePrototypeEngine,
+    *,
+    host: str = "127.0.0.1",
+    port: int = BASE_DASHBOARD_PORT,
+) -> None:
+    """Serve the local Base dashboard.
+
+    There are no POST routes at all. The Solana dashboard shipped learn
+    start/stop endpoints while its banner claimed to be read-only, and because
+    solana learn_once takes no run lock that put a second writer one request
+    away. This server exposes no mutation surface to get wrong.
+    """
+    if host not in {"127.0.0.1", "localhost", "::1"}:
+        raise ValueError(
+            "The Base dashboard is local-only; bind to 127.0.0.1 or localhost"
+        )
+    dashboard_path = Path(__file__).with_name("base_dashboard.html")
+    if not dashboard_path.is_file():
+        raise FileNotFoundError(f"Base dashboard was not found: {dashboard_path}")
+
+    class DashboardHandler(BaseHTTPRequestHandler):
+        def _send(self, status: int, content_type: str, body: bytes) -> None:
+            self.send_response(status)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("X-Content-Type-Options", "nosniff")
+            self.send_header("Referrer-Policy", "no-referrer")
+            self.send_header(
+                "Content-Security-Policy",
+                "default-src 'self'; style-src 'self' 'unsafe-inline'; "
+                "script-src 'self' 'unsafe-inline'; connect-src 'self'; "
+                "img-src 'self' data:; frame-ancestors 'none'",
+            )
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):
+            route = urlparse(self.path).path
+            if route == "/":
+                # Re-read per request so a long-lived server cannot serve stale
+                # HTML after the asset is edited.
+                self._send(
+                    200, "text/html; charset=utf-8",
+                    dashboard_path.read_bytes(),
+                )
+                return
+            if route == "/api/status":
+                try:
+                    payload = _canonical_json(
+                        _base_dashboard_snapshot(engine)
+                    ).encode("utf-8")
+                    self._send(200, "application/json; charset=utf-8", payload)
+                except Exception as exc:
+                    payload = _canonical_json({
+                        "error": str(exc), "generated_at": _utc_now(),
+                    }).encode("utf-8")
+                    self._send(500, "application/json; charset=utf-8", payload)
+                return
+            if route == "/health":
+                self._send(
+                    200, "application/json; charset=utf-8",
+                    b'{"status":"ok","read_only":true}',
+                )
+                return
+            self._send(404, "text/plain; charset=utf-8", b"Not found")
+
+        def log_message(self, _format, *_args):
+            return
+
+    server = ThreadingHTTPServer((host, int(port)), DashboardHandler)
+    print(f"Base learning dashboard: http://{host}:{port}")
+    print("READ-ONLY: no write endpoints exist. Press Ctrl+C to stop.")
+    try:
+        server.serve_forever(poll_interval=0.5)
+    except KeyboardInterrupt:
+        pass
+    finally:
+        server.server_close()
+
 class BaseLearningLoop:
     """One restart-safe learning cycle suitable for Task Scheduler."""
 
@@ -2596,8 +2783,13 @@ def main() -> None:
         "command",
         choices=[
             "observe", "paper-run", "learn-once", "positions",
-            "shadow-positions", "shadow-summary", "verify",
+            "shadow-positions", "shadow-summary", "dashboard", "verify",
         ],
+    )
+    parser.add_argument("--host", default="127.0.0.1", help="dashboard bind host")
+    parser.add_argument(
+        "--port", type=int, default=BASE_DASHBOARD_PORT,
+        help="dashboard port (dashboard command only)",
     )
     parser.add_argument("--limit", type=int, default=10)
     parser.add_argument("--amount-virtual", type=float, default=10.0)
@@ -2684,6 +2876,8 @@ def main() -> None:
         print(json.dumps(engine.trader.state, indent=2, sort_keys=True))
     elif args.command == "shadow-positions":
         print(json.dumps(engine.shadow_trader.state, indent=2, sort_keys=True))
+    elif args.command == "dashboard":
+        serve_base_dashboard(engine, host=args.host, port=args.port)
     elif args.command == "shadow-summary":
         store = BaseLearningStore(engine.root / "learning.sqlite3")
         report = ShadowPerformanceReporter(
