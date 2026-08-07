@@ -159,6 +159,115 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertEqual(status["learning_eligible"], 1)
 
 
+class LaunchAdapterRingRecognitionTests(unittest.TestCase):
+    """Pons and Solana together produced 6,912 analyses the ledger refused to
+    read. Recognising them makes them citable; it must not make them look
+    better-evidenced than they are.
+    """
+
+    @staticmethod
+    def _pons_ring(**decision_overrides):
+        decision = {
+            "token_address": "0xC4Cb8A0167c77E36194f6affB6b71D931FAb62c0",
+            "block_pin": 4242,
+            "provenance": provenance(4242),
+            "risk_level": "Low",
+        }
+        decision.update(decision_overrides)
+        return {
+            "index": 11,
+            "ring_type": "pons_launch_analysis",
+            "ring_hash": "a" * 64,
+            "timestamp": "2026-01-01T00:00:00+00:00",
+            "payload": {
+                "chain_id": 4663,
+                "protocol": "pons",
+                "candidate": {"token_address": decision["token_address"]},
+                "decision": decision,
+            },
+        }
+
+    @staticmethod
+    def _solana_ring(**payload_overrides):
+        payload = {
+            "candidate": {"mint": "81Z3jR9J9sNZMgot5zSnRNj4AcjH9WtcbG4qLERspump",
+                          "slot": 777},
+            "decision": {"mint": "81Z3jR9J9sNZMgot5zSnRNj4AcjH9WtcbG4qLERspump",
+                         "risk_level": "High"},
+        }
+        payload.update(payload_overrides)
+        return {
+            "index": 12,
+            "ring_type": "solana_launch_analysis",
+            "ring_hash": "b" * 64,
+            "timestamp": "2026-01-01T00:00:01+00:00",
+            "payload": payload,
+        }
+
+    def test_pons_analysis_is_recognised(self):
+        reference = analysis_reference_from_ring(self._pons_ring())
+        # Pons runs ON Robinhood Chain, so it shares that subject namespace
+        # with general token_analysis rather than inventing its own.
+        self.assertEqual(reference["network"], "robinhood")
+        self.assertEqual(
+            reference["subject"], "0xC4Cb8A0167c77E36194f6affB6b71D931FAb62c0"
+        )
+        self.assertEqual(reference["anchor_type"], "block_pin")
+        self.assertEqual(reference["anchor_value"], 4242)
+
+    def test_pons_provenance_is_read_from_the_decision(self):
+        # Pons seals provenance under decision, not at the payload root. Read
+        # from the root and every Pons ring would look evidence-less.
+        reference = analysis_reference_from_ring(self._pons_ring())
+        self.assertTrue(reference["evidence_complete"])
+        self.assertEqual(reference["evidence_fact_count"], 2)
+
+    def test_solana_launch_analysis_pins_to_a_slot_not_a_block(self):
+        reference = analysis_reference_from_ring(self._solana_ring())
+        self.assertEqual(reference["network"], "solana")
+        self.assertEqual(reference["anchor_type"], "slot_pin")
+        self.assertEqual(reference["anchor_value"], 777)
+
+    def test_solana_launch_shares_the_namespace_of_solana_token_analysis(self):
+        # One mint analysed by both the public product and the autotrader is
+        # ONE subject; splitting it would hide cross-system agreement.
+        mint = "So11111111111111111111111111111111111111112"
+        launch = analysis_reference_from_ring(
+            self._solana_ring(
+                candidate={"mint": mint, "slot": 5},
+                decision={"mint": mint},
+            )
+        )
+        binding = analysis_evidence_binding(
+            provenance(5, slot=True), anchor_type="slot_pin", anchor_value=5
+        )
+        token = analysis_reference_from_ring({
+            "index": 13,
+            "ring_type": "solana_token_analysis",
+            "ring_hash": "c" * 64,
+            "timestamp": "2026-01-01T00:00:02+00:00",
+            "payload": {"network": "solana", "mint": mint,
+                        "slot_anchor": 5, **binding},
+        })
+        self.assertEqual(launch["network"], token["network"])
+        self.assertEqual(launch["subject"], token["subject"])
+
+    def test_legacy_rings_are_labelled_legacy_not_sealed(self):
+        # These 6,912 rings predate evidence manifests. Recognising them must
+        # not launder them into looking sealed-at-analysis.
+        for ring in (self._pons_ring(), self._solana_ring()):
+            reference = analysis_reference_from_ring(ring)
+            self.assertEqual(
+                reference["binding_state"], "derived_from_legacy_analysis_ring"
+            )
+
+    def test_missing_provenance_is_reported_as_incomplete_not_invented(self):
+        ring = self._solana_ring()          # no provenance anywhere
+        reference = analysis_reference_from_ring(ring)
+        self.assertFalse(reference["evidence_complete"])
+        self.assertEqual(reference["evidence_fact_count"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
 

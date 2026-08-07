@@ -307,17 +307,33 @@ class MemoryCoreDocumentationTests(unittest.TestCase):
                 "documented coverage list",
             )
 
-    def test_uncovered_ring_types_are_named_and_still_uncovered(self):
+    def test_launch_adapter_ring_types_are_covered(self):
         from chainseer_outcome_ledger import SUPPORTED_ANALYSIS_RING_TYPES
 
         for ring_type in ("solana_launch_analysis", "pons_launch_analysis"):
             self.assertIn(ring_type, self.doc)
-            self.assertNotIn(
-                ring_type,
-                SUPPORTED_ANALYSIS_RING_TYPES,
-                f"{ring_type} is now covered in code; the documented "
-                "coverage boundary needs updating",
+            self.assertIn(ring_type, SUPPORTED_ANALYSIS_RING_TYPES)
+
+    def test_cross_chain_citation_is_still_documented_as_unbuilt(self):
+        # Recognising the launch ring types is read-side only. It must not be
+        # mistaken for federation: a claim still cannot cite a ring from
+        # another chain, and the doc has to keep saying so.
+        self.assertIn("Treat cross-chain memory as unbuilt", self.doc)
+
+    def test_documented_namespaces_match_the_code(self):
+        from chainseer_outcome_ledger import _ring_network_subject
+
+        cases = (
+            ("pons_launch_analysis",
+             {"decision": {"token_address": "0xabc"}}, "robinhood", "0xabc"),
+            ("solana_launch_analysis",
+             {"decision": {"mint": "Mint111"}}, "solana", "Mint111"),
+        )
+        for ring_type, payload, network, subject in cases:
+            self.assertEqual(
+                _ring_network_subject(ring_type, payload), (network, subject)
             )
+            self.assertIn(f"| `{ring_type}` | `{network}` |", self.doc)
 
     def test_documented_schema_versions_match_the_code(self):
         import chainseer_governance

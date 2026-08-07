@@ -36,7 +36,16 @@ SUPPORTED_ANALYSIS_RING_TYPES = {
     "token_analysis",
     "solana_token_analysis",
     "base_launch_analysis",
+    "pons_launch_analysis",
+    "solana_launch_analysis",
 }
+
+# Analyses whose provenance hangs off the decision rather than the payload
+# root. These adapters seal the candidate and the decision side by side, so the
+# provenance travels with the decision that used it.
+_DECISION_PROVENANCE_RING_TYPES = frozenset(
+    {"base_launch_analysis", "pons_launch_analysis"}
+)
 
 SECURITY_OUTCOME_KEYS = {
     "rug_pull",
@@ -186,7 +195,7 @@ def analysis_evidence_binding(
 
 
 def _ring_payload_provenance(ring_type: str, payload: dict[str, Any]) -> dict[str, Any]:
-    if ring_type == "base_launch_analysis":
+    if ring_type in _DECISION_PROVENANCE_RING_TYPES:
         return ((payload.get("decision") or {}).get("provenance") or {})
     return payload.get("provenance") or {}
 
@@ -199,6 +208,23 @@ def _ring_network_subject(
     if ring_type == "base_launch_analysis":
         candidate = payload.get("candidate") or {}
         return "base", candidate.get("token_address")
+    if ring_type == "solana_launch_analysis":
+        # Same "solana" namespace as solana_token_analysis on purpose: a mint
+        # analysed by both the public product and the autotrader is ONE
+        # subject, and splitting it would hide exactly the cross-system
+        # agreement the Memory Core exists to surface.
+        decision = payload.get("decision") or {}
+        candidate = payload.get("candidate") or {}
+        return "solana", decision.get("mint") or candidate.get("mint")
+    if ring_type == "pons_launch_analysis":
+        # Pons runs ON Robinhood Chain (chain_id 4663), so its subjects share
+        # the "robinhood" namespace with general token_analysis rings rather
+        # than forming a separate one. The token is the same token.
+        decision = payload.get("decision") or {}
+        candidate = payload.get("candidate") or {}
+        return "robinhood", (
+            decision.get("token_address") or candidate.get("token_address")
+        )
     chain_id = payload.get("chain_id")
     network = str(payload.get("network") or "").strip().lower()
     if not network:
@@ -248,12 +274,18 @@ def analysis_reference_from_ring(ring: dict[str, Any]) -> dict[str, Any]:
                 if anchor_value is not None
                 else payload.get("slot_anchor")
             )
+        elif ring_type == "solana_launch_analysis":
+            # Solana has no block numbers; the slot the candidate was observed
+            # at is the only honest pin for these legacy rings.
+            anchor_type = anchor_type or "slot_pin"
+            if anchor_value is None:
+                anchor_value = (payload.get("candidate") or {}).get("slot")
         else:
-            anchor_value = (
-                anchor_value
-                if anchor_value is not None
-                else payload.get("block_pin")
-            )
+            if anchor_value is None:
+                anchor_value = payload.get("block_pin")
+            if anchor_value is None:
+                # Pons seals its pin inside the decision, not at the root.
+                anchor_value = (payload.get("decision") or {}).get("block_pin")
         binding = analysis_evidence_binding(
             provenance,
             anchor_type=anchor_type,
