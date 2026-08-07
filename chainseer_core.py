@@ -31,7 +31,9 @@ from __future__ import annotations
 
 import json
 import math
+import os
 import time
+import uuid
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -74,22 +76,46 @@ def atomic_json_write(path: Path, value, *, ensure_ascii: bool = False, default=
     destination handle open; the reader releases it immediately, so a short
     bounded retry preserves atomicity without weakening the single-writer
     contract these adapters rely on.
+
+    The scratch file is unique per call. A fixed "<name>.tmp" is shared by
+    every process writing the same path, so two writers interleave as:
+    A writes scratch, B overwrites the SAME scratch, B replaces, A replaces.
+    The loud outcome is A failing with FileNotFoundError because its scratch
+    is gone. The quiet one is worse -- A's destination silently receives B's
+    content, with no exception raised at all. Pons hit both: its learn cycle
+    and its quote guard each write admission_state.json.
+
+    A unique scratch name does not make concurrent writes safe -- last writer
+    still wins, and callers that must not clobber each other need a lock. It
+    makes each write self-consistent, so a file can never contain a blend of
+    two writers or lose one entirely to the other's rename.
     """
     path = Path(path)
     path.parent.mkdir(parents=True, exist_ok=True)
-    temporary = path.with_suffix(path.suffix + ".tmp")
-    temporary.write_text(
-        json.dumps(value, indent=2, sort_keys=True, ensure_ascii=ensure_ascii, default=default),
-        encoding="utf-8",
+    temporary = path.with_name(
+        f"{path.name}.{os.getpid()}.{uuid.uuid4().hex[:8]}.tmp"
     )
-    for attempt in range(6):
+    try:
+        temporary.write_text(
+            json.dumps(value, indent=2, sort_keys=True, ensure_ascii=ensure_ascii, default=default),
+            encoding="utf-8",
+        )
+        for attempt in range(6):
+            try:
+                temporary.replace(path)
+                return
+            except PermissionError:
+                if attempt == 5:
+                    raise
+                time.sleep(0.05 * (2**attempt))
+    finally:
+        # A unique name means a failed write leaves litter no later run would
+        # reuse, so it has to be cleaned up here. Succeeded replaces have
+        # already moved the file, making this a no-op.
         try:
-            temporary.replace(path)
-            return
-        except PermissionError:
-            if attempt == 5:
-                raise
-            time.sleep(0.05 * (2**attempt))
+            temporary.unlink()
+        except OSError:
+            pass
 
 
 def read_json(path: Path, default=None):
