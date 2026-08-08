@@ -3252,6 +3252,138 @@ class TransientHardStopRecoveryTests(unittest.TestCase):
             )
 
 
+class ObserverHealthTest(unittest.TestCase):
+    """Make a sustained discovery outage distinguishable from a blip.
+
+    Discovery was dead for six and a half hours while every cycle exited 0,
+    because nothing anywhere held the fact that a venue had failed twice in a
+    row. Each cycle is a fresh process, so the run length has to survive on
+    disk or it resets before it can mean anything.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+        engine = chainseer_solana.SolanaPrototypeEngine.__new__(
+            chainseer_solana.SolanaPrototypeEngine
+        )
+        engine.root = self.root
+        engine.observer_health_path = self.root / "observer_health.json"
+        engine.observer = types.SimpleNamespace(
+            catalog_path=self.root / "catalog.json"
+        )
+        engine.meteora_observer = types.SimpleNamespace(
+            catalog_path=self.root / "meteora_catalog.json"
+        )
+        self.engine = engine
+
+    def _write_catalog(self, name, age_seconds=0.0):
+        path = self.root / name
+        path.write_text("{}", encoding="utf-8")
+        when = time.time() - age_seconds
+        os.utime(path, (when, when))
+
+    def _record(self, results):
+        with patch("chainseer_solana.send_alert") as alert:
+            summary = self.engine._record_observer_health(results)
+        return summary, alert
+
+    def test_consecutive_failures_survive_across_cycles(self):
+        """The counter is useless if it resets with each fresh process."""
+        self._write_catalog("catalog.json")
+        self._record({"pump_fun": "429 rate limited"})
+        summary, _ = self._record({"pump_fun": "429 rate limited"})
+
+        self.assertEqual(
+            summary["venues"]["pump_fun"]["consecutive_failures"], 2,
+            "the count did not persist between calls, so no threshold could "
+            "ever be reached across cycles",
+        )
+        self.assertIn("pump_fun", summary["degraded_venues"])
+
+    def test_one_failure_is_not_an_outage(self):
+        """A single blip is exactly what _safe_observer_sync should absorb."""
+        self._write_catalog("catalog.json")
+        summary, alert = self._record({"pump_fun": "transient"})
+
+        self.assertEqual(summary["degraded_venues"], [])
+        alert.assert_not_called()
+
+    def test_success_resets_the_counter(self):
+        self._write_catalog("catalog.json")
+        self._record({"pump_fun": "429"})
+        self._record({"pump_fun": "429"})
+        summary, _ = self._record({"pump_fun": None})
+
+        self.assertEqual(
+            summary["venues"]["pump_fun"]["consecutive_failures"], 0
+        )
+        self.assertEqual(summary["degraded_venues"], [])
+
+    def test_stale_catalog_is_degraded_even_when_the_sweep_reports_success(self):
+        """The failure mode the counter cannot see.
+
+        A sweep that raises nothing but writes nothing looks perfectly
+        healthy to a failure counter. Staleness is what catches it.
+        """
+        self._write_catalog(
+            "catalog.json",
+            age_seconds=chainseer_solana.CATALOG_STALENESS_ALERT_SECONDS + 60,
+        )
+        summary, alert = self._record({"pump_fun": None})
+
+        venue = summary["venues"]["pump_fun"]
+        self.assertEqual(venue["consecutive_failures"], 0)
+        self.assertTrue(
+            venue["degraded"],
+            "a silently empty sweep left the catalogue stale and still "
+            "reported healthy",
+        )
+        self.assertIn("catalog_stale", venue["degraded_reasons"])
+        alert.assert_called_once()
+
+    def test_alert_is_rate_limited_rather_than_fired_every_cycle(self):
+        """Cycles run every five minutes; an outage must not alert 78 times."""
+        self._write_catalog("catalog.json")
+        self._record({"pump_fun": "429"})
+        _, first = self._record({"pump_fun": "429"})
+        _, second = self._record({"pump_fun": "429"})
+
+        first.assert_called_once()
+        second.assert_not_called()
+
+    def test_venues_are_tracked_independently(self):
+        self._write_catalog("catalog.json")
+        self._write_catalog("meteora_catalog.json")
+        self._record({"pump_fun": "429", "meteora_dbc": None})
+        summary, _ = self._record({"pump_fun": "429", "meteora_dbc": None})
+
+        self.assertEqual(summary["degraded_venues"], ["pump_fun"])
+        self.assertEqual(
+            summary["venues"]["meteora_dbc"]["consecutive_failures"], 0
+        )
+
+    def test_alerting_failure_cannot_break_the_cycle(self):
+        """A health monitor that breaks the cycle is worse than none."""
+        self._write_catalog("catalog.json")
+        self._record({"pump_fun": "429"})
+        with patch(
+            "chainseer_solana.send_alert", side_effect=RuntimeError("webhook down")
+        ):
+            with self.assertRaises(RuntimeError):
+                self.engine._record_observer_health({"pump_fun": "429"})
+        # State must still have been persisted before the alert was attempted.
+        state = json.loads(
+            (self.root / "observer_health.json").read_text(encoding="utf-8")
+        )
+        self.assertEqual(
+            state["venues"]["pump_fun"]["consecutive_failures"], 2,
+            "health state was lost when alerting raised",
+        )
+
+
 class RpcPacingAndRetryCeilingTest(unittest.TestCase):
     """Bound the three delays that turned a 429 into a six-hour outage.
 

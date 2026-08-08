@@ -159,6 +159,30 @@ SOLANA_LAUNCH_EXPLORATION_SHARE = 1
 # endpoint anyway, and the caller then slept out the full cooldown before
 # every attempt -- so the breaker, meant to shed load, became the largest
 # delay of all.
+# --- discovery health -------------------------------------------------
+#
+# _safe_observer_sync absorbs one venue's RPC failure so the other venue and
+# the rest of the cycle survive it. That is right for a blip and blind to an
+# outage: it absorbed the ten-thousandth failure exactly like the first, so
+# discovery was dead for six and a half hours while every cycle exited 0, the
+# scheduler reported success, and nothing anywhere held the fact that a venue
+# had failed twice in a row. There was no state for an alarm to read.
+#
+# Two independent detectors, because they fail differently:
+#
+# FAILURE_THRESHOLD counts consecutive sync failures per venue and says WHY.
+# Two in a row is unambiguous -- transient RPC noise does not reproduce
+# deterministically across a five-minute gap.
+#
+# STALENESS watches how long since the catalogue was last written and says
+# WHETHER. It catches every failure mode including ones not yet imagined: a
+# silent empty result, a cursor that stops advancing, a venue delisted, a bug
+# that returns [] without raising. The counter can only catch failures that
+# raise; staleness catches discovery simply not happening.
+OBSERVER_FAILURE_ALERT_THRESHOLD = 2
+CATALOG_STALENESS_ALERT_SECONDS = 30 * 60
+OBSERVER_HEALTH_ALERT_COOLDOWN_SECONDS = 30 * 60
+
 SOLANA_MINIMUM_REQUEST_INTERVAL = 0.12
 SOLANA_MAX_RETRY_SLEEP_SECONDS = 20.0
 SOLANA_MAX_CIRCUIT_WAIT_SECONDS = 5.0
@@ -3748,6 +3772,7 @@ class SolanaPrototypeEngine:
         self.analysis_index_path = self.root / "analysis_index.json"
         self.recovery_queue_path = self.root / "recovery_queue.json"
         self.rpc_health_path = self.root / "rpc_health.json"
+        self.observer_health_path = self.root / "observer_health.json"
         self.reflection_state_path = self.root / "reflection_state.json"
         self.reflection_ledger = HashLedger(
             self.root / "reflection_checkpoints.jsonl"
@@ -4741,6 +4766,128 @@ class SolanaPrototypeEngine:
         except InfrastructureIndeterminateError as exc:
             return [], _redact_sensitive_text(str(exc))
 
+    def _record_observer_health(self, results: dict) -> dict:
+        """Turn per-venue sync outcomes into durable, alertable state.
+
+        `results` maps a venue label to that venue's sync error string, or
+        None when the sweep succeeded.
+
+        Every learn cycle is a fresh process, so an in-memory counter would
+        reset before it could ever reach a threshold -- the state has to
+        survive on disk to mean anything. Written with the same atomic
+        helper as the rest of the estate so a killed cycle cannot leave a
+        torn record.
+
+        Alerting is deliberately fire-and-forget: send_alert never raises
+        and returns a result dict. A health monitor that could itself break
+        the cycle would be worse than no monitor, and this one exists
+        precisely because the cycle kept reporting success through an
+        outage.
+        """
+        now = time.time()
+        state = _read_json(self.observer_health_path, {}) or {}
+        venues = state.get("venues") or {}
+        alerts: list[dict] = []
+        degraded: list[str] = []
+
+        for label, error in results.items():
+            record = dict(venues.get(label) or {})
+            catalog_path = self._observer_catalog_path(label)
+            age = None
+            if catalog_path is not None and catalog_path.exists():
+                age = max(0.0, now - catalog_path.stat().st_mtime)
+            if error:
+                record["consecutive_failures"] = (
+                    _safe_int(record.get("consecutive_failures")) + 1
+                )
+                record["last_failure_at"] = _utc_now()
+                record["last_error"] = error
+            else:
+                record["consecutive_failures"] = 0
+                record["last_success_at"] = _utc_now()
+                record["last_error"] = None
+            record["catalog_age_seconds"] = (
+                round(age, 1) if age is not None else None
+            )
+
+            # Two independent reasons to consider a venue down. Staleness is
+            # checked even on a "successful" sweep: a sync that raises nothing
+            # but writes nothing is exactly the silent mode the counter misses.
+            failing = (
+                record["consecutive_failures"] >= OBSERVER_FAILURE_ALERT_THRESHOLD
+            )
+            stale = age is not None and age >= CATALOG_STALENESS_ALERT_SECONDS
+            record["degraded"] = bool(failing or stale)
+            record["degraded_reasons"] = [
+                reason for reason, hit in (
+                    ("consecutive_sync_failures", failing),
+                    ("catalog_stale", stale),
+                ) if hit
+            ]
+            if record["degraded"]:
+                degraded.append(label)
+                last_alert = _timestamp(record.get("last_alert_at")) or 0.0
+                if now - last_alert >= OBSERVER_HEALTH_ALERT_COOLDOWN_SECONDS:
+                    record["last_alert_at"] = _utc_now()
+                    alerts.append(
+                        {
+                            "venue": label,
+                            "consecutive_failures": record[
+                                "consecutive_failures"
+                            ],
+                            "catalog_age_seconds": record[
+                                "catalog_age_seconds"
+                            ],
+                            "reasons": record["degraded_reasons"],
+                            "last_error": record.get("last_error"),
+                        }
+                    )
+            venues[label] = record
+
+        state["venues"] = venues
+        state["updated_at"] = _utc_now()
+        state["degraded_venues"] = sorted(degraded)
+        _atomic_json(self.observer_health_path, state)
+
+        for alert in alerts:
+            send_alert(
+                {
+                    "summary": (
+                        f"Solana discovery degraded on {alert['venue']}: "
+                        f"{', '.join(alert['reasons'])}"
+                    ),
+                    **alert,
+                },
+                chain="solana",
+                token_address="",
+                event_type="discovery_degraded",
+                cooldown_seconds=OBSERVER_HEALTH_ALERT_COOLDOWN_SECONDS,
+            )
+
+        return {
+            "degraded_venues": sorted(degraded),
+            "alerts_emitted": len(alerts),
+            "venues": {
+                label: {
+                    "consecutive_failures": record.get(
+                        "consecutive_failures", 0
+                    ),
+                    "catalog_age_seconds": record.get("catalog_age_seconds"),
+                    "degraded": record.get("degraded", False),
+                    "degraded_reasons": record.get("degraded_reasons") or [],
+                }
+                for label, record in venues.items()
+            },
+        }
+
+    def _observer_catalog_path(self, label: str):
+        """The catalogue whose mtime is that venue's freshness signal."""
+        observer = {
+            "pump_fun": self.observer,
+            "meteora_dbc": self.meteora_observer,
+        }.get(label)
+        return getattr(observer, "catalog_path", None)
+
     def observe(
         self, *, limit: int = 10, signature_limit: int = 100,
         slot_span: int | None = None, max_pages: int = 10,
@@ -4846,16 +4993,26 @@ class SolanaPrototypeEngine:
             self.meteora_observer,
             signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages,
         )
+        observer_health = self._record_observer_health(
+            {
+                "pump_fun": pump_sync_error,
+                "meteora_dbc": meteora_sync_error,
+            }
+        )
         recovered_mints = {
             result["candidate"]["mint"] for result in recovered
         }
-        # The graduation lane is the expensive one: each candidate needs live
-        # market probes, not just a signature decode. Raising it 3 -> 6 to
-        # prioritise graduated tokens (every complete_safe token the estate has
-        # ever produced is graduated or near-graduated) took the cycle mean
-        # from 447s over 78 cycles to 912s and then 2099s, and killed five
-        # cycles against the scheduler limit. 4 keeps the priority -- which the
-        # outcome data does support -- at a cost the cycle budget can absorb.
+        # Prioritises graduated tokens, which the outcome data supports: every
+        # complete_safe token the estate has produced is graduated or
+        # near-graduated, and none came from raw launch observation.
+        #
+        # A previous version of this comment also claimed the lane drove the
+        # cycle mean from 447s to 2099s. That was wrong. The slowdown began
+        # eleven minutes BEFORE that change merged, and limit 6 vs limit 4
+        # measured 2099.0s vs 2095.7s -- a 3.3s difference across a 2100s
+        # cycle. The real cost was unpaced RPC pagination collecting a 429 and
+        # then sleeping through an unbounded Retry-After. The lane size is a
+        # budget-allocation choice; it was never the bottleneck.
         graduation_candidates, graduation_probe = (
             self._probe_graduation_candidates(
                 limit=max(0, graduation_limit),
@@ -4941,6 +5098,10 @@ class SolanaPrototypeEngine:
                     "pump_fun": pump_sync_error,
                     "meteora_dbc": meteora_sync_error,
                 },
+                # sync_errors above shows only THIS cycle, which is what made
+                # a six-hour outage look like an ordinary blip every five
+                # minutes. observer_health carries the run length.
+                "observer_health": observer_health,
                 "analyzed": len(results),
                 "new_analyzed": len(results) - len(recovered),
                 "recovery_analyzed": len(recovered),
