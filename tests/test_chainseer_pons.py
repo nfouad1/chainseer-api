@@ -1303,6 +1303,123 @@ class PonsAdapterTests(unittest.TestCase):
         self.assertFalse(pipeline["live_execution_enabled"])
 
 
+class ProvenancePruningTests(unittest.TestCase):
+    """Provenance is 79% of admission_state.json and every cycle rewrites it.
+
+    It is read in exactly one place -- the outcome collector, and only from the
+    later observation of a pair -- so once no further outcome is possible it is
+    dead weight in a file whose size drives cycle time.
+    """
+
+    WINDOW = chainseer_pons.PonsAdmissionQuarantine.PROVENANCE_RETENTION_SECONDS
+
+    def _store(self, temp, candidates, completed=()):
+        path = Path(temp) / "admission_state.json"
+        path.write_text(json.dumps({
+            "candidates": candidates,
+            "completed_outcomes": list(completed),
+        }), encoding="utf-8")
+        store = chainseer_pons.PonsAdmissionQuarantine(path)
+        store.state["candidates"] = candidates
+        store.state["completed_outcomes"] = list(completed)
+        return store
+
+    @staticmethod
+    def _obs(age_seconds, *, provenance=True):
+        from datetime import datetime, timedelta, timezone
+        when = datetime.now(timezone.utc) - timedelta(seconds=age_seconds)
+        item = {
+            "observed_at": when.isoformat(),
+            "observed_timestamp": when.timestamp(),
+            "analysis_ring": 7,
+            "hard_stops": [],
+            "liquidity_usd": 1000.0,
+            "risk_level": "Low",
+            "score": 80.0,
+        }
+        if provenance:
+            item["provenance"] = {"facts": [{"fact_id": "F0"}] * 40}
+        return item
+
+    def test_provenance_inside_the_window_is_never_pruned(self):
+        """A younger observation can still pair inside a horizon."""
+        with tempfile.TemporaryDirectory() as temp:
+            store = self._store(temp, {"t": {
+                "status": "terminal",
+                "observations": [self._obs(self.WINDOW - 3600)],
+            }})
+            result = store.prune_sealed_provenance()
+            self.assertEqual(result["pruned_observations"], 0)
+            self.assertEqual(result["retained_within_window"], 1)
+            self.assertIn(
+                "provenance", store.state["candidates"]["t"]["observations"][0]
+            )
+
+    def test_spent_provenance_is_dropped_once_past_the_window(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = self._store(temp, {"t": {
+                "status": "cooldown",           # status is deliberately not the key
+                "observations": [
+                    self._obs(self.WINDOW + 7200),
+                    self._obs(self.WINDOW + 3600),
+                ],
+            }}, completed=["7:6h", "7:24h", "7:72h"])
+            result = store.prune_sealed_provenance()
+            self.assertEqual(result["pruned_candidates"], 1)
+            self.assertEqual(result["pruned_observations"], 2)
+            for item in store.state["candidates"]["t"]["observations"]:
+                self.assertNotIn("provenance", item)
+            # The absence is explained in the record rather than unexplained.
+            self.assertEqual(
+                store.state["candidates"]["t"]["provenance_pruned_observations"], 2
+            )
+
+    def test_a_candidate_with_outcomes_still_due_keeps_its_evidence(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = self._store(temp, {"t": {
+                "observations": [
+                    self._obs(self.WINDOW + 7200),
+                    self._obs(self.WINDOW + 7200 - 6 * 3600 - 60),
+                ],
+            }})                                 # nothing completed -> 6h is due
+            result = store.prune_sealed_provenance()
+            self.assertEqual(result["pruned_observations"], 0)
+
+    def test_pruning_never_removes_a_candidate(self):
+        """The counterfactual learner replays refused candidates.
+
+        Dropping them would leave it sampling only tokens already admitted --
+        survivorship bias in the component whose job is to question the gate.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            store = self._store(temp, {"t": {
+                "status": "terminal",
+                "observations": [self._obs(self.WINDOW + 7200)],
+            }}, completed=["7:6h", "7:24h", "7:72h"])
+            store.prune_sealed_provenance()
+            self.assertIn("t", store.state["candidates"])
+            self.assertTrue(store.state["candidates"]["t"]["observations"])
+
+    def test_unreadable_timestamp_is_never_assumed_spent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            bad = self._obs(self.WINDOW + 7200)
+            bad["observed_at"] = "not-a-timestamp"
+            store = self._store(temp, {"t": {"observations": [bad]}})
+            self.assertEqual(
+                store.prune_sealed_provenance()["pruned_observations"], 0
+            )
+
+    def test_pruning_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as temp:
+            store = self._store(temp, {"t": {
+                "observations": [self._obs(self.WINDOW + 7200)],
+            }}, completed=["7:6h", "7:24h", "7:72h"])
+            first = store.prune_sealed_provenance()
+            second = store.prune_sealed_provenance()
+            self.assertEqual(first["pruned_observations"], 1)
+            self.assertEqual(second["pruned_observations"], 0)
+
+
 class PonsSecurityOutcomeCollectorTests(unittest.TestCase):
     """The collector is only worth anything if a learn cycle actually runs it."""
 
