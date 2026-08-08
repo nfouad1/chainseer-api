@@ -588,11 +588,19 @@ class ChainseerCognitiveLoop:
     def verify_incremental(self, *, maximum_new_rings: int = 128) -> tuple[bool, list[str]]:
         """Verify only rings appended after the startup-trusted head.
 
-        Chainseer owns an exclusive process lease for the ledger.  A full
-        verification establishes the initial trust anchor at startup; every
-        subsequent application append is then checked for index continuity,
-        previous-hash linkage, content hash, proof difficulty, and blockspace
-        integrity.  Periodic full audits remain an independent backstop.
+        A full verification establishes the initial trust anchor at startup;
+        every subsequent application append is then checked for index
+        continuity, previous-hash linkage, content hash, proof difficulty, and
+        blockspace integrity.  Periodic full audits remain an independent
+        backstop.
+
+        Chainseer does NOT own an exclusive process lease for the ledger --
+        the bot, the dashboards and the per-chain learners all seal into it
+        concurrently.  ``maximum_new_rings`` therefore bounds how much work a
+        single incremental check will do, not how far the chain is allowed to
+        move: exceeding it means this process fell behind, so the check falls
+        back to a full verification and re-anchors rather than reporting
+        tampering.
         """
 
         with self._integrity_lock:
@@ -612,9 +620,38 @@ class ChainseerCognitiveLoop:
             if delta <= 0:
                 return False, ["Timechain head regressed or changed in place"]
             if delta > maximum_new_rings:
-                return False, [
-                    f"incremental append span {delta} exceeds safety bound "
-                    f"{maximum_new_rings}"
+                # A span this wide means THIS process fell behind the other
+                # appenders -- not that the chain is corrupt. The ledger has
+                # no exclusive lease: the bot, the dashboards and three
+                # learners all seal into it, so any long-lived process drifts
+                # past the bound simply by staying up. Treating that as
+                # tampering locked a provably intact chain and stopped all
+                # sealing estate-wide.
+                #
+                # Recover the way startup already does -- fall back to a FULL
+                # verification and re-anchor. That is strictly STRONGER than
+                # the incremental check it replaces: it walks every ring from
+                # genesis rather than only the appended span. Cost is ~2s at
+                # 2.5k rings, paid only on an overflow that would otherwise
+                # have been an outage.
+                #
+                # If the full walk fails, the chain really is damaged and the
+                # caller's lockdown is correct -- so the failure is returned
+                # unchanged rather than swallowed.
+                full_ok, full_report = self.recall.tc.verify()
+                if not full_ok:
+                    return False, [
+                        f"incremental append span {delta} exceeds safety bound "
+                        f"{maximum_new_rings}; full verification also failed",
+                        *full_report,
+                    ]
+                self._trusted_head = head_identity
+                return True, [
+                    f"append span {delta} exceeded the incremental bound "
+                    f"{maximum_new_rings}; full verification passed and the "
+                    f"trust anchor was re-established at head "
+                    f"{head_identity[0]}",
+                    *full_report,
                 ]
             appended = self.recall.tc.tail_rings(delta)
             if len(appended) != delta:
