@@ -10,7 +10,7 @@ param(
     [int]$RecoveryLimit = 3,
 
     [ValidateRange(0, 25)]
-    [int]$GraduationLimit = 3
+    [int]$GraduationLimit = 6
 )
 
 $ErrorActionPreference = "Stop"

@@ -107,6 +107,22 @@ PUMP_PROGRAM_ID = "6EF8rrecthR5Dkzon8Nwu78hRvfCKubJ14M5uBEwF6P"
 PUMP_AMM_PROGRAM_ID = "pAMMBay6oceH9fJKBRHGP5D4bD4sWpmSwMn52FMfXEA"
 PUMP_PUBLIC_DOCS_COMMIT = "9c82f61cb711b044a17f770ab8ce9f9bdf78f333"
 
+# Analysis slots are the scarce resource, so spend them where safe tokens have
+# actually appeared. Measured on 1,507 analysed tokens: all 21 complete_safe
+# sit in graduated or near-graduated states (15 graduated_market_ready, 4
+# graduation_pending, 2 canonical_migration_pending) and NOT ONE came from raw
+# launch observation, against 720 launch_observation_unsafe.
+#
+# This does not reduce discovery. Both observers still sync and catalogue every
+# launch they see; only the analysis budget moves. A launch analysed less often
+# now remains indexed and becomes a graduation candidate later if it graduates.
+#
+# The raw-launch floor is deliberate. A cycle that only ever analysed graduated
+# tokens could never observe a raw launch turning out safe, and so could never
+# notice this pattern changing -- it would be optimising into a local optimum
+# it had made itself blind to. The floor is the cost of being able to be wrong.
+SOLANA_LAUNCH_EXPLORATION_SHARE = 1
+
 _ECOSYSTEM_LABELS = {
     "pump_fun": "Pump.fun",
     "meteora_dbc": "Meteora DBC",
@@ -4632,7 +4648,7 @@ class SolanaPrototypeEngine:
         limit: int = 10,
         signature_limit: int = 100,
         recovery_limit: int = 3,
-        graduation_limit: int = 3,
+        graduation_limit: int = 6,
         stranded_limit: int = 3,
         slot_span: int | None = None,
         max_pages: int = 10,
@@ -4663,9 +4679,18 @@ class SolanaPrototypeEngine:
             candidate.mint: candidate
             for candidate in graduation_candidates
         }
+        # Raw launches get the exploration floor, not the full limit: see
+        # SOLANA_LAUNCH_EXPLORATION_SHARE. Both venues keep a slot so neither
+        # goes unobserved -- meteora_dbc is 1,143 of 1,507 analysed tokens and
+        # would dominate a shared budget.
+        launch_share = max(0, min(int(limit), SOLANA_LAUNCH_EXPLORATION_SHARE))
         candidate_map.update({
             candidate.mint: candidate
-            for candidate in discovered[-limit:] + meteora_discovered[-limit:]
+            for candidate in (
+                discovered[-launch_share:] if launch_share else []
+            ) + (
+                meteora_discovered[-launch_share:] if launch_share else []
+            )
             if candidate.mint not in recovered_mints
         })
         stranded_candidates = self._probe_stranded_ready_candidates(
@@ -5981,7 +6006,7 @@ def main() -> None:
             command.add_argument(
                 "--graduation-limit",
                 type=int,
-                default=3,
+                default=6,
                 help="Maximum confirmed Pump launches selected by the bounded "
                 "curve-completion discovery lane for full analysis.",
             )
