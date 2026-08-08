@@ -5674,6 +5674,7 @@ class LearningLoopController:
 
 _DASHBOARD_SNAPSHOT_TTL_SECONDS = 15.0
 _DASHBOARD_SNAPSHOT_ATTR = "_dashboard_snapshot_cache"
+_DASHBOARD_BUILD_LOCK_ATTR = "_dashboard_snapshot_lock"
 
 
 def _solana_dashboard_snapshot(
@@ -5707,16 +5708,42 @@ def _solana_dashboard_snapshot(
     cached = getattr(engine, _DASHBOARD_SNAPSHOT_ATTR, None)
     if cached and (now - cached[0]) < max(0.0, ttl_seconds):
         return cached[1]
-    value = _build_solana_dashboard_snapshot(engine, learning_loop)
-    # Stamp AFTER the build, not before. The build itself takes longer than the
-    # TTL on a large chain, so timestamping at entry would leave every cached
-    # value already expired and rebuild on every request -- a cache that costs
-    # a dict write and saves nothing.
+
+    lock = getattr(engine, _DASHBOARD_BUILD_LOCK_ATTR, None)
+    if lock is None:
+        lock = threading.Lock()
+        try:
+            setattr(engine, _DASHBOARD_BUILD_LOCK_ATTR, lock)
+        except AttributeError:
+            pass
+
+    # Single-flight. The build outlasts the TTL on a real chain -- 74s measured
+    # against a 15s window -- so without this every poll arriving during a
+    # rebuild starts its OWN rebuild. That is the same unbounded pile-up the
+    # cache was added to prevent, merely rarer.
+    #
+    # A caller that finds a build already running serves the stale snapshot
+    # instead of queueing. Slightly old data now beats correct data never: the
+    # request that never returns is what made the Pons dashboard look dead.
+    if not lock.acquire(blocking=cached is None):
+        return cached[1]
     try:
-        setattr(engine, _DASHBOARD_SNAPSHOT_ATTR, (time.time(), value))
-    except AttributeError:
-        pass          # a slotted or frozen engine simply goes uncached
-    return value
+        # Re-check: another thread may have finished while this one waited.
+        cached = getattr(engine, _DASHBOARD_SNAPSHOT_ATTR, None)
+        if cached and (time.time() - cached[0]) < max(0.0, ttl_seconds):
+            return cached[1]
+        value = _build_solana_dashboard_snapshot(engine, learning_loop)
+        # Stamp AFTER the build, not before. The build itself takes longer than
+        # the TTL on a large chain, so timestamping at entry would leave every
+        # cached value already expired and rebuild on every request -- a cache
+        # that costs a dict write and saves nothing.
+        try:
+            setattr(engine, _DASHBOARD_SNAPSHOT_ATTR, (time.time(), value))
+        except AttributeError:
+            pass      # a slotted or frozen engine simply goes uncached
+        return value
+    finally:
+        lock.release()
 
 
 def serve_solana_dashboard(
