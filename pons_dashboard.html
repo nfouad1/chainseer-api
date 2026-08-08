@@ -279,36 +279,6 @@
       <div class="recommendation" id="managed-blockers">Managed paper entries remain paused until the active admission policy passes robust out-of-sample gates.</div>
     </section>
 
-    <section class="grid">
-      <article class="panel">
-        <div class="panel-head">
-          <div><h2>Admission quarantine</h2><div class="sub">Repeated independent evidence before any new position</div></div>
-          <span class="status"><span class="dot" id="admission-dot"></span><span id="admission-status">LOADING</span></span>
-        </div>
-        <div class="admission-counts">
-          <div class="mini"><strong id="admission-pending">—</strong><span>Pending</span></div>
-          <div class="mini"><strong id="admission-ready">—</strong><span>Ready</span></div>
-          <div class="mini"><strong id="admission-cooldown">—</strong><span>Cooldown</span></div>
-          <div class="mini"><strong id="admission-terminal">—</strong><span>Terminal</span></div>
-        </div>
-        <div class="gate-grid">
-          <div class="gate"><strong id="gate-observations">2×</strong><span>Clean observations</span></div>
-          <div class="gate"><strong id="gate-age">5m</strong><span>Minimum survival</span></div>
-          <div class="gate"><strong id="gate-roundtrip">≤8%</strong><span>Round-trip ceiling</span></div>
-          <div class="gate"><strong id="gate-liquidity">≤20%</strong><span>Liquidity drawdown</span></div>
-          <div class="gate"><strong id="gate-indeterminate">0</strong><span>Indeterminate evidence</span></div>
-          <div class="gate"><strong id="gate-rpc-retries">0</strong><span>RPC retries this process</span></div>
-        </div>
-        <div class="queue" id="quarantine-list"><div class="empty">Loading admission queue…</div></div>
-      </article>
-      <article class="panel">
-        <div class="panel-head">
-          <div><h2>Counterfactual policy lab</h2><div class="sub">Predeclared variants · no automatic adoption</div></div>
-        </div>
-        <div class="policy-list" id="policy-list"><div class="empty">Awaiting policy evaluation…</div></div>
-        <div class="recommendation" id="policy-recommendation">A policy recommendation requires closed out-of-sample evidence and explicit human approval.</div>
-      </article>
-    </section>
 
     <section class="grid">
       <article class="panel">
@@ -318,42 +288,8 @@
         </div>
         <div id="performance"><div class="empty">Loading live shadow positions…</div></div>
       </article>
-      <article class="panel">
-        <div class="panel-head"><div><h2>Shadow cohort</h2><div class="sub">Lifecycle composition</div></div></div>
-        <div class="donut-wrap">
-          <div>
-            <div class="donut" id="donut"><div class="donut-center"><strong id="donut-total">0</strong><span>Total<br>positions</span></div></div>
-            <div class="donut-legend">
-              <div class="mini"><strong id="donut-open">0</strong><span>Open</span></div>
-              <div class="mini"><strong id="donut-closed">0</strong><span>Closed</span></div>
-            </div>
-            <div class="robust-grid">
-              <div class="mini"><strong id="robust-ex-best">—</strong><span>Return excluding best</span></div>
-              <div class="mini"><strong id="robust-median">—</strong><span>Median multiple</span></div>
-              <div class="mini"><strong id="robust-winners">—</strong><span>Profitable breadth</span></div>
-              <div class="mini"><strong id="robust-concentration">—</strong><span>Best profit share</span></div>
-            </div>
-          </div>
-        </div>
-      </article>
     </section>
 
-    <section class="panel" style="margin-bottom:20px">
-      <div class="panel-head"><div><h2>Evidence & integrity path</h2><div class="sub">Each layer is checked independently on refresh</div></div><span class="status"><span class="dot" id="integrity-dot"></span><span id="integrity-label">CHECKING</span></span></div>
-      <details class="disclosure">
-        <summary>Show all 8 integrity layers</summary>
-        <div class="integrity">
-          <div class="node"><div class="node-top"><span class="node-name">Factory catalog</span><span class="dot" id="catalog-dot"></span></div><div class="node-value" id="catalog-node">—</div><div class="node-note">Canonical launch events</div></div>
-          <div class="node"><div class="node-top"><span class="node-name">Paper ledger</span><span class="dot" id="paper-dot"></span></div><div class="node-value" id="paper-events">—</div><div class="node-note" id="paper-report">Hash-linked events</div></div>
-          <div class="node"><div class="node-top"><span class="node-name">Shadow ledger</span><span class="dot" id="shadow-dot"></span></div><div class="node-value" id="shadow-events">—</div><div class="node-note" id="shadow-report">Hash-linked events</div></div>
-          <div class="node"><div class="node-top"><span class="node-name">Admission</span><span class="dot" id="admission-integrity-dot"></span></div><div class="node-value" id="admission-node">—</div><div class="node-note" id="admission-report">Quarantine state</div></div>
-          <div class="node"><div class="node-top"><span class="node-name">Policy lab</span><span class="dot" id="policy-integrity-dot"></span></div><div class="node-value" id="policy-node">—</div><div class="node-note" id="policy-report">Human-gated learner</div></div>
-          <div class="node"><div class="node-top"><span class="node-name">Managed paper</span><span class="dot" id="managed-integrity-dot"></span></div><div class="node-value" id="managed-node">—</div><div class="node-note" id="managed-report">Portfolio breakers</div></div>
-          <div class="node"><div class="node-top"><span class="node-name">Timechain</span><span class="dot" id="chain-dot"></span></div><div class="node-value" id="chain-node">—</div><div class="node-note" id="chain-report">Tamper-evident rings</div></div>
-          <div class="node"><div class="node-top"><span class="node-name">Faculties</span><span class="dot" id="faculty-dot"></span></div><div class="node-value" id="faculty-node">—</div><div class="node-note">Registry integrity</div></div>
-        </div>
-      </details>
-    </section>
 
     <section class="grid">
       <article class="panel table-panel">
@@ -365,16 +301,22 @@
           </table>
         </div>
       </article>
-      <article class="panel">
-        <div class="panel-head"><div><h2>Sealed activity</h2><div class="sub">Most recent operational ledger events</div></div></div>
-        <div class="events" id="events"><div class="empty">Loading ledger activity…</div></div>
-      </article>
     </section>
 
     <footer><span>READ-ONLY LOCAL OBSERVATORY · NO SIGNING · NO BROADCAST · NO PRIVATE KEYS</span><span id="updated">Not yet refreshed</span></footer>
   </main>
   <script>
-    const $ = (id) => document.getElementById(id);
+    // Sections can be removed from the markup without touching the render
+    // code: a missing element yields an inert stand-in whose writes go
+    // nowhere, so one absent panel cannot abort the whole refresh and leave
+    // every other panel stuck on "Loading".
+    const INERT = new Proxy({}, {
+      get: (_t, key) => (key === "style" || key === "classList" ? INERT
+                        : key === "textContent" || key === "innerHTML" ? ""
+                        : typeof key === "string" ? () => INERT : undefined),
+      set: () => true,
+    });
+    const $ = (id) => document.getElementById(id) || INERT;
     const esc = (value) => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
     const short = (value, n=12) => value ? `${String(value).slice(0,n)}…${String(value).slice(-6)}` : "—";
     const number = (value, digits=0) => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined,{maximumFractionDigits:digits}) : "—";
