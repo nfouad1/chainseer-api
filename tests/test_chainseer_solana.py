@@ -2366,6 +2366,98 @@ class SolanaPrototypeTests(unittest.TestCase):
                 chainseer_solana._solana_dashboard_snapshot(engine, ttl_seconds=0.2)
             self.assertEqual(len(builds), 1, "entry expired before it was stored")
 
+    def test_concurrent_polls_trigger_exactly_one_build(self):
+        """The build outlasts the TTL, so expiry must not start a herd.
+
+        Measured live: a 74s build against a 15s window. Without single-flight
+        every poll arriving during a rebuild starts its own -- the same
+        unbounded pile-up the cache exists to prevent, merely rarer.
+        """
+        import threading
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=Path(temp), rpc=FakeRPC(), jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            builds = []
+            started = threading.Event()
+
+            def slow(eng, loop=None):
+                builds.append(1)
+                started.set()
+                time.sleep(0.4)
+                return {"generated_at": "built"}
+
+            errors = []
+
+            def poll():
+                try:
+                    chainseer_solana._solana_dashboard_snapshot(engine)
+                except BaseException as exc:      # noqa: BLE001 - recorded
+                    errors.append(exc)
+
+            with unittest.mock.patch.object(
+                chainseer_solana, "_build_solana_dashboard_snapshot", slow
+            ):
+                threads = [threading.Thread(target=poll) for _ in range(8)]
+                for t in threads:
+                    t.start()
+                for t in threads:
+                    t.join(timeout=20)
+
+            self.assertEqual(errors, [], f"concurrent polls raised: {errors[:2]}")
+            self.assertEqual(
+                len(builds), 1, f"{len(builds)} concurrent builds -- herd not collapsed"
+            )
+
+    def test_a_poll_during_a_rebuild_is_served_stale_not_queued(self):
+        """Slightly old data now beats correct data never.
+
+        A request that never returns is what made the Pons dashboard look dead;
+        serving the previous snapshot keeps the page answering while a refresh
+        runs behind it.
+        """
+        import threading
+
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=Path(temp), rpc=FakeRPC(), jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            with unittest.mock.patch.object(
+                chainseer_solana, "_build_solana_dashboard_snapshot",
+                lambda eng, loop=None: {"generated_at": "first"},
+            ):
+                first = chainseer_solana._solana_dashboard_snapshot(engine)
+            self.assertEqual(first["generated_at"], "first")
+
+            in_build = threading.Event()
+            release = threading.Event()
+
+            def slow(eng, loop=None):
+                in_build.set()
+                release.wait(timeout=10)
+                return {"generated_at": "second"}
+
+            result = {}
+
+            def refresh():
+                with unittest.mock.patch.object(
+                    chainseer_solana, "_build_solana_dashboard_snapshot", slow
+                ):
+                    chainseer_solana._solana_dashboard_snapshot(engine, ttl_seconds=0)
+
+            worker = threading.Thread(target=refresh)
+            worker.start()
+            self.assertTrue(in_build.wait(timeout=10), "rebuild never started")
+            # A poll arriving mid-rebuild gets the previous value immediately.
+            served = chainseer_solana._solana_dashboard_snapshot(engine, ttl_seconds=0)
+            result["served"] = served
+            release.set()
+            worker.join(timeout=10)
+            self.assertEqual(result["served"]["generated_at"], "first")
+
     def test_cache_does_not_leak_across_engines(self):
         """CPython reuses id() once an object is collected.
 
