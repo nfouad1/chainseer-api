@@ -3252,5 +3252,144 @@ class TransientHardStopRecoveryTests(unittest.TestCase):
             )
 
 
+class RpcPacingAndRetryCeilingTest(unittest.TestCase):
+    """Bound the three delays that turned a 429 into a six-hour outage.
+
+    Discovery pages hard against getSignaturesForAddress, collected a 429, and
+    then slept: once for the open circuit breaker, once for an unbounded
+    Retry-After, per attempt, per retry round, per observer. Three consecutive
+    cycles measured 2099.0s, 2095.7s and 2100.0s -- under five seconds apart,
+    which is a fixed sleep schedule rather than network variance.
+
+    These tests measure the TOTAL time a fully-failing call would sleep, using
+    the injectable clock, rather than asserting the constants. Asserting the
+    constants would restate the source; asserting the total is what the outage
+    actually consisted of.
+    """
+
+    class FakeClock:
+        def __init__(self):
+            self.now = 1000.0
+            self.slept: list[float] = []
+
+        def sleep(self, seconds):
+            self.slept.append(seconds)
+            self.now += max(0.0, seconds)
+
+        def monotonic(self):
+            return self.now
+
+    class HostileResponse:
+        """429 with a Retry-After far larger than any sane wait."""
+
+        status_code = 429
+        headers = {"Retry-After": "600"}
+
+        def raise_for_status(self):
+            error = ConnectionError("rate limited")
+            error.response = self
+            raise error
+
+        def json(self):  # pragma: no cover - never reached
+            return {}
+
+    def _rpc(self, clock, **kwargs):
+        class Session:
+            def post(self_inner, *_args, **_kwargs):
+                return RpcPacingAndRetryCeilingTest.HostileResponse()
+
+        return chainseer_solana.SolanaRPC(
+            "https://mainnet.helius-rpc.com/?api-key=test",
+            session=Session(),
+            sleep_fn=clock.sleep,
+            monotonic_fn=clock.monotonic,
+            jitter_fn=lambda maximum: 0.0,
+            **kwargs,
+        )
+
+    def test_total_sleep_of_a_failing_call_is_bounded(self):
+        """The regression: one hostile header must not park the whole cycle."""
+        clock = self.FakeClock()
+        rpc = self._rpc(clock)
+
+        with self.assertRaises(chainseer_solana.InfrastructureIndeterminateError):
+            rpc._call("getSignaturesForAddress", [{}])
+
+        total = sum(clock.slept)
+        # Uncapped this was 5 rounds x 600s Retry-After = 3000s per call,
+        # before the circuit cooldown on top, and discovery makes two such
+        # calls a cycle. The cycle's own trigger is 300s, so anything near
+        # that is already worse than failing.
+        self.assertLess(
+            total, 300.0,
+            f"a single failing call slept {total:.0f}s; that is how a 429 "
+            f"became a 2100s cycle",
+        )
+        ceiling = max(
+            chainseer_solana.SOLANA_MAX_RETRY_SLEEP_SECONDS,
+            chainseer_solana.SOLANA_MAX_CIRCUIT_WAIT_SECONDS,
+        )
+        self.assertTrue(
+            all(s <= ceiling + 1e-6 for s in clock.slept),
+            f"an individual sleep exceeded every ceiling: {clock.slept}",
+        )
+
+    def test_retry_after_is_honoured_up_to_the_cap(self):
+        """Capped, not ignored -- the provider still sets the wait below it."""
+        clock = self.FakeClock()
+        rpc = self._rpc(clock)
+
+        with self.assertRaises(chainseer_solana.InfrastructureIndeterminateError):
+            rpc._call("getSlot")
+
+        backoff_sleeps = [
+            s for s in clock.slept
+            if s > chainseer_solana.SOLANA_MINIMUM_REQUEST_INTERVAL
+        ]
+        self.assertTrue(backoff_sleeps, "expected retry backoff sleeps")
+        self.assertEqual(
+            max(backoff_sleeps),
+            chainseer_solana.SOLANA_MAX_RETRY_SLEEP_SECONDS,
+            "a 600s Retry-After should clamp to the cap, not to the local "
+            "exponential backoff -- the header still wins below the ceiling",
+        )
+
+    def test_open_circuit_does_not_block_for_the_full_cooldown(self):
+        """With one endpoint the breaker is returned anyway; cap the wait."""
+        clock = self.FakeClock()
+        rpc = self._rpc(clock, circuit_cooldown_seconds=600.0)
+        rpc._endpoint_states[0]["circuit_open_until"] = clock.now + 600.0
+
+        with self.assertRaises(chainseer_solana.InfrastructureIndeterminateError):
+            rpc._call("getSlot")
+
+        self.assertTrue(
+            all(
+                s <= chainseer_solana.SOLANA_MAX_CIRCUIT_WAIT_SECONDS + 1e-6
+                for s in clock.slept
+                if s > chainseer_solana.SOLANA_MAX_RETRY_SLEEP_SECONDS
+            ),
+            f"slept out an open breaker: {clock.slept}",
+        )
+
+    def test_configured_endpoints_are_paced_by_default(self):
+        """The unpaced burst is what drew the 429 in the first place."""
+        clock = self.FakeClock()
+        rpc = self._rpc(clock)
+        self.assertGreater(
+            rpc._endpoint_states[0]["minimum_request_interval"], 0.0,
+            "a configured provider defaulted to no pacing at all, which let "
+            "discovery fire ten getSignaturesForAddress calls back to back",
+        )
+
+    def test_explicit_interval_still_overrides_the_default(self):
+        """Callers -- and the existing tests -- may still ask for zero."""
+        clock = self.FakeClock()
+        rpc = self._rpc(clock, minimum_request_interval=0)
+        self.assertEqual(
+            rpc._endpoint_states[0]["minimum_request_interval"], 0.0
+        )
+
+
 if __name__ == "__main__":
     unittest.main()

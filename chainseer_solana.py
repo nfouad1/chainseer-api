@@ -133,6 +133,36 @@ SOLANA_LAUNCH_EXPLORATION_SHARE = 1
 # The wait is short on purpose. A second caller has nothing useful to add by
 # queueing behind a full cycle: the work it would do has just been done. It
 # should discover the lock quickly and skip.
+# --- RPC pacing and retry ceilings -------------------------------------
+#
+# Discovery pages through getSignaturesForAddress up to max_pages times per
+# observer, twice a cycle, with nothing between the calls. Against a rate
+# limiter that burst IS the problem: the provider answers 429, and the retry
+# path then multiplies it. Measured on 2026-08-08, three consecutive cycles
+# took 2099.0s, 2095.7s and 2100.0s -- a spread of under five seconds, which
+# is the signature of a fixed sleep schedule rather than network variance.
+# Discovery was dead for six and a half hours and every cycle still exited 0.
+#
+# Three ceilings, because the delay had three independent sources:
+#
+# INTERVAL spaces requests so the burst never triggers the limiter. The class
+# already supports this per endpoint but only defaulted it for the public
+# Solana endpoint, leaving every configured provider completely unpaced.
+#
+# RETRY_SLEEP bounds an honoured Retry-After. The server's value was obeyed
+# without limit, so one hostile header could park a whole cycle. A cycle that
+# reruns every five minutes gains nothing from sleeping longer than that --
+# failing and letting the next cycle try is strictly better.
+#
+# CIRCUIT_WAIT bounds how long an OPEN breaker may block. With a single
+# endpoint, _available_endpoint_indexes() falls back to returning that
+# endpoint anyway, and the caller then slept out the full cooldown before
+# every attempt -- so the breaker, meant to shed load, became the largest
+# delay of all.
+SOLANA_MINIMUM_REQUEST_INTERVAL = 0.12
+SOLANA_MAX_RETRY_SLEEP_SECONDS = 20.0
+SOLANA_MAX_CIRCUIT_WAIT_SECONDS = 5.0
+
 SOLANA_RUN_LOCK_STALE_SECONDS = 30 * 60
 SOLANA_RUN_LOCK_WAIT_SECONDS = 5
 
@@ -767,12 +797,17 @@ class SolanaRPC:
         self._endpoint_states = []
         for index, endpoint in enumerate(self.urls):
             public = _public_rpc_endpoint(endpoint)
-            interval = (
-                0.25
-                if minimum_request_interval is None
-                and public == "https://api.mainnet-beta.solana.com"
-                else max(0.0, minimum_request_interval or 0.0)
-            )
+            if minimum_request_interval is not None:
+                interval = max(0.0, float(minimum_request_interval))
+            elif public == "https://api.mainnet-beta.solana.com":
+                interval = 0.25
+            else:
+                # Configured providers used to default to 0.0 -- entirely
+                # unpaced. That is what let discovery fire ten consecutive
+                # getSignaturesForAddress calls per observer and collect a
+                # 429. A paid endpoint is a reason to send MORE requests, not
+                # to send them without spacing.
+                interval = SOLANA_MINIMUM_REQUEST_INTERVAL
             self._endpoint_states.append(
                 {
                     "url": endpoint,
@@ -870,7 +905,17 @@ class SolanaRPC:
                     endpoint["circuit_open_until"] - self._monotonic()
                 )
                 if circuit_delay > 0:
-                    self._sleep(circuit_delay)
+                    # Capped: with one endpoint configured,
+                    # _available_endpoint_indexes() returns it even while its
+                    # breaker is open, so an uncapped wait here paid the full
+                    # cooldown before every attempt of every retry round. The
+                    # breaker exists to stop hammering a failing endpoint, and
+                    # the interval pacing plus the retry backoff below already
+                    # do that; blocking the caller for the whole cooldown just
+                    # converts a fast failure into a stalled cycle.
+                    self._sleep(
+                        min(circuit_delay, SOLANA_MAX_CIRCUIT_WAIT_SECONDS)
+                    )
                 delay = endpoint["minimum_request_interval"] - (
                     self._monotonic() - endpoint["last_request_at"]
                 )
@@ -936,8 +981,17 @@ class SolanaRPC:
                     )
             if retry_round < self.max_retries and round_retryable:
                 backoff = min(8.0, 0.5 * (2**retry_round))
+                # Retry-After is honoured but no longer unbounded. It arrives
+                # from the provider, so an aggressive value used to set the
+                # cycle's duration directly. Capping keeps the header
+                # authoritative up to a limit past which waiting is pointless:
+                # this cycle reruns in five minutes regardless, so a failure
+                # now costs nothing a long sleep would have saved.
                 self._sleep(
-                    max(retry_after, backoff + self._jitter(backoff * 0.2))
+                    min(
+                        max(retry_after, backoff + self._jitter(backoff * 0.2)),
+                        SOLANA_MAX_RETRY_SLEEP_SECONDS,
+                    )
                 )
             else:
                 break
