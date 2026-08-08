@@ -171,6 +171,95 @@ class OwnershipCheckFallbackTests(unittest.TestCase):
         self.assertEqual(result["owner"], "0x" + "0" * 40)
 
 
+class ImmuneLockdownReasonTests(unittest.TestCase):
+    """A lockdown must explain itself, because it destroys its own evidence.
+
+    The reflex computes a precise reason and discards it into a return value
+    nothing stores, so a lockdown surfaces only as an opaque "the self is
+    wounded" on every later seal. Diagnosing one cost a full investigation that
+    still could not identify which branch fired: by then the chain was frozen,
+    and a frozen chain cannot reproduce a failure that needs appends.
+    """
+
+    class _Loop:
+        """Minimal stand-in carrying only what _record_lockdown_reason uses."""
+
+        def __init__(self, root, head=None, trusted=None):
+            self.root = Path(root)
+            self._trusted_head = trusted
+
+            class _TC:
+                def __init__(self, h): self._h = h
+                def tail_rings(self, n): return [self._h] if self._h else []
+
+            class _Recall:
+                def __init__(self, h): self.tc = _TC(h)
+
+            self.recall = _Recall(head)
+
+        _record_lockdown_reason = (
+            chainseer.ChainseerCognitiveLoop._record_lockdown_reason
+        )
+
+    def _read(self, root):
+        return json.loads(
+            (Path(root) / "chain" / "immune_lockdown_reason.json")
+            .read_text(encoding="utf-8")
+        )
+
+    def test_records_the_branch_that_fired_and_both_heads(self):
+        with tempfile.TemporaryDirectory() as temp:
+            loop = self._Loop(
+                temp,
+                head={"index": 2515, "ring_hash": "b" * 64},
+                trusted=(2512, "a" * 64),
+            )
+            loop._record_lockdown_reason(
+                "incremental_chain_verify_failed",
+                ["Timechain head regressed or changed in place"],
+            )
+            rec = self._read(temp)
+            self.assertEqual(rec["reason"], "incremental_chain_verify_failed")
+            self.assertIn("regressed", rec["report"][0])
+            self.assertEqual(rec["trusted_head"]["index"], 2512)
+            self.assertEqual(rec["observed_head"]["index"], 2515)
+            # delta is the whole point: it distinguishes "head moved on"
+            # (another writer) from "changed in place" (a rewrite).
+            self.assertEqual(rec["delta"], 3)
+            self.assertIn("pid", rec)
+            self.assertIn("locked_at", rec)
+
+    def test_survives_a_missing_trust_anchor(self):
+        with tempfile.TemporaryDirectory() as temp:
+            loop = self._Loop(temp, head={"index": 5, "ring_hash": "c" * 64})
+            loop._record_lockdown_reason("x", ["anchor not established"])
+            rec = self._read(temp)
+            self.assertIsNone(rec["trusted_head"])
+            self.assertIsNone(rec["delta"])
+
+    def test_a_failing_diagnostic_never_worsens_the_incident(self):
+        """It runs during an integrity failure; it must not raise there."""
+        class Exploding(self._Loop):
+            def __init__(self, root):
+                super().__init__(root)
+                class _Boom:
+                    tc = property(lambda self: (_ for _ in ()).throw(RuntimeError("boom")))
+                self.recall = _Boom()
+
+        with tempfile.TemporaryDirectory() as temp:
+            loop = Exploding(temp)
+            loop._record_lockdown_reason("x", ["y"])   # must not raise
+
+    def test_the_reason_is_recorded_before_the_lock_is_taken(self):
+        """Locking stops appends, so the failing state must be captured first."""
+        import inspect
+
+        source = inspect.getsource(chainseer.ChainseerCognitiveLoop._guard_ring)
+        record_at = source.index("_record_lockdown_reason")
+        lock_at = source.index("self.immune.lockdown()")
+        self.assertLess(record_at, lock_at)
+
+
 class ChainseerInfrastructureTests(unittest.TestCase):
     def test_holder_balances_use_one_json_rpc_batch(self):
         rpc = chainseer.RobinhoodRPC("https://rpc.example.invalid")
