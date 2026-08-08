@@ -233,6 +233,41 @@ CATALOG_RETENTION_SECONDS = _safe_int(
 ) * 86_400
 
 
+
+def _discovery_coverage(coverage: dict, discovered_count: int) -> dict:
+    """Turn a sweep's stop condition into a statement about what it missed.
+
+    Only "reached_cursor" means the sweep is contiguous with the previous one.
+    Every other stop leaves a gap between the oldest signature examined and the
+    cursor -- and because the cursor advances to the NEWEST signature seen
+    regardless of where the sweep stopped, that gap is skipped permanently
+    rather than picked up next cycle.
+
+    slot_gap is the width of that hole in slots. It is deliberately NOT
+    presented as a count of missed launches: the only way to know how many
+    launches sit in the gap is to fetch it, which is exactly the work the
+    ceiling refused to do. It is an honest signal that a hole exists and how
+    wide it is, not an estimate of its contents.
+    """
+    stop = coverage.get("stop_reason") or "empty"
+    oldest = coverage.get("oldest_slot_seen")
+    cursor = coverage.get("cursor_slot_before")
+    contiguous = stop == "reached_cursor"
+    slot_gap = None
+    if not contiguous and oldest is not None and cursor:
+        slot_gap = max(0, int(oldest) - int(cursor))
+    return {
+        "stop_reason": stop,
+        "contiguous_with_previous_sweep": contiguous,
+        "pages_used": coverage.get("pages_used", 0),
+        "signatures_seen": coverage.get("signatures_seen", 0),
+        "candidates_found": int(discovered_count),
+        "oldest_slot_seen": oldest,
+        "cursor_slot_before": cursor,
+        "slot_gap": slot_gap,
+        "measured_at": _utc_now(),
+    }
+
 def _timestamp(value: str | None) -> float | None:
     if not value:
         return None
@@ -1207,6 +1242,8 @@ class PumpFunObserver:
         self.root = Path(root)
         self.catalog_path = self.root / "catalog.json"
         self.cursor_path = self.root / "observer_cursor.json"
+        self.coverage_path = self.root / "discovery_coverage.json"
+        self.last_coverage: dict = {}
         self.ledger = ledger
 
     @staticmethod
@@ -1315,6 +1352,13 @@ class PumpFunObserver:
             {"schema_version": SCHEMA_VERSION, "ecosystem": "pump_fun", "tokens": {}},
         )
         discovered: list[SolanaLaunchCandidate] = []
+        coverage = {
+            "stop_reason": "empty",
+            "pages_used": 0,
+            "signatures_seen": 0,
+            "oldest_slot_seen": None,
+            "cursor_slot_before": cursor_slot or None,
+        }
         all_signatures: list[dict] = []
         newest_signature = cursor_signature
         newest_slot = cursor_slot
@@ -1341,16 +1385,30 @@ class PumpFunObserver:
                 newest_slot = _safe_int(batch[0].get("slot"), cursor_slot)
             oldest_in_batch = batch[-1]
             oldest_slot = _safe_int(oldest_in_batch.get("slot"))
+            coverage["pages_used"] = page_index + 1
+            coverage["signatures_seen"] = len(all_signatures)
+            coverage["oldest_slot_seen"] = oldest_slot
 
             # Stop conditions evaluated AFTER absorbing the batch.
             reached_cursor = cursor_slot and oldest_slot is not None and oldest_slot <= cursor_slot
             reached_floor = slot_floor is not None and oldest_slot is not None and oldest_slot <= slot_floor
             if reached_cursor or reached_floor:
+                coverage["stop_reason"] = (
+                    "reached_cursor" if reached_cursor else "slot_floor"
+                )
                 break
             # Advance the paging cursor to the oldest signature of this batch.
             before_signature = oldest_in_batch.get("signature")
             if not before_signature:
+                coverage["stop_reason"] = "no_before_signature"
                 break
+        else:
+            # The for-loop ran to exhaustion: the page ceiling stopped the
+            # sweep before it reached the cursor. Everything between the oldest
+            # signature seen and the cursor is skipped, and the cursor still
+            # advances to the newest -- so those launches are missed
+            # permanently, not deferred to the next cycle.
+            coverage["stop_reason"] = "max_pages"
 
         # Decode in chronological order (oldest first) so the catalog reflects
         # the order events actually occurred on-chain. Pump.fun emits many more
@@ -1383,6 +1441,8 @@ class PumpFunObserver:
             }
         self._write_catalog(catalog)
         _atomic_json(self.cursor_path, cursor)
+        self.last_coverage = _discovery_coverage(coverage, len(discovered))
+        _atomic_json(self.coverage_path, self.last_coverage)
         return discovered
 
     def _write_catalog(self, catalog: dict) -> None:
@@ -1495,6 +1555,8 @@ class MeteoraObserver:
         self.root = Path(root)
         self.catalog_path = self.root / "meteora_catalog.json"
         self.cursor_path = self.root / "meteora_observer_cursor.json"
+        self.coverage_path = self.root / "meteora_discovery_coverage.json"
+        self.last_coverage: dict = {}
         self.ledger = ledger
 
     @staticmethod
@@ -1531,6 +1593,13 @@ class MeteoraObserver:
             },
         )
         discovered: list[SolanaLaunchCandidate] = []
+        coverage = {
+            "stop_reason": "empty",
+            "pages_used": 0,
+            "signatures_seen": 0,
+            "oldest_slot_seen": None,
+            "cursor_slot_before": cursor_slot or None,
+        }
         all_signatures: list[dict] = []
         newest_signature = cursor_signature
         newest_slot = cursor_slot
@@ -1556,14 +1625,28 @@ class MeteoraObserver:
                 newest_slot = _safe_int(batch[0].get("slot"), cursor_slot)
             oldest_in_batch = batch[-1]
             oldest_slot = _safe_int(oldest_in_batch.get("slot"))
+            coverage["pages_used"] = page_index + 1
+            coverage["signatures_seen"] = len(all_signatures)
+            coverage["oldest_slot_seen"] = oldest_slot
 
             reached_cursor = cursor_slot and oldest_slot is not None and oldest_slot <= cursor_slot
             reached_floor = slot_floor is not None and oldest_slot is not None and oldest_slot <= slot_floor
             if reached_cursor or reached_floor:
+                coverage["stop_reason"] = (
+                    "reached_cursor" if reached_cursor else "slot_floor"
+                )
                 break
             before_signature = oldest_in_batch.get("signature")
             if not before_signature:
+                coverage["stop_reason"] = "no_before_signature"
                 break
+        else:
+            # The for-loop ran to exhaustion: the page ceiling stopped the
+            # sweep before it reached the cursor. Everything between the oldest
+            # signature seen and the cursor is skipped, and the cursor still
+            # advances to the newest -- so those launches are missed
+            # permanently, not deferred to the next cycle.
+            coverage["stop_reason"] = "max_pages"
 
         for row in reversed(all_signatures):
             if row.get("err"):
@@ -1587,6 +1670,8 @@ class MeteoraObserver:
             }
         self._write_catalog(catalog)
         _atomic_json(self.cursor_path, cursor)
+        self.last_coverage = _discovery_coverage(coverage, len(discovered))
+        _atomic_json(self.coverage_path, self.last_coverage)
         return discovered
 
     def _write_catalog(self, catalog: dict) -> None:
@@ -4796,6 +4881,13 @@ class SolanaPrototypeEngine:
                     for result in results
                 ),
                 "graduation_probe": graduation_probe,
+                # How complete each discovery sweep was. A stop_reason other
+                # than reached_cursor means launches were skipped permanently,
+                # which is invisible everywhere else in this summary.
+                "discovery_coverage": {
+                    "pump_fun": self.observer.last_coverage,
+                    "meteora_dbc": self.meteora_observer.last_coverage,
+                },
             },
             "evidence_states": {
                 name: sum(
