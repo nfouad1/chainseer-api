@@ -5672,8 +5672,8 @@ class LearningLoopController:
 
 
 
-_DASHBOARD_SNAPSHOT_CACHE: dict = {}
 _DASHBOARD_SNAPSHOT_TTL_SECONDS = 15.0
+_DASHBOARD_SNAPSHOT_ATTR = "_dashboard_snapshot_cache"
 
 
 def _solana_dashboard_snapshot(
@@ -5698,8 +5698,13 @@ def _solana_dashboard_snapshot(
     take minutes.
     """
     now = time.time()
-    key = id(engine)
-    cached = _DASHBOARD_SNAPSHOT_CACHE.get(key)
+    # Cached ON the engine, not in a module dict keyed by id(engine). CPython
+    # reuses id() values once an object is collected, so a module-level cache
+    # hands a fresh engine the snapshot of a dead one -- which is exactly what
+    # happened: a test built a new engine, got a previous engine's cached
+    # snapshot, and read analysis_count 0 instead of 3. Tying the cache to the
+    # instance makes its lifetime the engine's lifetime.
+    cached = getattr(engine, _DASHBOARD_SNAPSHOT_ATTR, None)
     if cached and (now - cached[0]) < max(0.0, ttl_seconds):
         return cached[1]
     value = _build_solana_dashboard_snapshot(engine, learning_loop)
@@ -5707,7 +5712,10 @@ def _solana_dashboard_snapshot(
     # TTL on a large chain, so timestamping at entry would leave every cached
     # value already expired and rebuild on every request -- a cache that costs
     # a dict write and saves nothing.
-    _DASHBOARD_SNAPSHOT_CACHE[key] = (time.time(), value)
+    try:
+        setattr(engine, _DASHBOARD_SNAPSHOT_ATTR, (time.time(), value))
+    except AttributeError:
+        pass          # a slotted or frozen engine simply goes uncached
     return value
 
 

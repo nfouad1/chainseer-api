@@ -2366,6 +2366,35 @@ class SolanaPrototypeTests(unittest.TestCase):
                 chainseer_solana._solana_dashboard_snapshot(engine, ttl_seconds=0.2)
             self.assertEqual(len(builds), 1, "entry expired before it was stored")
 
+    def test_cache_does_not_leak_across_engines(self):
+        """CPython reuses id() once an object is collected.
+
+        A module-level cache keyed by id(engine) hands a fresh engine the
+        snapshot of a dead one. Not theoretical: it turned analysis_count 3
+        into 0 in CI while passing locally, because allocation order differed.
+        The cache must live on the instance.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            builds = []
+            real = chainseer_solana._build_solana_dashboard_snapshot
+
+            def counting(eng, loop=None):
+                builds.append(1)
+                return real(eng, loop)
+
+            with unittest.mock.patch.object(
+                chainseer_solana, "_build_solana_dashboard_snapshot", counting
+            ):
+                for _ in range(3):
+                    engine = chainseer_solana.SolanaPrototypeEngine(
+                        root=Path(temp), rpc=FakeRPC(), jupiter=FakeJupiter(),
+                        record_timechain=False,
+                    )
+                    chainseer_solana._solana_dashboard_snapshot(engine)
+                    chainseer_solana._solana_dashboard_snapshot(engine)
+            # 3 distinct engines, 2 calls each: 3 builds, not 1 and not 6.
+            self.assertEqual(len(builds), 3)
+
     def test_snapshot_does_not_materialise_the_whole_chain(self):
         # list(iter_rings()) loaded all 7,292 rings -- 235MB -- purely to take
         # len() and [-1]. height() and tail_rings(1) give both.
