@@ -306,6 +306,7 @@ PONS_FACTORY_BY_ADDRESS = {
 
 
 from chainseer_core import (
+    schedule_with_live_state,
     utc_now as _utc_now,
     canonical_json as _canonical_json,
     safe_float as _safe_float,
@@ -5793,11 +5794,15 @@ def _dashboard_snapshot(engine: PonsPrototypeEngine) -> dict:
         "managed_portfolio": managed_portfolio,
         "rpc_health": rpc_health,
         "analysis_pipeline": engine.analysis_pipeline(),
-        "schedule": schedule,
+        # Real scheduler state, not schedule.json's declared value: that file
+        # is only written by manage_chainseer_pons_learning_task.ps1, so any
+        # other way of enabling the task leaves it stale and the dashboard
+        # reports a paused learner that is actually running.
+        "schedule": schedule_with_live_state(schedule),
         "scheduler": scheduler,
         "learning": learning,
         "guard": guard,
-        "guard_schedule": guard_schedule,
+        "guard_schedule": schedule_with_live_state(guard_schedule),
         "guard_scheduler": guard_scheduler,
     }
 

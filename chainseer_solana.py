@@ -183,6 +183,7 @@ class ReflectionCheckpointPending(RuntimeError):
 import functools
 
 from chainseer_core import (
+    schedule_with_live_state,
     utc_now as _utc_now,
     canonical_json as _canonical_json_impl,
     safe_float as _safe_float,
@@ -5190,7 +5191,11 @@ def _solana_dashboard_snapshot(
         engine.root / "concentration_calibration.json",
         engine.concentration_calibration(),
     )
-    schedule = _read_json(engine.root / "schedule.json", {})
+    # Live scheduler state rather than the declared file; see
+    # chainseer_core.schedule_with_live_state.
+    schedule = schedule_with_live_state(
+        _read_json(engine.root / "schedule.json", {})
+    )
     scheduler = _read_json(engine.root / "scheduler_status.json", {})
     controller = _read_json(engine.root / "controller_status.json", {})
     reflection = engine.reflection_status()
