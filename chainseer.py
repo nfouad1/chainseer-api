@@ -660,6 +660,53 @@ class ChainseerCognitiveLoop:
                 f"head {head_identity[0]}"
             ]
 
+    def _record_lockdown_reason(self, reason: str, report: list[str]) -> None:
+        """Persist why the reflex locked, next to the chain it locked.
+
+        The reflex already computes a precise reason and discards it into a
+        return value nothing stores, so a lockdown surfaces only as an opaque
+        "the self is wounded" on every subsequent seal. Diagnosing one cost a
+        full investigation that still could not identify which branch fired,
+        because by then the chain was frozen and the failure unreproducible --
+        a lockdown stops the appends whose absence makes it un-diagnosable.
+
+        Written to its own file rather than into immune.json, which the skill
+        owns and rewrites. Best-effort: a diagnostic that could itself raise
+        during an integrity failure would make the incident worse.
+        """
+        try:
+            head = None
+            tail = self.recall.tc.tail_rings(1)
+            if tail:
+                head = {
+                    "index": tail[-1].get("index"),
+                    "ring_hash": tail[-1].get("ring_hash"),
+                }
+            trusted = self._trusted_head
+            record = {
+                "reason": reason,
+                "report": list(report or []),
+                "trusted_head": (
+                    {"index": trusted[0], "ring_hash": trusted[1]}
+                    if trusted else None
+                ),
+                "observed_head": head,
+                "delta": (
+                    head["index"] - trusted[0]
+                    if head and trusted and isinstance(head.get("index"), int)
+                    else None
+                ),
+                "pid": os.getpid(),
+                "locked_at": datetime.now(timezone.utc).isoformat(),
+            }
+            path = self.root / "chain" / "immune_lockdown_reason.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(
+                json.dumps(record, indent=2, sort_keys=True), encoding="utf-8"
+            )
+        except Exception:                      # never worsen an integrity event
+            pass
+
     def _guard_ring(
         self,
         ring: dict,
@@ -671,6 +718,9 @@ class ChainseerCognitiveLoop:
 
         ok, report = self.verify_incremental()
         if not ok:
+            # Record BEFORE locking: once locked, appends stop, and the state
+            # that produced the failure can no longer be observed.
+            self._record_lockdown_reason("incremental_chain_verify_failed", report)
             self.immune.lockdown()
             return {
                 "action": "lockdown",
