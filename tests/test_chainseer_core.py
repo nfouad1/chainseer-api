@@ -5,7 +5,13 @@ import unittest
 import unittest.mock
 from pathlib import Path
 
-from chainseer_core import atomic_json_write, read_json
+import chainseer_core
+from chainseer_core import (
+    atomic_json_write,
+    read_json,
+    schedule_with_live_state,
+    scheduled_task_state,
+)
 
 
 class AtomicJsonWriteTests(unittest.TestCase):
@@ -102,6 +108,117 @@ class AtomicJsonWriteTests(unittest.TestCase):
             ["state.json"],
             "scratch files were left behind",
         )
+
+
+class ScheduledTaskStateTests(unittest.TestCase):
+    """A dashboard must report the scheduler's real state, or admit it cannot.
+
+    The adapters persist schedule.json, but only the manage_*.ps1 scripts write
+    it. Enabling a task any other way leaves that file stale -- observed in
+    production claiming enabled=false from a three-week-old timestamp while the
+    task was Running, so the dashboard showed a paused learner that wasn't.
+    """
+
+    def setUp(self):
+        chainseer_core._TASK_STATE_CACHE.clear()
+
+    tearDown = setUp
+
+    @staticmethod
+    def _row(state):
+        # schtasks CSV: TaskName, Next Run Time, Status
+        return '"Task","N/A","' + state + '"' + chr(10)
+
+    @staticmethod
+    def _result(returncode=0, stdout="", stderr=""):
+        class Result:
+            pass
+
+        value = Result()
+        value.returncode = returncode
+        value.stdout = stdout
+        value.stderr = stderr
+        return value
+
+    def _as_windows(self, run_value):
+        return (
+            unittest.mock.patch.object(chainseer_core.os, "name", "nt"),
+            unittest.mock.patch.object(
+                chainseer_core.subprocess, "run", return_value=run_value
+            ),
+        )
+
+    def test_running_task_reads_as_enabled(self):
+        os_patch, run_patch = self._as_windows(self._result(stdout=self._row("Running")))
+        with os_patch, run_patch:
+            state = scheduled_task_state("Task")
+        self.assertEqual(state["state"], "Running")
+        self.assertTrue(state["enabled"])
+        self.assertTrue(state["available"])
+
+    def test_disabled_is_the_only_state_meaning_not_enabled(self):
+        for raw, expected in (("Ready", True), ("Running", True), ("Disabled", False)):
+            chainseer_core._TASK_STATE_CACHE.clear()
+            os_patch, run_patch = self._as_windows(self._result(stdout=self._row(raw)))
+            with os_patch, run_patch, self.subTest(state=raw):
+                self.assertEqual(scheduled_task_state("Task")["enabled"], expected)
+
+    def test_unknown_state_is_none_not_false(self):
+        """Never claim the learner is stopped merely because we cannot see it."""
+        os_patch, run_patch = self._as_windows(
+            self._result(returncode=1, stderr="ERROR: cannot find the file")
+        )
+        with os_patch, run_patch:
+            state = scheduled_task_state("Absent")
+        self.assertIsNone(state["enabled"])
+        self.assertFalse(state["available"])
+        self.assertIn("cannot find", state["reason"])
+
+    def test_non_windows_degrades_without_claiming_disabled(self):
+        with unittest.mock.patch.object(chainseer_core.os, "name", "posix"):
+            state = scheduled_task_state("Anything")
+        self.assertIsNone(state["enabled"])
+        self.assertFalse(state["available"])
+
+    def test_result_is_cached_so_polling_does_not_spawn_a_process_each_time(self):
+        calls = []
+
+        def fake_run(*args, **kwargs):
+            calls.append(args)
+            return self._result(stdout=self._row("Ready"))
+
+        with unittest.mock.patch.object(chainseer_core.os, "name", "nt"), \
+                unittest.mock.patch.object(chainseer_core.subprocess, "run", fake_run):
+            for _ in range(5):
+                scheduled_task_state("Task")
+        self.assertEqual(len(calls), 1, "cache did not hold")
+
+    def test_live_state_overrides_the_declared_file_and_flags_drift(self):
+        declared = {"task_name": "Task", "enabled": False, "interval_minutes": 10}
+        os_patch, run_patch = self._as_windows(self._result(stdout=self._row("Running")))
+        with os_patch, run_patch:
+            merged = schedule_with_live_state(declared)
+        self.assertTrue(merged["enabled"])              # reality wins
+        self.assertFalse(merged["declared_enabled"])    # stale value preserved
+        self.assertTrue(merged["schedule_drift"])       # and the gap is visible
+        self.assertEqual(merged["interval_minutes"], 10)  # static config intact
+
+    def test_no_drift_when_file_and_reality_agree(self):
+        os_patch, run_patch = self._as_windows(self._result(stdout=self._row("Ready")))
+        with os_patch, run_patch:
+            merged = schedule_with_live_state({"task_name": "Task", "enabled": True})
+        self.assertFalse(merged["schedule_drift"])
+
+    def test_unavailable_scheduler_reports_enabled_none(self):
+        with unittest.mock.patch.object(chainseer_core.os, "name", "posix"):
+            merged = schedule_with_live_state({"task_name": "Task", "enabled": True})
+        self.assertIsNone(merged["enabled"])
+        self.assertIn("enabled_unavailable_reason", merged)
+
+    def test_missing_task_name_leaves_the_declared_block_alone(self):
+        merged = schedule_with_live_state({"enabled": True})
+        self.assertTrue(merged["enabled"])
+        self.assertEqual(merged["enabled_source"], "declared")
 
 
 if __name__ == "__main__":

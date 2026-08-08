@@ -32,6 +32,7 @@ from __future__ import annotations
 import json
 import math
 import os
+import subprocess
 import time
 import uuid
 from datetime import datetime, timezone
@@ -117,6 +118,116 @@ def atomic_json_write(path: Path, value, *, ensure_ascii: bool = False, default=
         except OSError:
             pass
 
+
+
+# --------------------------------------------------------------------------- #
+# Live scheduler state
+# --------------------------------------------------------------------------- #
+
+_TASK_STATE_CACHE: dict[str, tuple[float, dict]] = {}
+_TASK_STATE_TTL_SECONDS = 10.0
+
+
+def scheduled_task_state(
+    task_name: str, *, ttl_seconds: float = _TASK_STATE_TTL_SECONDS
+) -> dict:
+    """Ask the OS what a scheduled task is actually doing.
+
+    The adapters persist a schedule.json saying whether their task is enabled,
+    but only the manage_*.ps1 scripts update it. Enabling a task any other way
+    -- Enable-ScheduledTask, the Task Scheduler UI -- leaves that file behind,
+    and a dashboard reading it then reports "paused" while the learner runs.
+    Observed in production: schedule.json still claimed enabled=false from a
+    timestamp three weeks stale while the task was Running.
+
+    Returns enabled=None, not False, when the state cannot be determined. A
+    dashboard that cannot see the scheduler must say so rather than assert the
+    learner is stopped -- the whole point is to stop reporting confident
+    falsehoods about it.
+    """
+    now = time.time()
+    cached = _TASK_STATE_CACHE.get(task_name)
+    if cached and (now - cached[0]) < max(0.0, ttl_seconds):
+        return dict(cached[1])
+
+    result = {
+        "task_name": task_name,
+        "state": None,
+        "enabled": None,
+        "available": False,
+        "source": "unavailable",
+        "reason": None,
+    }
+    if os.name != "nt":
+        result["reason"] = "scheduled tasks are Windows-only"
+    else:
+        try:
+            completed = subprocess.run(
+                ["schtasks", "/query", "/tn", task_name, "/fo", "csv", "/nh"],
+                capture_output=True,
+                text=True,
+                errors="replace",
+                timeout=8,
+            )
+        except (OSError, subprocess.SubprocessError) as exc:
+            result["reason"] = f"{type(exc).__name__}: {exc}"[:160]
+        else:
+            if completed.returncode != 0:
+                result["reason"] = (
+                    (completed.stderr or "schtasks query failed").strip()[:160]
+                )
+            else:
+                row = (completed.stdout or "").strip().splitlines()
+                fields = (
+                    [item.strip().strip('"') for item in row[0].split('","')]
+                    if row
+                    else []
+                )
+                state = fields[2].strip() if len(fields) > 2 else ""
+                if state:
+                    result.update({
+                        "state": state,
+                        # "Disabled" is the only state that means not running on
+                        # schedule; Ready and Running are both live.
+                        "enabled": state.lower() != "disabled",
+                        "available": True,
+                        "source": "schtasks",
+                    })
+                else:
+                    result["reason"] = "schtasks returned no state column"
+
+    _TASK_STATE_CACHE[task_name] = (now, dict(result))
+    return result
+
+
+def schedule_with_live_state(declared: dict, task_name: str | None = None) -> dict:
+    """Merge a persisted schedule block with the scheduler's real state.
+
+    The declared file still supplies static configuration -- interval, runner
+    path, task name. Only `enabled` is replaced, and the file's own value is
+    preserved as declared_enabled so a drift between the two stays visible
+    rather than being silently overwritten.
+    """
+    merged = dict(declared or {})
+    name = task_name or merged.get("task_name")
+    if not name:
+        merged["enabled_source"] = "declared"
+        return merged
+    live = scheduled_task_state(str(name))
+    merged["declared_enabled"] = merged.get("enabled")
+    merged["live_state"] = live["state"]
+    merged["enabled_source"] = live["source"]
+    if live["available"]:
+        merged["enabled"] = live["enabled"]
+    else:
+        merged["enabled"] = None
+        merged["enabled_unavailable_reason"] = live["reason"]
+    merged["schedule_drift"] = (
+        live["available"]
+        and merged["declared_enabled"] is not None
+        and bool(merged["declared_enabled"]) != bool(live["enabled"])
+    )
+    return merged
 
 def read_json(path: Path, default=None):
     """Read JSON, tolerant of a UTF-8 BOM (PowerShell's `-Encoding utf8`
