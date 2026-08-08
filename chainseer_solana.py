@@ -123,6 +123,19 @@ PUMP_PUBLIC_DOCS_COMMIT = "9c82f61cb711b044a17f770ab8ce9f9bdf78f333"
 # it had made itself blind to. The floor is the cost of being able to be wrong.
 SOLANA_LAUNCH_EXPLORATION_SHARE = 1
 
+# Solana learn cycles run 400-500s against a 5-minute trigger, so overlap is
+# the normal case rather than the exception. Task Scheduler's IgnoreNew keeps
+# two SCHEDULED instances apart, but nothing kept a manual run, a dashboard
+# loop, or any other caller from writing solana_chain at the same time -- and
+# that is exactly how this chain was corrupted once already, producing a
+# duplicate ring index that needed a manual orphan-drop to repair.
+#
+# The wait is short on purpose. A second caller has nothing useful to add by
+# queueing behind a full cycle: the work it would do has just been done. It
+# should discover the lock quickly and skip.
+SOLANA_RUN_LOCK_STALE_SECONDS = 30 * 60
+SOLANA_RUN_LOCK_WAIT_SECONDS = 5
+
 _ECOSYSTEM_LABELS = {
     "pump_fun": "Pump.fun",
     "meteora_dbc": "Meteora DBC",
@@ -207,6 +220,7 @@ from chainseer_core import (
     atomic_json_write as _atomic_json,
     read_json as _read_json,
 )
+from chainseer_base import LearningRunLock, LearningRunLockedError
 from chainseer_wallet_convergence import WalletConvergenceTracker
 from chainseer_meteora_provenance import (
     DAMM_V2_PROGRAM_ID,
@@ -4739,6 +4753,33 @@ class SolanaPrototypeEngine:
         max_pages: int = 10,
     ) -> dict:
         self.assert_learning_allowed()
+        with LearningRunLock(
+            self.root / ".learn_once.lock",
+            stale_seconds=SOLANA_RUN_LOCK_STALE_SECONDS,
+            wait_seconds=SOLANA_RUN_LOCK_WAIT_SECONDS,
+        ):
+            return self._learn_once_locked(
+                limit=limit,
+                signature_limit=signature_limit,
+                recovery_limit=recovery_limit,
+                graduation_limit=graduation_limit,
+                stranded_limit=stranded_limit,
+                slot_span=slot_span,
+                max_pages=max_pages,
+            )
+
+    def _learn_once_locked(
+        self,
+        *,
+        limit: int = 10,
+        signature_limit: int = 100,
+        recovery_limit: int = 3,
+        graduation_limit: int = 6,
+        stranded_limit: int = 3,
+        slot_span: int | None = None,
+        max_pages: int = 10,
+    ) -> dict:
+        """The cycle body. Callers must hold the run lock -- see learn_once."""
         recovery_seeded = self._seed_recovery_queue()
         recovered = self._recover_indeterminate(
             limit=max(0, recovery_limit), shadow_enter=True

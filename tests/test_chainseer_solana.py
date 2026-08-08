@@ -1,5 +1,6 @@
 import base64
 import json
+import os
 import struct
 import tempfile
 import time
@@ -2312,6 +2313,69 @@ class SolanaPrototypeTests(unittest.TestCase):
         self.assertEqual(by_key["meteora_dbc"]["analysed"], 1)
         self.assertEqual(by_key["pump_fun"]["analysed"], 0)
 
+    def test_learn_once_holds_a_run_lock(self):
+        """Pons and Base both take one; solana did not.
+
+        Cycles run 400-500s against a 5-minute trigger, so overlap is the
+        normal case. Task Scheduler keeps two SCHEDULED instances apart, but
+        nothing stopped a manual run or a dashboard loop from writing
+        solana_chain concurrently -- which is how this chain was corrupted
+        once already, producing a duplicate ring index.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root, rpc=FakeRPC(), jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            # Hold the lock as another process would.
+            (root / ".learn_once.lock").write_text(
+                json.dumps({"pid": os.getpid(), "started_at": "2026-08-08T00:00:00+00:00"}),
+                encoding="utf-8",
+            )
+            with self.assertRaises(chainseer_solana.LearningRunLockedError):
+                engine.learn_once(limit=1)
+
+    def test_a_dead_holder_does_not_block_the_cycle(self):
+        # Same liveness rule as Base: a lock naming a dead process is
+        # abandoned immediately rather than after the stale window.
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root, rpc=FakeRPC(), jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            (root / ".learn_once.lock").write_text(
+                json.dumps({"pid": 999999, "started_at": "2026-08-08T00:00:00+00:00"}),
+                encoding="utf-8",
+            )
+            called = []
+            engine._learn_once_locked = lambda **kw: called.append(1) or {"ok": True}
+            engine.learn_once(limit=1)
+            self.assertEqual(len(called), 1, "dead holder blocked the cycle")
+
+    def test_the_lock_is_released_when_the_cycle_ends(self):
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root, rpc=FakeRPC(), jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            engine._learn_once_locked = lambda **kw: {"ok": True}
+            engine.learn_once(limit=1)
+            self.assertFalse(
+                (root / ".learn_once.lock").exists(), "lock leaked after the cycle"
+            )
+
+    def test_the_wait_is_short_because_a_queued_caller_adds_nothing(self):
+        # A second caller has nothing to add by waiting out a full cycle: the
+        # work it would do has just been done. It should skip, not queue.
+        self.assertLessEqual(chainseer_solana.SOLANA_RUN_LOCK_WAIT_SECONDS, 30)
+        self.assertLess(
+            chainseer_solana.SOLANA_RUN_LOCK_WAIT_SECONDS,
+            chainseer_solana.SOLANA_RUN_LOCK_STALE_SECONDS,
+        )
+
     def test_reaching_the_cursor_is_the_only_contiguous_sweep(self):
         """Every other stop leaves a permanent hole.
 
@@ -2376,8 +2440,10 @@ class SolanaPrototypeTests(unittest.TestCase):
         self.assertEqual(chainseer_solana.SOLANA_LAUNCH_EXPLORATION_SHARE, 1)
         import inspect
 
+        # The cycle body lives in _learn_once_locked; learn_once is the run-lock
+        # wrapper around it.
         source = inspect.getsource(
-            chainseer_solana.SolanaPrototypeEngine.learn_once
+            chainseer_solana.SolanaPrototypeEngine._learn_once_locked
         )
         self.assertIn("SOLANA_LAUNCH_EXPLORATION_SHARE", source)
         # The old shape spent the whole limit on each observer's raw launches.
@@ -2395,8 +2461,10 @@ class SolanaPrototypeTests(unittest.TestCase):
         shared raw-launch budget, leaving pump_fun launches unobserved."""
         import inspect
 
+        # The cycle body lives in _learn_once_locked; learn_once is the run-lock
+        # wrapper around it.
         source = inspect.getsource(
-            chainseer_solana.SolanaPrototypeEngine.learn_once
+            chainseer_solana.SolanaPrototypeEngine._learn_once_locked
         )
         self.assertIn("discovered[-launch_share:]", source)
         self.assertIn("meteora_discovered[-launch_share:]", source)
