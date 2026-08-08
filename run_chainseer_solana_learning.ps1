@@ -9,8 +9,12 @@ param(
     [ValidateRange(0, 25)]
     [int]$RecoveryLimit = 3,
 
+    # 4, not 6: the graduation lane needs live market probes per candidate, so
+    # 6 took the cycle mean from 447s to 912s then 2099s and killed five cycles
+    # against the scheduler limit. Keep the graduated-token priority, at a cost
+    # the 5-minute trigger can absorb.
     [ValidateRange(0, 25)]
-    [int]$GraduationLimit = 6
+    [int]$GraduationLimit = 4
 )
 
 $ErrorActionPreference = "Stop"

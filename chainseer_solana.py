@@ -4747,7 +4747,7 @@ class SolanaPrototypeEngine:
         limit: int = 10,
         signature_limit: int = 100,
         recovery_limit: int = 3,
-        graduation_limit: int = 6,
+        graduation_limit: int = 4,
         stranded_limit: int = 3,
         slot_span: int | None = None,
         max_pages: int = 10,
@@ -4774,7 +4774,7 @@ class SolanaPrototypeEngine:
         limit: int = 10,
         signature_limit: int = 100,
         recovery_limit: int = 3,
-        graduation_limit: int = 6,
+        graduation_limit: int = 4,
         stranded_limit: int = 3,
         slot_span: int | None = None,
         max_pages: int = 10,
@@ -4795,6 +4795,13 @@ class SolanaPrototypeEngine:
         recovered_mints = {
             result["candidate"]["mint"] for result in recovered
         }
+        # The graduation lane is the expensive one: each candidate needs live
+        # market probes, not just a signature decode. Raising it 3 -> 6 to
+        # prioritise graduated tokens (every complete_safe token the estate has
+        # ever produced is graduated or near-graduated) took the cycle mean
+        # from 447s over 78 cycles to 912s and then 2099s, and killed five
+        # cycles against the scheduler limit. 4 keeps the priority -- which the
+        # outcome data does support -- at a cost the cycle budget can absorb.
         graduation_candidates, graduation_probe = (
             self._probe_graduation_candidates(
                 limit=max(0, graduation_limit),
