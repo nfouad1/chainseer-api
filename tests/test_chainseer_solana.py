@@ -2312,6 +2312,59 @@ class SolanaPrototypeTests(unittest.TestCase):
         self.assertEqual(by_key["meteora_dbc"]["analysed"], 1)
         self.assertEqual(by_key["pump_fun"]["analysed"], 0)
 
+    def test_reaching_the_cursor_is_the_only_contiguous_sweep(self):
+        """Every other stop leaves a permanent hole.
+
+        The cursor advances to the NEWEST signature seen regardless of where
+        the sweep stopped, so anything between the oldest examined signature
+        and the previous cursor is skipped forever rather than picked up next
+        cycle. A 476x token (A13oRB9F...pump, +47,593% in 24h) was missed this
+        way while the observer was running throughout.
+        """
+        done = chainseer_solana._discovery_coverage(
+            {"stop_reason": "reached_cursor", "oldest_slot_seen": 100,
+             "cursor_slot_before": 100, "pages_used": 2, "signatures_seen": 40},
+            7,
+        )
+        self.assertTrue(done["contiguous_with_previous_sweep"])
+        self.assertIsNone(done["slot_gap"])
+
+    def test_a_ceiling_stop_reports_the_width_of_the_hole(self):
+        gapped = chainseer_solana._discovery_coverage(
+            {"stop_reason": "max_pages", "oldest_slot_seen": 5000,
+             "cursor_slot_before": 4000, "pages_used": 10,
+             "signatures_seen": 1000},
+            12,
+        )
+        self.assertFalse(gapped["contiguous_with_previous_sweep"])
+        self.assertEqual(gapped["slot_gap"], 1000)
+        self.assertEqual(gapped["stop_reason"], "max_pages")
+
+    def test_slot_gap_is_never_reported_as_a_count_of_missed_launches(self):
+        """The only way to know what is in the gap is to fetch it, which is
+        the work the ceiling refused. Reporting a launch estimate would be
+        inventing a number."""
+        gapped = chainseer_solana._discovery_coverage(
+            {"stop_reason": "max_pages", "oldest_slot_seen": 5000,
+             "cursor_slot_before": 4000}, 3,
+        )
+        self.assertNotIn("missed_launches", gapped)
+        self.assertNotIn("estimated_missed", gapped)
+        self.assertEqual(gapped["candidates_found"], 3)
+
+    def test_a_first_ever_sweep_has_no_gap_to_report(self):
+        # No prior cursor means nothing was skipped, only nothing was known.
+        first = chainseer_solana._discovery_coverage(
+            {"stop_reason": "max_pages", "oldest_slot_seen": 5000,
+             "cursor_slot_before": None}, 5,
+        )
+        self.assertIsNone(first["slot_gap"])
+
+    def test_an_empty_sweep_is_reported_as_empty(self):
+        empty = chainseer_solana._discovery_coverage({}, 0)
+        self.assertEqual(empty["stop_reason"], "empty")
+        self.assertEqual(empty["candidates_found"], 0)
+
     def test_raw_launch_analysis_is_capped_at_the_exploration_floor(self):
         """Analysis slots go where safe tokens actually appear.
 
