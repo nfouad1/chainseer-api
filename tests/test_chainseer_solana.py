@@ -2312,6 +2312,54 @@ class SolanaPrototypeTests(unittest.TestCase):
         self.assertEqual(by_key["meteora_dbc"]["analysed"], 1)
         self.assertEqual(by_key["pump_fun"]["analysed"], 0)
 
+    def test_raw_launch_analysis_is_capped_at_the_exploration_floor(self):
+        """Analysis slots go where safe tokens actually appear.
+
+        Measured on 1,507 analysed tokens: all 21 complete_safe sit in
+        graduated or near-graduated states and NOT ONE came from raw launch
+        observation, against 720 launch_observation_unsafe. Raw launches
+        previously took up to 2x the cycle limit; they now take the floor.
+        """
+        self.assertEqual(chainseer_solana.SOLANA_LAUNCH_EXPLORATION_SHARE, 1)
+        import inspect
+
+        source = inspect.getsource(
+            chainseer_solana.SolanaPrototypeEngine.learn_once
+        )
+        self.assertIn("SOLANA_LAUNCH_EXPLORATION_SHARE", source)
+        # The old shape spent the whole limit on each observer's raw launches.
+        self.assertNotIn("discovered[-limit:]", source)
+
+    def test_the_exploration_floor_is_never_zero(self):
+        """A cycle that only analysed graduated tokens could never observe a
+        raw launch turning out safe, and so could never notice the pattern
+        changing. The floor is the cost of being able to be wrong.
+        """
+        self.assertGreaterEqual(chainseer_solana.SOLANA_LAUNCH_EXPLORATION_SHARE, 1)
+
+    def test_both_venues_keep_a_raw_launch_slot(self):
+        """meteora_dbc is 1,143 of 1,507 analysed tokens and would dominate a
+        shared raw-launch budget, leaving pump_fun launches unobserved."""
+        import inspect
+
+        source = inspect.getsource(
+            chainseer_solana.SolanaPrototypeEngine.learn_once
+        )
+        self.assertIn("discovered[-launch_share:]", source)
+        self.assertIn("meteora_discovered[-launch_share:]", source)
+
+    def test_graduated_lane_gets_the_larger_share(self):
+        import inspect
+
+        sig = inspect.signature(
+            chainseer_solana.SolanaPrototypeEngine.learn_once
+        )
+        graduation = sig.parameters["graduation_limit"].default
+        self.assertGreater(
+            graduation, chainseer_solana.SOLANA_LAUNCH_EXPLORATION_SHARE * 2,
+            "graduated lane must outweigh the combined raw-launch floor",
+        )
+
     def test_dashboard_snapshot_is_cached_between_polls(self):
         """The page polls on a timer; the build must not run per request.
 
