@@ -5169,7 +5169,7 @@ def _solana_ecosystem_breakdown(
     return out
 
 
-def _solana_dashboard_snapshot(
+def _build_solana_dashboard_snapshot(
     engine: SolanaPrototypeEngine,
     learning_loop: LearningLoopController | None = None,
 ) -> dict:
@@ -5399,14 +5399,21 @@ def _solana_dashboard_snapshot(
         "head": None,
     }
     if engine.timechain:
-        chain_ok, chain_report = engine.timechain.tc.verify()
-        rings = list(engine.timechain.tc.iter_rings())
-        head = rings[-1] if rings else None
+        # Do NOT materialise the chain here. list(iter_rings()) loaded all
+        # 7,292 rings -- 235MB measured -- on every dashboard request, purely
+        # to take len() and [-1]. height() and tail_rings(1) give both without
+        # holding the chain in memory.
+        #
+        # The verify() result is reused from engine.verify() above rather than
+        # re-running tc.verify(), which was a second full pass over the chain
+        # in the same request.
+        head_rings = engine.timechain.tc.tail_rings(1)
+        head = head_rings[-1] if head_rings else None
         timechain.update(
             {
-                "ok": chain_ok,
-                "report": _dashboard_report_text(chain_report),
-                "height": len(rings),
+                "ok": bool(verification.get("ok")),
+                "report": _dashboard_report_text(verification.get("timechain")),
+                "height": engine.timechain.tc.height(),
                 "head": (
                     {
                         "index": head.get("index"),
@@ -5497,11 +5504,6 @@ def _solana_dashboard_snapshot(
         "concentration_calibration": calibration,
         "learning": learning,
         "decisions": decisions[:50],
-        "events": {
-            "observation": len(observation_events),
-            "shadow": len(shadow_events),
-            "recent": recent_events,
-        },
         "integrity": {
             "ok": verification["ok"],
             "observation_ledger": verification["observation_ledger"],
@@ -5667,6 +5669,54 @@ class LearningLoopController:
         with self._lock:
             base = dict(self._status)
         return self._snapshot_from(base)
+
+
+
+_DASHBOARD_SNAPSHOT_TTL_SECONDS = 15.0
+_DASHBOARD_SNAPSHOT_ATTR = "_dashboard_snapshot_cache"
+
+
+def _solana_dashboard_snapshot(
+    engine,
+    learning_loop=None,
+    *,
+    ttl_seconds: float = _DASHBOARD_SNAPSHOT_TTL_SECONDS,
+):
+    """Build the dashboard snapshot at most once per ttl_seconds.
+
+    Profiled on the live root: one snapshot parsed 29,608 JSON records across
+    five separate ledger loads -- each verify() reloads the ledger it checks --
+    plus a full chain verify and height scan. 8.9s under the profiler, 26-35s
+    under real contention, 491MB peak. The page polls on a timer, so requests
+    arrived faster than they completed. That is precisely how the Pons
+    dashboard queued behind itself until it stopped answering at all.
+
+    Caching the whole snapshot rather than its individual costs is the honest
+    shape: the panels are consistent with each other because they come from one
+    build, and generated_at already tells the reader how old that build is.
+    Sub-15s staleness is invisible to a human watching a learner whose cycles
+    take minutes.
+    """
+    now = time.time()
+    # Cached ON the engine, not in a module dict keyed by id(engine). CPython
+    # reuses id() values once an object is collected, so a module-level cache
+    # hands a fresh engine the snapshot of a dead one -- which is exactly what
+    # happened: a test built a new engine, got a previous engine's cached
+    # snapshot, and read analysis_count 0 instead of 3. Tying the cache to the
+    # instance makes its lifetime the engine's lifetime.
+    cached = getattr(engine, _DASHBOARD_SNAPSHOT_ATTR, None)
+    if cached and (now - cached[0]) < max(0.0, ttl_seconds):
+        return cached[1]
+    value = _build_solana_dashboard_snapshot(engine, learning_loop)
+    # Stamp AFTER the build, not before. The build itself takes longer than the
+    # TTL on a large chain, so timestamping at entry would leave every cached
+    # value already expired and rebuild on every request -- a cache that costs
+    # a dict write and saves nothing.
+    try:
+        setattr(engine, _DASHBOARD_SNAPSHOT_ATTR, (time.time(), value))
+    except AttributeError:
+        pass          # a slotted or frozen engine simply goes uncached
+    return value
 
 
 def serve_solana_dashboard(
