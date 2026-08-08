@@ -5727,66 +5727,22 @@ def _dashboard_snapshot(engine: PonsPrototypeEngine) -> dict:
     # The scheduler runs in another process. Reload atomically-written cohort
     # files on every request so the long-lived dashboard never serves a stale
     # in-memory snapshot.
+    # Only what the remaining panels actually need.
+    #
+    # This request path used to reload admission_state.json (14.7 MB and
+    # growing), run a full engine.verify() over every ring in the chain, and
+    # read both event ledgers end to end -- roughly 21s per request when idle
+    # and 77-113s while a learn cycle held the state lock. The page polls on a
+    # timer, so requests arrived faster than they completed and piled up until
+    # the dashboard stopped answering at all.
+    #
+    # The panels those fed (admission quarantine, counterfactual policy lab,
+    # shadow cohort, evidence & integrity path, sealed activity) have been
+    # removed, so the work goes with them. A dashboard must never be
+    # expensive enough to queue behind itself.
     engine.trader.state = engine.trader._load_state()
     engine.shadow_trader.state = engine.shadow_trader._load_state()
-    engine.admission.state = engine.admission._load()
     engine.managed_portfolio.state = engine.managed_portfolio._load()
-    verification = engine.verify()
-    paper_events = engine.paper_ledger.load()
-    shadow_events = engine.shadow_ledger.load()
-    timechain = {
-        "enabled": engine.timechain is not None,
-        "ok": verification["timechain"] != "disabled"
-        and verification["ok"],
-        "report": verification["timechain"],
-        "height": 0,
-        "head": None,
-        "registry_ok": None,
-    }
-    if engine.timechain:
-        chain_ok, chain_report = engine.timechain.tc.verify()
-        timechain["ok"] = chain_ok
-        timechain["report"] = "; ".join(chain_report)
-        rings = list(engine.timechain.tc.iter_rings())
-        head = rings[-1] if rings else None
-        timechain["height"] = len(rings)
-        timechain["head"] = (
-            {
-                "index": head.get("index"),
-                "ring_type": head.get("ring_type"),
-                "timestamp": head.get("timestamp"),
-                "ring_hash": head.get("ring_hash"),
-                "summary": str((head.get("payload") or {}).get("summary") or ""),
-            }
-            if head else None
-        )
-        try:
-            engine.timechain.cognitive.verify_registry()
-            timechain["registry_ok"] = True
-        except Exception as exc:
-            timechain["registry_ok"] = False
-            timechain["registry_error"] = str(exc)
-
-    recent_events = []
-    for event in sorted(
-        paper_events + shadow_events,
-        key=lambda item: item.get("timestamp") or "",
-        reverse=True,
-    )[:20]:
-        payload = event.get("payload") or {}
-        recent_events.append({
-            "index": event.get("index"),
-            "event_type": event.get("event_type"),
-            "timestamp": event.get("timestamp"),
-            "event_hash": event.get("event_hash"),
-            "token_address": payload.get("token_address"),
-            "symbol": payload.get("symbol"),
-            "reason": payload.get("reason"),
-            "proceeds_eth": payload.get(
-                "proceeds_eth_after_slippage_and_gas"
-            ),
-        })
-
     catalog = _read_json(engine.root / "launch_catalog.json", {})
     schedule = _read_json(engine.root / "schedule.json", {})
     scheduler = _read_json(engine.root / "scheduler_status.json", {})
@@ -5812,9 +5768,6 @@ def _dashboard_snapshot(engine: PonsPrototypeEngine) -> dict:
             "status": "disabled",
         }
     learning = _read_json(engine.root / "learning_summary.json", {})
-    policy_learning = _read_json(
-        engine.root / "policy_learning.json", {}
-    )
     managed_portfolio = (
         engine.managed_portfolio.state.get("last_evaluation") or {
             "status": "not_evaluated",
@@ -5837,25 +5790,9 @@ def _dashboard_snapshot(engine: PonsPrototypeEngine) -> dict:
         "catalog_size": len(catalog),
         "paper": _dashboard_cohort(engine.trader),
         "shadow": _dashboard_cohort(engine.shadow_trader),
-        "admission": engine.admission.summary(),
-        "policy_learning": policy_learning,
         "managed_portfolio": managed_portfolio,
         "rpc_health": rpc_health,
         "analysis_pipeline": engine.analysis_pipeline(),
-        "events": {
-            "paper": len(paper_events),
-            "shadow": len(shadow_events),
-            "recent": recent_events,
-        },
-        "integrity": {
-            "ok": verification["ok"],
-            "paper_ledger": verification["paper_ledger"],
-            "shadow_ledger": verification["shadow_ledger"],
-            "admission_state": verification["admission_state"],
-            "policy_learning": verification["policy_learning"],
-            "managed_portfolio": verification["managed_portfolio"],
-            "timechain": timechain,
-        },
         "schedule": schedule,
         "scheduler": scheduler,
         "learning": learning,

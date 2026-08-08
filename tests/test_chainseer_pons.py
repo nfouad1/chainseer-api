@@ -1103,8 +1103,8 @@ class PonsAdapterTests(unittest.TestCase):
         )
         self.assertEqual(snapshot["shadow"]["profitable_positions"], 1)
         self.assertTrue(snapshot["shadow"]["concentration_warning"])
-        self.assertIn("admission", snapshot)
-        self.assertIn("policy_learning", snapshot)
+        # admission and policy_learning were dropped with their panels; see
+        # test_dashboard_snapshot_does_no_chain_or_admission_work.
         self.assertIn("managed_portfolio", snapshot)
         self.assertIn("rpc_health", snapshot)
         self.assertEqual(
@@ -1114,17 +1114,51 @@ class PonsAdapterTests(unittest.TestCase):
         self.assertFalse(
             snapshot["analysis_pipeline"]["full_chainseer_analysis_run"]
         )
-        self.assertTrue(snapshot["integrity"]["ok"])
         self.assertEqual(snapshot["scheduler"]["status"], "disabled")
         self.assertEqual(snapshot["scheduler"]["stale_status"], "running")
         self.assertEqual(snapshot["guard_scheduler"]["status"], "disabled")
         self.assertEqual(
             snapshot["guard_scheduler"]["stale_status"], "running"
         )
-        self.assertEqual(
-            snapshot["integrity"]["managed_portfolio"],
-            "verified managed paper portfolio state",
-        )
+        # The integrity panel is gone, so its verify() cost is gone with it.
+        # `pons verify` remains the supported way to check ledger integrity.
+        self.assertNotIn("integrity", snapshot)
+
+    def test_dashboard_snapshot_does_no_chain_or_admission_work(self):
+        """The dashboard must never be expensive enough to queue behind itself.
+
+        This request path used to reload admission_state.json (14.7 MB), run a
+        full engine.verify(), and materialise every ring via iter_rings(). The
+        page polls on a timer, so at 21s idle -- and 77-113s while a learn
+        cycle held the state lock -- requests arrived faster than they
+        completed and the dashboard stopped answering entirely.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            engine = chainseer_pons.PonsPrototypeEngine(
+                root=temp_dir,
+                rpc=FakePonsRPC(),
+                http_get=fake_http,
+                record_timechain=False,
+            )
+            calls = []
+            engine.verify = lambda *a, **k: calls.append("verify")
+            engine.admission._load = lambda *a, **k: calls.append("admission")
+            engine.paper_ledger.load = lambda *a, **k: calls.append("paper_ledger")
+            engine.shadow_ledger.load = lambda *a, **k: calls.append("shadow_ledger")
+
+            snapshot = chainseer_pons._dashboard_snapshot(engine)
+
+            self.assertEqual(
+                calls, [], f"snapshot still does heavy work: {calls}"
+            )
+            # The panels these fed are gone; their payload must go too, or the
+            # cost creeps back the next time someone renders them.
+            for gone in ("admission", "policy_learning", "integrity", "events"):
+                self.assertNotIn(gone, snapshot)
+            # What the remaining panels need is still present.
+            for kept in ("paper", "shadow", "managed_portfolio", "catalog_size",
+                         "schedule", "scheduler", "learning"):
+                self.assertIn(kept, snapshot)
 
     def test_dashboard_asset_is_read_only_and_has_no_example_data(self):
         html = (
@@ -1134,14 +1168,20 @@ class PonsAdapterTests(unittest.TestCase):
         self.assertIn('fetch("/api/status"', html)
         self.assertIn("LIVE LOCAL DATA", html)
         self.assertIn("NO SIGNING", html)
-        self.assertIn("Admission quarantine", html)
-        self.assertIn("Counterfactual policy lab", html)
-        self.assertIn("renderAdmission", html)
         self.assertIn("renderManaged", html)
         self.assertIn("Managed paper portfolio", html)
         self.assertIn("managed-drawdown", html)
-        self.assertIn("admission-cooldown", html)
-        self.assertIn("gate-rpc-retries", html)
+        # These panels were removed deliberately: each one required work the
+        # request path could not afford (admission_state.json is 14.7 MB, and
+        # the integrity panel ran a full chain verify plus iter_rings).
+        for removed in (
+            "Admission quarantine", "Counterfactual policy lab",
+            "Shadow cohort", "Evidence &amp; integrity path", "Sealed activity",
+        ):
+            self.assertNotIn(removed, html)
+        # A missing element must not abort the whole refresh and leave every
+        # other panel stuck on "Loading".
+        self.assertIn("INERT", html)
         self.assertIn("robust-ex-best", html)
         self.assertIn("robust-concentration", html)
         self.assertIn("OUTLIER WARNING", html)
