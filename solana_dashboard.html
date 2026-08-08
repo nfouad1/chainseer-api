@@ -354,10 +354,6 @@
         </div>
         <div class="position-list" id="positions" style="margin-top:15px"><div class="empty">No shadow positions have been opened.</div></div>
       </article>
-      <article class="panel">
-        <div class="panel-head"><div><h2>Sealed activity</h2><div class="sub">Recent observation and shadow ledgers</div></div></div>
-        <div class="events" id="events"><div class="empty">No ledger activity yet.</div></div>
-      </article>
     </section>
 
     <section class="panel table-panel" style="margin-bottom:18px">
@@ -399,7 +395,16 @@
     </footer>
   </main>
   <script>
-    const $ = id => document.getElementById(id);
+    // A removed panel leaves its render code behind; an inert stand-in keeps a
+    // missing element from throwing partway through a refresh and stranding
+    // every other panel on "Loading".
+    const INERT = new Proxy({}, {
+      get: (_t, key) => (key === "style" || key === "classList" ? INERT
+                        : key === "textContent" || key === "innerHTML" ? ""
+                        : typeof key === "string" ? () => INERT : undefined),
+      set: () => true,
+    });
+    const $ = id => document.getElementById(id) || INERT;
     const esc = value => String(value ?? "").replace(/[&<>"']/g, c => ({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#039;"}[c]));
     const num = (value, digits=0) => Number.isFinite(Number(value)) ? Number(value).toLocaleString(undefined,{maximumFractionDigits:digits}) : "—";
     const pct = value => Number.isFinite(Number(value)) && value !== null ? `${Number(value) >= 0 ? "+" : ""}${Number(value).toFixed(2)}%` : "—";

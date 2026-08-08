@@ -2312,6 +2312,81 @@ class SolanaPrototypeTests(unittest.TestCase):
         self.assertEqual(by_key["meteora_dbc"]["analysed"], 1)
         self.assertEqual(by_key["pump_fun"]["analysed"], 0)
 
+    def test_dashboard_snapshot_is_cached_between_polls(self):
+        """The page polls on a timer; the build must not run per request.
+
+        Profiled on the live root: one build parsed 29,608 JSON records across
+        five ledger loads (each verify() reloads the ledger it checks), plus a
+        full chain verify and height scan -- 18s cold. Requests arrived faster
+        than they completed, which is exactly how the Pons dashboard queued
+        behind itself until it stopped answering.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=Path(temp), rpc=FakeRPC(), jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            builds = []
+            real = chainseer_solana._build_solana_dashboard_snapshot
+
+            def counting(eng, loop=None):
+                builds.append(1)
+                return real(eng, loop)
+
+            with unittest.mock.patch.object(
+                chainseer_solana, "_build_solana_dashboard_snapshot", counting
+            ):
+                for _ in range(5):
+                    chainseer_solana._solana_dashboard_snapshot(engine)
+            self.assertEqual(len(builds), 1, "snapshot rebuilt on every poll")
+
+    def test_cache_is_stamped_after_the_build_not_before(self):
+        """A build slower than the TTL must still produce a usable entry.
+
+        Stamping at entry leaves every value already expired by the time it is
+        stored, so the cache costs a dict write and saves nothing -- which is
+        what happened on the live chain, where the build outlasts the TTL.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=Path(temp), rpc=FakeRPC(), jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            builds = []
+
+            def slow(eng, loop=None):
+                builds.append(1)
+                time.sleep(0.25)          # longer than the TTL below
+                return {"generated_at": "x"}
+
+            with unittest.mock.patch.object(
+                chainseer_solana, "_build_solana_dashboard_snapshot", slow
+            ):
+                chainseer_solana._solana_dashboard_snapshot(engine, ttl_seconds=0.2)
+                chainseer_solana._solana_dashboard_snapshot(engine, ttl_seconds=0.2)
+            self.assertEqual(len(builds), 1, "entry expired before it was stored")
+
+    def test_snapshot_does_not_materialise_the_whole_chain(self):
+        # list(iter_rings()) loaded all 7,292 rings -- 235MB -- purely to take
+        # len() and [-1]. height() and tail_rings(1) give both.
+        import inspect
+
+        source = inspect.getsource(
+            chainseer_solana._build_solana_dashboard_snapshot
+        )
+        # Match the CALL, not the comment that explains why it is gone.
+        self.assertNotIn("list(engine.timechain.tc.iter_rings())", source)
+        self.assertIn("tail_rings(1)", source)
+
+    def test_sealed_activity_panel_and_payload_are_gone(self):
+        html = (
+            Path(chainseer_solana.__file__)
+            .with_name("solana_dashboard.html")
+            .read_text(encoding="utf-8")
+        )
+        self.assertNotIn("Sealed activity", html)
+        self.assertIn("INERT", html)   # a missing element must not throw
+
     def test_dashboard_asset_is_read_only_and_has_no_mock_data(self):
         html = (
             Path(chainseer_solana.__file__)
