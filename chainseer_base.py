@@ -1215,6 +1215,62 @@ class BasePrototypeEngine:
         return results
 
 
+
+def _process_is_running(pid: int) -> bool | None:
+    """Is this PID a live process? None when it cannot be determined.
+
+    Deliberately never uses os.kill(pid, 0) as a liveness probe: on Windows
+    os.kill does not implement signal 0 as a no-op query -- it terminates the
+    target -- so the usual POSIX idiom would kill the very process it is asking
+    about.
+    """
+    if not isinstance(pid, int) or pid <= 0:
+        return None
+    if os.name == "nt":
+        try:
+            import ctypes
+
+            PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
+            kernel32 = ctypes.windll.kernel32
+            handle = kernel32.OpenProcess(
+                PROCESS_QUERY_LIMITED_INFORMATION, False, pid
+            )
+            if handle:
+                # An open handle is NOT proof of life: Windows keeps a
+                # terminated process addressable while any handle to it
+                # remains open, so OpenProcess succeeds for a corpse. Ask for
+                # the exit code instead -- STILL_ACTIVE (259) is the only
+                # answer that means running.
+                #
+                # A process that genuinely exits with code 259 is
+                # indistinguishable from a running one. That is a known
+                # Windows quirk and the safe direction: it reports the holder
+                # alive, so the lock falls back to the age threshold rather
+                # than being stolen from a live run.
+                STILL_ACTIVE = 259
+                code = ctypes.c_ulong()
+                ok = kernel32.GetExitCodeProcess(handle, ctypes.byref(code))
+                kernel32.CloseHandle(handle)
+                if not ok:
+                    return None
+                return code.value == STILL_ACTIVE
+            # 87 == ERROR_INVALID_PARAMETER, which is what OpenProcess returns
+            # for a pid that does not exist. Anything else (notably 5,
+            # ERROR_ACCESS_DENIED) means it exists but is not ours to inspect.
+            return False if kernel32.GetLastError() == 87 else True
+        except Exception:
+            return None
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:
+        return True          # exists, owned by someone else
+    except OSError:
+        return None
+    return True
+
+
 class LearningRunLockedError(RuntimeError):
     """Raised when a previous learn-once cycle is still active."""
 
@@ -1259,6 +1315,21 @@ class LearningRunLock:
                     raise
                 time.sleep(min(self.poll_seconds, max(0.0, deadline - time.time())))
 
+    def _holder_is_gone(self) -> bool:
+        """True only when the lock names a process we can prove is not running.
+
+        Unreadable or pid-less lock files fall back to the age threshold: an
+        unknown holder must never be assumed dead.
+        """
+        try:
+            record = json.loads(self.path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        pid = record.get("pid")
+        if not isinstance(pid, int):
+            return False
+        return _process_is_running(pid) is False
+
     def _acquire(self):
         self.path.parent.mkdir(parents=True, exist_ok=True)
         for attempt in range(2):
@@ -1276,7 +1347,20 @@ class LearningRunLock:
                     # and this stat. It is free now, so just retry rather
                     # than reporting it as held.
                     continue
-                if attempt == 0 and age > self.stale_seconds:
+                # A lock whose owning process is gone is abandoned NOW, not
+                # in stale_seconds. A cycle killed mid-run leaves its lock
+                # behind, and a purely time-based threshold then fails every
+                # subsequent cycle for the full window -- observed in
+                # production as ~15 consecutive failed Base cycles over 30
+                # minutes after one abandoned run.
+                #
+                # PID reuse is handled by what follows rather than by guessing:
+                # the unlink is attempted, and on Windows a live holder still
+                # has the file open, so the unlink fails and the lock is
+                # correctly reported as held.
+                if attempt == 0 and (
+                    age > self.stale_seconds or self._holder_is_gone()
+                ):
                     try:
                         self.path.unlink(missing_ok=True)
                     except OSError:
