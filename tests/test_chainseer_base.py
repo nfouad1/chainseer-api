@@ -1,6 +1,7 @@
 import json
 import os
 import sqlite3
+import sys
 import tempfile
 import time
 import unittest
@@ -1477,6 +1478,87 @@ class BaseDashboardTests(unittest.TestCase):
         self.assertIn("NO PRIVATE KEYS", html)
         self.assertNotIn("mockData", html)
 
+
+
+class LearningRunLockLivenessTests(unittest.TestCase):
+    """A lock whose owner died must not block the next cycle for 30 minutes.
+
+    Reproduces the production failure: a Base cycle was killed mid-run and left
+    .learn_once.lock behind holding a dead pid. Staleness was purely
+    time-based, so every subsequent cycle raised LearningRunLockedError until
+    the 30-minute window expired -- about 15 wasted cycles at a 2-minute
+    interval.
+    """
+
+    def setUp(self):
+        self.temp = tempfile.TemporaryDirectory()
+        self.path = Path(self.temp.name) / ".learn_once.lock"
+
+    def tearDown(self):
+        self.temp.cleanup()
+
+    def _write_lock(self, pid):
+        self.path.write_text(
+            json.dumps({"pid": pid, "started_at": "2026-08-08T05:43:54+00:00"}),
+            encoding="utf-8",
+        )
+
+    def test_dead_holder_releases_the_lock_immediately(self):
+        self._write_lock(999999)          # not a running process
+        with chainseer_base.LearningRunLock(self.path):
+            pass                          # acquired without waiting out the window
+        self.assertFalse(self.path.exists())
+
+    def test_live_holder_still_blocks(self):
+        self._write_lock(os.getpid())     # this very process is alive
+        with self.assertRaises(chainseer_base.LearningRunLockedError):
+            with chainseer_base.LearningRunLock(self.path):
+                pass
+
+    def test_unreadable_lock_falls_back_to_the_age_threshold(self):
+        # An unknown holder must never be assumed dead.
+        self.path.write_text("not json at all", encoding="utf-8")
+        with self.assertRaises(chainseer_base.LearningRunLockedError):
+            with chainseer_base.LearningRunLock(self.path):
+                pass
+
+    def test_lock_without_a_pid_falls_back_to_the_age_threshold(self):
+        self.path.write_text(json.dumps({"started_at": "x"}), encoding="utf-8")
+        with self.assertRaises(chainseer_base.LearningRunLockedError):
+            with chainseer_base.LearningRunLock(self.path):
+                pass
+
+    def test_a_genuinely_stale_lock_is_still_reclaimed_by_age(self):
+        # The age path must keep working for locks with no usable pid.
+        self.path.write_text(json.dumps({"started_at": "x"}), encoding="utf-8")
+        old = time.time() - (31 * 60)
+        os.utime(self.path, (old, old))
+        with chainseer_base.LearningRunLock(self.path):
+            pass
+
+    def test_probing_a_live_process_does_not_kill_it(self):
+        """os.kill(pid, 0) is not a query on Windows -- it terminates.
+
+        Behavioural guard, not a source grep: spawn a real child, probe it,
+        and require it to still be running afterwards.
+        """
+        import subprocess
+
+        child = subprocess.Popen(
+            [sys.executable, "-c", "import time; time.sleep(30)"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+        try:
+            self.assertTrue(chainseer_base._process_is_running(child.pid))
+            self.assertIsNone(
+                child.poll(), "probing the pid terminated the process"
+            )
+        finally:
+            child.kill()
+            child.wait(timeout=10)
+        # And once it really is gone, the probe must say so.
+        self.assertFalse(chainseer_base._process_is_running(child.pid))
 
 if __name__ == "__main__":
     unittest.main()
