@@ -49,6 +49,7 @@ from chainseer_base import (
     PaperTradeLedger,
 )
 from chainseer_outcome_ledger import (
+    OUTCOME_LATENESS_FRACTION,
     analysis_evidence_binding,
     build_outcome_record,
 )
@@ -3008,6 +3009,86 @@ class PonsAdmissionQuarantine:
                 values.append(candidate)
         return values
 
+    # Longest horizon plus its lateness tolerance. Once a candidate's baseline
+    # observation is older than this, no later observation can pair with it
+    # inside any horizon window, so no further outcome is possible for it.
+    PROVENANCE_RETENTION_SECONDS = int(
+        PONS_OUTCOME_HORIZONS[-1][1] * (1 + OUTCOME_LATENESS_FRACTION)
+    )
+
+    def prune_sealed_provenance(self, *, limit: int = 250, now: float | None = None) -> dict:
+        """Drop provenance that can no longer seal an outcome.
+
+        Provenance is 79% of admission_state.json -- 13.7MB of 17.4MB across
+        768 observations -- and every learn cycle loads AND rewrites that file,
+        so it is the dominant term in a cycle time that climbed from ~670s to
+        over 1200s as the refresh rate was raised.
+
+        It is read in exactly one place: the outcome collector, and only from
+        the LATER observation of a pair. A baseline's provenance is never read.
+
+        The retention rule is time-based, NOT status-based. "terminal" looks
+        like the obvious key and is not: _reconcile_state re-evaluates every
+        candidate against the CURRENT policy on load, so a stored terminal
+        status is derived rather than authoritative -- measured, 859 stored
+        terminal candidates became 18 after construction. Keying on it would
+        prune whatever the last policy happened to reject.
+
+        Baseline age is authoritative instead: once the first observation is
+        older than the longest horizon window, no later observation can pair
+        with it inside any horizon, so nothing further can be sealed. Due
+        outcomes are re-checked anyway, so the rule is safe twice over.
+
+        Candidates are never removed, only their spent provenance. The
+        counterfactual policy learner replays every candidate to model what a
+        looser policy would have done, and the refused ones are the whole
+        point of that exercise; dropping them would leave it sampling only
+        tokens already admitted -- survivorship bias in the component whose job
+        is to question the admission gate.
+        """
+        moment = time.time() if now is None else float(now)
+        state = self.state
+        completed = set(state.get("completed_outcomes") or [])
+        summary = {
+            "scanned": 0,
+            "pruned_candidates": 0,
+            "pruned_observations": 0,
+            "retained_within_window": 0,
+        }
+        changed = False
+        for record in (state.get("candidates") or {}).values():
+            if summary["pruned_candidates"] >= max(0, int(limit)):
+                break
+            observations = record.get("observations") or []
+            if not any(item.get("provenance") for item in observations):
+                continue
+            summary["scanned"] += 1
+            baseline = _pons_observed_at((observations[0] or {}).get("observed_at"))
+            if baseline is None:
+                continue          # unreadable timestamp: never assume it is spent
+            age = moment - baseline.timestamp()
+            if age <= self.PROVENANCE_RETENTION_SECONDS:
+                summary["retained_within_window"] += 1
+                continue
+            if pons_due_outcomes(observations, completed):
+                continue          # still able to seal; keep its evidence
+            dropped = 0
+            for item in observations:
+                if item.pop("provenance", None):
+                    dropped += 1
+            if dropped:
+                # Recorded in the state so the absence is explained rather than
+                # looking like provenance was never captured.
+                record["provenance_pruned_observations"] = (
+                    int(record.get("provenance_pruned_observations") or 0) + dropped
+                )
+                summary["pruned_candidates"] += 1
+                summary["pruned_observations"] += dropped
+                changed = True
+        if changed:
+            self._save()
+        return summary
+
     def summary(self) -> dict:
         counts = {
             "pending": 0,
@@ -5497,6 +5578,9 @@ class PonsPrototypeEngine:
             # or not. Runs after observe() so it sees this cycle's fresh
             # observations, and before summary() so its writes are included.
             security_outcomes = self.collect_security_outcomes()
+            # After sealing, not before: anything pruned this cycle must
+            # already have contributed whatever outcome it could.
+            provenance_pruned = self.admission.prune_sealed_provenance()
             admission_summary = self.admission.summary()
             summary = {
                 "protocol": "pons",
@@ -5561,6 +5645,7 @@ class PonsPrototypeEngine:
                 "managed_portfolio": managed_portfolio,
                 "admission_scheduler": admission_summary["scheduler"],
                 "security_outcomes": security_outcomes,
+                "provenance_pruned": provenance_pruned,
                 "rpc_health": self._save_rpc_health(),
                 "analysis_pipeline": self.analysis_pipeline(),
                 "paper_only": True,
