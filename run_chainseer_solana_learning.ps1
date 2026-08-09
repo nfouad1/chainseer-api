@@ -3,19 +3,25 @@ param(
     [ValidateRange(1, 25)]
     [int]$Limit = 3,
 
-    # 300, not 100 and not 1000. At 100 a pump.fun sweep reaches ~6 seconds of
-    # chain per cycle against a 300s trigger -- about 2% coverage, and biased,
-    # since it samples whatever launches in one particular second. 1000 was
-    # measured and rejected: the sweep issues one get_transaction per
-    # SUCCESSFUL signature (299 per 1000 on pump.fun at a 0.25s pacing floor),
-    # so limit=1000 is ~2,990 decodes, roughly 12 minutes of decode per venue
-    # per cycle. 300 triples the window for a few minutes of added work.
+    # BACK TO 100 after 300 was measured in production and failed.
     #
-    # Coverage is deliberately NOT pushed to contiguity: 1,196 of 2,715
-    # catalogued candidates had never been analysed, so intake already exceeds
-    # analysis capacity. This buys a less biased selection pool, not volume.
+    # At 100 a pump.fun sweep reaches only ~6 seconds of chain per 300s cycle
+    # -- about 2% coverage, and biased toward whatever launches in that one
+    # second. 300 was meant to triple the window for "a few minutes" of added
+    # decode. The first cycle to run it took over 62 minutes, blew through the
+    # PT1H scheduler limit, was orphaned from its wrapper, and held the run
+    # lock while every subsequent trigger failed.
+    #
+    # The estimate missed that cycle time was ALREADY climbing at 100 -- 2199s,
+    # 2305s, 2536s across the preceding cycles -- because a standing discovery
+    # backlog means every sweep now pays a drain pass on top of the fresh
+    # sweep. Tripling signature_limit triples BOTH, not just the fresh sweep.
+    #
+    # Raising this again requires headroom that does not currently exist. The
+    # honest order is: drain the backlog, confirm cycles are stable well under
+    # the ceiling, and only then widen the sampling window.
     [ValidateRange(1, 1000)]
-    [int]$SignatureLimit = 300,
+    [int]$SignatureLimit = 100,
 
     [ValidateRange(0, 25)]
     [int]$RecoveryLimit = 3,
