@@ -3843,6 +3843,98 @@ class DiscoveryBacklogTest(unittest.TestCase):
         )
 
 
+class BacklogTargetRegressionTest(unittest.TestCase):
+    """The backlog target must only ever deepen, never march upward.
+
+    _merge_backlog overwrote target_slot with the CURRENT cursor on every
+    truncated sweep. Because the cursor advances each cycle, the unread span
+    crept upward and the older, wider gap was discarded -- the same data loss
+    the backlog was built to prevent. It read as progress because only the
+    width was being watched, not both ends:
+
+        69,577 slots at target 438,028,669
+         5,040 slots at target 438,098,248   <- target moved UP ~70k
+
+    A token that launched inside a discarded span is unrecoverable, which is
+    how 3fqify4Q...pump was lost.
+    """
+
+    def _truncated(self, oldest_slot, oldest_signature="sig-old"):
+        return {
+            "stop_reason": "max_pages",
+            "oldest_slot": oldest_slot,
+            "oldest_signature": oldest_signature,
+        }
+
+    def test_target_never_moves_up(self):
+        """The regression, stated as the invariant it violated."""
+        existing = {
+            "before_signature": "sig-a",
+            "target_slot": 438_028_669,
+            "oldest_slot_reached": 438_098_246,
+        }
+        merged = chainseer_solana._merge_backlog(
+            existing, self._truncated(438_103_288), 438_098_248
+        )
+        self.assertEqual(
+            merged["target_slot"], 438_028_669,
+            "the deeper unread span was discarded when a later cycle "
+            "reported a shallower one",
+        )
+
+    def test_gap_width_cannot_shrink_by_forgetting(self):
+        existing = {
+            "before_signature": "sig-a",
+            "target_slot": 438_028_669,
+            "oldest_slot_reached": 438_098_246,
+        }
+        before = existing["oldest_slot_reached"] - existing["target_slot"]
+        merged = chainseer_solana._merge_backlog(
+            existing, self._truncated(438_103_288), 438_098_248
+        )
+        after = merged["oldest_slot_reached"] - merged["target_slot"]
+        self.assertGreaterEqual(
+            after, before,
+            "the span narrowed without any sweep having read the difference",
+        )
+
+    def test_disjoint_gaps_merge_into_their_union(self):
+        """Two truncations can leave separated holes; cover both."""
+        existing = {
+            "before_signature": "sig-old",
+            "target_slot": 100,
+            "oldest_slot_reached": 200,
+        }
+        merged = chainseer_solana._merge_backlog(
+            existing, self._truncated(900, "sig-new"), 800
+        )
+        self.assertEqual(merged["target_slot"], 100, "deepest edge lost")
+        self.assertEqual(
+            merged["oldest_slot_reached"], 900,
+            "upper edge of the union lost -- the newer gap would be skipped",
+        )
+        self.assertEqual(merged["before_signature"], "sig-new")
+
+    def test_first_truncation_records_the_span(self):
+        merged = chainseer_solana._merge_backlog(
+            None, self._truncated(500), 100
+        )
+        self.assertEqual(merged["target_slot"], 100)
+        self.assertEqual(merged["oldest_slot_reached"], 500)
+
+    def test_a_contiguous_pass_clears_the_backlog(self):
+        """Reaching the target is the one honest way for a gap to close."""
+        existing = {"before_signature": "s", "target_slot": 100,
+                    "oldest_slot_reached": 200}
+        merged = chainseer_solana._merge_backlog(
+            existing,
+            {"stop_reason": "reached_cursor", "oldest_slot": 100,
+             "oldest_signature": "s"},
+            100,
+        )
+        self.assertIsNone(merged)
+
+
 class ObserverHealthTest(unittest.TestCase):
     """Make a sustained discovery outage distinguishable from a blip.
 

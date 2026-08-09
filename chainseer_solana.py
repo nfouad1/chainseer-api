@@ -442,14 +442,41 @@ def _merge_backlog(existing: dict | None, pass_result: dict,
     resume = pass_result.get("oldest_signature")
     if not resume:
         return existing
+    existing = existing or {}
+    new_target = target_slot
+    old_target = _safe_int(existing.get("target_slot")) or None
+    new_reached = pass_result.get("oldest_slot")
+    old_reached = _safe_int(existing.get("oldest_slot_reached")) or None
+
+    # Keep the DEEPEST target, never the newest. This overwrote the target
+    # with the current cursor on every truncated sweep, and since the cursor
+    # advances each cycle the unread span marched upward and the older, wider
+    # gap was silently discarded -- the exact data loss the backlog exists to
+    # prevent, reintroduced in a subtler form. Observed: a 69,577-slot gap at
+    # target 438,028,669 became a 5,040-slot gap at target 438,098,248 one
+    # cycle later. That was not draining. That was forgetting, and it read as
+    # progress because only one end of the span was being watched.
+    if old_target is not None and new_target is not None:
+        target = min(old_target, new_target)
+    else:
+        target = new_target if new_target is not None else old_target
+
+    # Two truncations can leave DISJOINT gaps. Rather than track a list, take
+    # the union's upper edge -- the newer resume point -- so paging back from
+    # there toward the deepest target covers both. That re-reads the span
+    # between them, which is harmless: the catalogue is keyed by mint, so a
+    # re-read costs RPC calls and yields no duplicates. Missing a launch is
+    # not recoverable; reading one twice is.
+    if old_reached is not None and new_reached is not None and old_reached > new_reached:
+        resume = existing.get("before_signature") or resume
+        reached = old_reached
+    else:
+        reached = new_reached
+
     return {
         "before_signature": resume,
-        "target_slot": (
-            target_slot
-            if target_slot is not None
-            else (existing or {}).get("target_slot")
-        ),
-        "oldest_slot_reached": pass_result.get("oldest_slot"),
+        "target_slot": target,
+        "oldest_slot_reached": reached,
         "updated_at": _utc_now(),
     }
 
