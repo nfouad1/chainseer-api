@@ -1,476 +1,229 @@
 # Chainseer
 
-Chainseer is an evidence-first on-chain risk analysis system for **Robinhood
-Chain tokens**, **Base contracts**, and **Solana SPL mints**. It combines deterministic blockchain
-and market checks with a tamper-evident Cypher Tempre Timechain, then presents
-the result as an investor-oriented risk report with explicit hard stops,
-unknowns, confidence, and provenance.
+On-chain risk analysis that watches tokens autonomously, records every outcome against a tamper-evident ledger, and never signs a transaction.
 
-Chainseer is analysis and risk-management infrastructure. This repository does
-**not** contain a wallet, private-key loader, transaction signer, or transaction
-broadcast path.
+## What it does
 
-## What Chainseer provides
+Chainseer monitors token launches on Solana (Pump.fun and Meteora DBC), Robinhood Chain, and Base. For every token it sees, it gathers on-chain evidence — holder concentration, liquidity custody, creator history, market quality — and produces a risk report with hard stops. Hard stops are non-negotiable: if a token fails one, the analysis says so regardless of how good everything else looks.
 
-- Robinhood Chain, Base, and Solana analysis through one authenticated API
-- network-specific evidence collection instead of pretending both chains have
-  identical security models
-- investor-readable risk level, action, legitimacy score, confidence, market
-  cap, holder evidence, red/yellow/green flags, and hard stops
-- block- or slot-anchored on-chain observations with timestamped,
-  content-addressed HTTP evidence
-- a non-bypassable Timechain cognitive loop with executable senses,
-  modalities, covenant screening, Proof of Qualia (PoQ), and sealed analysis
-  history
-- isolated confirmed-block monitoring and drift alerts for Robinhood Chain
-  and Base contracts
-- one-time pre-trade authorization artifacts with block freshness and
-  executable-route guardrails—without signing or executing a trade
-- a canonical Outcome Ledger that binds each follow-up observation to the
-  exact analysis ring, original evidence hash, and block/slot pin
-- an authenticated, subject-scoped recall API that refuses uncited claims and
-  binds every answer to exact Ring, evidence-hash, and anchor citations
-- a five-pillar Timechain Memory Core dashboard plus manifest-verified,
-  nondestructive backup/rebuild/restore drills
-- tighten-only calibration proposals that exclude unverified outcome evidence
-- automatic, version-pinned production benchmark capture
+On Solana, it does more than respond to requests. It runs autonomous learning cycles that sample the Pump.fun and Meteora programs for new launches, track them through graduation, evaluate them against risk gates, and paper-trade shadow positions (0.01 SOL each) to measure whether the scoring system is actually predicting outcomes. Every cycle appends to a hash-chained ledger so the history can't be altered.
 
-## How an analysis flows
+**It never signs transactions. It never holds capital. There is no wallet.**
 
-```mermaid
-flowchart LR
-    A["Token address or SPL mint"] --> B["Network-specific evidence collection"]
-    B --> C["Deterministic risk factors and hard stops"]
-    C --> D["Evidence completeness and confidence"]
-    D --> E["Timechain cognitive loop and PoQ"]
-    E --> F["Investor-oriented public report"]
-    F --> G["Immutable benchmark observation"]
-    F --> H["Optional confirmed-block monitoring"]
-    H --> I["Provenance-bound Outcome Ledger ring"]
+## Honest status
+
+Chainseer is research infrastructure under active development. Three limitations are load-bearing enough to state up front:
+
+**The score does not yet discriminate.** Most entry-eligible tokens score 90–95, and winners and losers score alike. The scoring formula is not currently a useful predictor of which entries will be profitable.
+
+**Paper-trading results are poor.** Across 43 closed shadow positions: 7% win rate (3 profitable), −71.3% net return, −81.1% excluding the single best position. These are paper results on 0.01 SOL notional, and they are the measurement the shadow portfolio exists to produce. They do not currently support a claim that the system picks winners.
+
+**Discovery samples rather than sweeps.** A Pump.fun sweep reaches roughly six seconds of chain per five-minute cycle — about 2% coverage — because the program's transaction volume vastly exceeds the per-cycle page budget. Meteora DBC reaches further but also falls behind. Launches outside a sweep's reach are recorded as a deferred backlog and drained on later cycles, but tokens can be, and are, missed.
+
+The learning loop described below is built and instrumented. **It has not yet closed:** no calibration proposal has been generated, and 43 closed positions is far too few to fit scoring weights without overfitting.
+
+## Two modes
+
+### Request-response API
+
+Submit a token address, get a structured risk report:
+
+```
+POST /v1/analyses  {"network": "solana", "address": "3fqify...Dmpump"}
 ```
 
-The deterministic analyzer owns the score and hard-stop decision. The
-cognitive layer can surface patterns, caveats, or capability gaps, but it
-cannot lower deterministic risk thresholds or turn missing evidence into a
-safety claim.
+The API is authenticated, rate-limited, and runs on a single Fly.io instance in Frankfurt. Reports include risk level, legitimacy score, hard stops, confidence, holder evidence, market data, and a tamper-evident cognitive provenance trace.
 
-## Robinhood Chain analysis
+Supported networks:
 
-Robinhood Chain reports are pinned to a confirmed block and combine independent
-RPC, explorer, security-provider, and market observations where available.
+| Network | Analysis focus | Status |
+|---|---|---|
+| **Solana** | SPL mint authority, holder concentration, Jupiter route quality, DexScreener market evidence, Pump.fun graduation state | available |
+| **Robinhood Chain** | Bytecode risk, proxy ownership, LP custody, honeypot detection, deployer history, sell restrictions | **unavailable on the hosted API** — the Robinhood RPC returns HTTP 403 to the deployment's egress IPs. Works from local/self-hosted deployments whose network is not blocked. |
+| **Base** | Same EVM evidence core as Robinhood, chain-isolated (chain ID 8453, Base RPC, Base Blockscout) | available |
 
-The analyzer covers:
+### Autonomous Solana learning engine
 
-- bytecode, ownership, proxy, pausable, mint, blacklist, and transfer-control
-  risks
-- verified source-code status and deployer history through Blockscout
-- honeypot and sell-restriction evidence
-- buy/sell tax estimation and executable liquidity evidence
-- canonical market discovery, reserves, liquidity, volume, age, market cap,
-  price, and activity through DexScreener and on-chain calls
-- LP custody using market-type-aware states; launchpad/platform-managed
-  liquidity is distinguished from independently controlled unlocked LP
-- holder adoption and supply concentration, with indexer-discovered balances
-  revalidated by `balanceOf` at the pinned block and only independently
-  identified AMM contracts excluded
-- scam-flagged wallets, proxy-holder patterns, creator concentration, and
-  serial-deployer signals
-- wash-trading indicators, social-attention context, cross-chain provider
-  attestations, MEV exposure, and historical Timechain trends
+The Solana engine runs continuous cycles that:
 
-The composite model uses 12 bounded factors: security, honeypot safety,
-liquidity, LP custody, holder distribution, volume, maturity, creator risk,
-wash trading, deployer history, sentiment, and trend. A separate hard-stop
-layer prevents a weighted average from hiding a loss-of-capital condition.
+1. **Discover** — sample the Pump.fun and Meteora programs for new CreateEvents via on-chain signatures, recording what each sweep could not reach
+2. **Catalog** — store every launch in a local index with bonding curve, creator, and timestamp
+3. **Evaluate** — run the risk analyzer on a budget of tokens per cycle (graduated candidates first, then raw launches, then previously-unanalysed backlog)
+4. **Enter** — if a token passes every gate (evidence complete, no hard stops, graduated, minimum age), open a paper shadow position
+5. **Mark** — re-price open positions each cycle, exit on stop-loss (0.65x), take-profit (3.0x), maximum hold (6h), or risk signal deterioration
+6. **Record** — append win/loss outcomes, score distributions, and failure modes for calibration against realized results
 
-## Base analysis
+The shadow portfolio uses 0.01 SOL per position. It is purely observational — no real capital, no execution path, no slippage risk. But the positions are tracked against real market prices via Jupiter quotes, so the outcomes reflect actual market conditions.
 
-Base uses the same production EVM evidence and scoring core as Robinhood Chain,
-but every analyzer instance has an immutable Base profile: chain ID `8453`,
-Base RPC, Base Blockscout, Base DexScreener markets, GoPlus chain scope, Base
-WETH, explorer links, cache namespace, benchmark cohort, and watcher files.
-This keeps scores comparable without allowing one network's data or protocol
-assumptions to leak into another.
+## How the Solana pipeline works
 
-Base reports cover the full EVM factor set above. Protocol-specific evidence
-fails closed when it cannot be verified on Base; unknown liquidity custody is
-reported as `custody_unverified`, never silently converted into locked or
-creator-withdrawable liquidity. The default public Base RPC is rate-limited,
-so production operators should set `CHAINSEER_BASE_RPC_URL` to a dedicated
-HTTPS endpoint.
-
-## Solana analysis
-
-Solana uses its own conservative evidence model. It does not translate EVM
-ownership or LP-lock assumptions onto SPL tokens.
-
-The analyzer covers:
-
-- confirmed starting-slot anchor and observation hashes
-- mint authority, freeze authority, supply, decimals, and risky token
-  extensions
-- largest-account concentration relative to total supply
-- canonical Solana market, liquidity, market age, price, volume, transaction
-  activity, and market cap through DexScreener
-- Jupiter token metadata and bounded two-way route evidence
-- round-trip retention, price impact, and route availability
-
-Generic SPL scans do not claim creator attribution, pool-vault custody, or
-wash-trading detection unless those facts are independently verified.
-Largest-account data may include AMM or program vaults, so Chainseer reports
-that limitation instead of presenting it as certain holder ownership.
-Provider/RPC failure is classified as **infrastructure indeterminate**, not as
-negative token evidence.
-
-## Entity and insider evidence graph
-
-Every analysis now projects its verified and provider-attested entities into a
-deterministic graph. It connects the analyzed asset to deployers, reported
-owners, proxy implementations, primary markets, LP withdrawal controllers, top
-holders, Solana authorities, token accounts, and resolved account owners.
-
-Each relationship carries an evidence status, confidence, fact references, and
-bounded attributes. Chainseer surfaces exact-address role overlaps, privileged
-supply concentration, direct liquidity control, serial deployers, scam-flagged
-entities, provider disagreement, proxy holders, and Solana authority/account
-overlaps.
-
-The graph is deliberately conservative:
-
-- ordinary large holders are not labelled insiders without a privileged link
-- shared funding and behavioral wallet clusters remain unmeasured
-- Solana AMM/program vaults remain unresolved until independently identified
-- graph v1 is evidence-only and does not silently change the legitimacy score
-
-The canonical graph hash, summary, signals, and complete bounded graph snapshot
-are included in Timechain sealing. The authenticated API returns the current
-nodes/edges plus a longitudinal view of relationship and score changes. See
-[`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) for the schema, relationship semantics,
-temporal lifecycle, signal definitions, and limitations.
-
-## Temporal entity and risk memory
-
-The Timechain now functions as an event source for a persistent temporal
-knowledge graph. Each analysis preserves when a relationship was first seen,
-last confirmed, semantically changed, became unconfirmed, defensibly
-disappeared, or reappeared. Every event carries the exact analysis ring/hash,
-evidence-manifest hash, timestamp, and original block or slot pin.
-
-Risk evolution is recorded on the same axis: score, risk level, component
-scores, hard stops, and per-analysis deltas remain tied to their evidence
-snapshot. Infrastructure-indeterminate observations stay visible but are
-excluded from the usable token-evidence score trajectory. Historical rings
-that never sealed full graph snapshots are labeled legacy rather than
-retroactively reconstructed.
-
-`chainseer_chain/temporal_entity_graph-v1.json` is an atomic, hash-verified read
-model. It is never authoritative and can be rebuilt from Timechain rings.
-Exact-address equality can reveal the same deployer, authority, holder, or
-market across analyzed tokens; no behavior-based identity or beneficial
-ownership is inferred.
-
-## Timechain Memory Core
-
-Chainseer’s persistent intelligence is organized as five linked layers:
-
-1. the immutable **Timechain Ledger**;
-2. the temporal **Entity Knowledge Graph**;
-3. the tighten-only governed **Pattern & Faculty Store**;
-4. the provenance-bound **Outcome Ledger**; and
-5. the evidence-citing **Query & Recall Engine**.
-
-The authenticated recall API returns subject-specific assessment, risk,
-relationship, and outcome claims only when every claim can cite the exact
-verified Ring and original evidence hash. It does not expose raw Ring payloads
-or provider requests. Legacy analyses whose evidence manifest was not sealed
-in the original Ring are visible as exclusions, not upgraded into facts.
-
-The operator dashboard reports all five pillars, projection integrity,
-governance state, and the latest recovery proof. Backups contain only the
-authoritative `chain/` and epoch-covered `registry/` paths. Recovery always
-restores to an isolated new/empty root, verifies the snapshot, deterministically
-rebuilds projections, and never overwrites the live Timechain. See
-[`TIMECHAIN_MEMORY_CORE.md`](TIMECHAIN_MEMORY_CORE.md) for API schemas,
-commands, recovery drills, and honest scope boundaries.
-
-## Timechain cognitive provenance
-
-Every completed analysis passes through the Cypher Tempre self-model:
-
-1. relevant prior rings are recalled;
-2. executable senses and modalities inspect the structured evidence;
-3. the covenant membrane checks safety and grounding;
-4. PoQ decides whether the cognition is sufficiently supported to seal;
-5. analysis and cognitive-completion evidence are appended to a hash-linked
-   Timechain ring.
-
-Production also installs the reviewed
-[`chainseer-production-risk-lenses`](faculties/chainseer-production-v1.json)
-pack before Recall is initialized. Its 12 bounded faculties cover liquidity
-custody, holder-concentration basis, authority state, proxy upgrades,
-sellability, and infrastructure indeterminacy. The pack is canonical-hash
-verified, immune-screened, imported once, and anchored by a registry epoch.
-It transfers capability definitions onlyâ€”no developer Timechain history is
-copied into production.
-
-The result is tamper-evident and internally consistent: later verification can
-detect modified, removed, reordered, or incompatible rings and faculty
-registries. Timechain verification does not claim that a historical external
-API response can always be reproduced from its present-day endpoint.
-
-When a genuine capability gap is detected, Cambium may grow a constrained
-primitive faculty and seal a new registry epoch. Growth is fail-closed and
-cannot silently change deterministic scoring policy.
-
-The boundary is now executable rather than documentary. Every installed or
-Cambium-grown faculty is fingerprinted with a `cognitive_advisory_only` effect
-contract inside the epoch-covered registry. Learned patterns follow
-candidate -> shadow -> held-out/outcome validation -> active. A common gate
-recomputes every score, hard-stop, threshold, admission, and execution effect.
-Only observability-only or genuinely tighten-only changes can activate
-automatically. A potentially relaxing pattern needs an exact proposal-bound
-human approval receipt and a new registry epoch; live execution, signing, and
-broadcast expansion are non-overridable. See
-[`CHAINSEER_GOVERNANCE.md`](CHAINSEER_GOVERNANCE.md).
-
-The public report exposes an expandable **Cognitive trace** with the active
-senses, reasoning modalities, bounded recall references, growth events, PoQ
-completion state, and cognitive ring. This is provenance and observability,
-not a second scoring engine: deterministic evidence and hard-stop rules remain
-authoritative, and the cognitive layer has no signing or broadcast capability.
-
-## Canonical Outcome Ledger
-
-Real-world feedback is appended as a new Timechain ring; the original analysis
-is never edited. Every canonical outcome record contains a cryptographically
-checked analysis reference with:
-
-- the exact analysis ring index, full ring hash, ring type, and timestamp
-- the original evidence-manifest hash sealed by that analysis
-- the original `block_pin` or `slot_pin`
-- the analyzed network and token/mint
-- separately classified security, market, infrastructure, and other outcomes
-- a record hash covering the complete outcome document
-
-The original evidence manifest is an ordered digest of fact identifiers,
-query hashes, response hashes, and their observation pins. Follow-up evidence
-gets its own manifest hash. An outcome with missing or incomplete follow-up
-evidence remains in history but is marked ineligible for calibration, so an
-unsupported label cannot train the agent. Before calibration, canonical records
-are revalidated against the referenced analysis ring and tampered or mismatched
-records are excluded.
-
-Timechain rings are the source of truth. Future databases, graph projections,
-and dashboards are derived indexes that must be rebuildable from those rings;
-they never become an independent authority. The schema and verification logic
-live in [`chainseer_outcome_ledger.py`](chainseer_outcome_ledger.py).
-Outcome rings created before schema v1 remain visible as `legacy_unbound`; they
-are not silently rewritten or treated as canonical training evidence.
-
-## Monitoring and pre-trade controls
-
-`chainseer_controls.py` extends all network analyzers with:
-
-- confirmed-block watching for owner, proxy, transfer, LP-burn, holder, and
-  outcome changes
-- reorg detection and state-drift alerts
-- confirmed Solana signature indexing plus compact mint-authority, supply,
-  extension, holder-concentration, primary-market, liquidity, and price
-  transition detection
-- event-triggered Solana rescans with noisy activity debounced and a periodic
-  reconciliation scan to recover from missed provider events
-- Timechain-sealed critical alerts for liquidity removal or custody
-  deterioration, privileged-authority changes, proxy implementation upgrades,
-  and newly unsafe sellability, tax, or Jupiter route conditions
-- a subscriber-isolated, cursor-based critical-alert feed; subscriber
-  identities are one-way hashes and raw watcher state is not exposed
-- outcome checks at 1 hour, 6 hours, 24 hours, 7 days, and 30 days
-- calibration proposals that can only tighten the adopted pre-trade policy
-- governed faculty and learned-pattern promotion with effect manifests,
-  held-out Outcome Ledger validation, explicit human override receipts for
-  risk relaxation, and registry-epoch anchoring
-- short-lived, one-time `TradePermit` artifacts bound to the current block,
-  token, canonical pair, input amount, recipient, and executable quote
-- slippage, price-impact, route, MEV, expiry, replay, and hard-stop rejection
-
-A `TradePermit` is an authorization artifact for a separate execution adapter.
-It is not a signed transaction and cannot move funds. See
-[`CHAINSEER_CONTROLS.md`](CHAINSEER_CONTROLS.md) for commands and safety
-invariants.
-
-## Benchmark
-
-Chainseer includes a time-separated benchmark designed to measure what the
-analyzer knew **before** an outcome occurred.
-
-Production automatically captures one immutable observation for every fresh
-successful Robinhood, Base, or Solana analysis. Cache hits are not duplicated.
-Observations are:
-
-- pinned to the exact deployed Git commit
-- assigned deterministically to train (60%), validation (20%), or test (20%)
-  so the same token never leaks across splits
-- stored separately from later, independently reviewed outcomes
-- classified so infrastructure failure is not confused with token risk
-
-Benign labels require at least seven days of outcome evidence. Reports measure
-dangerous false negatives, false positives, precision, recall, specificity,
-abstention, infrastructure handling, latency, evidence freshness, confidence
-intervals, and optional probability calibration. Analyzer comparisons are
-valid only for matched cases with the same evidence cutoff.
-
-The benchmark currently provides the capture, validation, materialization, and
-evaluation system. It does **not** claim production accuracy until enough
-time-separated, independently reviewed cases mature. Full schema, commands,
-metrics, and comparison rules are documented in
-[`BENCHMARK.md`](BENCHMARK.md).
-
-## API
-
-The FastAPI service uses bearer authentication, per-client rate limits, a
-bounded single-worker queue, network-aware caching, request-size limits,
-trusted-host/CORS policy, and a single-process Timechain lease. Job polling
-includes a bounded stage, human-readable detail, and percentage. Successful
-reports are published before benchmark aggregation and rebuildable projection
-maintenance complete.
-
-Timechain integrity is fully verified at process startup and on a periodic
-background audit. Each request synchronously verifies only rings appended
-after that trusted head, including index/hash continuity, proof difficulty,
-and blockspace references. A failed audit makes readiness and new submissions
-fail closed. This preserves the verification boundary without replaying the
-entire growing ledger several times per scan.
-
-### Submit an analysis
-
-```bash
-curl -X POST "http://127.0.0.1:8000/v1/analyses" \
-  -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"network":"robinhood","address":"0xYourTokenAddress"}'
+```
+New Pump.fun launch
+        │
+        ▼
+┌─ Discovery ──────────────────────────────────────┐
+│  Sample Pump.fun program signatures               │
+│  Decode CreateEvents → catalog with mint,         │
+│  bonding curve, creator, timestamp                │
+│  Unreached span → deferred backlog, drained       │
+│  on later cycles rather than discarded            │
+└────────────────────┬──────────────────────────────┘
+                     │
+                     ▼
+┌─ Admission Cascade ───────────────────────────────┐
+│  infrastructure_indeterminate                     │
+│       → graduation_pending                       │
+│       → canonical_migration_pending               │
+│       → market_indexing_pending                   │
+│       → execution_evidence_pending                │
+│       → distribution_pending                      │
+│       → market_age_pending                         │
+│       → graduated_market_ready  ← entry gate       │
+│                                                    │
+│  Hard stops at any stage → graduated_market_unsafe │
+│  Missing data → infrastructure_indeterminate       │
+└────────────────────┬──────────────────────────────┘
+                     │
+                     ▼
+┌─ Entry Gate ─────────────────────────────────────┐
+│  evidence_state == complete_safe                   │
+│  AND admission_state == graduated_market_ready     │
+│  AND age_seconds >= minimum_age_seconds            │
+│  AND NOT momentum_entry_blocked                    │
+└────────────────────┬──────────────────────────────┘
+                     │ pass
+                     ▼
+              Shadow position opened
+              (0.01 SOL, paper-only)
 ```
 
-```bash
-curl -X POST "http://127.0.0.1:8000/v1/analyses" \
-  -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"network":"base","address":"0xYourBaseTokenAddress"}'
+### What triggers a hard stop
+
+- **Holder concentration**: top 1 holder > 25% of supply, or top 10 > 90%
+- **Creator risk**: industrialized deployment (10+ launches in 24h), scam-flagged wallets
+- **Market quality**: Jupiter roundtrip retention too low, buy price impact too high
+- **Liquidity**: insufficient liquidity or unresolved concentration state
+
+### What triggers an exit
+
+Priority order:
+1. **Risk signal** — re-analysis detects hard stops on a held position
+2. **Stop loss** — position drops below 0.65x entry
+3. **Take profit** — position exceeds 3.0x entry
+4. **Maximum hold** — position held for 6 hours regardless of P&L
+
+## Evidence model
+
+Chainseer treats missing data differently from negative data. If an RPC call fails or a provider is down, the token gets classified as `infrastructure_indeterminate` — not unsafe, not safe, just unknown. This prevents a Solana RPC outage from silently flagging every token as risky.
+
+The scoring formula separates hard stops from warnings from scoring signals. Hard stops are binary — present or absent. Warnings are informational. The composite score deducts from 100 for each hard stop, warning, and infrastructure error, and is capped at 50 for tokens in `distribution_pending` state.
+
+**Known limitation**: the current formula produces near-zero discrimination among entry-eligible tokens (most score 90–95), which means the score alone doesn't predict which entries will be profitable. The h6 buy/sell ratio and Jupiter roundtrip retention are the strongest outcome discriminators observed so far, but are weighted as minor warnings rather than scoring terms. This is a known calibration gap under active development.
+
+## Calibration and learning
+
+The pieces required to calibrate scoring against realized outcomes are built:
+
+- **Outcome recording** — every closed position carries its entry score, evidence state, exit reason, and realized proceeds
+- **Time-separated evaluation** — the benchmark keeps each token in one `train` / `validation` / `test` split, and the default evaluation excludes the training split
+- **Threshold sensitivity** — the calibration report characterizes the admit rate at every candidate threshold across concentration, retention, and distribution axes
+- **A tighten-only calibration engine** — proposals may only make gates stricter, and adoption is human-approved through the governance path
+
+What is not yet done is the join between them. The calibration report labels itself `DESCRIPTIVE_NOT_VALIDATING`: it reports what each threshold *would admit*, never what those admissions *earned*. No calibration proposal has been generated to date. Until that loop closes and enough outcomes accumulate, the scoring weights are hand-set, not learned.
+
+## Timechain
+
+Every analysis, trade event, and learning outcome is appended to a SHA-256 hash-chained ledger called the Timechain. Each ring contains a hash of the previous ring, so any modification, removal, or reordering is detectable by verification.
+
+The Timechain also carries a cognitive trace — a record of what the system's reasoning layer observed, which prior rings it recalled, and whether its cognition was sufficiently grounded in evidence to seal (Proof of Qualia, or PoQ). This is provenance, not a second scoring engine. The deterministic risk checks remain authoritative.
+
+## Architecture
+
+```
+┌─────────────────────────────────────────────────┐
+│  chainseer_api.py (FastAPI)                      │
+│  Auth, rate limits, job queue, caching           │
+├─────────────────────────────────────────────────┤
+│  chainseer.py              chainseer_solana.py    │
+│  EVM analyzer             Solana analyzer        │
+│  (Robinhood + Base)       + learning engine       │
+├─────────────────────────────────────────────────┤
+│  chainseer_controls.py    chainseer_outcome.py   │
+│  Monitoring, permits      Outcome ledger         │
+├─────────────────────────────────────────────────┤
+│  chainseer_entity_graph.py  chainseer_temporal.py│
+│  Entity relationships      Time-series risk       │
+├─────────────────────────────────────────────────┤
+│  Cypher Tempre Timechain (hash-chained ledger)   │
+└─────────────────────────────────────────────────┘
 ```
 
-```bash
-curl -X POST "http://127.0.0.1:8000/v1/analyses" \
-  -H "Authorization: Bearer $CHAINSEER_API_TOKEN" \
-  -H "Content-Type: application/json" \
-  -d '{"network":"solana","address":"YourSolanaMint"}'
-```
+**Single process. Single writer.** The Timechain is filesystem-backed and cannot be horizontally scaled. There is one Fly.io instance, one analysis worker, one Timechain lease. This is intentional.
 
-The API returns `202 Accepted` and a job ID. Poll the job until it succeeds:
+## Entity graph
 
-```bash
-curl "http://127.0.0.1:8000/v1/analyses/JOB_ID" \
-  -H "Authorization: Bearer $CHAINSEER_API_TOKEN"
-```
+Beyond per-token analysis, Chainseer projects verified entities (deployers, holders, authorities, LP controllers) into a deterministic graph. Exact-address matches across tokens reveal serial deployers, shared LP withdrawal controllers, and authority overlaps. The graph is deliberately conservative — it does not label ordinary large holders as insiders without privileged-link evidence, and it does not cluster wallets by behavioral analysis.
 
-### Endpoints
+## Safety
 
-| Method | Endpoint | Purpose |
-| --- | --- | --- |
-| `GET` | `/health/live` | Process liveness |
-| `GET` | `/health/ready` | Worker, watcher, network, and benchmark readiness |
-| `POST` | `/v1/analyses` | Submit a Robinhood, Base, or Solana analysis |
-| `GET` | `/v1/analyses/{job_id}` | Retrieve job state and public report |
-| `GET` | `/v1/watch` | Inspect the authenticated client's watch state |
-| `POST` | `/v1/watch` | Add an idempotent, client-aware watch subscription |
-| `GET` | `/v1/watch/alerts` | Read bounded critical alerts after an ISO cursor |
-| `DELETE` | `/v1/watch/{address}` | Remove only the authenticated client's subscription |
+- A high score is not a guarantee of safety, liquidity, or future return
+- Paper-trading results to date are negative; nothing here demonstrates profitable selection
+- Missing evidence lowers confidence — it is never silently converted into a green flag
+- The cognitive layer surfaces patterns but cannot override hard stops
+- Re-run analysis immediately before any real action — on-chain state changes fast
+- This is research and decision-support infrastructure, not financial advice
 
 ## Run locally
 
-Prerequisites:
-
-- Python 3.11 or newer
-- an installed Cypher Tempre self-model skill
-- `CHAINSEER_SKILL_DIR` pointing to that skill directory
-- HTTPS RPC endpoints for the networks you want to analyze
-
-Install the test dependencies and run the complete test suite. The test
-requirements include bot-only packages that are intentionally absent from the
-production API image:
-
 ```bash
-python -X utf8 -m pip install -r requirements-test.txt
-python -X utf8 -m unittest discover -s tests -v
-```
+# Prerequisites: Python 3.11+, Cypher Tempre self-model skill
+pip install -r requirements-api.txt        # API service
+pip install -r requirements-solana.txt     # Solana learning engine
+pip install -r requirements-test.txt       # test suite only
 
-Run the Robinhood Chain CLI:
+# CLI analysis
+python -X utf8 chainseer.py 0xTokenAddress
+python -X utf8 chainseer.py 0xTokenAddress --full
 
-```bash
-python -X utf8 chainseer.py 0xYourTokenAddress
-python -X utf8 chainseer.py 0xYourTokenAddress --full
-```
-
-Run the API locally:
-
-```bash
+# API
 export CHAINSEER_SKILL_DIR="/path/to/cypher-tempre-self-model"
-export CHAINSEER_API_TOKEN="replace-with-a-long-random-development-token"
-export CHAINSEER_BASE_RPC_URL="https://your-base-rpc.example"
-export CHAINSEER_SOLANA_RPC_URL="https://your-solana-rpc.example"
+export CHAINSEER_API_TOKEN="your-token"
+export CHAINSEER_SOLANA_RPC_URL="https://your-solana-rpc"
 python -X utf8 chainseer_api.py
 ```
 
-Development API documentation is available at `http://127.0.0.1:8000/docs`.
-Interactive docs are disabled in production.
+Development docs at `http://127.0.0.1:8000/docs`. Interactive docs disabled in production.
 
-## Production architecture
+Tests run the way CI does:
 
-- one Fly.io application instance in Frankfurt
-- one bounded analysis worker and confirmed-block watcher
-- persistent disk mounted at `/data`
-- one filesystem lease and one ordered Timechain writer
-- Timechain and benchmark storage survive deploys and restarts
-- Cypher Tempre runtime pinned to an exact source revision
-- faculty-registry epoch verification at startup
-- public reports omit raw upstream responses and internal query parameters
-- cognition receives trusted structured fields, never raw provider bodies
+```bash
+python -X utf8 -m unittest discover -s tests
+```
 
-Do not horizontally scale the current filesystem-backed Timechain. Multiple
-writers require a coordinated consensus or transactional append design.
-Deployment, secrets, backups, health checks, and domain setup are covered in
-[`API_DEPLOYMENT.md`](API_DEPLOYMENT.md).
+## Repository
 
-## Repository guide
+| File | What it does |
+|---|---|
+| `chainseer.py` | EVM analyzer — Robinhood Chain and Base |
+| `chainseer_base_public.py` | Base chain adapter (chain ID 8453, isolated profile) |
+| `chainseer_solana_public.py` | Public Solana analyzer (single-token analysis) |
+| `chainseer_solana.py` | Solana learning engine — discovery, evaluation, shadow portfolio, learning cycles |
+| `chainseer_api.py` | FastAPI service — auth, queue, cache, Timechain integration |
+| `chainseer_controls.py` | Monitoring, TradePermit artifacts, calibration |
+| `chainseer_outcome_ledger.py` | Canonical outcome schema and ledger verification |
+| `chainseer_entity_graph.py` | Entity relationships, insider-exposure signals |
+| `chainseer_temporal_graph.py` | Timechain-derived relationship lifecycle |
+| `chainseer_memory.py` | Evidence-citing recall, five-pillar integrity |
 
-| File | Responsibility |
-| --- | --- |
-| [`chainseer.py`](chainseer.py) | Network-configurable production EVM analyzer and report model |
-| [`chainseer_base_public.py`](chainseer_base_public.py) | Isolated first-class Base adapter |
-| [`chainseer_solana_public.py`](chainseer_solana_public.py) | Conservative Solana analyzer |
-| [`chainseer_api.py`](chainseer_api.py) | Authenticated FastAPI service, queue, cache, watcher integration, and production benchmark capture |
-| [`chainseer_controls.py`](chainseer_controls.py) | Monitoring, outcomes, calibration, MEV checks, and TradePermit boundary |
-| [`chainseer_benchmark.py`](chainseer_benchmark.py) | Immutable case bank and deterministic benchmark evaluator |
-| [`chainseer_outcome_ledger.py`](chainseer_outcome_ledger.py) | Canonical outcome schema, evidence/pin binding, record hashing, and ledger verification |
-| [`chainseer_entity_graph.py`](chainseer_entity_graph.py) | Deterministic entity relationships, insider-exposure signals, and graph verification |
-| [`chainseer_temporal_graph.py`](chainseer_temporal_graph.py) | Timechain-derived relationship lifecycle, cross-analysis exact-address identity, risk-score evolution, and projection verification |
-| [`chainseer_memory.py`](chainseer_memory.py) | Evidence-citing subject recall, sanitized citation proofs, five-pillar integrity status, and nondestructive backup/rebuild/restore drills |
-| [`CHAINSEER_CONTROLS.md`](CHAINSEER_CONTROLS.md) | Monitoring and pre-trade control operations |
-| [`BENCHMARK.md`](BENCHMARK.md) | Benchmark schema, workflow, metrics, and caveats |
-| [`ENTITY_GRAPH.md`](ENTITY_GRAPH.md) | Entity graph schema, evidence semantics, signals, and inference limits |
-| [`API_DEPLOYMENT.md`](API_DEPLOYMENT.md) | Fly.io deployment and production operations |
-| [`fly.toml`](fly.toml) | Authoritative Fly.io application, volume, health-check, and singleton configuration |
-| [`Dockerfile.api`](Dockerfile.api) | Reproducible API container |
+## Documentation
 
-## Safety and interpretation
-
-- A high score is not a guarantee of safety, liquidity, or future return.
-- Missing or stale evidence lowers confidence; it is never silently converted
-  into a green flag.
-- Social attention is manipulable and cannot override a hard stop.
-- Market performance and security correctness are tracked separately.
-- Re-run the analysis immediately before any action because ownership,
-  liquidity, holders, routes, and market state can change.
-- This software is research and decision-support infrastructure, not financial
-  advice.
-
-Never commit API tokens, private keys, environment files, local Timechain
-rings, learning databases, benchmark ledgers, or analysis reports.
+| Document | Scope |
+|---|---|
+| `API_DEPLOYMENT.md` | Fly.io deployment, secrets, health checks |
+| `CHAINSEER_CONTROLS.md` | Monitoring, TradePermit safety invariants |
+| `CHAINSEER_GOVERNANCE.md` | Faculty governance, calibration proposals, PoQ |
+| `BENCHMARK.md` | Time-separated benchmark schema and metrics |
+| `ENTITY_GRAPH.md` | Entity graph schema, relationship semantics |
+| `TIMECHAIN_MEMORY_CORE.md` | Five-pillar memory architecture |
+| `SOLANA_PROTOTYPE.md` | Solana analyzer design decisions |
+| `BASE_PROTOTYPE.md` | Base adapter design decisions |
