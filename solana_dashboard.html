@@ -344,6 +344,17 @@
     <section class="grid">
       <article class="panel">
         <div class="panel-head">
+          <div><h2>Discovery health</h2><div class="sub">Catalogue freshness is measured live from disk, not read back from the learner's own bookkeeping</div></div>
+          <span class="status"><span class="dot" id="discovery-dot"></span><span id="discovery-label">AWAITING DATA</span></span>
+        </div>
+        <div class="evidence-counts" style="grid-template-columns:repeat(2,1fr)" id="discovery-venues"></div>
+        <div class="callout" id="discovery-callout">Discovery status appears after the first refresh.</div>
+      </article>
+    </section>
+
+    <section class="grid">
+      <article class="panel">
+        <div class="panel-head">
           <div><h2>Shadow portfolio</h2><div class="sub">Only positions with executable quote marks contribute to modeled return</div></div>
           <span class="status"><span class="dot" id="portfolio-dot"></span><span id="portfolio-status">NO POSITIONS</span></span>
         </div>
@@ -510,6 +521,66 @@
       } else {
         $("evidence-callout").textContent="All current analyses have complete evidence and no token-specific hard stop.";
       }
+    }
+
+    // Discovery is the intake for everything else on this page: if it stops,
+    // every other panel keeps rendering perfectly valid numbers about a
+    // frozen candidate pool. That is exactly what happened for six and a half
+    // hours while every learn cycle exited 0.
+    function renderDiscovery(data) {
+      const health = data.discovery_health || {};
+      const venues = health.venues || {};
+      const labels = { pump_fun: "Pump.fun", meteora_dbc: "Meteora DBC" };
+      const host = $("discovery-venues");
+      if (!host) return;
+      const names = Object.keys(venues);
+      host.innerHTML = names.map((key) => {
+        const v = venues[key] || {};
+        const hours = v.catalog_age_hours;
+        const age = hours === null || hours === undefined
+          ? "—"
+          : (hours < 1 ? `${Math.round(hours*60)}m` : `${hours.toFixed(1)}h`);
+        const cls = v.degraded ? "negative" : "positive";
+        return `<div class="mini"><strong class="${cls}">${age}</strong>`
+          + `<span>${labels[key] || key} catalogue age</span></div>`;
+      }).join("");
+
+      const degraded = health.degraded_venues || [];
+      $("discovery-label").textContent = names.length
+        ? (degraded.length ? `${degraded.length} VENUE${degraded.length===1?"":"S"} DEGRADED` : "DISCOVERING")
+        : "AWAITING DATA";
+      setDot("discovery-dot", names.length ? degraded.length === 0 : null);
+
+      const notes = [];
+      names.forEach((key) => {
+        const v = venues[key] || {};
+        const name = labels[key] || key;
+        if (v.stale) {
+          const hrs = v.catalog_age_hours;
+          notes.push(`${name} has not written a catalogue entry for ${hrs ? hrs.toFixed(1) : "?"}h — no new launches are being discovered.`);
+        }
+        if (v.failing) {
+          notes.push(`${name} has failed ${v.consecutive_failures} sweeps in a row${v.last_error ? `: ${v.last_error}` : "."}`);
+        }
+        if (v.sweep_failed) {
+          notes.push(`${name}'s last sweep aborted with ${v.sweep_error || "an error"}.`);
+        }
+        if (v.backlog_pending) {
+          notes.push(`${name} has a deferred backlog still to drain — launches in that span are not yet discovered.`);
+        } else if (v.stop_reason === "max_pages") {
+          notes.push(`${name} hit its page ceiling; the skipped span is recorded for the next sweep.`);
+        }
+      });
+      // Said plainly rather than implying an alert went out: the webhook is
+      // unset in this estate, so this panel is where detection actually lands.
+      if (health.webhook_configured === false && degraded.length) {
+        notes.push("No alert webhook is configured, so these conditions are reported here only.");
+      }
+      $("discovery-callout").textContent = notes.length
+        ? notes.join(" ")
+        : (names.length
+            ? "Both venues are sweeping and writing catalogue entries within the freshness threshold."
+            : "Discovery status appears after the first learn cycle.");
     }
 
     // Renders only the header's Timechain-head widget (ring-height/-type/
@@ -682,6 +753,7 @@
     function render(data) {
       renderVerdict(data);
       renderEvidence(data);
+      renderDiscovery(data);
       renderIntegrity(data);
       renderPositions(data.shadow || {});
       renderDecisions(data.decisions || []);
