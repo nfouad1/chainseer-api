@@ -261,6 +261,22 @@ RPC_HEALTH_SCHEMA_VERSION = 2
 REFLECTION_ANALYSIS_INTERVAL = 200
 REFLECTION_MIN_SECONDS = 6 * 60 * 60
 
+# A checkpoint used to halt ALL learning until a human acknowledged it. The
+# review is worth keeping; enforcing it by stopping the pipeline is not.
+# Measured: 178 skipped cycles, all of them this one reason, and one overnight
+# checkpoint at 02:30 cost six hours of learning before it was cleared at
+# 08:42 -- on a system that was healthy throughout.
+#
+# So a pending checkpoint now NOTIFIES and lets learning continue. Halting is
+# reserved for the case the pause was really guarding against: a human who has
+# stopped reading. After this many unacknowledged checkpoints accumulate, the
+# learner stops and waits, because at that point nobody is reviewing the
+# trajectory and continuing would be unsupervised drift rather than autonomy.
+#
+# Note this is paper_only / live_execution_enabled=False. If live execution is
+# ever enabled, this should go back to halting on the first checkpoint.
+REFLECTION_MAX_UNACKNOWLEDGED = 3
+
 RISKY_TOKEN_2022_EXTENSIONS = {
     "confidentialtransfermint",
     "defaultaccountstate",
@@ -4064,17 +4080,56 @@ class SolanaPrototypeEngine:
         return state
 
     def assert_learning_allowed(self) -> None:
+        """Halt only when review has actually stopped, not on every checkpoint.
+
+        A single pending checkpoint no longer blocks: it is sealed, it
+        notifies, and learning continues. Blocking is reserved for a backlog
+        of them, which is the signal that nobody is reading -- the condition
+        the pause was really meant to catch. See
+        REFLECTION_MAX_UNACKNOWLEDGED.
+        """
         state = self.reflection_status()
-        if state.get("pause_requested") or state.get("status") == "pending":
-            raise ReflectionCheckpointPending(
-                "A sealed recursive-learning reflection checkpoint is pending. "
-                "No further analysis will run until it is reviewed and acknowledged."
-            )
+        pending = bool(
+            state.get("pause_requested") or state.get("status") == "pending"
+        )
+        if not pending:
+            return
+        unacknowledged = _safe_int(state.get("unacknowledged_count"), 1) or 1
+        if unacknowledged < REFLECTION_MAX_UNACKNOWLEDGED:
+            return
+        raise ReflectionCheckpointPending(
+            f"{unacknowledged} sealed recursive-learning reflection "
+            f"checkpoints are pending, at or past the "
+            f"{REFLECTION_MAX_UNACKNOWLEDGED} allowed unreviewed. No further "
+            f"analysis will run until they are reviewed and acknowledged."
+        )
 
     def _maybe_request_reflection(self) -> dict:
         state = self.reflection_status()
-        if state.get("pause_requested") or state.get("status") == "pending":
-            return state
+        pending = bool(
+            state.get("pause_requested") or state.get("status") == "pending"
+        )
+        if pending:
+            # Learning no longer stops here, so this path is now reachable
+            # every cycle with the interval still due -- next_analysis_
+            # checkpoint only advances on acknowledgement. Without a time
+            # guard that would seal a checkpoint per cycle.
+            #
+            # REFLECTION_MIN_SECONDS existed for exactly this and was never
+            # enforced: it appeared once, writing itself into the state dict,
+            # and was never compared against anything. Enforce it now.
+            since = _timestamp(
+                (state.get("pending_checkpoint") or {}).get("requested_at")
+                or state.get("last_reflection_at")
+            )
+            if since is not None and (time.time() - since) < REFLECTION_MIN_SECONDS:
+                return state
+            if _safe_int(state.get("unacknowledged_count"), 1) >= (
+                REFLECTION_MAX_UNACKNOWLEDGED
+            ):
+                # Already at the halt threshold; assert_learning_allowed is
+                # stopping the cycle anyway, so adding more is pure noise.
+                return state
         analyses = _read_json(
             self.analysis_index_path, {}
         ).get("tokens", {})
@@ -4121,6 +4176,9 @@ class SolanaPrototypeEngine:
             ),
             "analysis_events": analysis_events,
             "analysis_interval": self._reflection_interval(),
+            "unacknowledged_count": _safe_int(
+                state.get("unacknowledged_count")
+            ) + 1,
             "graduated_market_count": len(graduated),
             "first_graduated_mint": graduated[0] if graduated else None,
             "observation_ledger_head": (
@@ -4148,6 +4206,12 @@ class SolanaPrototypeEngine:
                 "last_checkpoint_id": checkpoint_id,
                 "analysis_events": analysis_events,
                 "analyses_until_checkpoint": 0,
+                # Counts how many checkpoints have gone unreviewed. Learning
+                # continues until this reaches REFLECTION_MAX_UNACKNOWLEDGED;
+                # acknowledging any checkpoint resets it.
+                "unacknowledged_count": _safe_int(
+                    state.get("unacknowledged_count")
+                ) + 1,
                 "updated_at": _utc_now(),
             }
         )
@@ -4177,17 +4241,135 @@ class SolanaPrototypeEngine:
                 tally[state] += 1
         return tally
 
+    def _learning_progress_lines(self) -> list[str]:
+        """How the learning is actually going, for the checkpoint notification.
+
+        A checkpoint that only says "N analyses done" tells the reviewer
+        nothing about whether the run is working, which is the one question
+        an acknowledgement is supposed to answer. Every figure here is read
+        from persisted state -- no live RPC -- so a notification cannot be
+        delayed or failed by an endpoint being slow.
+
+        Best-effort throughout: this is a message body, and a missing metric
+        must degrade to a line saying so rather than cost the reviewer the
+        whole notification.
+        """
+        lines: list[str] = []
+        try:
+            promotion = _read_json(self.root / "promotion_status.json", {}) or {}
+            metrics = promotion.get("metrics") or {}
+            policy = promotion.get("policy") or {}
+            closed = _safe_int(metrics.get("closed_positions"))
+            need_closed = _safe_int(policy.get("minimum_closed_positions"))
+
+            def pct(value, digits: int = 1) -> str:
+                # Raw floats arrive at full precision; a notification read on
+                # a phone needs "-71.3%", not "-71.33429372093023%".
+                try:
+                    return f"{float(value):.{digits}f}%"
+                except (TypeError, ValueError):
+                    return "?"
+
+            lines += [
+                "",
+                "-- Paper trading --",
+                f"Closed positions: {closed}"
+                + (f" of {need_closed} needed" if need_closed else ""),
+                f"Win rate: {pct(metrics.get('winner_rate_pct'))}"
+                f"  (need {pct(policy.get('minimum_winner_rate_pct'), 0)})",
+                f"Net return: {pct(metrics.get('net_return_pct'))}"
+                f"  excluding best: {pct(metrics.get('return_without_best_pct'))}",
+                f"Profitable: {metrics.get('profitable_positions')}"
+                f"  max drawdown: {pct(metrics.get('maximum_drawdown_pct'))}",
+            ]
+            blockers = promotion.get("blockers") or []
+            if blockers:
+                lines.append(
+                    f"Promotion blocked by: {', '.join(blockers[:4])}"
+                    + (" ..." if len(blockers) > 4 else "")
+                )
+            elif not promotion:
+                # Absent state is NOT a passing state. Reporting "all clear"
+                # from a missing file is the same class of error as a health
+                # check that reads green because nothing wrote to it.
+                lines.append("Promotion gates: no evaluation recorded yet")
+            else:
+                lines.append("Promotion gates: all clear")
+        except Exception:
+            lines += ["", "-- Paper trading -- (unavailable)"]
+
+        try:
+            tally = self._evidence_state_tally()
+            total = sum(tally.values()) or 1
+            lines += [
+                "",
+                "-- Analysis --",
+                # One decimal, not integer division: complete_safe is ~1% of
+                # the index, which floors to a misleading "0%".
+                f"Evidence: {tally['complete_safe']} safe"
+                f" ({tally['complete_safe'] * 100 / total:.1f}%),"
+                f" {tally['complete_unsafe']} unsafe,"
+                f" {tally['distribution_pending']} pending,"
+                f" {tally['infrastructure_indeterminate']} indeterminate",
+                f"Never analysed (backlog): {self._unanalysed_backlog_depth()}",
+            ]
+        except Exception:
+            lines += ["", "-- Analysis -- (unavailable)"]
+
+        try:
+            health = _read_json(self.observer_health_path, {}) or {}
+            degraded = health.get("degraded_venues") or []
+            lines += [
+                "",
+                "-- Discovery --",
+                f"Venues: {'ALL HEALTHY' if not degraded else 'DEGRADED: ' + ', '.join(degraded)}",
+            ]
+            for label, record in (health.get("venues") or {}).items():
+                age = record.get("catalog_age_seconds")
+                age_txt = f"{age / 60:.0f}m ago" if isinstance(age, (int, float)) else "?"
+                reasons = record.get("degraded_reasons") or []
+                lines.append(
+                    f"  {label}: last catalogue write {age_txt}"
+                    + (f"  [{', '.join(reasons)}]" if reasons else "")
+                )
+            cursor = _read_json(
+                getattr(self.observer, "cursor_path", None), {}
+            ) or {}
+            backlog = cursor.get("backlog") or {}
+            if backlog:
+                gap = _safe_int(backlog.get("oldest_slot_reached")) - _safe_int(
+                    backlog.get("target_slot")
+                )
+                lines.append(f"  deferred discovery span: {gap:,} slots")
+        except Exception:
+            lines += ["", "-- Discovery -- (unavailable)"]
+
+        return lines
+
     def _reflection_notification_text(self, checkpoint: dict) -> str:
         """Human-readable pause explanation, for both the pushed Telegram
         notification and (via the bot's /reflection command) an on-demand
         recap -- the goal is that acknowledging never means acting blind."""
         reason = checkpoint.get("reason")
+        # The learner no longer stops here, so saying it is paused would be
+        # false and would make an unreviewed checkpoint look more urgent than
+        # it is. State plainly what will happen if this is ignored.
+        outstanding = _safe_int(checkpoint.get("unacknowledged_count"), 1) or 1
+        remaining = max(0, REFLECTION_MAX_UNACKNOWLEDGED - outstanding)
         lines = [
-            "Chainseer Solana learner paused for review.",
+            "Chainseer Solana reflection checkpoint sealed.",
+            "",
+            "Learning is CONTINUING -- this is for review, not a stop.",
+            (
+                f"{outstanding} checkpoint(s) unreviewed; learning halts after "
+                f"{REFLECTION_MAX_UNACKNOWLEDGED}"
+                + (f" ({remaining} more to go)." if remaining else " -- reached.")
+            ),
             "",
             f"Reason: {reason}",
             f"Analyses so far: {checkpoint.get('analysis_events')}",
         ]
+        lines += self._learning_progress_lines()
         # first_graduated_mint is populated on EVERY checkpoint once any
         # token has ever graduated (it's just "the earliest-sorting
         # graduated mint so far"), not only on the checkpoint that reason
@@ -4215,15 +4397,9 @@ class SolanaPrototypeEngine:
                 f"Hard stops: {', '.join(hard_stops) if hard_stops else 'none'}",
                 f"Warnings: {', '.join(warnings) if warnings else 'none'}",
             ]
-        else:
-            tally = self._evidence_state_tally()
-            lines += [
-                "",
-                f"Evidence so far: {tally['complete_safe']} safe, "
-                f"{tally['complete_unsafe']} unsafe, "
-                f"{tally['distribution_pending']} pending, "
-                f"{tally['infrastructure_indeterminate']} indeterminate",
-            ]
+        # No else-branch evidence line: the Analysis section above already
+        # carries the same tally, and printing it twice made the message
+        # longer without telling the reviewer anything new.
         lines += [
             "",
             "From Telegram:",
@@ -4266,6 +4442,10 @@ class SolanaPrototypeEngine:
                 "status": "armed",
                 "pause_requested": False,
                 "pending_checkpoint": None,
+                # One acknowledgement clears the whole backlog: the reviewer
+                # has just looked at the trajectory, which is the thing the
+                # count was tracking the absence of.
+                "unacknowledged_count": 0,
                 "last_reflection_outcome": outcome,
                 "last_reflection_summary": _redact_sensitive_text(summary)[
                     :1000

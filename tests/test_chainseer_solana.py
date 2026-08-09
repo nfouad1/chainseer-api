@@ -1191,15 +1191,34 @@ class SolanaPrototypeTests(unittest.TestCase):
             pending = engine._maybe_request_reflection()
             self.assertEqual(pending["status"], "pending")
             self.assertTrue(pending["pause_requested"])
+            self.assertEqual(pending["unacknowledged_count"], 1)
+            # A single sealed checkpoint no longer stops the pipeline. Halting
+            # on the first one cost 178 skipped cycles and six hours of
+            # overnight learning on a healthy system; the review is what
+            # matters, not the stoppage.
+            engine.assert_learning_allowed()
+
+            # Blocking is reserved for a backlog of unreviewed checkpoints,
+            # which is the actual signal that nobody is reading them.
+            state = engine.reflection_status()
+            state["unacknowledged_count"] = (
+                chainseer_solana.REFLECTION_MAX_UNACKNOWLEDGED
+            )
+            chainseer_solana._atomic_json(engine.reflection_state_path, state)
             with self.assertRaises(
                 chainseer_solana.ReflectionCheckpointPending
             ):
                 engine.assert_learning_allowed()
+
             acknowledged = engine.acknowledge_reflection(
                 "no_change", "Evidence did not justify a code change."
             )
             self.assertEqual(acknowledged["status"], "armed")
             self.assertFalse(acknowledged["pause_requested"])
+            self.assertEqual(
+                acknowledged["unacknowledged_count"], 0,
+                "one review clears the backlog it was tracking",
+            )
             engine.assert_learning_allowed()
             self.assertTrue(engine.reflection_ledger.verify()[0])
 
@@ -1272,10 +1291,57 @@ class SolanaPrototypeTests(unittest.TestCase):
             self.assertEqual(pending["status"], "pending")
             notify.assert_called_once()
             (text,) = notify.call_args.args
-            self.assertIn("paused for review", text)
+            # Must not claim a pause that no longer happens -- an unreviewed
+            # checkpoint would otherwise read as more urgent than it is.
+            self.assertNotIn("paused for review", text)
+            self.assertIn("Learning is CONTINUING", text)
             self.assertIn("analysis_interval", text)
             self.assertIn("/ack no_change", text)
             self.assertIn("reflection-ack", text)
+            # The reviewer asked for enough context to judge the run, not just
+            # a count of analyses.
+            for section in ("-- Paper trading --", "-- Analysis --", "-- Discovery --"):
+                self.assertIn(section, text)
+            for figure in ("Closed positions", "Win rate", "Net return",
+                           "Evidence", "Never analysed", "Venues"):
+                self.assertIn(figure, text)
+
+    def test_pending_checkpoint_does_not_reseal_every_cycle(self):
+        """REFLECTION_MIN_SECONDS was declared and never enforced.
+
+        It only ever appeared writing itself into the state dict. That was
+        harmless while a pending checkpoint halted learning, because the path
+        was unreachable. Now that learning continues, next_analysis_checkpoint
+        stays due until acknowledgement, so without the guard every cycle
+        would seal another checkpoint and fire another notification.
+        """
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            engine = chainseer_solana.SolanaPrototypeEngine(
+                root=root,
+                rpc=FakeRPC(),
+                jupiter=FakeJupiter(),
+                record_timechain=False,
+            )
+            state = engine.reflection_status()
+            state["next_analysis_checkpoint"] = 1
+            chainseer_solana._atomic_json(engine.reflection_state_path, state)
+            engine.observation_ledger.append(
+                "solana_risk_analysis", {"mint": candidate().mint}
+            )
+            with patch("chainseer_solana._send_telegram_notification") as notify:
+                first = engine._maybe_request_reflection()
+                second = engine._maybe_request_reflection()
+                third = engine._maybe_request_reflection()
+
+            self.assertEqual(first["unacknowledged_count"], 1)
+            self.assertEqual(
+                third["unacknowledged_count"], 1,
+                "a second checkpoint was sealed within the minimum interval",
+            )
+            notify.assert_called_once()
+            self.assertEqual(second["pending_checkpoint"]["checkpoint_id"],
+                             first["pending_checkpoint"]["checkpoint_id"])
 
     def test_reflection_checkpoint_not_triggered_sends_no_notification(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -1368,7 +1434,13 @@ class SolanaPrototypeTests(unittest.TestCase):
             text = engine._reflection_notification_text(checkpoint)
             self.assertNotIn("First graduated market", text)
             self.assertNotIn(item.mint, text)
-            self.assertIn("Evidence so far:", text)
+            # The generic evidence tally now lives in the Analysis section of
+            # the progress block rather than a standalone "Evidence so far"
+            # line, which duplicated it.
+            self.assertIn("-- Analysis --", text)
+            self.assertIn("Evidence:", text)
+            # Absent promotion state must not read as a pass.
+            self.assertIn("no evaluation recorded yet", text)
 
     def test_curve_completion_without_canonical_pool_stays_pending(self):
         analyzer = chainseer_solana.SolanaRiskAnalyzer(
