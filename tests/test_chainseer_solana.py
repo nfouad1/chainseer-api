@@ -3252,6 +3252,191 @@ class TransientHardStopRecoveryTests(unittest.TestCase):
             )
 
 
+class DiscoveryBacklogTest(unittest.TestCase):
+    """A truncated sweep must defer the span it missed, not destroy it.
+
+    The page ceiling stops a sweep before it reaches the cursor, and the cursor
+    used to advance to the newest signature regardless -- so every launch
+    between the oldest signature absorbed and the previous cursor became
+    permanently undiscoverable. This is the most likely reason a token the user
+    asked about was never found.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+
+    def _observer(self, rpc):
+        ledger = chainseer_solana.HashLedger(self.root / "events.jsonl")
+        return chainseer_solana.PumpFunObserver(rpc, self.root, ledger)
+
+    def _rpc_with_pages(self, total):
+        """Signatures newest-first, so paging backwards walks slots down."""
+        rpc = FakeRPC()
+        rpc.signatures = [
+            {
+                "signature": f"sig-{i}",
+                "slot": 10_000 - i,
+                "blockTime": 1_700_000_000 - i,
+                "err": None,
+            }
+            for i in range(total)
+        ]
+        return rpc
+
+    def _cursor(self):
+        return json.loads(
+            (self.root / "observer_cursor.json").read_text(encoding="utf-8")
+        )
+
+    def _coverage(self):
+        return json.loads(
+            (self.root / "discovery_coverage.json").read_text(encoding="utf-8")
+        )
+
+    def test_truncated_sweep_records_where_to_resume(self):
+        """The regression: the skipped span must be remembered."""
+        rpc = self._rpc_with_pages(50)
+        observer = self._observer(rpc)
+        # A cursor far below anything on offer, so the sweep can never reach
+        # it within the page budget and must truncate.
+        _atomic = chainseer_solana._atomic_json
+        _atomic(
+            self.root / "observer_cursor.json",
+            {"newest_signature": "old-sig", "newest_slot": 1},
+        )
+
+        observer.sync(signature_limit=5, max_pages=2)
+
+        cursor = self._cursor()
+        self.assertIn(
+            "backlog", cursor,
+            "a truncated sweep left no backlog, so the skipped launches are "
+            "unreachable forever",
+        )
+        self.assertTrue(cursor["backlog"]["before_signature"])
+        self.assertEqual(cursor["backlog"]["target_slot"], 1)
+
+    def test_cursor_still_advances_so_fresh_launches_are_not_blocked(self):
+        """Deferring the gap must not stall discovery of new launches."""
+        rpc = self._rpc_with_pages(50)
+        observer = self._observer(rpc)
+        chainseer_solana._atomic_json(
+            self.root / "observer_cursor.json",
+            {"newest_signature": "old-sig", "newest_slot": 1},
+        )
+
+        observer.sync(signature_limit=5, max_pages=2)
+
+        cursor = self._cursor()
+        self.assertEqual(
+            cursor["newest_slot"], 10_000,
+            "the high-water mark must still track the newest signature, or "
+            "each cycle would re-read the same pages and never progress",
+        )
+
+    def test_next_sweep_resumes_from_the_backlog(self):
+        """The deferred span is actually revisited, not just recorded."""
+        rpc = self._rpc_with_pages(50)
+        observer = self._observer(rpc)
+        chainseer_solana._atomic_json(
+            self.root / "observer_cursor.json",
+            {"newest_signature": "old-sig", "newest_slot": 1},
+        )
+        observer.sync(signature_limit=5, max_pages=2)
+        resume_from = self._cursor()["backlog"]["before_signature"]
+
+        seen_before = []
+        original = rpc.get_signatures
+
+        def spy(address, *, limit, until=None, before=None):
+            seen_before.append(before)
+            return original(address, limit=limit, until=until, before=before)
+
+        rpc.get_signatures = spy
+        observer.sync(signature_limit=5, max_pages=4)
+
+        self.assertIn(
+            resume_from, seen_before,
+            f"the second sweep never paged from the backlog point "
+            f"{resume_from}; it only fetched {seen_before}",
+        )
+
+    def test_contiguous_sweep_clears_the_backlog(self):
+        """Once the hole is closed it must not linger in the cursor."""
+        rpc = self._rpc_with_pages(6)
+        observer = self._observer(rpc)
+        chainseer_solana._atomic_json(
+            self.root / "observer_cursor.json",
+            {
+                "newest_signature": "old-sig",
+                "newest_slot": 9_999,
+                "backlog": {"before_signature": "sig-1", "target_slot": 9_990},
+            },
+        )
+
+        observer.sync(signature_limit=50, max_pages=5)
+
+        self.assertNotIn(
+            "backlog", self._cursor(),
+            "a fully contiguous sweep left a stale backlog behind",
+        )
+
+    def test_coverage_is_written_when_the_sweep_raises(self):
+        """The instrument must report from the failure path.
+
+        discovery_coverage read {} for both venues through a six-and-a-half
+        hour outage precisely because the write sat after the code that threw.
+        """
+        rpc = self._rpc_with_pages(10)
+
+        def boom(*_args, **_kwargs):
+            raise chainseer_solana.InfrastructureIndeterminateError("429")
+
+        rpc.get_signatures = boom
+        observer = self._observer(rpc)
+
+        with self.assertRaises(chainseer_solana.InfrastructureIndeterminateError):
+            observer.sync(signature_limit=5, max_pages=2)
+
+        coverage = self._coverage()
+        self.assertTrue(
+            coverage["failed"], "a failed sweep produced a success-shaped record"
+        )
+        self.assertEqual(coverage["error"], "InfrastructureIndeterminateError")
+
+    def test_failed_sweep_does_not_fabricate_a_slot_gap(self):
+        """A partial pass never established the far edge of the hole."""
+        rpc = self._rpc_with_pages(50)
+        calls = {"n": 0}
+        original = rpc.get_signatures
+
+        def fail_on_second(address, *, limit, until=None, before=None):
+            calls["n"] += 1
+            if calls["n"] > 1:
+                raise chainseer_solana.InfrastructureIndeterminateError("429")
+            return original(address, limit=limit, until=until, before=before)
+
+        rpc.get_signatures = fail_on_second
+        observer = self._observer(rpc)
+        chainseer_solana._atomic_json(
+            self.root / "observer_cursor.json",
+            {"newest_signature": "old-sig", "newest_slot": 1},
+        )
+
+        with self.assertRaises(chainseer_solana.InfrastructureIndeterminateError):
+            observer.sync(signature_limit=5, max_pages=4)
+
+        coverage = self._coverage()
+        self.assertTrue(coverage["failed"])
+        self.assertIsNone(
+            coverage["slot_gap"],
+            "a gap width was computed from a pass that never reached its far "
+            "edge -- confidently wrong is worse than absent",
+        )
+
+
 class ObserverHealthTest(unittest.TestCase):
     """Make a sustained discovery outage distinguishable from a blip.
 
