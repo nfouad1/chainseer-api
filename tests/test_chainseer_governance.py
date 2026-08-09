@@ -241,6 +241,13 @@ class GovernedPatternLifecycleTests(unittest.TestCase):
                             "id": 900,
                             "name": "Legacy Observation",
                             "function": "Observe a bounded field.",
+                            # Required by registry_store.validate_registry_set,
+                            # which refuses a partial registry rather than let a
+                            # later growth event overwrite promoted faculties.
+                            # The fixture omitted it and so was constructing a
+                            # registry the runtime considers corrupt -- every
+                            # real faculty in this estate carries one.
+                            "category": "structural",
                             "effect": {
                                 "type": "op",
                                 "spec": {"primitive": "markers", "terms": ["field"]},
