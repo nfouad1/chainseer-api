@@ -5575,6 +5575,82 @@ def _dashboard_redact_text(value) -> str:
     return _redact_sensitive_text(value)
 
 
+def _solana_discovery_health(engine: SolanaPrototypeEngine) -> dict:
+    """Per-venue discovery health for the dashboard.
+
+    Catalogue age is computed HERE, from the file's mtime, rather than read
+    back from observer_health.json. That is the whole point: observer_health
+    is written BY a learn cycle, so if the learner stops entirely its health
+    record freezes too and would report whatever was true when it died. A
+    stalled learner and a healthy one look identical through their own
+    bookkeeping -- which is the failure this panel exists to make visible.
+    The catalogue's mtime keeps ticking regardless of who is alive.
+
+    CHAINSEER_ALERT_WEBHOOK_URL is unset in this estate, so send_alert
+    no-ops. This panel is therefore the only place the detectors actually
+    reach a human, and it is read by one already.
+    """
+    health = _read_json(engine.observer_health_path, {}) or {}
+    recorded = health.get("venues") or {}
+    coverage_paths = {
+        "pump_fun": engine.root / "discovery_coverage.json",
+        "meteora_dbc": engine.root / "meteora_discovery_coverage.json",
+    }
+    catalog_paths = {
+        "pump_fun": engine.root / "catalog.json",
+        "meteora_dbc": engine.root / "meteora_catalog.json",
+    }
+
+    now = time.time()
+    venues = {}
+    for label, catalog_path in catalog_paths.items():
+        age = None
+        if catalog_path.exists():
+            age = max(0.0, now - catalog_path.stat().st_mtime)
+        entry = dict(recorded.get(label) or {})
+        coverage = _read_json(coverage_paths[label], {}) or {}
+        stale = (
+            age is not None and age >= CATALOG_STALENESS_ALERT_SECONDS
+        )
+        failing = (
+            _safe_int(entry.get("consecutive_failures"))
+            >= OBSERVER_FAILURE_ALERT_THRESHOLD
+        )
+        venues[label] = {
+            "consecutive_failures": _safe_int(entry.get("consecutive_failures")),
+            "last_error": entry.get("last_error"),
+            "last_success_at": entry.get("last_success_at"),
+            # Live, not recorded -- see the docstring.
+            "catalog_age_seconds": round(age, 1) if age is not None else None,
+            "catalog_age_hours": round(age / 3600.0, 2) if age is not None else None,
+            "stale": stale,
+            "failing": failing,
+            "degraded": bool(stale or failing),
+            "stop_reason": coverage.get("stop_reason"),
+            "contiguous": coverage.get("contiguous_with_previous_sweep"),
+            "slot_gap": coverage.get("slot_gap"),
+            "backlog_pending": coverage.get("backlog_pending", False),
+            "sweep_failed": coverage.get("failed", False),
+            "sweep_error": coverage.get("error"),
+            "coverage_measured_at": coverage.get("measured_at"),
+        }
+
+    degraded = sorted(l for l, v in venues.items() if v["degraded"])
+    return {
+        "status": "degraded" if degraded else "ok",
+        "degraded_venues": degraded,
+        "staleness_threshold_seconds": CATALOG_STALENESS_ALERT_SECONDS,
+        "failure_threshold": OBSERVER_FAILURE_ALERT_THRESHOLD,
+        # Surfaced so the panel can say the alerts go nowhere rather than
+        # implying something was sent.
+        "webhook_configured": bool(
+            os.environ.get("CHAINSEER_ALERT_WEBHOOK_URL", "").strip()
+        ),
+        "venues": venues,
+        "health_updated_at": health.get("updated_at"),
+    }
+
+
 def _solana_dashboard_cohort(trader: SolanaShadowTrader) -> dict:
     now = time.time()
     positions = []
@@ -6044,6 +6120,7 @@ def _build_solana_dashboard_snapshot(
             "credentials_exposed": False,
         },
         "rpc_health": rpc_health,
+        "discovery_health": _solana_discovery_health(engine),
         "recovery": recovery,
         "jupiter_health": jupiter_health,
         "dexscreener_health": dexscreener_health,

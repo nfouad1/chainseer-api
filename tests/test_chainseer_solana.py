@@ -3252,6 +3252,97 @@ class TransientHardStopRecoveryTests(unittest.TestCase):
             )
 
 
+class DashboardDiscoveryHealthTest(unittest.TestCase):
+    """The panel must not trust the learner's account of its own health.
+
+    observer_health.json is written BY a learn cycle. If the learner stops,
+    that record freezes at whatever was true when it died, so a stalled
+    learner and a healthy one look identical through it. Catalogue mtime keeps
+    ticking regardless of who is alive, which is why freshness is computed at
+    render time rather than read back.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        engine = chainseer_solana.SolanaPrototypeEngine.__new__(
+            chainseer_solana.SolanaPrototypeEngine
+        )
+        engine.root = self.root
+        engine.observer_health_path = self.root / "observer_health.json"
+        self.engine = engine
+
+    def _catalog(self, name, age_seconds=0.0):
+        path = self.root / name
+        path.write_text("{}", encoding="utf-8")
+        when = time.time() - age_seconds
+        os.utime(path, (when, when))
+
+    def test_live_mtime_overrides_a_frozen_health_record(self):
+        """The regression this panel exists for."""
+        # The learner recorded perfect health, then stopped.
+        chainseer_solana._atomic_json(
+            self.root / "observer_health.json",
+            {
+                "venues": {
+                    "pump_fun": {
+                        "consecutive_failures": 0,
+                        "catalog_age_seconds": 12.0,
+                    }
+                },
+                "updated_at": "2026-08-08T16:41:00+00:00",
+            },
+        )
+        self._catalog("catalog.json", age_seconds=7 * 3600)
+        self._catalog("meteora_catalog.json", age_seconds=7 * 3600)
+
+        health = chainseer_solana._solana_discovery_health(self.engine)
+
+        venue = health["venues"]["pump_fun"]
+        self.assertTrue(
+            venue["stale"],
+            "the panel believed a frozen health record claiming 12s freshness "
+            "over a catalogue that is 7 hours old",
+        )
+        self.assertGreater(venue["catalog_age_hours"], 6.0)
+        self.assertEqual(health["status"], "degraded")
+
+    def test_healthy_when_catalogues_are_fresh(self):
+        self._catalog("catalog.json", age_seconds=30)
+        self._catalog("meteora_catalog.json", age_seconds=30)
+        health = chainseer_solana._solana_discovery_health(self.engine)
+        self.assertEqual(health["status"], "ok")
+        self.assertEqual(health["degraded_venues"], [])
+
+    def test_reports_that_alerts_have_nowhere_to_go(self):
+        """Do not imply an alert was sent when the webhook is unset."""
+        self._catalog("catalog.json")
+        self._catalog("meteora_catalog.json")
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CHAINSEER_ALERT_WEBHOOK_URL", None)
+            health = chainseer_solana._solana_discovery_health(self.engine)
+        self.assertFalse(health["webhook_configured"])
+
+    def test_surfaces_backlog_and_sweep_failure_from_coverage(self):
+        self._catalog("catalog.json")
+        self._catalog("meteora_catalog.json")
+        chainseer_solana._atomic_json(
+            self.root / "discovery_coverage.json",
+            {
+                "stop_reason": "max_pages",
+                "backlog_pending": True,
+                "failed": False,
+                "slot_gap": 4200,
+            },
+        )
+        health = chainseer_solana._solana_discovery_health(self.engine)
+        venue = health["venues"]["pump_fun"]
+        self.assertTrue(venue["backlog_pending"])
+        self.assertEqual(venue["slot_gap"], 4200)
+        self.assertEqual(venue["stop_reason"], "max_pages")
+
+
 class DiscoveryBacklogTest(unittest.TestCase):
     """A truncated sweep must defer the span it missed, not destroy it.
 
