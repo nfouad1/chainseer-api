@@ -197,8 +197,16 @@ class ChainseerBotSolanaRoutingTests(unittest.IsolatedAsyncioTestCase):
             await self.bot.cmd_reflection(update, None)
         reply.assert_awaited_once()
         text = reply.await_args.args[0]
-        self.assertIn("paused for review", text)
+        # /reflection shares the checkpoint notification body, which no longer
+        # claims a pause: a sealed checkpoint notifies and learning continues
+        # until REFLECTION_MAX_UNACKNOWLEDGED of them go unreviewed.
+        self.assertNotIn("paused for review", text)
+        self.assertIn("Learning is CONTINUING", text)
+        self.assertIn("unreviewed", text)
         self.assertIn("/ack", text)
+        # The recap must carry the run, not just a checkpoint id.
+        self.assertIn("-- Paper trading --", text)
+        self.assertIn("-- Discovery --", text)
 
     async def test_cmd_reflection_rejects_non_owner(self):
         update, reply = _fake_update(1, "/reflection")
