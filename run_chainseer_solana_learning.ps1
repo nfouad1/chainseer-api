@@ -3,8 +3,19 @@ param(
     [ValidateRange(1, 25)]
     [int]$Limit = 3,
 
+    # 300, not 100 and not 1000. At 100 a pump.fun sweep reaches ~6 seconds of
+    # chain per cycle against a 300s trigger -- about 2% coverage, and biased,
+    # since it samples whatever launches in one particular second. 1000 was
+    # measured and rejected: the sweep issues one get_transaction per
+    # SUCCESSFUL signature (299 per 1000 on pump.fun at a 0.25s pacing floor),
+    # so limit=1000 is ~2,990 decodes, roughly 12 minutes of decode per venue
+    # per cycle. 300 triples the window for a few minutes of added work.
+    #
+    # Coverage is deliberately NOT pushed to contiguity: 1,196 of 2,715
+    # catalogued candidates had never been analysed, so intake already exceeds
+    # analysis capacity. This buys a less biased selection pool, not volume.
     [ValidateRange(1, 1000)]
-    [int]$SignatureLimit = 100,
+    [int]$SignatureLimit = 300,
 
     [ValidateRange(0, 25)]
     [int]$RecoveryLimit = 3,
@@ -14,7 +25,13 @@ param(
     # against the scheduler limit. Keep the graduated-token priority, at a cost
     # the 5-minute trigger can absorb.
     [ValidateRange(0, 25)]
-    [int]$GraduationLimit = 4
+    [int]$GraduationLimit = 4,
+
+    # Reclaims catalogued-but-never-analysed candidates, newest first. The
+    # launch lane only ever offered what the current cycle discovered, so
+    # anything missed on arrival was previously dropped for good.
+    [ValidateRange(0, 25)]
+    [int]$BacklogLimit = 3
 )
 
 $ErrorActionPreference = "Stop"
@@ -223,7 +240,8 @@ try {
                 --limit $Limit `
                 --signature-limit $SignatureLimit `
                 --recovery-limit $RecoveryLimit `
-                --graduation-limit $GraduationLimit 2>&1
+                --graduation-limit $GraduationLimit `
+                --backlog-limit $BacklogLimit 2>&1
         )
         $exitCode = $LASTEXITCODE
     }

@@ -1705,18 +1705,29 @@ class SolanaPrototypeTests(unittest.TestCase):
                 return self.responses.pop(0)
 
         secret = "never-persist-this-key"
-        rpc = chainseer_solana.SolanaRPC(
-            f"https://primary.helius.invalid/rpc?api-key={secret}",
-            urls=[
-                "https://fallback.chainstack.invalid/"
-                f"private/{secret}"
-            ],
-            session=Session(),
-            minimum_request_interval=0,
-            max_retries=0,
-            circuit_failure_threshold=1,
-            jitter_fn=lambda _maximum: 0,
-        )
+        # SolanaRPC also absorbs CHAINSEER_SOLANA_RPC_FALLBACK_URLS, and
+        # _environment_setting reads the PROCESS environment first and then the
+        # persistent Windows user environment -- so clearing os.environ alone
+        # is not isolation, it just falls through to the registry value. This
+        # test asserts an exact endpoint count, so a fallback configured on the
+        # host machine silently broke it. Both layers are pinned.
+        with patch.dict(
+            os.environ, {"CHAINSEER_SOLANA_RPC_FALLBACK_URLS": ""}, clear=False
+        ), patch.object(
+            chainseer_solana, "_windows_user_environment", lambda _name: None
+        ):
+            rpc = chainseer_solana.SolanaRPC(
+                f"https://primary.helius.invalid/rpc?api-key={secret}",
+                urls=[
+                    "https://fallback.chainstack.invalid/"
+                    f"private/{secret}"
+                ],
+                session=Session(),
+                minimum_request_interval=0,
+                max_retries=0,
+                circuit_failure_threshold=1,
+                jitter_fn=lambda _maximum: 0,
+            )
         self.assertEqual(rpc._call("getSlot"), 456)
         health = rpc.health()
         encoded = json.dumps(health)
@@ -3250,6 +3261,238 @@ class TransientHardStopRecoveryTests(unittest.TestCase):
                 engine._load_recovery_queue()["items"][item.mint]["status"],
                 "resolved",
             )
+
+
+class AnalysisBacklogTest(unittest.TestCase):
+    """Reclaim discovery that was paid for and then thrown away.
+
+    The launch lane only ever offered what the current cycle discovered, so a
+    candidate not selected on arrival was never revisited: 1,196 of 2,715
+    catalogued tokens had never been analysed at all when this was written.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        engine = chainseer_solana.SolanaPrototypeEngine.__new__(
+            chainseer_solana.SolanaPrototypeEngine
+        )
+        engine.root = self.root
+        engine.analysis_index_path = self.root / "analysis_index.json"
+        engine.observer = types.SimpleNamespace(
+            catalog_path=self.root / "catalog.json"
+        )
+        engine.meteora_observer = types.SimpleNamespace(
+            catalog_path=self.root / "meteora_catalog.json"
+        )
+        self.engine = engine
+
+    def _candidate(self, mint, block_time):
+        return {
+            "signature": f"sig-{mint}",
+            "slot": 100,
+            "block_time": block_time,
+            "name": f"name-{mint}",
+            "symbol": "SYM",
+            "uri": "https://example.invalid/meta.json",
+            "mint": mint,
+            "bonding_curve": f"curve-{mint}",
+            "user": "user1",
+            "creator": "creator1",
+            "token_program": "tokenprog",
+            "virtual_token_reserves": 1000,
+            "virtual_quote_reserves": 1000,
+            "real_token_reserves": 1000,
+            "token_total_supply": 1_000_000,
+            "is_mayhem_mode": False,
+            "is_cashback_enabled": False,
+            "launch_ecosystem": "pump_fun",
+        }
+
+    def _write(self, name, candidates):
+        chainseer_solana._atomic_json(
+            self.root / name,
+            {"tokens": {c["mint"]: c for c in candidates}},
+        )
+
+    def _write_analysed(self, mints):
+        chainseer_solana._atomic_json(
+            self.root / "analysis_index.json",
+            {"tokens": {m: {"decision": {}} for m in mints}},
+        )
+
+    def test_reclaims_candidates_the_launch_lane_dropped(self):
+        """The regression: catalogued-but-never-analysed must be reachable."""
+        self._write("catalog.json", [
+            self._candidate("mint-a", 1_700_000_100),
+            self._candidate("mint-b", 1_700_000_200),
+        ])
+        self._write_analysed([])
+
+        found = self.engine._probe_unanalysed_backlog(limit=5)
+
+        self.assertEqual(
+            {c.mint for c in found}, {"mint-a", "mint-b"},
+            "candidates discovered on an earlier cycle stayed unreachable",
+        )
+
+    def test_never_reanalyses_what_is_already_in_the_index(self):
+        self._write("catalog.json", [
+            self._candidate("mint-a", 1_700_000_100),
+            self._candidate("mint-b", 1_700_000_200),
+        ])
+        self._write_analysed(["mint-a"])
+
+        found = self.engine._probe_unanalysed_backlog(limit=5)
+
+        self.assertEqual([c.mint for c in found], ["mint-b"])
+
+    def test_newest_first_because_stale_markets_are_worthless(self):
+        """Oldest-first would spend the budget on long-dead tokens."""
+        self._write("catalog.json", [
+            self._candidate("old", 1_700_000_000),
+            self._candidate("new", 1_700_009_999),
+            self._candidate("mid", 1_700_005_000),
+        ])
+        self._write_analysed([])
+
+        found = self.engine._probe_unanalysed_backlog(limit=2)
+
+        self.assertEqual([c.mint for c in found], ["new", "mid"])
+
+    def test_respects_exclusions_so_lanes_do_not_double_book(self):
+        self._write("catalog.json", [
+            self._candidate("mint-a", 1_700_000_100),
+            self._candidate("mint-b", 1_700_000_200),
+        ])
+        self._write_analysed([])
+
+        found = self.engine._probe_unanalysed_backlog(
+            limit=5, exclude_mints={"mint-b"}
+        )
+
+        self.assertEqual([c.mint for c in found], ["mint-a"])
+
+    def test_spans_both_venue_catalogues(self):
+        self._write("catalog.json", [self._candidate("pump-1", 1_700_000_100)])
+        self._write("meteora_catalog.json", [
+            self._candidate("met-1", 1_700_000_200)
+        ])
+        self._write_analysed([])
+
+        found = self.engine._probe_unanalysed_backlog(limit=5)
+
+        self.assertEqual({c.mint for c in found}, {"pump-1", "met-1"})
+
+    def test_depth_reports_the_queue_that_is_not_draining(self):
+        self._write("catalog.json", [
+            self._candidate("a", 1), self._candidate("b", 2),
+        ])
+        self._write("meteora_catalog.json", [self._candidate("c", 3)])
+        self._write_analysed(["a"])
+
+        self.assertEqual(self.engine._unanalysed_backlog_depth(), 2)
+
+    def test_a_malformed_row_does_not_stall_the_lane(self):
+        chainseer_solana._atomic_json(
+            self.root / "catalog.json",
+            {"tokens": {
+                "broken": {"mint": "broken"},
+                "good": self._candidate("good", 1_700_000_100),
+            }},
+        )
+        self._write_analysed([])
+
+        found = self.engine._probe_unanalysed_backlog(limit=5)
+
+        self.assertEqual([c.mint for c in found], ["good"])
+
+
+class NonContiguousHealthTest(unittest.TestCase):
+    """Sweeps that succeed without keeping up must not read as healthy.
+
+    pump.fun reached ~6 seconds of chain per 300-second cycle while reporting
+    degraded=False, because every sweep completed. The failure counter answers
+    whether discovery is RUNNING; this answers whether it is KEEPING UP.
+    """
+
+    def setUp(self):
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.root = Path(self._tmp.name)
+        engine = chainseer_solana.SolanaPrototypeEngine.__new__(
+            chainseer_solana.SolanaPrototypeEngine
+        )
+        engine.root = self.root
+        engine.observer_health_path = self.root / "observer_health.json"
+        engine.observer = types.SimpleNamespace(
+            catalog_path=self.root / "catalog.json",
+            coverage_path=self.root / "discovery_coverage.json",
+        )
+        engine.meteora_observer = types.SimpleNamespace(
+            catalog_path=self.root / "meteora_catalog.json",
+            coverage_path=self.root / "meteora_discovery_coverage.json",
+        )
+        (self.root / "catalog.json").write_text("{}", encoding="utf-8")
+        (self.root / "meteora_catalog.json").write_text("{}", encoding="utf-8")
+        self.engine = engine
+
+    def _coverage(self, contiguous, failed=False):
+        chainseer_solana._atomic_json(
+            self.root / "discovery_coverage.json",
+            {
+                "stop_reason": "reached_cursor" if contiguous else "max_pages",
+                "contiguous_with_previous_sweep": contiguous,
+                "failed": failed,
+                "slot_gap": None if contiguous else 67639,
+            },
+        )
+
+    def _record(self):
+        with patch("chainseer_solana.send_alert"):
+            return self.engine._record_observer_health({"pump_fun": None})
+
+    def test_sustained_non_contiguity_is_degraded(self):
+        """The regression: 2% coverage reported healthy all night."""
+        self._coverage(contiguous=False)
+        for _ in range(chainseer_solana.SOLANA_NONCONTIGUOUS_ALERT_THRESHOLD):
+            summary = self._record()
+
+        venue = summary["venues"]["pump_fun"]
+        self.assertTrue(
+            venue["degraded"],
+            "a venue sampling the chain instead of covering it read healthy",
+        )
+        self.assertIn("not_keeping_up_with_chain", venue["degraded_reasons"])
+        self.assertEqual(venue["consecutive_failures"], 0)
+
+    def test_one_truncated_sweep_is_not_yet_a_problem(self):
+        """Normal right after an outage, while the backlog drains."""
+        self._coverage(contiguous=False)
+        summary = self._record()
+        self.assertFalse(summary["venues"]["pump_fun"]["degraded"])
+
+    def test_a_contiguous_sweep_resets_the_run(self):
+        self._coverage(contiguous=False)
+        for _ in range(chainseer_solana.SOLANA_NONCONTIGUOUS_ALERT_THRESHOLD):
+            self._record()
+        self._coverage(contiguous=True)
+        summary = self._record()
+
+        self.assertFalse(summary["venues"]["pump_fun"]["degraded"])
+        self.assertEqual(summary["degraded_venues"], [])
+
+    def test_a_failed_sweep_does_not_count_toward_non_contiguity(self):
+        """Failure is the counter's job; do not double-count it here."""
+        self._coverage(contiguous=False, failed=True)
+        for _ in range(chainseer_solana.SOLANA_NONCONTIGUOUS_ALERT_THRESHOLD + 2):
+            summary = self._record()
+
+        venue = summary["venues"]["pump_fun"]
+        self.assertNotIn(
+            "not_keeping_up_with_chain", venue["degraded_reasons"]
+        )
 
 
 class DashboardDiscoveryHealthTest(unittest.TestCase):

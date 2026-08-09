@@ -565,6 +565,9 @@
         if (v.sweep_failed) {
           notes.push(`${name}'s last sweep aborted with ${v.sweep_error || "an error"}.`);
         }
+        if (v.not_keeping_up) {
+          notes.push(`${name} has not reached the previous cursor in ${v.consecutive_noncontiguous} sweeps running — it is sampling the chain, not covering it.`);
+        }
         if (v.backlog_pending) {
           notes.push(`${name} has a deferred backlog still to drain — launches in that span are not yet discovered.`);
         } else if (v.stop_reason === "max_pages") {

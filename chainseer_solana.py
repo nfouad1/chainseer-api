@@ -123,6 +123,31 @@ PUMP_PUBLIC_DOCS_COMMIT = "9c82f61cb711b044a17f770ab8ce9f9bdf78f333"
 # it had made itself blind to. The floor is the cost of being able to be wrong.
 SOLANA_LAUNCH_EXPLORATION_SHARE = 1
 
+# The launch lane only ever offers what THIS cycle discovered
+# (discovered[-launch_share:]), so a candidate not picked on the cycle it
+# arrived is never revisited. Measured 2026-08-09: 2,715 catalogued tokens,
+# 1,537 analysed, 1,196 -- 44% -- never analysed at all.
+#
+# That queue, not discovery, is the binding constraint. Raising sweep coverage
+# was the obvious-looking fix and would have added intake in front of a
+# blocked outlet: pump.fun reaches only ~6s of chain per cycle, but the estate
+# already discovers more than it consumes.
+#
+# Newest-first on purpose. The backlog's value is recently-missed launches --
+# during the six-hour RPC outage, say -- which are still live enough to
+# analyse and to produce closed positions, the currency the promotion gate
+# actually counts (43 of 50 when this was written). Draining oldest-first
+# would spend the budget on tokens whose markets are long dead.
+SOLANA_ANALYSIS_BACKLOG_LIMIT = 3
+
+# A sweep that stops on max_pages did not reach the previous cursor, so it is
+# not contiguous: launches between its oldest signature and that cursor are
+# deferred to the backlog rather than observed now. One such sweep is normal
+# after an outage. A run of them means discovery is not keeping up with the
+# chain, which is invisible to the failure counter because every one of those
+# sweeps SUCCEEDS. pump.fun sat at ~2% coverage all night reporting healthy.
+SOLANA_NONCONTIGUOUS_ALERT_THRESHOLD = 3
+
 # Solana learn cycles run 400-500s against a 5-minute trigger, so overlap is
 # the normal case rather than the exception. Task Scheduler's IgnoreNew keeps
 # two SCHEDULED instances apart, but nothing kept a manual run, a dashboard
@@ -4968,6 +4993,23 @@ class SolanaPrototypeEngine:
             age = None
             if catalog_path is not None and catalog_path.exists():
                 age = max(0.0, now - catalog_path.stat().st_mtime)
+            # A successful sweep that never reached the previous cursor is not
+            # keeping up. The failure counter cannot see this -- those sweeps
+            # succeed -- which is how pump.fun reported healthy at ~2% chain
+            # coverage. The signal was already being persisted by the coverage
+            # writer; it just was not part of the verdict.
+            coverage_path = self._observer_coverage_path(label)
+            coverage = (
+                _read_json(coverage_path, {}) or {}
+            ) if coverage_path is not None else {}
+            if coverage.get("stop_reason") and not coverage.get("failed"):
+                if coverage.get("contiguous_with_previous_sweep"):
+                    record["consecutive_noncontiguous"] = 0
+                else:
+                    record["consecutive_noncontiguous"] = (
+                        _safe_int(record.get("consecutive_noncontiguous")) + 1
+                    )
+            record["last_slot_gap"] = coverage.get("slot_gap")
             if error:
                 record["consecutive_failures"] = (
                     _safe_int(record.get("consecutive_failures")) + 1
@@ -4989,11 +5031,16 @@ class SolanaPrototypeEngine:
                 record["consecutive_failures"] >= OBSERVER_FAILURE_ALERT_THRESHOLD
             )
             stale = age is not None and age >= CATALOG_STALENESS_ALERT_SECONDS
-            record["degraded"] = bool(failing or stale)
+            behind = (
+                _safe_int(record.get("consecutive_noncontiguous"))
+                >= SOLANA_NONCONTIGUOUS_ALERT_THRESHOLD
+            )
+            record["degraded"] = bool(failing or stale or behind)
             record["degraded_reasons"] = [
                 reason for reason, hit in (
                     ("consecutive_sync_failures", failing),
                     ("catalog_stale", stale),
+                    ("not_keeping_up_with_chain", behind),
                 ) if hit
             ]
             if record["degraded"]:
@@ -5052,6 +5099,57 @@ class SolanaPrototypeEngine:
             },
         }
 
+    def _probe_unanalysed_backlog(
+        self, *, limit: int, exclude_mints: set[str] | None = None
+    ) -> list[SolanaLaunchCandidate]:
+        """Candidates that were discovered, catalogued, and never analysed.
+
+        Discovery hands the launch lane only what the current cycle found, so
+        anything not selected on arrival is dropped for good -- 1,196 of 2,715
+        catalogued tokens had never been analysed when this was added. This
+        lane reclaims that work, which is already paid for: the RPC calls to
+        find those candidates were spent long ago.
+
+        Newest-first, because the backlog's worth is in recently-missed
+        launches whose markets are still alive. Admission gates still decide
+        whether anything is tradeable, so a stale token is analysed and
+        refused on its merits rather than being pre-filtered on age here.
+        """
+        if limit <= 0:
+            return []
+        analysed = set(
+            (_read_json(self.analysis_index_path, {}) or {}).get("tokens", {})
+        )
+        exclude = set(exclude_mints or set()) | analysed
+        rows: list[tuple[int, dict]] = []
+        for observer in (self.observer, self.meteora_observer):
+            catalog = _read_json(getattr(observer, "catalog_path", None), {}) or {}
+            for mint, value in (catalog.get("tokens") or {}).items():
+                if mint in exclude:
+                    continue
+                rows.append((_safe_int(value.get("block_time")), value))
+        rows.sort(key=lambda row: row[0], reverse=True)
+        candidates: list[SolanaLaunchCandidate] = []
+        for _, value in rows:
+            if len(candidates) >= limit:
+                break
+            try:
+                candidates.append(SolanaLaunchCandidate.from_dict(value))
+            except (KeyError, TypeError):
+                continue          # a malformed row must not stall the lane
+        return candidates
+
+    def _unanalysed_backlog_depth(self) -> int:
+        """How many catalogued candidates have never been analysed."""
+        analysed = set(
+            (_read_json(self.analysis_index_path, {}) or {}).get("tokens", {})
+        )
+        catalogued: set[str] = set()
+        for observer in (self.observer, self.meteora_observer):
+            catalog = _read_json(getattr(observer, "catalog_path", None), {}) or {}
+            catalogued.update(catalog.get("tokens") or {})
+        return len(catalogued - analysed)
+
     def _observer_catalog_path(self, label: str):
         """The catalogue whose mtime is that venue's freshness signal."""
         observer = {
@@ -5059,6 +5157,14 @@ class SolanaPrototypeEngine:
             "meteora_dbc": self.meteora_observer,
         }.get(label)
         return getattr(observer, "catalog_path", None)
+
+    def _observer_coverage_path(self, label: str):
+        """The coverage record carrying that venue's contiguity signal."""
+        observer = {
+            "pump_fun": self.observer,
+            "meteora_dbc": self.meteora_observer,
+        }.get(label)
+        return getattr(observer, "coverage_path", None)
 
     def observe(
         self, *, limit: int = 10, signature_limit: int = 100,
@@ -5122,6 +5228,7 @@ class SolanaPrototypeEngine:
         recovery_limit: int = 3,
         graduation_limit: int = 4,
         stranded_limit: int = 3,
+        backlog_limit: int = SOLANA_ANALYSIS_BACKLOG_LIMIT,
         slot_span: int | None = None,
         max_pages: int = 10,
     ) -> dict:
@@ -5137,6 +5244,7 @@ class SolanaPrototypeEngine:
                 recovery_limit=recovery_limit,
                 graduation_limit=graduation_limit,
                 stranded_limit=stranded_limit,
+                backlog_limit=backlog_limit,
                 slot_span=slot_span,
                 max_pages=max_pages,
             )
@@ -5149,6 +5257,7 @@ class SolanaPrototypeEngine:
         recovery_limit: int = 3,
         graduation_limit: int = 4,
         stranded_limit: int = 3,
+        backlog_limit: int = SOLANA_ANALYSIS_BACKLOG_LIMIT,
         slot_span: int | None = None,
         max_pages: int = 10,
     ) -> dict:
@@ -5216,6 +5325,16 @@ class SolanaPrototypeEngine:
         candidate_map.update({
             candidate.mint: candidate for candidate in stranded_candidates
         })
+        # Reclaim discovery already paid for. Runs after the other lanes so it
+        # only ever consumes budget they left, and never displaces a fresh
+        # launch or a graduated candidate.
+        backlog_candidates = self._probe_unanalysed_backlog(
+            limit=max(0, backlog_limit),
+            exclude_mints=recovered_mints | set(candidate_map),
+        )
+        candidate_map.update({
+            candidate.mint: candidate for candidate in backlog_candidates
+        })
         for position in self.trader.open_positions():
             candidate = self._candidate_by_mint(position["mint"])
             if candidate and candidate.mint not in recovered_mints:
@@ -5275,6 +5394,11 @@ class SolanaPrototypeEngine:
                 # minutes. observer_health carries the run length.
                 "observer_health": observer_health,
                 "analyzed": len(results),
+                "backlog_reclaimed": len(backlog_candidates),
+                # Depth AFTER this cycle's reclaim, so the trend is readable:
+                # falling means the lane is outpacing discovery, rising means
+                # intake still exceeds analysis capacity.
+                "unanalysed_backlog_depth": self._unanalysed_backlog_depth(),
                 "new_analyzed": len(results) - len(recovered),
                 "recovery_analyzed": len(recovered),
                 "recovery_resolved": sum(
@@ -5616,8 +5740,19 @@ def _solana_discovery_health(engine: SolanaPrototypeEngine) -> dict:
             _safe_int(entry.get("consecutive_failures"))
             >= OBSERVER_FAILURE_ALERT_THRESHOLD
         )
+        behind = (
+            _safe_int(entry.get("consecutive_noncontiguous"))
+            >= SOLANA_NONCONTIGUOUS_ALERT_THRESHOLD
+        )
         venues[label] = {
             "consecutive_failures": _safe_int(entry.get("consecutive_failures")),
+            "consecutive_noncontiguous": _safe_int(
+                entry.get("consecutive_noncontiguous")
+            ),
+            "not_keeping_up": (
+                _safe_int(entry.get("consecutive_noncontiguous"))
+                >= SOLANA_NONCONTIGUOUS_ALERT_THRESHOLD
+            ),
             "last_error": entry.get("last_error"),
             "last_success_at": entry.get("last_success_at"),
             # Live, not recorded -- see the docstring.
@@ -5625,7 +5760,8 @@ def _solana_discovery_health(engine: SolanaPrototypeEngine) -> dict:
             "catalog_age_hours": round(age / 3600.0, 2) if age is not None else None,
             "stale": stale,
             "failing": failing,
-            "degraded": bool(stale or failing),
+            "behind": behind,
+            "degraded": bool(stale or failing or behind),
             "stop_reason": coverage.get("stop_reason"),
             "contiguous": coverage.get("contiguous_with_previous_sweep"),
             "slot_gap": coverage.get("slot_gap"),
@@ -6622,6 +6758,15 @@ def main() -> None:
                 "received a shadow-entry attempt (e.g. graded via the plain "
                 "observe path) to re-evaluate with shadow_enter=True per cycle.",
             )
+            command.add_argument(
+                "--backlog-limit",
+                type=int,
+                default=SOLANA_ANALYSIS_BACKLOG_LIMIT,
+                help="Maximum catalogued-but-never-analysed candidates to "
+                "reclaim per cycle, newest first. The launch lane only offers "
+                "what the current cycle discovered, so anything missed on "
+                "arrival was previously never revisited.",
+            )
     dashboard = subparsers.add_parser("dashboard")
     dashboard.add_argument("--host", default="127.0.0.1")
     dashboard.add_argument("--port", type=int, default=8767)
@@ -6666,6 +6811,7 @@ def main() -> None:
                     recovery_limit=args.recovery_limit,
                     graduation_limit=args.graduation_limit,
                     stranded_limit=args.stranded_limit,
+                    backlog_limit=args.backlog_limit,
                     slot_span=args.slot_span,
                     max_pages=args.max_pages,
                 ),
