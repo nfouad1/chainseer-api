@@ -302,37 +302,162 @@ CATALOG_RETENTION_SECONDS = _safe_int(
 
 
 
+def _sweep_signatures(
+    rpc,
+    program_id: str,
+    *,
+    page_size: int,
+    max_pages: int,
+    until_signature: str | None,
+    until_slot: int | None,
+    before_signature: str | None = None,
+    slot_floor: int | None = None,
+) -> dict:
+    """One backward pagination pass over a program's signatures.
+
+    Extracted because the Pump.fun and Meteora observers ran byte-identical
+    loops differing only in program id, and the backlog drain needs to run
+    the same loop a second time from a different starting point. Four copies
+    of this would have been four places for the cursor accounting to drift.
+
+    Returns what it absorbed AND why it stopped. Only "reached_cursor" means
+    the pass is contiguous with what the caller already had; every other stop
+    leaves a gap the caller is responsible for remembering.
+    """
+    signatures: list[dict] = []
+    newest_signature = None
+    newest_slot = None
+    oldest_slot = None
+    oldest_signature = None
+    stop_reason = "empty"
+    pages_used = 0
+
+    for page_index in range(max(1, int(max_pages))):
+        batch = rpc.get_signatures(
+            program_id,
+            limit=page_size,
+            until=until_signature,
+            before=before_signature,
+        )
+        if not batch:
+            # Preserved from the original loop: an empty first page leaves the
+            # stop reason as "empty" rather than inventing a new one.
+            break
+        signatures.extend(batch)
+        if page_index == 0:
+            newest_signature = batch[0].get("signature")
+            newest_slot = _safe_int(batch[0].get("slot"))
+        oldest_in_batch = batch[-1]
+        oldest_slot = _safe_int(oldest_in_batch.get("slot"))
+        oldest_signature = oldest_in_batch.get("signature")
+        pages_used = page_index + 1
+
+        reached_cursor = (
+            until_slot and oldest_slot is not None and oldest_slot <= until_slot
+        )
+        reached_floor = (
+            slot_floor is not None
+            and oldest_slot is not None
+            and oldest_slot <= slot_floor
+        )
+        if reached_cursor or reached_floor:
+            stop_reason = "reached_cursor" if reached_cursor else "slot_floor"
+            break
+        before_signature = oldest_signature
+        if not before_signature:
+            stop_reason = "no_before_signature"
+            break
+    else:
+        stop_reason = "max_pages"
+
+    return {
+        "signatures": signatures,
+        "stop_reason": stop_reason,
+        "pages_used": pages_used,
+        "newest_signature": newest_signature,
+        "newest_slot": newest_slot,
+        "oldest_slot": oldest_slot,
+        "oldest_signature": oldest_signature,
+        "contiguous": stop_reason == "reached_cursor",
+    }
+
+
+def _merge_backlog(existing: dict | None, pass_result: dict,
+                   target_slot: int | None) -> dict | None:
+    """Carry forward the span a truncated pass could not reach.
+
+    When a pass stops on max_pages, everything between the oldest signature it
+    absorbed and its target is unread. Before this existed the cursor advanced
+    to the newest signature anyway, so that span was not deferred -- it was
+    destroyed, and the launches inside it could never be discovered. That is
+    the most likely reason a token the user asked about was never found.
+
+    Recording where to resume converts permanent loss into deferred work. The
+    resume point only ever moves BACKWARD (toward the target), so repeated
+    truncation shrinks the hole instead of forgetting it.
+    """
+    if pass_result["stop_reason"] != "max_pages":
+        return None                       # the span was fully absorbed
+    resume = pass_result.get("oldest_signature")
+    if not resume:
+        return existing
+    return {
+        "before_signature": resume,
+        "target_slot": (
+            target_slot
+            if target_slot is not None
+            else (existing or {}).get("target_slot")
+        ),
+        "oldest_slot_reached": pass_result.get("oldest_slot"),
+        "updated_at": _utc_now(),
+    }
+
+
 def _discovery_coverage(coverage: dict, discovered_count: int) -> dict:
     """Turn a sweep's stop condition into a statement about what it missed.
 
     Only "reached_cursor" means the sweep is contiguous with the previous one.
     Every other stop leaves a gap between the oldest signature examined and the
-    cursor -- and because the cursor advances to the NEWEST signature seen
-    regardless of where the sweep stopped, that gap is skipped permanently
-    rather than picked up next cycle.
+    cursor. That gap is now DEFERRED rather than destroyed -- the backlog
+    records where to resume -- but it is still a gap, and until it drains those
+    launches are undiscovered.
 
     slot_gap is the width of that hole in slots. It is deliberately NOT
     presented as a count of missed launches: the only way to know how many
     launches sit in the gap is to fetch it, which is exactly the work the
     ceiling refused to do. It is an honest signal that a hole exists and how
     wide it is, not an estimate of its contents.
+
+    `failed` marks a record written from the failure path. Without it a sweep
+    that died on page one would emit pages_used, signatures_seen and a
+    slot_gap computed from partial state, which reads as a measurement rather
+    than a fragment -- confidently wrong, which is worse than the empty record
+    this instrument used to leave.
     """
     stop = coverage.get("stop_reason") or "empty"
     oldest = coverage.get("oldest_slot_seen")
     cursor = coverage.get("cursor_slot_before")
     contiguous = stop == "reached_cursor"
+    failed = bool(coverage.get("failed"))
     slot_gap = None
-    if not contiguous and oldest is not None and cursor:
+    # Never compute a gap from a failed pass: the far edge was never
+    # established, so any number here would be fiction.
+    if not contiguous and not failed and oldest is not None and cursor:
         slot_gap = max(0, int(oldest) - int(cursor))
     return {
         "stop_reason": stop,
         "contiguous_with_previous_sweep": contiguous,
+        "failed": failed,
+        "error": coverage.get("error"),
         "pages_used": coverage.get("pages_used", 0),
         "signatures_seen": coverage.get("signatures_seen", 0),
         "candidates_found": int(discovered_count),
         "oldest_slot_seen": oldest,
         "cursor_slot_before": cursor,
         "slot_gap": slot_gap,
+        "backlog_pending": bool(coverage.get("backlog_pending")),
+        "backlog_target_slot": coverage.get("backlog_target_slot"),
+        "backlog_drained_pages": coverage.get("backlog_drained_pages", 0),
         "measured_at": _utc_now(),
     }
 
@@ -1454,88 +1579,116 @@ class PumpFunObserver:
         all_signatures: list[dict] = []
         newest_signature = cursor_signature
         newest_slot = cursor_slot
-        before_signature: str | None = None
         slot_floor = (
             max(0, cursor_slot - int(slot_span))
             if slot_span is not None and cursor_slot
             else None
         )
+        backlog = cursor.get("backlog") or None
+        page_budget = max_pages
 
-        for page_index in range(max_pages):
-            batch = self.rpc.get_signatures(
+        try:
+            # PASS 1 -- drain any span a previous sweep could not reach.
+            # Runs first: the gap is older than anything a fresh pass would
+            # find, and leaving it unclaimed is what used to make those
+            # launches undiscoverable forever.
+            if backlog and backlog.get("before_signature"):
+                drain_budget = max(1, page_budget // 2)
+                drain = _sweep_signatures(
+                    self.rpc,
+                    PUMP_PROGRAM_ID,
+                    page_size=page_size,
+                    max_pages=drain_budget,
+                    until_signature=None,
+                    until_slot=_safe_int(backlog.get("target_slot")),
+                    before_signature=backlog["before_signature"],
+                    slot_floor=slot_floor,
+                )
+                all_signatures.extend(drain["signatures"])
+                page_budget = max(1, page_budget - drain["pages_used"])
+                coverage["backlog_drained_pages"] = drain["pages_used"]
+                backlog = _merge_backlog(
+                    backlog, drain, _safe_int(backlog.get("target_slot"))
+                )
+
+            # PASS 2 -- the fresh sweep, newest backwards to the cursor.
+            fresh = _sweep_signatures(
+                self.rpc,
                 PUMP_PROGRAM_ID,
-                limit=page_size,
-                until=cursor_signature,
-                before=before_signature,
+                page_size=page_size,
+                max_pages=page_budget,
+                until_signature=cursor_signature,
+                until_slot=cursor_slot,
+                slot_floor=slot_floor,
             )
-            if not batch:
-                break
-            all_signatures.extend(batch)
-            # Track the freshest signature seen across all pages for cursor advance.
-            if page_index == 0:
-                newest_signature = batch[0].get("signature", cursor_signature)
-                newest_slot = _safe_int(batch[0].get("slot"), cursor_slot)
-            oldest_in_batch = batch[-1]
-            oldest_slot = _safe_int(oldest_in_batch.get("slot"))
-            coverage["pages_used"] = page_index + 1
+            all_signatures.extend(fresh["signatures"])
+            if fresh["newest_signature"]:
+                newest_signature = fresh["newest_signature"]
+                newest_slot = fresh["newest_slot"]
+            coverage["stop_reason"] = fresh["stop_reason"]
+            coverage["pages_used"] = (
+                fresh["pages_used"] + coverage.get("backlog_drained_pages", 0)
+            )
             coverage["signatures_seen"] = len(all_signatures)
-            coverage["oldest_slot_seen"] = oldest_slot
+            coverage["oldest_slot_seen"] = fresh["oldest_slot"]
+            # A truncated fresh pass leaves its own gap, whose far edge is the
+            # cursor this sweep started from.
+            fresh_backlog = _merge_backlog(backlog, fresh, cursor_slot)
+            backlog = fresh_backlog if fresh_backlog else backlog
 
-            # Stop conditions evaluated AFTER absorbing the batch.
-            reached_cursor = cursor_slot and oldest_slot is not None and oldest_slot <= cursor_slot
-            reached_floor = slot_floor is not None and oldest_slot is not None and oldest_slot <= slot_floor
-            if reached_cursor or reached_floor:
-                coverage["stop_reason"] = (
-                    "reached_cursor" if reached_cursor else "slot_floor"
-                )
-                break
-            # Advance the paging cursor to the oldest signature of this batch.
-            before_signature = oldest_in_batch.get("signature")
-            if not before_signature:
-                coverage["stop_reason"] = "no_before_signature"
-                break
-        else:
-            # The for-loop ran to exhaustion: the page ceiling stopped the
-            # sweep before it reached the cursor. Everything between the oldest
-            # signature seen and the cursor is skipped, and the cursor still
-            # advances to the newest -- so those launches are missed
-            # permanently, not deferred to the next cycle.
-            coverage["stop_reason"] = "max_pages"
-
-        # Decode in chronological order (oldest first) so the catalog reflects
-        # the order events actually occurred on-chain. Pump.fun emits many more
-        # trade transactions than creates, and most trades fail (err set) -- a
-        # CreateEvent only lives in a SUCCESSFUL tx. Skip failed rows at the
-        # signature level (their err is already visible in the signature row)
-        # so we don't burn a getTransaction call on each one. This typically
-        # cuts the per-sweep getTransaction workload by ~90%.
-        decoded = 0
-        for row in reversed(all_signatures):
-            if row.get("err"):
-                continue
-            transaction = self.rpc.get_transaction(row["signature"])
-            for candidate in self.decode_transaction(row, transaction):
-                catalog["tokens"][candidate.mint] = candidate.to_dict()
-                discovered.append(candidate)
-                self.ledger.append(
-                    "pump_create_event",
-                    {
-                        "candidate": candidate.to_dict(),
-                        "source": "solana_rpc_confirmed_transaction_log",
-                    },
-                )
-            decoded += 1
-        if all_signatures:
-            cursor = {
-                "newest_signature": newest_signature,
-                "newest_slot": newest_slot,
-                "updated_at": _utc_now(),
-            }
-        self._write_catalog(catalog)
-        _atomic_json(self.cursor_path, cursor)
-        self.last_coverage = _discovery_coverage(coverage, len(discovered))
-        _atomic_json(self.coverage_path, self.last_coverage)
-        return discovered
+            # Decode in chronological order (oldest first) so the catalog
+            # reflects the order events actually occurred on-chain. Pump.fun
+            # emits many more trade transactions than creates, and most trades
+            # fail (err set) -- a CreateEvent only lives in a SUCCESSFUL tx.
+            # Skip failed rows at the signature level (their err is already
+            # visible in the signature row) so we don't burn a getTransaction
+            # call on each one. This typically cuts the per-sweep
+            # getTransaction workload by ~90%.
+            decoded = 0
+            for row in reversed(all_signatures):
+                if row.get("err"):
+                    continue
+                transaction = self.rpc.get_transaction(row["signature"])
+                for candidate in self.decode_transaction(row, transaction):
+                    catalog["tokens"][candidate.mint] = candidate.to_dict()
+                    discovered.append(candidate)
+                    self.ledger.append(
+                        "pump_create_event",
+                        {
+                            "candidate": candidate.to_dict(),
+                            "source": "solana_rpc_confirmed_transaction_log",
+                        },
+                    )
+                decoded += 1
+            if all_signatures:
+                cursor = {
+                    "newest_signature": newest_signature,
+                    "newest_slot": newest_slot,
+                    "updated_at": _utc_now(),
+                }
+            if backlog:
+                cursor["backlog"] = backlog
+            else:
+                cursor.pop("backlog", None)
+            self._write_catalog(catalog)
+            _atomic_json(self.cursor_path, cursor)
+            return discovered
+        except Exception as exc:
+            # Record the failure rather than vanishing. Before this, the
+            # coverage write sat after the pagination loop, so any sweep that
+            # raised produced no record at all -- discovery_coverage read {}
+            # for both venues through a six-and-a-half-hour outage, which is
+            # exactly when the instrument was most needed.
+            coverage["failed"] = True
+            coverage["error"] = type(exc).__name__
+            raise
+        finally:
+            coverage["backlog_pending"] = bool(backlog)
+            coverage["backlog_target_slot"] = (backlog or {}).get("target_slot")
+            self.last_coverage = _discovery_coverage(
+                coverage, len(discovered)
+            )
+            _atomic_json(self.coverage_path, self.last_coverage)
 
     def _write_catalog(self, catalog: dict) -> None:
         retention_cutoff = time.time() - CATALOG_RETENTION_SECONDS
@@ -1695,76 +1848,95 @@ class MeteoraObserver:
         all_signatures: list[dict] = []
         newest_signature = cursor_signature
         newest_slot = cursor_slot
-        before_signature: str | None = None
         slot_floor = (
             max(0, cursor_slot - int(slot_span))
             if slot_span is not None and cursor_slot
             else None
         )
+        backlog = cursor.get("backlog") or None
+        page_budget = max_pages
 
-        for page_index in range(max_pages):
-            batch = self.rpc.get_signatures(
+        try:
+            # See PumpFunObserver.sync for why the backlog drains first.
+            if backlog and backlog.get("before_signature"):
+                drain_budget = max(1, page_budget // 2)
+                drain = _sweep_signatures(
+                    self.rpc,
+                    DBC_PROGRAM_ID,
+                    page_size=page_size,
+                    max_pages=drain_budget,
+                    until_signature=None,
+                    until_slot=_safe_int(backlog.get("target_slot")),
+                    before_signature=backlog["before_signature"],
+                    slot_floor=slot_floor,
+                )
+                all_signatures.extend(drain["signatures"])
+                page_budget = max(1, page_budget - drain["pages_used"])
+                coverage["backlog_drained_pages"] = drain["pages_used"]
+                backlog = _merge_backlog(
+                    backlog, drain, _safe_int(backlog.get("target_slot"))
+                )
+
+            fresh = _sweep_signatures(
+                self.rpc,
                 DBC_PROGRAM_ID,
-                limit=page_size,
-                until=cursor_signature,
-                before=before_signature,
+                page_size=page_size,
+                max_pages=page_budget,
+                until_signature=cursor_signature,
+                until_slot=cursor_slot,
+                slot_floor=slot_floor,
             )
-            if not batch:
-                break
-            all_signatures.extend(batch)
-            if page_index == 0:
-                newest_signature = batch[0].get("signature", cursor_signature)
-                newest_slot = _safe_int(batch[0].get("slot"), cursor_slot)
-            oldest_in_batch = batch[-1]
-            oldest_slot = _safe_int(oldest_in_batch.get("slot"))
-            coverage["pages_used"] = page_index + 1
+            all_signatures.extend(fresh["signatures"])
+            if fresh["newest_signature"]:
+                newest_signature = fresh["newest_signature"]
+                newest_slot = fresh["newest_slot"]
+            coverage["stop_reason"] = fresh["stop_reason"]
+            coverage["pages_used"] = (
+                fresh["pages_used"] + coverage.get("backlog_drained_pages", 0)
+            )
             coverage["signatures_seen"] = len(all_signatures)
-            coverage["oldest_slot_seen"] = oldest_slot
+            coverage["oldest_slot_seen"] = fresh["oldest_slot"]
+            fresh_backlog = _merge_backlog(backlog, fresh, cursor_slot)
+            backlog = fresh_backlog if fresh_backlog else backlog
 
-            reached_cursor = cursor_slot and oldest_slot is not None and oldest_slot <= cursor_slot
-            reached_floor = slot_floor is not None and oldest_slot is not None and oldest_slot <= slot_floor
-            if reached_cursor or reached_floor:
-                coverage["stop_reason"] = (
-                    "reached_cursor" if reached_cursor else "slot_floor"
-                )
-                break
-            before_signature = oldest_in_batch.get("signature")
-            if not before_signature:
-                coverage["stop_reason"] = "no_before_signature"
-                break
-        else:
-            # The for-loop ran to exhaustion: the page ceiling stopped the
-            # sweep before it reached the cursor. Everything between the oldest
-            # signature seen and the cursor is skipped, and the cursor still
-            # advances to the newest -- so those launches are missed
-            # permanently, not deferred to the next cycle.
-            coverage["stop_reason"] = "max_pages"
-
-        for row in reversed(all_signatures):
-            if row.get("err"):
-                continue
-            transaction = self.rpc.get_transaction(row["signature"])
-            for candidate in self.decode_transaction(row, transaction):
-                catalog["tokens"][candidate.mint] = candidate.to_dict()
-                discovered.append(candidate)
-                self.ledger.append(
-                    "meteora_pool_creation_event",
-                    {
-                        "candidate": candidate.to_dict(),
-                        "source": "solana_rpc_confirmed_transaction_log",
-                    },
-                )
-        if all_signatures:
-            cursor = {
-                "newest_signature": newest_signature,
-                "newest_slot": newest_slot,
-                "updated_at": _utc_now(),
-            }
-        self._write_catalog(catalog)
-        _atomic_json(self.cursor_path, cursor)
-        self.last_coverage = _discovery_coverage(coverage, len(discovered))
-        _atomic_json(self.coverage_path, self.last_coverage)
-        return discovered
+            for row in reversed(all_signatures):
+                if row.get("err"):
+                    continue
+                transaction = self.rpc.get_transaction(row["signature"])
+                for candidate in self.decode_transaction(row, transaction):
+                    catalog["tokens"][candidate.mint] = candidate.to_dict()
+                    discovered.append(candidate)
+                    self.ledger.append(
+                        "meteora_pool_creation_event",
+                        {
+                            "candidate": candidate.to_dict(),
+                            "source": "solana_rpc_confirmed_transaction_log",
+                        },
+                    )
+            if all_signatures:
+                cursor = {
+                    "newest_signature": newest_signature,
+                    "newest_slot": newest_slot,
+                    "updated_at": _utc_now(),
+                }
+            if backlog:
+                cursor["backlog"] = backlog
+            else:
+                cursor.pop("backlog", None)
+            self._write_catalog(catalog)
+            _atomic_json(self.cursor_path, cursor)
+            return discovered
+        except Exception as exc:
+            coverage["failed"] = True
+            coverage["error"] = type(exc).__name__
+            raise
+        finally:
+            coverage["backlog_pending"] = bool(backlog)
+            coverage["backlog_target_slot"] = (backlog or {}).get("target_slot")
+            self.last_coverage = _discovery_coverage(
+                coverage, len(discovered)
+            )
+            _atomic_json(self.coverage_path, self.last_coverage)
 
     def _write_catalog(self, catalog: dict) -> None:
         retention_cutoff = time.time() - CATALOG_RETENTION_SECONDS
