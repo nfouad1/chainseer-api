@@ -1897,8 +1897,15 @@ class TradePermitGuard:
         }
 
 
-class WatcherPreempted(Exception):
-    """Internal cooperative cancellation at a safe watcher boundary."""
+class WatcherPreempted(BaseException):
+    """Internal cooperative cancellation at a safe watcher boundary.
+
+    Analyzer progress callbacks intentionally suppress ordinary ``Exception``
+    instances so observability failures cannot invalidate an analysis.  A
+    watcher yield is control flow, not an observability failure, and therefore
+    must bypass that suppression.  It is always caught explicitly by the
+    watcher before leaving ``run_once``.
+    """
 
 
 class ChainseerWatcher:
