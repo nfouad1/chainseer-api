@@ -834,6 +834,21 @@ class MaintenanceTask:
     benchmark_done: bool = False
 
 
+@dataclass
+class FullAuditCursor:
+    """Bounded, resumable state for a deep append-only ledger walk."""
+
+    target_index: int
+    target_hash: str
+    started_monotonic: float
+    started_at: str
+    offset: int = 0
+    next_index: int = 0
+    previous_hash: str = "0" * 64
+    verified_rings: int = 0
+    errors: list[str] = field(default_factory=list)
+
+
 class AnalysisService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -863,7 +878,9 @@ class AnalysisService:
             "last_full_audit_at": None,
             "last_full_audit_duration_seconds": None,
             "last_error": None,
+            "full_audit_progress": None,
         }
+        self._full_audit_cursor: FullAuditCursor | None = None
         self._watch_lock = threading.Lock()
         self._watcher: ChainseerWatcher | None = None
         self._base_watcher: ChainseerWatcher | None = None
@@ -984,6 +1001,7 @@ class AnalysisService:
             "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
             "last_full_audit_duration_seconds": None,
             "last_error": None,
+            "full_audit_progress": None,
         }
         self._ready.set()
 
@@ -1553,7 +1571,18 @@ class AnalysisService:
                 self.settings.memory_warning_mb,
             )
 
-    def _run_full_audit(self) -> None:
+    def _run_full_audit(self, *, batch_rings: int = 8) -> bool:
+        """Advance a deep audit by a bounded number of physical rings.
+
+        The target head is pinned once. Each batch owns the writer lock only
+        while validating a few immutable JSONL records, then releases it so a
+        queued analysis can run. Appends between batches are safe because the
+        Timechain is append-only; they belong to the next audit/incremental
+        verification span.
+
+        Returns True only when the pinned audit has completed (successfully or
+        with a fail-closed integrity result), False when it yielded/deferred.
+        """
         if self._agent is None or not hasattr(self._agent, "tc"):
             self._integrity_status = {
                 "status": "unsupported",
@@ -1561,39 +1590,160 @@ class AnalysisService:
                 "last_full_audit_duration_seconds": None,
                 "last_error": None,
             }
-            return
-        if self._analysis_active.is_set():
-            return
+            return True
+        if self._analysis_active.is_set() or not self.work.empty():
+            return False
         if not self._timechain_lock.acquire(blocking=False):
-            return
-        if not self._watch_lock.acquire(blocking=False):
-            self._timechain_lock.release()
-            return
-        started = time.monotonic()
+            return False
         try:
-            ok, report = self._agent.tc.verify()
-            if not ok:
+            # Close the race between the priority check and lock acquisition.
+            if self._analysis_active.is_set() or not self.work.empty():
+                return False
+            tc = self._agent.tc
+            cursor = self._full_audit_cursor
+            if cursor is None:
+                tail = tc.tail_rings(1)
+                if not tail:
+                    self._integrity_status = {
+                        "status": "verified",
+                        "last_full_audit_at": datetime.now(
+                            timezone.utc
+                        ).isoformat(),
+                        "last_full_audit_duration_seconds": 0.0,
+                        "last_error": None,
+                        "full_audit_progress": None,
+                    }
+                    return True
+                target = tail[-1]
+                cursor = FullAuditCursor(
+                    target_index=int(target["index"]),
+                    target_hash=str(target["ring_hash"]),
+                    started_monotonic=time.monotonic(),
+                    started_at=datetime.now(timezone.utc).isoformat(),
+                )
+                self._full_audit_cursor = cursor
+
+            processed = 0
+            with tc.rings_path.open("rb") as handle:
+                handle.seek(cursor.offset)
+                while (
+                    processed < max(1, int(batch_rings))
+                    and cursor.next_index <= cursor.target_index
+                ):
+                    raw = handle.readline()
+                    if not raw:
+                        cursor.errors.append(
+                            f"ring {cursor.next_index}: pinned audit target "
+                            "disappeared -> TAMPERED"
+                        )
+                        cursor.next_index = cursor.target_index + 1
+                        break
+                    cursor.offset = handle.tell()
+                    line = raw.strip()
+                    if not line:
+                        continue
+                    index = cursor.next_index
+                    try:
+                        ring = json.loads(line.decode("utf-8"))
+                    except Exception as exc:
+                        cursor.errors.append(
+                            f"ring {index}: unreadable/torn line -> "
+                            f"TAMPERED ({exc})"
+                        )
+                        cursor.next_index += 1
+                        processed += 1
+                        continue
+                    if ring.get("index") != index:
+                        cursor.errors.append(
+                            f"ring {index}: index mismatch "
+                            f"(got {ring.get('index')})"
+                        )
+                    if ring.get("prev_hash") != cursor.previous_hash:
+                        cursor.errors.append(
+                            f"ring {index}: prev_hash broken "
+                            f"(expected {cursor.previous_hash[:12]}..)"
+                        )
+                    recomputed = self._agent.timechain_module.compute_ring_hash(
+                        ring
+                    )
+                    if recomputed != ring.get("ring_hash"):
+                        cursor.errors.append(
+                            f"ring {index}: ring_hash mismatch -> TAMPERED"
+                        )
+                    difficulty = ring.get("difficulty", 0)
+                    if difficulty and not str(
+                        ring.get("ring_hash", "")
+                    ).startswith("0" * difficulty):
+                        cursor.errors.append(
+                            f"ring {index}: does not meet stated difficulty "
+                            f"{difficulty}"
+                        )
+                    for ref in ring.get("blockspace_refs", []):
+                        blob_hash = ref.get("hash")
+                        if not tc.blockspace.has(blob_hash):
+                            cursor.errors.append(
+                                f"ring {index}: blockspace blob "
+                                f"{str(blob_hash)[:12]}.. missing"
+                            )
+                        elif not tc.blockspace.verify_blob(blob_hash):
+                            cursor.errors.append(
+                                f"ring {index}: blockspace blob "
+                                f"{str(blob_hash)[:12]}.. corrupted"
+                            )
+                    cursor.previous_hash = str(ring.get("ring_hash"))
+                    cursor.next_index += 1
+                    cursor.verified_rings += 1
+                    processed += 1
+                    if self._analysis_active.is_set() or not self.work.empty():
+                        break
+
+            self._integrity_status = {
+                **self._integrity_status,
+                "status": "auditing",
+                "last_error": None,
+                "full_audit_progress": {
+                    "verified_rings": cursor.verified_rings,
+                    "target_rings": cursor.target_index + 1,
+                    "started_at": cursor.started_at,
+                },
+            }
+            if cursor.next_index <= cursor.target_index:
+                return False
+            if cursor.previous_hash != cursor.target_hash:
+                cursor.errors.append(
+                    "pinned audit head hash changed -> TAMPERED"
+                )
+            if cursor.errors:
                 self._integrity_status = {
                     "status": "failed",
                     "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
                     "last_full_audit_duration_seconds": round(
-                        time.monotonic() - started, 3
+                        time.monotonic() - cursor.started_monotonic, 3
                     ),
-                    "last_error": "; ".join(report)[:500],
+                    "last_error": "; ".join(cursor.errors)[:500],
+                    "full_audit_progress": None,
                 }
-                return
+                self._full_audit_cursor = None
+                return True
             self._agent.cognitive_loop.verify_registry()
-            self._agent.cognitive_loop.establish_trust()
             self._integrity_status = {
                 "status": "verified",
                 "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
                 "last_full_audit_duration_seconds": round(
-                    time.monotonic() - started, 3
+                    time.monotonic() - cursor.started_monotonic, 3
                 ),
                 "last_error": None,
+                "full_audit_progress": None,
             }
+            self._full_audit_cursor = None
+            return True
         except Exception as exc:
             LOGGER.exception("Background Timechain audit failed")
+            started = (
+                self._full_audit_cursor.started_monotonic
+                if self._full_audit_cursor is not None
+                else time.monotonic()
+            )
             self._integrity_status = {
                 "status": "failed",
                 "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
@@ -1601,9 +1751,11 @@ class AnalysisService:
                     time.monotonic() - started, 3
                 ),
                 "last_error": credential_safe_error(exc),
+                "full_audit_progress": None,
             }
+            self._full_audit_cursor = None
+            return True
         finally:
-            self._watch_lock.release()
             self._timechain_lock.release()
 
     def _run_maintenance(self) -> None:
@@ -1687,10 +1839,14 @@ class AnalysisService:
                             self._timechain_lock.release()
                 self._maintenance_work.task_done()
             if time.monotonic() >= next_audit:
-                self._run_full_audit()
+                completed = self._run_full_audit()
                 next_audit = (
                     time.monotonic()
-                    + self.settings.full_audit_interval_seconds
+                    + (
+                        self.settings.full_audit_interval_seconds
+                        if completed
+                        else 0.1
+                    )
                 )
 
     def _run(self) -> None:
