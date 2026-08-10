@@ -616,6 +616,7 @@ class ChainseerInfrastructureTests(unittest.TestCase):
 
             self.assertFalse(retrieve.call_args.kwargs["use_index"])
             self.assertFalse(gate_and_seal.call_args.kwargs["use_index"])
+            self.assertNotIn("CT_AUTOINDEX", os.environ)
 
             rings = agent.tc.load()
             ring = next(r for r in rings if r["ring_type"] == "token_analysis")

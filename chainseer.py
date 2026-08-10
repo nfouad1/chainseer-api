@@ -4652,6 +4652,19 @@ class Chainseer:
 
     # ── TIMECHAIN SEALING ───────────────────────────────────────────────────
 
+    @staticmethod
+    def _online_seal(operation):
+        """Append on the request path without synchronous index maintenance."""
+        previous = os.environ.get("CT_AUTOINDEX")
+        os.environ["CT_AUTOINDEX"] = "0"
+        try:
+            return operation()
+        finally:
+            if previous is None:
+                os.environ.pop("CT_AUTOINDEX", None)
+            else:
+                os.environ["CT_AUTOINDEX"] = previous
+
     def _seal_report(self, report: dict):
         cognition = self.cognitive_loop.prepare(report)
         poq = report.get("poq_scores", {})
@@ -4690,7 +4703,7 @@ class Chainseer:
                 "entity_graph": sealed_entity_graph,
             }, sort_keys=True, default=str)
         )
-        verdict, ring = self.poq_module.gate_and_seal(
+        verdict, ring = self._online_seal(lambda: self.poq_module.gate_and_seal(
             self.tc,
             candidate,
             context=gate_context,
@@ -4747,7 +4760,7 @@ class Chainseer:
                 "uncertain_components": report["analysis"].get("uncertain_components", {}),
                 "cognitive_loop": cognition,
             },
-        )
+        ))
         if ring is None:
             raise RuntimeError(
                 f"PoQ refused token analysis seal ({verdict.get('decision')}): "
@@ -4756,7 +4769,7 @@ class Chainseer:
         report["analysis_ring"] = ring.get("index")
         report["analysis_ring_hash"] = ring.get("ring_hash")
         report["poq_verdict"] = verdict
-        self.cognitive_loop.finalize(report, ring)
+        self._online_seal(lambda: self.cognitive_loop.finalize(report, ring))
         try:
             report["temporal_entity_graph"] = append_temporal_projection(
                 self.chain_root,
