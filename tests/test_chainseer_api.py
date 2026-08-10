@@ -3,6 +3,7 @@ import threading
 import time
 import unittest
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from pydantic import ValidationError
@@ -16,6 +17,7 @@ from chainseer_api import (
     SlidingWindowRateLimiter,
     WatcherBusyError,
     WatchRequest,
+    _cypher_tempre_runtime_status,
     _server_port,
     build_public_report,
     deterministic_benchmark_split,
@@ -448,6 +450,42 @@ class SettingsTests(unittest.TestCase):
         with patch.dict("os.environ", {"PORT": "10000"}, clear=True):
             self.assertEqual(_server_port(), 10000)
 
+    def test_cypher_tempre_runtime_attests_exact_version(self):
+        with tempfile.TemporaryDirectory() as temp:
+            skill = Path(temp)
+            (skill / "VERSION").write_text(
+                "3.30.08-tca.1\n", encoding="utf-8"
+            )
+            with patch.dict(
+                "os.environ",
+                {
+                    "CHAINSEER_SKILL_DIR": str(skill),
+                    "CHAINSEER_CYPHER_TEMPRE_VERSION": "3.30.08-tca.1",
+                    "CHAINSEER_CYPHER_TEMPRE_COMMIT": "abc123",
+                },
+                clear=False,
+            ):
+                status = _cypher_tempre_runtime_status()
+        self.assertEqual(status["status"], "verified")
+        self.assertEqual(status["version"], "3.30.08-tca.1")
+        self.assertEqual(status["commit"], "abc123")
+
+    def test_ci_and_docker_pin_the_same_cypher_tempre_runtime(self):
+        root = Path(__file__).resolve().parents[1]
+        docker = (root / "Dockerfile.api").read_text(encoding="utf-8")
+        workflow = (root / ".github/workflows/test.yml").read_text(
+            encoding="utf-8"
+        )
+        commit = "963ee364718e369718a2d8b15754305ae28806c5"
+        version = "3.30.08-tca.1"
+        self.assertIn(commit, docker)
+        self.assertIn(commit, workflow)
+        self.assertIn(version, docker)
+        self.assertIn(version, workflow)
+        self.assertIn("FrostedFlaming0/cypher-tempre-tcaFork", docker)
+        self.assertIn("FrostedFlaming0/cypher-tempre-tcaFork", workflow)
+        self.assertNotIn("patch_timechain_seal_timestamp", docker)
+
     def test_explicit_chainseer_port_overrides_platform_port(self):
         with patch.dict(
             "os.environ",
@@ -604,6 +642,8 @@ class ServiceTests(unittest.TestCase):
         *,
         benchmark_root=None,
         benchmark_capture_enabled=False,
+        watcher_enabled=False,
+        watcher_interval_seconds=60,
     ):
         return Settings(
             environment="test",
@@ -620,6 +660,8 @@ class ServiceTests(unittest.TestCase):
                 or str(Path(root).resolve().parent / "benchmark_data")
             ),
             benchmark_analyzer_version="test-commit",
+            watcher_enabled=watcher_enabled,
+            watcher_interval_seconds=watcher_interval_seconds,
         )
 
     def test_worker_returns_and_caches_structured_result(self):
@@ -722,6 +764,132 @@ class ServiceTests(unittest.TestCase):
                 {"base": {"message": "temporary"}},
             )
             self.assertFalse(health["benchmark_capture"]["enabled"])
+
+    def test_base_ring_import_uses_append_time_and_keeps_source_time(self):
+        class FakeTimechain:
+            def __init__(self):
+                self.sealed = []
+
+            def iter_rings(self):
+                return iter(())
+
+            def seal(self, ring_type, payload):
+                self.sealed.append((ring_type, payload))
+                return {"index": len(self.sealed)}
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            tc = FakeTimechain()
+            service._agent = SimpleNamespace(tc=tc)
+            source_time = "2026-08-10T06:00:00+00:00"
+            result = service.import_base_analysis_rings(
+                [
+                    {
+                        "timestamp": source_time,
+                        "payload": {"idempotency_key": "sample-1"},
+                    }
+                ]
+            )
+        self.assertEqual(result, [{"status": "sealed", "index": 1}])
+        self.assertEqual(tc.sealed[0][0], "base_launch_analysis")
+        self.assertEqual(tc.sealed[0][1]["timestamp"], source_time)
+        self.assertEqual(tc.sealed[0][1]["source_timestamp"], source_time)
+
+    def test_watcher_cycle_defers_all_networks_for_queued_analysis(self):
+        class CountingWatcher:
+            def __init__(self):
+                self.calls = 0
+
+            def run_once(self):
+                self.calls += 1
+                return {"calls": self.calls}
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(
+                self.settings(root, watcher_enabled=True)
+            )
+            watchers = [CountingWatcher() for _ in range(3)]
+            (
+                service._watcher,
+                service._base_watcher,
+                service._solana_watcher,
+            ) = watchers
+            service.work.put_nowait("queued-analysis")
+            service._run_watcher_cycle()
+            service.work.get_nowait()
+        self.assertEqual([watcher.calls for watcher in watchers], [0, 0, 0])
+        self.assertEqual(
+            set(service._watcher_status["last_deferred"]),
+            {"robinhood", "base", "solana"},
+        )
+
+    def test_watcher_releases_lane_between_networks_for_new_analysis(self):
+        class FirstWatcher:
+            def __init__(self, service):
+                self.service = service
+                self.calls = 0
+
+            def run_once(self, should_yield=None):
+                self.calls += 1
+                self.service.work.put_nowait("new-analysis")
+                return {"calls": self.calls}
+
+        class CountingWatcher:
+            def __init__(self):
+                self.calls = 0
+
+            def run_once(self):
+                self.calls += 1
+                return {"calls": self.calls}
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(
+                self.settings(root, watcher_enabled=True)
+            )
+            first = FirstWatcher(service)
+            second = CountingWatcher()
+            third = CountingWatcher()
+            service._watcher = first
+            service._base_watcher = second
+            service._solana_watcher = third
+            service._run_watcher_cycle()
+            service.work.get_nowait()
+        self.assertEqual(first.calls, 1)
+        self.assertEqual(second.calls, 0)
+        self.assertEqual(third.calls, 0)
+        self.assertEqual(
+            service._watcher_status["last_deferred"]["base"]["reason"],
+            "analysis_priority",
+        )
+
+    def test_watcher_scheduler_uses_a_dedicated_thread(self):
+        class IdleWatcher:
+            def run_once(self, should_yield=None):
+                return {"idle": True}
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(
+                self.settings(
+                    root,
+                    watcher_enabled=True,
+                    watcher_interval_seconds=3600,
+                )
+            )
+            service._agent = FakeAgent()
+            service._watcher = IdleWatcher()
+            service._base_watcher = IdleWatcher()
+            service._solana_watcher = IdleWatcher()
+            service.start()
+            try:
+                self.assertTrue(service._worker.is_alive())
+                self.assertTrue(service._watcher_worker.is_alive())
+                self.assertNotEqual(service._worker, service._watcher_worker)
+                self.assertEqual(
+                    service._watcher_worker.name,
+                    "chainseer-watcher-worker",
+                )
+            finally:
+                self.assertTrue(service.stop())
 
     def test_watch_reads_do_not_wait_for_long_running_cycle_lock(self):
         subscriber = "a" * 64

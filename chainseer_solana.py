@@ -65,6 +65,19 @@ def _environment_setting(name: str) -> str | None:
     return value or _windows_user_environment(name)
 
 
+def _environment_int(name: str, default: int, *, minimum: int = 1) -> int:
+    raw = _environment_setting(name)
+    if raw is None:
+        return default
+    try:
+        value = int(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be an integer") from exc
+    if value < minimum:
+        raise RuntimeError(f"{name} must be at least {minimum}")
+    return value
+
+
 def _send_telegram_notification(text: str) -> bool:
     """Best-effort push notification for reflection-checkpoint pauses.
 
@@ -275,7 +288,13 @@ REFLECTION_MIN_SECONDS = 6 * 60 * 60
 #
 # Note this is paper_only / live_execution_enabled=False. If live execution is
 # ever enabled, this should go back to halting on the first checkpoint.
-REFLECTION_MAX_UNACKNOWLEDGED = 3
+REFLECTION_MAX_UNACKNOWLEDGED = max(
+    1,
+    _environment_int(
+        "CHAINSEER_SOLANA_REFLECTION_MAX_UNACKNOWLEDGED",
+        3,
+    ),
+)
 
 RISKY_TOKEN_2022_EXTENSIONS = {
     "confidentialtransfermint",
@@ -437,8 +456,11 @@ def _merge_backlog(existing: dict | None, pass_result: dict,
     resume point only ever moves BACKWARD (toward the target), so repeated
     truncation shrinks the hole instead of forgetting it.
     """
-    if pass_result["stop_reason"] != "max_pages":
-        return None                       # the span was fully absorbed
+    if pass_result["stop_reason"] in {"reached_cursor", "empty"}:
+        # Reaching the target is explicit completion. Exhausting the RPC's
+        # history is also complete: there are no older program signatures in
+        # which a launch could be hiding.
+        return None
     resume = pass_result.get("oldest_signature")
     if not resume:
         return existing
@@ -467,7 +489,22 @@ def _merge_backlog(existing: dict | None, pass_result: dict,
     # between them, which is harmless: the catalogue is keyed by mint, so a
     # re-read costs RPC calls and yields no duplicates. Missing a launch is
     # not recoverable; reading one twice is.
-    if old_reached is not None and new_reached is not None and old_reached > new_reached:
+    same_span = (
+        old_target is not None
+        and new_target is not None
+        and old_target == new_target
+    )
+    if same_span:
+        # This is the next drain page of one recorded gap. Moving backward is
+        # progress, so resume from the newly reached signature.
+        reached = new_reached
+    elif (
+        old_reached is not None
+        and new_reached is not None
+        and old_reached > new_reached
+    ):
+        # Different targets describe disjoint gaps. Keep their union's upper
+        # edge so paging backward still traverses both.
         resume = existing.get("before_signature") or resume
         reached = old_reached
     else:
@@ -1670,7 +1707,12 @@ class PumpFunObserver:
                     until_signature=None,
                     until_slot=_safe_int(backlog.get("target_slot")),
                     before_signature=backlog["before_signature"],
-                    slot_floor=slot_floor,
+                    # The backlog target can be older than this cycle's
+                    # freshness floor. Applying the moving floor here made a
+                    # partial drain look complete and discarded the remaining
+                    # historical span. Fresh sweeps stay bounded below; a
+                    # recorded backlog drains to its own immutable target.
+                    slot_floor=None,
                 )
                 all_signatures.extend(drain["signatures"])
                 page_budget = max(1, page_budget - drain["pages_used"])
@@ -1936,7 +1978,7 @@ class MeteoraObserver:
                     until_signature=None,
                     until_slot=_safe_int(backlog.get("target_slot")),
                     before_signature=backlog["before_signature"],
-                    slot_floor=slot_floor,
+                    slot_floor=None,
                 )
                 all_signatures.extend(drain["signatures"])
                 page_budget = max(1, page_budget - drain["pages_used"])

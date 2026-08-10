@@ -526,6 +526,20 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             )
             self.assertIsNotNone(alert["timechain"]["ring"])
 
+    def test_evm_watcher_yields_before_subscription_work(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = FakeAgent()
+            agent.chain_root = temp_dir
+            watcher = controls.ChainseerWatcher(
+                agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(TOKEN)
+            result = watcher.run_once(should_yield=lambda: True)
+            self.assertEqual(result["rescans"], 0)
+            self.assertEqual(result["deferred_subscriptions"], 1)
+            self.assertEqual(agent.scan_count, 0)
+
     def test_watcher_seals_reorg_alert(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             agent = FakeAgent()
@@ -641,6 +655,21 @@ class WatcherAndOutcomeTests(unittest.TestCase):
                 timechain_agent.tc.rings[-1]["ring_type"],
                 "solana_watch_transition",
             )
+
+    def test_solana_watcher_yields_before_subscription_work(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            timechain_agent = FakeAgent()
+            analyzer = FakeSolanaAnalyzer(timechain_agent)
+            watcher = controls.SolanaEventWatcher(
+                analyzer,
+                timechain_agent=timechain_agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(SOLANA_MINT)
+            result = watcher.run_once(should_yield=lambda: True)
+            self.assertEqual(result["rescans"], 0)
+            self.assertEqual(result["deferred_subscriptions"], 1)
+            self.assertEqual(analyzer.scan_count, 0)
 
     def test_solana_watcher_debounces_small_holder_rotation(self):
         with tempfile.TemporaryDirectory() as temp_dir:

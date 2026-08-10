@@ -2798,7 +2798,12 @@ class SolanaPrototypeTests(unittest.TestCase):
         self.assertIn("Local\\ChainseerSolanaLearnOnce", runner)
         self.assertIn("live_execution_enabled = $false", runner)
         self.assertIn("--graduation-limit $GraduationLimit", runner)
-        self.assertIn("sealed_reflection_checkpoint_pending", runner)
+        self.assertIn(
+            "CHAINSEER_SOLANA_REFLECTION_MAX_UNACKNOWLEDGED", runner
+        )
+        self.assertIn(
+            "reflection_checkpoint_backlog_limit_reached", runner
+        )
         self.assertIn("controller_status.json", runner)
         self.assertIn("-MultipleInstances IgnoreNew", manager)
         self.assertIn('"stop"', manager)
@@ -3933,6 +3938,26 @@ class BacklogTargetRegressionTest(unittest.TestCase):
             100,
         )
         self.assertIsNone(merged)
+
+    def test_slot_floor_stop_preserves_the_original_backlog(self):
+        """A freshness floor is not proof that the old target was reached."""
+        existing = {
+            "before_signature": "sig-existing",
+            "target_slot": 100,
+            "oldest_slot_reached": 200,
+        }
+        merged = chainseer_solana._merge_backlog(
+            existing,
+            {
+                "stop_reason": "slot_floor",
+                "oldest_slot": 175,
+                "oldest_signature": "sig-175",
+            },
+            100,
+        )
+        self.assertIsNotNone(merged)
+        self.assertEqual(merged["target_slot"], 100)
+        self.assertEqual(merged["before_signature"], "sig-175")
 
 
 class ObserverHealthTest(unittest.TestCase):

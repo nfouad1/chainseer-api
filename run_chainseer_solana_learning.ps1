@@ -57,6 +57,17 @@ $mutexOwned = $false
 $exitCode = $null
 $started = Get-Date
 $startedAt = $started.ToUniversalTime().ToString("o")
+$reflectionMaxUnacknowledged = 3
+if (-not [string]::IsNullOrWhiteSpace(
+    $env:CHAINSEER_SOLANA_REFLECTION_MAX_UNACKNOWLEDGED
+)) {
+    $reflectionMaxUnacknowledged = [int](
+        $env:CHAINSEER_SOLANA_REFLECTION_MAX_UNACKNOWLEDGED
+    )
+    if ($reflectionMaxUnacknowledged -lt 1) {
+        throw "CHAINSEER_SOLANA_REFLECTION_MAX_UNACKNOWLEDGED must be at least 1"
+    }
+}
 
 function Write-AtomicJson {
     param(
@@ -184,15 +195,29 @@ try {
         exit 0
     }
     $reflection = Read-JsonFile -Path $reflectionPath
-    if (
+    $reflectionPending = (
         $null -ne $reflection -and
         ($reflection.pause_requested -eq $true -or $reflection.status -eq "pending")
+    )
+    $unacknowledgedReflections = $(
+        if (
+            $reflectionPending -and
+            $null -ne $reflection.unacknowledged_count
+        ) {
+            [int]$reflection.unacknowledged_count
+        }
+        elseif ($reflectionPending) { 1 }
+        else { 0 }
+    )
+    if (
+        $reflectionPending -and
+        $unacknowledgedReflections -ge $reflectionMaxUnacknowledged
     ) {
         Write-ControllerState `
             -Status "reflection_pending" `
             -At (Get-Date) `
             -SkippedDelta 1 `
-            -Reason "sealed_reflection_checkpoint_pending"
+            -Reason "reflection_checkpoint_backlog_limit_reached"
         Write-AtomicJson -Path $statusPath -Value @{
             status = "reflection_pending"
             started_at = $startedAt
@@ -202,10 +227,12 @@ try {
             log_path = $logPath
             last_error = $null
             reflection_checkpoint_id = $reflection.pending_checkpoint.checkpoint_id
+            unacknowledged_reflections = $unacknowledgedReflections
+            reflection_backlog_limit = $reflectionMaxUnacknowledged
             paper_only = $true
             live_execution_enabled = $false
         }
-        "[$startedAt] SKIP sealed recursive-learning reflection checkpoint pending" |
+        "[$startedAt] SKIP reflection checkpoint backlog $unacknowledgedReflections/$reflectionMaxUnacknowledged reached" |
             Out-File -LiteralPath $logPath -Append -Encoding utf8
         exit 0
     }

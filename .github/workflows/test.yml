@@ -30,10 +30,9 @@ jobs:
       # different build than production tests code nobody is running, which is
       # the one failure mode a pin exists to prevent.
       #
-      # The codex path is kept deliberately: the fork's codex and claude
-      # runtimes share all 53 python modules byte-for-byte, differing only by
-      # codex's install_codex_hooks.py, which is an installer rather than part
-      # of the verified surface. Production runs the claude variant.
+      # The codex path is the exact runtime path packaged by Dockerfile.api.
+      # Local .zcode, CI, and Fly therefore exercise the same 53 shared Python
+      # modules instead of merely sharing a nominal version.
       - name: Install pinned Cypher Tempre runtime
         env:
           CYPHER_TEMPRE_REPO: FrostedFlaming0/cypher-tempre-tcaFork
@@ -47,6 +46,10 @@ jobs:
             "$RUNNER_TEMP/cypher-tempre.zip" \
             "$RUNNER_TEMP/cypher-tempre"
           echo "CHAINSEER_SKILL_DIR=$RUNNER_TEMP/cypher-tempre/${CYPHER_TEMPRE_ARCHIVE}-${CYPHER_TEMPRE_COMMIT}/skills/codex/cypher-tempre-self-model" \
+            >> "$GITHUB_ENV"
+          echo "CHAINSEER_CYPHER_TEMPRE_COMMIT=${CYPHER_TEMPRE_COMMIT}" \
+            >> "$GITHUB_ENV"
+          echo "CHAINSEER_CYPHER_TEMPRE_VERSION=3.30.08-tca.1" \
             >> "$GITHUB_ENV"
 
       - name: Compile
