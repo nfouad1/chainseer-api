@@ -1468,7 +1468,7 @@ class AnalysisService:
                         # lane. Only analyzer/sealing mutations serialize with
                         # user work, and those sections cooperatively yield.
                         kwargs["timechain_lane"] = (
-                            lambda: self._timechain_lock
+                            self._watcher_timechain_lane
                         )
                 except (TypeError, ValueError):
                     pass
@@ -1490,6 +1490,20 @@ class AnalysisService:
             "last_error": errors or None,
             "last_deferred": deferred or None,
         }
+
+    @contextmanager
+    def _watcher_timechain_lane(self):
+        """Serialize watcher writes without doing index maintenance inline."""
+        with self._timechain_lock:
+            previous = os.environ.get("CT_AUTOINDEX")
+            os.environ["CT_AUTOINDEX"] = "0"
+            try:
+                yield
+            finally:
+                if previous is None:
+                    os.environ.pop("CT_AUTOINDEX", None)
+                else:
+                    os.environ["CT_AUTOINDEX"] = previous
 
     def _run_watchers(self) -> None:
         interval = max(0.1, float(self.settings.watcher_interval_seconds))

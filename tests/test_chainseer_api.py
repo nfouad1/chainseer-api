@@ -1,4 +1,5 @@
 import json
+import os
 import tempfile
 import threading
 import time
@@ -1024,6 +1025,41 @@ class ServiceTests(unittest.TestCase):
         self.assertEqual(
             [watcher.include_calibration for watcher in watchers],
             [False, False, False],
+        )
+
+    def test_watcher_mutation_lane_disables_and_restores_autoindex(self):
+        class LaneAwareWatcher:
+            def __init__(self):
+                self.autoindex_inside = None
+
+            def run_once(
+                self,
+                should_yield=None,
+                *,
+                include_calibration=True,
+                timechain_lane=None,
+            ):
+                with timechain_lane():
+                    self.autoindex_inside = os.environ.get("CT_AUTOINDEX")
+                return {"ok": True}
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(
+                self.settings(root, watcher_enabled=True)
+            )
+            watchers = [LaneAwareWatcher() for _ in range(3)]
+            (
+                service._watcher,
+                service._base_watcher,
+                service._solana_watcher,
+            ) = watchers
+            with patch.dict(os.environ, {"CT_AUTOINDEX": "1"}):
+                service._run_watcher_cycle()
+                self.assertEqual(os.environ["CT_AUTOINDEX"], "1")
+
+        self.assertEqual(
+            [watcher.autoindex_inside for watcher in watchers],
+            ["0", "0", "0"],
         )
 
     def test_watcher_scheduler_uses_a_dedicated_thread(self):
