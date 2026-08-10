@@ -932,9 +932,14 @@ class AnalysisService:
                 ),
             )
         if self._solana_watcher is None:
+            solana_observer = SolanaPublicAnalyzer(
+                self.settings.solana_rpc_url,
+                jupiter_api_key=self.settings.jupiter_api_key or None,
+            )
             self._solana_watcher = SolanaEventWatcher(
                 self._solana_agent,
                 timechain_agent=self._agent,
+                observer_analyzer=solana_observer,
                 control_root=self.settings.chain_root,
                 config=SolanaWatchConfig(
                     poll_seconds=self.settings.watcher_interval_seconds,
