@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import inspect
 import json
 import math
 import os
@@ -1896,6 +1897,10 @@ class TradePermitGuard:
         }
 
 
+class WatcherPreempted(Exception):
+    """Internal cooperative cancellation at a safe watcher boundary."""
+
+
 class ChainseerWatcher:
     """Confirmed-block log watcher with debounced full rescans and outcomes."""
 
@@ -2081,6 +2086,8 @@ class ChainseerWatcher:
     def run_once(
         self,
         should_yield: Callable[[], bool] | None = None,
+        *,
+        include_calibration: bool = True,
     ) -> dict[str, Any]:
         now = self.clock()
         state = self.store.load()
@@ -2093,8 +2100,11 @@ class ChainseerWatcher:
                 "alerts": 0,
                 "outcomes": 0,
                 "errors": [],
-                "calibration": self.calibration.propose(
-                    self.agent.tc.load()
+                "calibration": (
+                    self.calibration.propose(self.agent.tc.load())
+                    if include_calibration
+                    and not (should_yield is not None and should_yield())
+                    else {"status": "deferred"}
                 ),
             }
         self._unbind()
@@ -2197,9 +2207,43 @@ class ChainseerWatcher:
                     reasons.append("outcome_horizon_due")
 
                 if reasons:
-                    report = self.agent.analyze_token(
-                        token, full_report=False, block_pin=safe_block
-                    )
+                    if should_yield is not None and should_yield():
+                        summary["deferred_subscriptions"] = (
+                            len(subscriptions) - index
+                        )
+                        break
+
+                    def watcher_progress(
+                        _stage: str, _percent: int, _detail: str
+                    ) -> None:
+                        if should_yield is not None and should_yield():
+                            raise WatcherPreempted
+
+                    analyze_kwargs: dict[str, Any] = {
+                        "full_report": False,
+                        "block_pin": safe_block,
+                    }
+                    try:
+                        if (
+                            "progress_callback"
+                            in inspect.signature(
+                                self.agent.analyze_token
+                            ).parameters
+                        ):
+                            analyze_kwargs["progress_callback"] = (
+                                watcher_progress
+                            )
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        report = self.agent.analyze_token(
+                            token, **analyze_kwargs
+                        )
+                    except WatcherPreempted:
+                        summary["deferred_subscriptions"] = (
+                            len(subscriptions) - index
+                        )
+                        break
                     if report.get("error"):
                         raise RuntimeError(report["error"])
                     current = _analysis_view(report)
@@ -2296,8 +2340,11 @@ class ChainseerWatcher:
                     "message": str(exc),
                 }
         self.store.save(state)
-        summary["calibration"] = self.calibration.propose(
-            self.agent.tc.load()
+        summary["calibration"] = (
+            self.calibration.propose(self.agent.tc.load())
+            if include_calibration
+            and not (should_yield is not None and should_yield())
+            else {"status": "deferred"}
         )
         return summary
 
@@ -2892,7 +2939,40 @@ class SolanaEventWatcher:
                 )
 
                 if should_rescan:
-                    report = self.analyzer.analyze_token(mint)
+                    if should_yield is not None and should_yield():
+                        summary["deferred_subscriptions"] = (
+                            len(subscriptions) - index
+                        )
+                        break
+
+                    def watcher_progress(
+                        _stage: str, _percent: int, _detail: str
+                    ) -> None:
+                        if should_yield is not None and should_yield():
+                            raise WatcherPreempted
+
+                    analyze_kwargs: dict[str, Any] = {}
+                    try:
+                        if (
+                            "progress_callback"
+                            in inspect.signature(
+                                self.analyzer.analyze_token
+                            ).parameters
+                        ):
+                            analyze_kwargs["progress_callback"] = (
+                                watcher_progress
+                            )
+                    except (TypeError, ValueError):
+                        pass
+                    try:
+                        report = self.analyzer.analyze_token(
+                            mint, **analyze_kwargs
+                        )
+                    except WatcherPreempted:
+                        summary["deferred_subscriptions"] = (
+                            len(subscriptions) - index
+                        )
+                        break
                     current = _solana_analysis_view(report)
                     drift = _solana_diff_views(latest or None, current)
                     summary["rescans"] += 1

@@ -17,7 +17,7 @@ import os
 import time
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, Callable
 
 import requests
 
@@ -882,7 +882,17 @@ class SolanaPublicAnalyzer:
                 "error_type": type(exc).__name__,
             }
 
-    def analyze_token(self, mint: str) -> dict:
+    def analyze_token(
+        self,
+        mint: str,
+        *,
+        progress_callback: Callable[[str, int, str], None] | None = None,
+    ) -> dict:
+        def progress(stage: str, percent: int, detail: str) -> None:
+            if progress_callback is not None:
+                progress_callback(stage, percent, detail)
+
+        progress("validating", 5, "Validating mint and slot boundary")
         mint = validate_solana_mint(mint)
         facts: list[dict] = []
         infrastructure_errors: list[str] = []
@@ -1125,6 +1135,7 @@ class SolanaPublicAnalyzer:
         pairs: list[dict] = []
         pair: dict | None = None
         dex_ok = False
+        progress("checking_markets", 40, "Checking Solana markets")
         try:
             pairs = self.dexscreener.token_pairs(mint)
             dex_ok = True
@@ -1272,6 +1283,7 @@ class SolanaPublicAnalyzer:
         # ownership check built for them so far.
 
         token_info: dict | None = None
+        progress("checking_routes", 58, "Checking executable routes")
         try:
             token_info = self.jupiter.token_info(mint)
             facts.append(
@@ -1712,6 +1724,7 @@ class SolanaPublicAnalyzer:
             ),
             "poq_scores": poq_scores,
         }
+        progress("checking_entities", 78, "Building the entity graph")
         report["data"]["entity_graph"] = build_solana_entity_graph(
             mint,
             report["data"],
@@ -1728,5 +1741,7 @@ class SolanaPublicAnalyzer:
         report["analysis"]["entity_insider_summary"] = (
             report["data"]["entity_graph"]["summary"]
         )
+        progress("sealing_timechain", 90, "Sealing the Timechain analysis")
         self._seal_report(report)
+        progress("complete", 100, "Sealed analysis is ready")
         return report
