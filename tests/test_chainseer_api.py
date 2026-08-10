@@ -611,6 +611,36 @@ class TrustedHostCheckTests(unittest.TestCase):
         # host validation before reaching the handler.
         self.assertNotEqual(response.status_code, 400)
 
+    def test_health_ready_exposes_runtime_attestation(self):
+        import chainseer_api
+
+        health = {
+            "watcher_last_error": None,
+            "benchmark_capture": {"enabled": False},
+            "timechain_integrity": {"status": "verified"},
+            "cypher_tempre_runtime": {
+                "status": "verified",
+                "version": "3.30.08-tca.1",
+                "expected_version": "3.30.08-tca.1",
+                "commit": "abc123",
+            },
+            "maintenance_queue_depth": 0,
+            "faculty_pack": {"status": "verified"},
+            "memory": {"warning": False},
+        }
+        service = SimpleNamespace(
+            ready=True,
+            work=SimpleNamespace(qsize=lambda: 0),
+            health_status=lambda: health,
+        )
+        with patch.object(chainseer_api, "SERVICE", service):
+            response = self.client.get("/health/ready")
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(
+            response.json()["cypher_tempre_runtime"],
+            health["cypher_tempre_runtime"],
+        )
+
     def test_other_routes_still_reject_untrusted_host_header(self):
         response = self.client.get("/", headers={"host": self.bad_host})
         self.assertEqual(response.status_code, 400)
