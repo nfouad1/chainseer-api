@@ -1,3 +1,4 @@
+import json
 import tempfile
 import threading
 import time
@@ -852,6 +853,112 @@ class ServiceTests(unittest.TestCase):
             set(service._watcher_status["last_deferred"]),
             {"robinhood", "base", "solana"},
         )
+
+    def test_full_audit_yields_at_ring_boundary_for_user_analysis(self):
+        class Blockspace:
+            @staticmethod
+            def has(_blob_hash):
+                return True
+
+            @staticmethod
+            def verify_blob(_blob_hash):
+                return True
+
+        class AuditTimechain:
+            def __init__(self, root, rings):
+                self.rings_path = Path(root) / "rings.jsonl"
+                self.rings_path.write_text(
+                    "".join(json.dumps(ring) + "\n" for ring in rings),
+                    encoding="utf-8",
+                )
+                self.blockspace = Blockspace()
+                self._tail = rings[-1]
+
+            def tail_rings(self, _count):
+                return [self._tail]
+
+        class CognitiveLoop:
+            def __init__(self):
+                self.registry_checks = 0
+
+            def verify_registry(self):
+                self.registry_checks += 1
+
+        with tempfile.TemporaryDirectory() as root:
+            rings = []
+            previous = "0" * 64
+            for index in range(5):
+                ring_hash = f"{index + 1:064x}"
+                rings.append(
+                    {
+                        "index": index,
+                        "prev_hash": previous,
+                        "ring_hash": ring_hash,
+                        "difficulty": 0,
+                        "blockspace_refs": [],
+                    }
+                )
+                previous = ring_hash
+            service = AnalysisService(self.settings(root))
+            cognitive_loop = CognitiveLoop()
+            priority_injected = False
+
+            def compute_ring_hash(ring):
+                nonlocal priority_injected
+                if not priority_injected:
+                    priority_injected = True
+                    service.work.put_nowait("priority-analysis")
+                return ring["ring_hash"]
+
+            service._agent = SimpleNamespace(
+                tc=AuditTimechain(root, rings),
+                timechain_module=SimpleNamespace(
+                    compute_ring_hash=compute_ring_hash
+                ),
+                cognitive_loop=cognitive_loop,
+            )
+            service._watch_lock.acquire()
+            try:
+                completed = service._run_full_audit(batch_rings=5)
+            finally:
+                service._watch_lock.release()
+
+            self.assertFalse(completed)
+            self.assertEqual(service._full_audit_cursor.verified_rings, 1)
+            self.assertEqual(
+                service._integrity_status["full_audit_progress"]
+                ["verified_rings"],
+                1,
+            )
+            self.assertTrue(service._timechain_lock.acquire(blocking=False))
+            service._timechain_lock.release()
+
+            self.assertEqual(service.work.get_nowait(), "priority-analysis")
+            while not service._run_full_audit(batch_rings=2):
+                pass
+
+            self.assertIsNone(service._full_audit_cursor)
+            self.assertEqual(service._integrity_status["status"], "verified")
+            self.assertEqual(cognitive_loop.registry_checks, 1)
+
+            persisted = service._agent.tc.rings_path.read_text(
+                encoding="utf-8"
+            ).splitlines()
+            damaged = [json.loads(line) for line in persisted]
+            damaged[2]["prev_hash"] = "f" * 64
+            service._agent.tc.rings_path.write_text(
+                "".join(json.dumps(ring) + "\n" for ring in damaged),
+                encoding="utf-8",
+            )
+            while not service._run_full_audit(batch_rings=2):
+                pass
+
+            self.assertEqual(service._integrity_status["status"], "failed")
+            self.assertIn(
+                "prev_hash broken",
+                service._integrity_status["last_error"],
+            )
+            self.assertEqual(cognitive_loop.registry_checks, 1)
 
     def test_watcher_releases_lane_between_networks_for_new_analysis(self):
         class FirstWatcher:
