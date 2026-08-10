@@ -1,13 +1,16 @@
 FROM python:3.13-slim
 
-ARG CYPHER_TEMPRE_COMMIT=5b7783f5c84706c5034273cc2772563d5d8fdb76
+ARG CYPHER_TEMPRE_COMMIT=963ee364718e369718a2d8b15754305ae28806c5
+ARG CYPHER_TEMPRE_VERSION=3.30.08-tca.1
 
 ENV PYTHONDONTWRITEBYTECODE=1 \
     PYTHONUNBUFFERED=1 \
     PYTHONUTF8=1 \
     CHAINSEER_API_HOST=0.0.0.0 \
     CHAINSEER_CHAIN_ROOT=/data/chainseer_chain \
-    CHAINSEER_SKILL_DIR=/opt/cypher-tempre-self-model
+    CHAINSEER_SKILL_DIR=/opt/cypher-tempre-self-model \
+    CHAINSEER_CYPHER_TEMPRE_COMMIT=${CYPHER_TEMPRE_COMMIT} \
+    CHAINSEER_CYPHER_TEMPRE_VERSION=${CYPHER_TEMPRE_VERSION}
 
 WORKDIR /app
 
@@ -17,15 +20,13 @@ RUN pip install --no-cache-dir -r requirements-api.txt
 # Pin the MIT-licensed Cypher Tempre runtime so production analyses use the
 # same reproducible Timechain implementation on every build. User chain data
 # is never copied into the image; it lives only on the persistent /data disk.
-ADD https://github.com/cyberphysicsai/cypher-tempre-genesis/archive/${CYPHER_TEMPRE_COMMIT}.zip /tmp/cypher-tempre.zip
-COPY scripts/patch_timechain_seal_timestamp.py /tmp/patch_timechain_seal_timestamp.py
+ADD https://github.com/FrostedFlaming0/cypher-tempre-tcaFork/archive/${CYPHER_TEMPRE_COMMIT}.zip /tmp/cypher-tempre.zip
 RUN python -m zipfile -e /tmp/cypher-tempre.zip /tmp/cypher-tempre \
     && cp -R \
-      /tmp/cypher-tempre/cypher-tempre-genesis-${CYPHER_TEMPRE_COMMIT}/skills/codex/cypher-tempre-self-model \
+      /tmp/cypher-tempre/cypher-tempre-tcaFork-${CYPHER_TEMPRE_COMMIT}/skills/codex/cypher-tempre-self-model \
       /opt/cypher-tempre-self-model \
     && rm -rf /tmp/cypher-tempre /tmp/cypher-tempre.zip \
-    && python /tmp/patch_timechain_seal_timestamp.py /opt/cypher-tempre-self-model/timechain.py \
-    && rm /tmp/patch_timechain_seal_timestamp.py \
+    && test "$(cat /opt/cypher-tempre-self-model/VERSION)" = "${CYPHER_TEMPRE_VERSION}" \
     && test -f /opt/cypher-tempre-self-model/timechain.py \
     && test -f /opt/cypher-tempre-self-model/poq.py \
     && test -f /opt/cypher-tempre-self-model/recall.py \

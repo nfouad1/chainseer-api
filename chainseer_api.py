@@ -2,8 +2,11 @@
 
 The API deliberately runs one analysis worker. Chainseer owns mutable,
 request-scoped scan state and appends to a single Timechain, so concurrent
-analysis in one process would be unsafe. Web requests enqueue jobs and poll
-for a structured public report.
+analysis in one process would be unsafe. A separate scheduler thread triggers
+watcher work only while the analysis lane is idle; the Timechain lock still
+serializes cognitive writes, but a three-network watcher sweep can no longer
+occupy the queue worker itself. Web requests enqueue jobs and poll for a
+structured public report.
 """
 
 from __future__ import annotations
@@ -104,6 +107,34 @@ def _env_bool(name: str, default: bool = False) -> bool:
     if normalized in {"0", "false", "no", "off"}:
         return False
     raise RuntimeError(f"{name} must be a boolean")
+
+
+def _cypher_tempre_runtime_status() -> dict[str, Any]:
+    """Return a bounded, public-safe attestation of the loaded skill runtime."""
+
+    configured = os.environ.get("CHAINSEER_SKILL_DIR", "").strip()
+    skill_dir = Path(configured).expanduser() if configured else None
+    version = None
+    if skill_dir is not None:
+        try:
+            version = (skill_dir / "VERSION").read_text(
+                encoding="utf-8"
+            ).strip()
+        except OSError:
+            version = None
+    expected = os.environ.get(
+        "CHAINSEER_CYPHER_TEMPRE_VERSION", ""
+    ).strip() or None
+    commit = os.environ.get(
+        "CHAINSEER_CYPHER_TEMPRE_COMMIT", ""
+    ).strip() or None
+    attested = bool(version and expected and version == expected)
+    return {
+        "status": "verified" if attested else "unattested",
+        "version": version,
+        "expected_version": expected,
+        "commit": commit,
+    }
 
 
 def _server_port() -> int:
@@ -814,6 +845,7 @@ class AnalysisService:
         )
         self._lock = threading.RLock()
         self._worker: threading.Thread | None = None
+        self._watcher_worker: threading.Thread | None = None
         self._maintenance_worker: threading.Thread | None = None
         self._maintenance_work: queue.Queue[MaintenanceTask | None] = (
             queue.Queue(maxsize=max(4, settings.queue_size * 2))
@@ -844,9 +876,11 @@ class AnalysisService:
                 "solana": None,
             },
             "last_error": None,
+            "last_deferred": None,
         }
         self._benchmark = BenchmarkCaptureRecorder(settings)
         self._base_analysis_idempotency_keys: set[str] | None = None
+        self._cypher_tempre_runtime = _cypher_tempre_runtime_status()
         self._last_memory_rss_mb: float | None = None
         self._memory_warning_active = False
 
@@ -854,6 +888,13 @@ class AnalysisService:
         if self._worker and self._worker.is_alive():
             return
         self._stopping.clear()
+        if (
+            self.settings.environment == "production"
+            and self._cypher_tempre_runtime.get("status") != "verified"
+        ):
+            raise RuntimeError(
+                "Cypher Tempre production runtime is not version-attested"
+            )
         if self._agent is None:
             self._agent = Chainseer(
                 rpc_url=self.settings.rpc_url,
@@ -918,8 +959,19 @@ class AnalysisService:
             name="chainseer-maintenance-worker",
             daemon=True,
         )
+        self._watcher_worker = (
+            threading.Thread(
+                target=self._run_watchers,
+                name="chainseer-watcher-worker",
+                daemon=True,
+            )
+            if self.settings.watcher_enabled
+            else None
+        )
         self._worker.start()
         self._maintenance_worker.start()
+        if self._watcher_worker is not None:
+            self._watcher_worker.start()
         self._integrity_status = {
             "status": "verified",
             "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
@@ -947,11 +999,19 @@ class AnalysisService:
             self._maintenance_worker.join(
                 timeout=self.settings.shutdown_grace_seconds
             )
+        if self._watcher_worker:
+            self._watcher_worker.join(
+                timeout=self.settings.shutdown_grace_seconds
+            )
         return not bool(
             (self._worker and self._worker.is_alive())
             or (
                 self._maintenance_worker
                 and self._maintenance_worker.is_alive()
+            )
+            or (
+                self._watcher_worker
+                and self._watcher_worker.is_alive()
             )
         )
 
@@ -963,6 +1023,13 @@ class AnalysisService:
             and self._worker.is_alive()
             and self._maintenance_worker
             and self._maintenance_worker.is_alive()
+            and (
+                not self.settings.watcher_enabled
+                or bool(
+                    self._watcher_worker
+                    and self._watcher_worker.is_alive()
+                )
+            )
             and self._integrity_status.get("status") != "failed"
             and not self._stopping.is_set()
         )
@@ -1123,6 +1190,12 @@ class AnalysisService:
         """Backfill/forward-sync base_launch_analysis rings sealed elsewhere
         (locally-run chainseer_base.py) onto this process's Timechain.
 
+        The imported observation time is retained inside the payload. The new
+        ring keeps its real append time: backdating a ledger ring makes chain
+        chronology describe the source event rather than the import that
+        actually happened, and previously required a private Timechain patch
+        that made production differ from CI.
+
         Runs under self._timechain_lock so the idempotency-key scan and the
         seal it guards stay atomic against any other seal this process makes
         concurrently; Timechain.seal()'s own file lock already keeps the
@@ -1159,17 +1232,15 @@ class AnalysisService:
                     }
                 seen_keys = self._base_analysis_idempotency_keys
                 for item in items:
-                    payload = item["payload"]
+                    payload = dict(item["payload"])
+                    payload.setdefault("timestamp", item["timestamp"])
+                    payload.setdefault("source_timestamp", item["timestamp"])
                     key = payload.get("idempotency_key")
                     if key and key in seen_keys:
                         results.append({"status": "duplicate", "idempotency_key": key})
                         continue
                     try:
-                        ring = tc.seal(
-                            "base_launch_analysis",
-                            payload,
-                            timestamp=item["timestamp"],
-                        )
+                        ring = tc.seal("base_launch_analysis", payload)
                     except Exception as exc:  # noqa: BLE001 - report per-item, never abort the batch
                         results.append({"status": "error", "detail": str(exc)})
                         continue
@@ -1188,8 +1259,10 @@ class AnalysisService:
         watcher_status = self._watcher_status
         return {
             "watcher_last_error": watcher_status.get("last_error"),
+            "watcher_last_deferred": watcher_status.get("last_deferred"),
             "benchmark_capture": self._benchmark.health_status(),
             "timechain_integrity": dict(self._integrity_status),
+            "cypher_tempre_runtime": dict(self._cypher_tempre_runtime),
             "maintenance_queue_depth": self._maintenance_work.qsize(),
             "faculty_pack": (
                 dict(getattr(self._agent, "faculty_pack_status", {}) or {})
@@ -1294,37 +1367,82 @@ class AnalysisService:
     def _run_watcher_cycle(self) -> None:
         if not self.settings.watcher_enabled:
             return
+        previous = self._watcher_status.get("last_cycle") or {}
         summaries: dict[str, Any] = {
-            "robinhood": None,
-            "base": None,
-            "solana": None,
+            network: previous.get(network)
+            for network in ("robinhood", "base", "solana")
         }
         errors: dict[str, Any] = {}
-        with self._timechain_lock, self._watch_lock:
-            for network, watcher in (
-                ("robinhood", self._watcher),
-                ("base", self._base_watcher),
-                ("solana", self._solana_watcher),
-            ):
-                if watcher is None:
-                    errors[network] = {
-                        "at": datetime.now(timezone.utc).isoformat(),
-                        "message": f"{network} watcher is not initialized",
+        deferred: dict[str, Any] = {}
+        for network, watcher in (
+            ("robinhood", self._watcher),
+            ("base", self._base_watcher),
+            ("solana", self._solana_watcher),
+        ):
+            observed_at = datetime.now(timezone.utc).isoformat()
+            if watcher is None:
+                errors[network] = {
+                    "at": observed_at,
+                    "message": f"{network} watcher is not initialized",
+                }
+                continue
+            if self._analysis_active.is_set() or not self.work.empty():
+                deferred[network] = {
+                    "at": observed_at,
+                    "reason": "analysis_priority",
+                }
+                continue
+            acquired_timechain = self._timechain_lock.acquire(blocking=False)
+            if not acquired_timechain:
+                deferred[network] = {
+                    "at": observed_at,
+                    "reason": "timechain_busy",
+                }
+                continue
+            acquired_watch = False
+            try:
+                # One network at a time: the analysis lane can claim the
+                # Timechain between networks rather than waiting behind the
+                # old all-chain critical section.
+                acquired_watch = self._watch_lock.acquire(blocking=False)
+                if not acquired_watch:
+                    deferred[network] = {
+                        "at": observed_at,
+                        "reason": "watch_state_busy",
                     }
                     continue
+                method = watcher.run_once
+                kwargs: dict[str, Any] = {}
                 try:
-                    summaries[network] = watcher.run_once()
-                except Exception as exc:
-                    LOGGER.exception("%s watcher cycle failed", network)
-                    errors[network] = {
-                        "at": datetime.now(timezone.utc).isoformat(),
-                        "message": credential_safe_error(exc),
-                    }
+                    if "should_yield" in inspect.signature(method).parameters:
+                        kwargs["should_yield"] = lambda: (
+                            self._analysis_active.is_set()
+                            or not self.work.empty()
+                        )
+                except (TypeError, ValueError):
+                    pass
+                summaries[network] = method(**kwargs)
+            except Exception as exc:
+                LOGGER.exception("%s watcher cycle failed", network)
+                errors[network] = {
+                    "at": observed_at,
+                    "message": credential_safe_error(exc),
+                }
+            finally:
+                if acquired_watch:
+                    self._watch_lock.release()
+                self._timechain_lock.release()
         self._watcher_status = {
             "enabled": True,
             "last_cycle": summaries,
             "last_error": errors or None,
+            "last_deferred": deferred or None,
         }
+
+    def _run_watchers(self) -> None:
+        interval = max(0.1, float(self.settings.watcher_interval_seconds))
+        while not self._stopping.wait(interval):
+            self._run_watcher_cycle()
 
     def _prune(self, now: float) -> None:
         cutoff = now - self.settings.result_ttl_seconds
@@ -1542,22 +1660,8 @@ class AnalysisService:
                 )
 
     def _run(self) -> None:
-        next_watch = (
-            time.monotonic() + self.settings.watcher_interval_seconds
-        )
         while not self._stopping.is_set():
-            timeout = None
-            if self.settings.watcher_enabled:
-                timeout = max(0.1, next_watch - time.monotonic())
-            try:
-                job_id = self.work.get(timeout=timeout)
-            except queue.Empty:
-                self._run_watcher_cycle()
-                next_watch = (
-                    time.monotonic()
-                    + self.settings.watcher_interval_seconds
-                )
-                continue
+            job_id = self.work.get()
             if job_id is None:
                 return
             with self._lock:
@@ -1718,15 +1822,6 @@ class AnalysisService:
                         None,
                     )
                 self.work.task_done()
-            if (
-                self.settings.watcher_enabled
-                and time.monotonic() >= next_watch
-            ):
-                self._run_watcher_cycle()
-                next_watch = (
-                    time.monotonic()
-                    + self.settings.watcher_interval_seconds
-                )
 
 
 class QueueFullError(Exception):

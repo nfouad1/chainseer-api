@@ -2078,7 +2078,10 @@ class ChainseerWatcher:
             "decision": verdict.get("decision"),
         }
 
-    def run_once(self) -> dict[str, Any]:
+    def run_once(
+        self,
+        should_yield: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         now = self.clock()
         state = self.store.load()
         if not state["subscriptions"]:
@@ -2105,8 +2108,15 @@ class ChainseerWatcher:
             "alerts": 0,
             "outcomes": 0,
             "errors": [],
+            "deferred_subscriptions": 0,
         }
-        for key, subscription in state["subscriptions"].items():
+        subscriptions = list(state["subscriptions"].items())
+        for index, (key, subscription) in enumerate(subscriptions):
+            if should_yield is not None and should_yield():
+                summary["deferred_subscriptions"] = (
+                    len(subscriptions) - index
+                )
+                break
             token = subscription["token_address"]
             try:
                 last = subscription.get("last_processed_block")
@@ -2768,7 +2778,10 @@ class SolanaEventWatcher:
             "decision": verdict.get("decision"),
         }
 
-    def run_once(self) -> dict[str, Any]:
+    def run_once(
+        self,
+        should_yield: Callable[[], bool] | None = None,
+    ) -> dict[str, Any]:
         now = self.clock()
         state = self.store.load()
         if not state["subscriptions"]:
@@ -2793,8 +2806,15 @@ class SolanaEventWatcher:
             "alerts": 0,
             "infrastructure_indeterminate": [],
             "errors": [],
+            "deferred_subscriptions": 0,
         }
-        for mint, subscription in state["subscriptions"].items():
+        subscriptions = list(state["subscriptions"].items())
+        for index, (mint, subscription) in enumerate(subscriptions):
+            if should_yield is not None and should_yield():
+                summary["deferred_subscriptions"] = (
+                    len(subscriptions) - index
+                )
+                break
             try:
                 last_slot = subscription.get("last_observed_slot")
                 if last_slot is not None and int(last_slot) >= head_slot:
