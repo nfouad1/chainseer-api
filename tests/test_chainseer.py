@@ -600,7 +600,22 @@ class ChainseerInfrastructureTests(unittest.TestCase):
                 },
             }
 
-            agent._seal_report(report)
+            with (
+                patch.object(
+                    agent.cognitive_loop.recall,
+                    "retrieve",
+                    wraps=agent.cognitive_loop.recall.retrieve,
+                ) as retrieve,
+                patch.object(
+                    agent.poq_module,
+                    "gate_and_seal",
+                    wraps=agent.poq_module.gate_and_seal,
+                ) as gate_and_seal,
+            ):
+                agent._seal_report(report)
+
+            self.assertFalse(retrieve.call_args.kwargs["use_index"])
+            self.assertFalse(gate_and_seal.call_args.kwargs["use_index"])
 
             rings = agent.tc.load()
             ring = next(r for r in rings if r["ring_type"] == "token_analysis")

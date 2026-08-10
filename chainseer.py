@@ -988,7 +988,13 @@ class ChainseerCognitiveLoop:
             budget_tokens=650,
             max_blocks=5,
             neighbors=0,
-            use_index=True,
+            # Online analyses must have bounded latency.  Updating the
+            # Hippocampus here can synchronously index every ring added since
+            # its last checkpoint; large evidence-rich chains made an API
+            # request sit at 90% for minutes.  Bounded recent-ring recall keeps
+            # the cognitive check O(window), while the report's explicit
+            # provenance remains the authority for the token decision.
+            use_index=False,
         )
         labels = recalled.get("query_labels") or self.recall.label(cognitive_input)
         computed = labels.get("computed") or {}
@@ -4697,7 +4703,11 @@ class Chainseer:
                 "depth": poq.get("depth", 0),
                 "covenant": poq.get("covenant", 0),
             },
-            use_index=True,
+            # The seal already supplies the complete analysis, provenance,
+            # claim evidence, and entity graph as evidence_texts.  Rebuilding
+            # the global relevance index cannot strengthen that grounding and
+            # would put unbounded maintenance work on the request path.
+            use_index=False,
             frame="assertion",
             evidence_texts=[
                 json.dumps(report.get("analysis", {}), sort_keys=True, default=str),
