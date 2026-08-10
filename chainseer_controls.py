@@ -19,6 +19,7 @@ import socket
 import threading
 import time
 from collections import deque
+from contextlib import nullcontext
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
@@ -1919,6 +1920,7 @@ class ChainseerWatcher:
         config: WatchConfig | None = None,
         clock: Callable[[], float] = time.time,
         network: str | None = None,
+        observer_rpc: Any | None = None,
     ):
         self.agent = agent
         self.network = network or getattr(
@@ -1928,39 +1930,43 @@ class ChainseerWatcher:
             raise ValueError("unsupported EVM watcher network")
         self.config = config or WatchConfig()
         self.clock = clock
+        # Watcher preflight must never touch the analyzer's request-bound RPC
+        # context.  A separate client also lets slow log/snapshot reads run
+        # without owning the Timechain writer lane.
+        self.observer_rpc = observer_rpc or agent.rpc
         root = Path(control_root or agent.chain_root) / "controls"
         self.store = WatchStore(root, self.network)
         self.outcomes = OutcomeCollector()
         self.calibration = CalibrationEngine(root)
 
     def _unbind(self) -> None:
-        if hasattr(self.agent.rpc, "unbind_context"):
-            self.agent.rpc.unbind_context()
+        if hasattr(self.observer_rpc, "unbind_context"):
+            self.observer_rpc.unbind_context()
         else:
-            self.agent.rpc.context = None
-            self.agent.rpc.ledger = None
+            self.observer_rpc.context = None
+            self.observer_rpc.ledger = None
 
     def _block(self, number: int) -> dict[str, Any]:
         self._unbind()
-        return self.agent.rpc.get_block(number)
+        return self.observer_rpc.get_block(number)
 
     def _quick_snapshot(
         self, token: str, block: int, pair: str | None
     ) -> dict[str, Any]:
         self._unbind()
-        code = self.agent.rpc.get_code(token, block=block) or "0x"
+        code = self.observer_rpc.get_code(token, block=block) or "0x"
         try:
-            owner = self.agent.rpc.erc20_owner(token, block=block)
+            owner = self.observer_rpc.erc20_owner(token, block=block)
         except Exception:
             owner = None
         try:
-            total_supply = self.agent.rpc.erc20_total_supply(token, block=block)
+            total_supply = self.observer_rpc.erc20_total_supply(token, block=block)
         except Exception:
             total_supply = None
         pair_code_hash = None
         if pair and ADDRESS_RE.fullmatch(pair):
             try:
-                pair_code = self.agent.rpc.get_code(pair, block=block) or "0x"
+                pair_code = self.observer_rpc.get_code(pair, block=block) or "0x"
                 pair_code_hash = hashlib.sha256(
                     pair_code.encode("utf-8")
                 ).hexdigest()
@@ -1985,7 +1991,7 @@ class ChainseerWatcher:
         to_block: int,
     ) -> dict[str, Any]:
         self._unbind()
-        token_logs = self.agent.rpc.get_logs(
+        token_logs = self.observer_rpc.get_logs(
             from_block,
             to_block,
             address=token,
@@ -2018,7 +2024,7 @@ class ChainseerWatcher:
         ]
         lp_burns = []
         if pair and ADDRESS_RE.fullmatch(pair):
-            lp_burns = self.agent.rpc.get_logs(
+            lp_burns = self.observer_rpc.get_logs(
                 from_block,
                 to_block,
                 address=pair,
@@ -2095,6 +2101,7 @@ class ChainseerWatcher:
         should_yield: Callable[[], bool] | None = None,
         *,
         include_calibration: bool = True,
+        timechain_lane: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         now = self.clock()
         state = self.store.load()
@@ -2115,7 +2122,7 @@ class ChainseerWatcher:
                 ),
             }
         self._unbind()
-        head = self.agent.rpc.get_block_number()
+        head = self.observer_rpc.get_block_number()
         safe_block = max(0, head - self.config.confirmations)
         summary = {
             "head": head,
@@ -2156,7 +2163,12 @@ class ChainseerWatcher:
                             "block": int(last),
                             "observed_at": utc_now_iso(now),
                         }
-                        alert["timechain"] = self._seal_transition(alert)
+                        with (
+                            timechain_lane()
+                            if timechain_lane is not None
+                            else nullcontext()
+                        ):
+                            alert["timechain"] = self._seal_transition(alert)
                         self.store.append_alert(alert)
                         summary["alerts"] += 1
                         subscription["last_processed_block"] = max(
@@ -2243,9 +2255,16 @@ class ChainseerWatcher:
                     except (TypeError, ValueError):
                         pass
                     try:
-                        report = self.agent.analyze_token(
-                            token, **analyze_kwargs
-                        )
+                        with (
+                            timechain_lane()
+                            if timechain_lane is not None
+                            else nullcontext()
+                        ):
+                            if should_yield is not None and should_yield():
+                                raise WatcherPreempted
+                            report = self.agent.analyze_token(
+                                token, **analyze_kwargs
+                            )
                     except WatcherPreempted:
                         summary["deferred_subscriptions"] = (
                             len(subscriptions) - index
@@ -2260,13 +2279,18 @@ class ChainseerWatcher:
                             token, safe_block, current_pair
                         )
                     drift = _diff_views(latest or None, current)
-                    emitted = self.outcomes.collect(
-                        self.agent,
-                        subscription,
-                        report,
-                        now=now,
-                        horizons=self.config.outcome_horizons_seconds,
-                    )
+                    with (
+                        timechain_lane()
+                        if timechain_lane is not None
+                        else nullcontext()
+                    ):
+                        emitted = self.outcomes.collect(
+                            self.agent,
+                            subscription,
+                            report,
+                            now=now,
+                            horizons=self.config.outcome_horizons_seconds,
+                        )
                     summary["outcomes"] += len(emitted)
                     summary["rescans"] += 1
                     subscription["latest_analysis"] = current
@@ -2328,7 +2352,12 @@ class ChainseerWatcher:
                             "analysis_ring_hash": report.get("analysis_ring_hash"),
                         }
                         alert["alert_hash"] = canonical_hash(alert)
-                        alert["timechain"] = self._seal_transition(alert)
+                        with (
+                            timechain_lane()
+                            if timechain_lane is not None
+                            else nullcontext()
+                        ):
+                            alert["timechain"] = self._seal_transition(alert)
                         self.store.append_alert(alert)
                         summary["alerts"] += 1
 

@@ -540,6 +540,40 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             self.assertEqual(result["deferred_subscriptions"], 1)
             self.assertEqual(agent.scan_count, 0)
 
+    def test_evm_watcher_preflight_uses_isolated_rpc_without_timechain_lane(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = FakeAgent()
+            agent.chain_root = temp_dir
+            agent.rpc.context = "active-user-scan"
+            agent.rpc.ledger = "active-user-ledger"
+            observer = FakeRPC()
+            observer.head = 777
+            watcher = controls.ChainseerWatcher(
+                agent,
+                control_root=temp_dir,
+                observer_rpc=observer,
+            )
+            watcher.store.subscribe(TOKEN)
+            lane_entries = []
+
+            class Lane:
+                def __enter__(self):
+                    lane_entries.append("entered")
+
+                def __exit__(self, *_args):
+                    return False
+
+            result = watcher.run_once(
+                should_yield=lambda: True,
+                include_calibration=False,
+                timechain_lane=Lane,
+            )
+
+            self.assertEqual(result["head"], 777)
+            self.assertEqual(lane_entries, [])
+            self.assertEqual(agent.rpc.context, "active-user-scan")
+            self.assertEqual(agent.rpc.ledger, "active-user-ledger")
+
     def test_evm_watcher_preempts_full_rescan_at_progress_boundary(self):
         class PreemptibleAgent(FakeAgent):
             def analyze_token(
@@ -576,7 +610,10 @@ class WatcherAndOutcomeTests(unittest.TestCase):
                 control_root=temp_dir,
             )
             watcher.store.subscribe(TOKEN)
-            checks = iter((False, False, False, True))
+            # The scoped Timechain lane adds a final priority check after the
+            # watcher enters its mutation section. Let analysis begin, then
+            # preempt at the first analyzer progress boundary.
+            checks = iter((False, False, False, False, True))
             result = watcher.run_once(
                 should_yield=lambda: next(checks, True),
                 include_calibration=False,

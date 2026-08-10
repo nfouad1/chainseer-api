@@ -41,7 +41,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
 from starlette.responses import JSONResponse
 
-from chainseer import Chainseer
+from chainseer import Chainseer, RobinhoodRPC
 from chainseer_base_public import BasePublicAnalyzer
 from chainseer_benchmark import (
     append_observation,
@@ -924,6 +924,7 @@ class AnalysisService:
         if self._watcher is None:
             self._watcher = ChainseerWatcher(
                 self._agent,
+                observer_rpc=RobinhoodRPC(self.settings.rpc_url),
                 control_root=self.settings.chain_root,
                 config=WatchConfig(
                     poll_seconds=self.settings.watcher_interval_seconds,
@@ -942,6 +943,7 @@ class AnalysisService:
         if self._base_watcher is None and self._base_agent is not None:
             self._base_watcher = ChainseerWatcher(
                 self._base_agent,
+                observer_rpc=RobinhoodRPC(self.settings.base_rpc_url),
                 control_root=self.settings.chain_root,
                 config=WatchConfig(
                     poll_seconds=self.settings.watcher_interval_seconds,
@@ -1392,18 +1394,26 @@ class AnalysisService:
                     "reason": "analysis_priority",
                 }
                 continue
-            acquired_timechain = self._timechain_lock.acquire(blocking=False)
-            if not acquired_timechain:
-                deferred[network] = {
-                    "at": observed_at,
-                    "reason": "timechain_busy",
-                }
-                continue
+            method = watcher.run_once
+            try:
+                supports_scoped_lane = (
+                    "timechain_lane" in inspect.signature(method).parameters
+                )
+            except (TypeError, ValueError):
+                supports_scoped_lane = False
+            acquired_timechain = False
+            if not supports_scoped_lane:
+                acquired_timechain = self._timechain_lock.acquire(
+                    blocking=False
+                )
+                if not acquired_timechain:
+                    deferred[network] = {
+                        "at": observed_at,
+                        "reason": "timechain_busy",
+                    }
+                    continue
             acquired_watch = False
             try:
-                # One network at a time: the analysis lane can claim the
-                # Timechain between networks rather than waiting behind the
-                # old all-chain critical section.
                 acquired_watch = self._watch_lock.acquire(blocking=False)
                 if not acquired_watch:
                     deferred[network] = {
@@ -1411,7 +1421,6 @@ class AnalysisService:
                         "reason": "watch_state_busy",
                     }
                     continue
-                method = watcher.run_once
                 kwargs: dict[str, Any] = {}
                 try:
                     if "should_yield" in inspect.signature(method).parameters:
@@ -1428,6 +1437,16 @@ class AnalysisService:
                         # explicit calibration workflow; a watcher sweep must
                         # never do it while holding the user-analysis lane.
                         kwargs["include_calibration"] = False
+                    if (
+                        "timechain_lane"
+                        in inspect.signature(method).parameters
+                    ):
+                        # Read-only watcher RPC preflight runs outside this
+                        # lane. Only analyzer/sealing mutations serialize with
+                        # user work, and those sections cooperatively yield.
+                        kwargs["timechain_lane"] = (
+                            lambda: self._timechain_lock
+                        )
                 except (TypeError, ValueError):
                     pass
                 summaries[network] = method(**kwargs)
@@ -1440,7 +1459,8 @@ class AnalysisService:
             finally:
                 if acquired_watch:
                     self._watch_lock.release()
-                self._timechain_lock.release()
+                if acquired_timechain:
+                    self._timechain_lock.release()
         self._watcher_status = {
             "enabled": True,
             "last_cycle": summaries,
