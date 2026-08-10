@@ -2413,8 +2413,10 @@ class SolanaEventWatcher:
         control_root: str | Path,
         config: SolanaWatchConfig | None = None,
         clock: Callable[[], float] = time.time,
+        observer_analyzer: Any | None = None,
     ):
         self.analyzer = analyzer
+        self.observer_analyzer = observer_analyzer or analyzer
         self.timechain_agent = (
             timechain_agent
             if timechain_agent is not None
@@ -2460,7 +2462,7 @@ class SolanaEventWatcher:
     ]:
         infrastructure_indeterminate: list[dict[str, str]] = []
         account_result = (
-            self.analyzer.rpc.get_account_info(mint, encoding="jsonParsed")
+            self.observer_analyzer.rpc.get_account_info(mint, encoding="jsonParsed")
             or {}
         )
         account_value = account_result.get("value")
@@ -2471,7 +2473,7 @@ class SolanaEventWatcher:
         if parsed.get("type") != "mint":
             raise RuntimeError("watched Solana address is no longer a mint")
 
-        supply_result = self.analyzer.rpc.get_token_supply(mint) or {}
+        supply_result = self.observer_analyzer.rpc.get_token_supply(mint) or {}
         supply_value = supply_result.get("value") or {}
         supply_raw = _safe_int(
             supply_value.get("amount"),
@@ -2480,7 +2482,7 @@ class SolanaEventWatcher:
         previous = previous or {}
         try:
             largest_result = (
-                self.analyzer.rpc.get_token_largest_accounts(mint) or {}
+                self.observer_analyzer.rpc.get_token_largest_accounts(mint) or {}
             )
             largest = largest_result.get("value") or []
             normalized_accounts = [
@@ -2528,8 +2530,8 @@ class SolanaEventWatcher:
             holder_slot = previous.get("holder_slot")
 
         try:
-            pairs = self.analyzer.dexscreener.token_pairs(mint)
-            pair = self.analyzer._market_pair(mint, pairs)
+            pairs = self.observer_analyzer.dexscreener.token_pairs(mint)
+            pair = self.observer_analyzer._market_pair(mint, pairs)
             base = (pair or {}).get("baseToken") or {}
             market = {
                 "pair_address": (pair or {}).get("pairAddress"),
@@ -2560,7 +2562,7 @@ class SolanaEventWatcher:
             market = dict(previous.get("market") or {})
         extensions = sorted(
             str(value)
-            for value in self.analyzer._extension_names(info)
+            for value in self.observer_analyzer._extension_names(info)
         )
         snapshot = {
             "observed_slot": observed_slot,
@@ -2601,7 +2603,7 @@ class SolanaEventWatcher:
         snapshot["fingerprint"] = canonical_hash(fingerprint_payload)
 
         try:
-            signatures = self.analyzer.rpc.get_signatures_for_address(
+            signatures = self.observer_analyzer.rpc.get_signatures_for_address(
                 mint,
                 limit=self.config.signature_limit,
             )
@@ -2864,6 +2866,8 @@ class SolanaEventWatcher:
     def run_once(
         self,
         should_yield: Callable[[], bool] | None = None,
+        *,
+        timechain_lane: Callable[[], Any] | None = None,
     ) -> dict[str, Any]:
         now = self.clock()
         state = self.store.load()
@@ -2879,7 +2883,7 @@ class SolanaEventWatcher:
                 "errors": [],
             }
 
-        head_slot = self.analyzer.rpc.get_slot()
+        head_slot = self.observer_analyzer.rpc.get_slot()
         summary = {
             "head_slot": head_slot,
             "subscriptions": len(state["subscriptions"]),
@@ -3001,9 +3005,16 @@ class SolanaEventWatcher:
                     except (TypeError, ValueError):
                         pass
                     try:
-                        report = self.analyzer.analyze_token(
-                            mint, **analyze_kwargs
-                        )
+                        with (
+                            timechain_lane()
+                            if timechain_lane is not None
+                            else nullcontext()
+                        ):
+                            if should_yield is not None and should_yield():
+                                raise WatcherPreempted
+                            report = self.analyzer.analyze_token(
+                                mint, **analyze_kwargs
+                            )
                     except WatcherPreempted:
                         summary["deferred_subscriptions"] = (
                             len(subscriptions) - index
@@ -3066,7 +3077,12 @@ class SolanaEventWatcher:
                             ),
                         }
                         alert["alert_hash"] = canonical_hash(alert)
-                        alert["timechain"] = self._seal_transition(alert)
+                        with (
+                            timechain_lane()
+                            if timechain_lane is not None
+                            else nullcontext()
+                        ):
+                            alert["timechain"] = self._seal_transition(alert)
                         self.store.append_alert(alert)
                         summary["alerts"] += 1
                     pending = []
