@@ -1419,6 +1419,15 @@ class AnalysisService:
                             self._analysis_active.is_set()
                             or not self.work.empty()
                         )
+                    if (
+                        "include_calibration"
+                        in inspect.signature(method).parameters
+                    ):
+                        # Calibration scans the complete Timechain and is not
+                        # latency-sensitive.  It stays available through the
+                        # explicit calibration workflow; a watcher sweep must
+                        # never do it while holding the user-analysis lane.
+                        kwargs["include_calibration"] = False
                 except (TypeError, ValueError):
                     pass
                 summaries[network] = method(**kwargs)

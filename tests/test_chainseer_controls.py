@@ -540,6 +540,41 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             self.assertEqual(result["deferred_subscriptions"], 1)
             self.assertEqual(agent.scan_count, 0)
 
+    def test_evm_watcher_preempts_full_rescan_at_progress_boundary(self):
+        class PreemptibleAgent(FakeAgent):
+            def analyze_token(
+                self,
+                token,
+                full_report=False,
+                block_pin=None,
+                progress_callback=None,
+            ):
+                self.scan_count += 1
+                progress_callback("collecting", 15, "collecting")
+                self.reached_expensive_phase = True
+                progress_callback("sealing_timechain", 90, "sealing")
+                raise AssertionError(
+                    "watcher should have preempted before sealing"
+                )
+
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent = PreemptibleAgent()
+            agent.chain_root = temp_dir
+            watcher = controls.ChainseerWatcher(
+                agent,
+                control_root=temp_dir,
+            )
+            watcher.store.subscribe(TOKEN)
+            checks = iter((False, False, False, True))
+            result = watcher.run_once(
+                should_yield=lambda: next(checks, True),
+                include_calibration=False,
+            )
+            self.assertEqual(result["rescans"], 0)
+            self.assertEqual(result["deferred_subscriptions"], 1)
+            self.assertEqual(result["calibration"], {"status": "deferred"})
+            self.assertTrue(agent.reached_expensive_phase)
+
     def test_watcher_seals_reorg_alert(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             agent = FakeAgent()

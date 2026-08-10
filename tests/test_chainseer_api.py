@@ -892,6 +892,33 @@ class ServiceTests(unittest.TestCase):
             "analysis_priority",
         )
 
+    def test_api_watcher_cycle_disables_inline_calibration(self):
+        class CalibrationAwareWatcher:
+            def __init__(self):
+                self.include_calibration = None
+
+            def run_once(
+                self, should_yield=None, *, include_calibration=True
+            ):
+                self.include_calibration = include_calibration
+                return {"calibration": {"status": "deferred"}}
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(
+                self.settings(root, watcher_enabled=True)
+            )
+            watchers = [CalibrationAwareWatcher() for _ in range(3)]
+            (
+                service._watcher,
+                service._base_watcher,
+                service._solana_watcher,
+            ) = watchers
+            service._run_watcher_cycle()
+        self.assertEqual(
+            [watcher.include_calibration for watcher in watchers],
+            [False, False, False],
+        )
+
     def test_watcher_scheduler_uses_a_dedicated_thread(self):
         class IdleWatcher:
             def run_once(self, should_yield=None):
