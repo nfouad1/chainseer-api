@@ -550,9 +550,20 @@ class WatcherAndOutcomeTests(unittest.TestCase):
                 progress_callback=None,
             ):
                 self.scan_count += 1
-                progress_callback("collecting", 15, "collecting")
+                # Production Chainseer suppresses ordinary exceptions from
+                # progress callbacks.  Model that contract here so this test
+                # fails if watcher cancellation ever inherits Exception again.
+                try:
+                    progress_callback("collecting", 15, "collecting")
+                except Exception:
+                    pass
                 self.reached_expensive_phase = True
-                progress_callback("sealing_timechain", 90, "sealing")
+                try:
+                    progress_callback(
+                        "sealing_timechain", 90, "sealing"
+                    )
+                except Exception:
+                    pass
                 raise AssertionError(
                     "watcher should have preempted before sealing"
                 )
