@@ -3628,6 +3628,7 @@ async def ready() -> dict[str, Any]:
         "timechain_integrity": health["timechain_integrity"],
         "cypher_tempre_runtime": health["cypher_tempre_runtime"],
         "maintenance_queue_depth": health["maintenance_queue_depth"],
+        "maintenance_telemetry": health["maintenance_telemetry"],
         "faculty_pack": health["faculty_pack"],
         "memory": health["memory"],
     }

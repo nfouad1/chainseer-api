@@ -632,6 +632,10 @@ class TrustedHostCheckTests(unittest.TestCase):
                 "commit": "abc123",
             },
             "maintenance_queue_depth": 0,
+            "maintenance_telemetry": {
+                "full_audit_deferred_analysis": 2,
+                "full_audit_deferred_memory": 1,
+            },
             "faculty_pack": {"status": "verified"},
             "memory": {"warning": False},
         }
@@ -646,6 +650,10 @@ class TrustedHostCheckTests(unittest.TestCase):
         self.assertEqual(
             response.json()["cypher_tempre_runtime"],
             health["cypher_tempre_runtime"],
+        )
+        self.assertEqual(
+            response.json()["maintenance_telemetry"],
+            health["maintenance_telemetry"],
         )
 
     def test_other_routes_still_reject_untrusted_host_header(self):
