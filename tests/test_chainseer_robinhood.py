@@ -95,29 +95,36 @@ class FakeV4RPC(FakeRPC):
 
 class RobinhoodLearningTests(unittest.TestCase):
     def test_observer_retries_transient_rpc_without_skipping_cursor_window(self):
+        live_scan_active = threading.Event()
+        throttle_observed = threading.Event()
+
         class ContendedRPC(FakeRPC):
             def __init__(self):
                 super().__init__(latest=100)
-                self.failures = 2
+                self.failures = 0
 
             def get_logs(self, *args, **kwargs):
-                if self.failures:
-                    self.failures -= 1
+                if live_scan_active.is_set():
+                    self.failures += 1
+                    throttle_observed.set()
                     raise TimeoutError("shared RPC temporarily throttled")
                 return super().get_logs(*args, **kwargs)
 
         with tempfile.TemporaryDirectory() as directory:
             cursor = Path(directory) / "cursor.json"
             rpc = ContendedRPC()
-            live_scan_released = threading.Event()
-
             def simulated_live_scan():
-                live_scan_released.set()
+                live_scan_active.set()
+                throttle_observed.wait(1)
+                live_scan_active.clear()
 
             scan = threading.Thread(target=simulated_live_scan)
             scan.start()
-            self.assertTrue(live_scan_released.wait(1))
-            with patch.object(rh.time, "sleep", return_value=None), patch.object(
+            self.assertTrue(live_scan_active.wait(1))
+            real_sleep = time.sleep
+            with patch.object(
+                rh.time, "sleep", side_effect=lambda _seconds: real_sleep(0.01)
+            ), patch.object(
                 rh.random, "uniform", return_value=0.0
             ):
                 rows, coverage = rh.RobinhoodPairObserver(rpc, cursor).sync(
@@ -127,7 +134,8 @@ class RobinhoodLearningTests(unittest.TestCase):
             self.assertEqual(rows, [])
             self.assertEqual(coverage["from_block"], 95)
             self.assertEqual(json.loads(cursor.read_text())["next_block"], 100)
-            self.assertEqual(rpc.failures, 0)
+            self.assertGreaterEqual(rpc.failures, 1)
+            self.assertFalse(live_scan_active.is_set())
 
     def test_observer_does_not_advance_cursor_after_exhausted_rpc_retries(self):
         class BrokenRPC(FakeRPC):
