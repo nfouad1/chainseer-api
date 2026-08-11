@@ -2095,6 +2095,10 @@ class ChainseerWatcher:
                 "covenant": 250,
             },
             declared_evidence=1,
+            # The alert already carries the complete confirmed transition as
+            # declared evidence. A watcher seal must never rebuild or query
+            # the global relevance index while holding the writer lane.
+            use_index=False,
             extra_payload=alert,
         )
         if ring is None:
@@ -2884,6 +2888,9 @@ class SolanaEventWatcher:
                 "covenant": 252,
             },
             declared_evidence=max(1, len(alert.get("events") or [])),
+            # Confirmed event evidence is self-contained; global recall is
+            # unbounded maintenance and cannot run inside the watcher lane.
+            use_index=False,
             extra_payload=alert,
         )
         if ring is None:

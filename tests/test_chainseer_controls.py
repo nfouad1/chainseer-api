@@ -29,7 +29,11 @@ class FakeTimechain:
 
 
 class FakePoQ:
+    def __init__(self):
+        self.calls = []
+
     def gate_and_seal(self, tc, _candidate, **kwargs):
+        self.calls.append(kwargs)
         ring = {
             "index": len(tc.rings),
             "ring_hash": f"ring-{len(tc.rings)}",
@@ -643,6 +647,7 @@ class WatcherAndOutcomeTests(unittest.TestCase):
                 "authority",
             )
             self.assertIsNotNone(alert["timechain"]["ring"])
+            self.assertFalse(agent.poq_module.calls[-1]["use_index"])
 
     def test_evm_watcher_yields_before_subscription_work(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -856,6 +861,9 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             self.assertEqual(
                 timechain_agent.tc.rings[-1]["ring_type"],
                 "solana_watch_transition",
+            )
+            self.assertFalse(
+                timechain_agent.poq_module.calls[-1]["use_index"]
             )
 
     def test_solana_watcher_yields_before_subscription_work(self):
