@@ -857,6 +857,7 @@ class SolanaPublicAnalyzer:
                 "entity_graph_snapshot": entity_graph,
                 "cognition": cognition,
                 "live_execution_enabled": False,
+                "idempotency_key": report.pop("_idempotency_key", None),
             },
         )
         if ring is None:
@@ -887,6 +888,7 @@ class SolanaPublicAnalyzer:
         mint: str,
         *,
         progress_callback: Callable[[str, int, str], None] | None = None,
+        seal: bool = True,
     ) -> dict:
         def progress(stage: str, percent: int, detail: str) -> None:
             if progress_callback is not None:
@@ -1741,7 +1743,10 @@ class SolanaPublicAnalyzer:
         report["analysis"]["entity_insider_summary"] = (
             report["data"]["entity_graph"]["summary"]
         )
-        progress("sealing_timechain", 90, "Sealing the Timechain analysis")
-        self._seal_report(report)
-        progress("complete", 100, "Sealed analysis is ready")
+        if seal:
+            progress("sealing_timechain", 90, "Sealing the Timechain analysis")
+            self._seal_report(report)
+            progress("complete", 100, "Sealed analysis is ready")
+        else:
+            progress("complete", 90, "Observational scan complete (sealing deferred)")
         return report

@@ -2266,6 +2266,8 @@ class Chainseer:
         full_report: bool = False,
         block_pin: int | None = None,
         progress_callback: Callable[[str, int, str], None] | None = None,
+        *,
+        seal: bool = True,
     ) -> dict:
         """Full token analysis with GoPlus + DexScreener + on-chain RPC.
 
@@ -2279,6 +2281,11 @@ class Chainseer:
                          if False (default), print the investor summary
             block_pin: optional historical/current block for all RPC reads;
                        mutable HTTP evidence remains timestamped, not historical
+            seal: if True (default), run cognitive sealing (prepare, PoQ
+                  gate, finalize) and append timechain rings.  If False,
+                  return the raw analysis report without any timechain
+                  writes — suitable for observational watcher rescans where
+                  sealing is deferred to an idle-period commit.
         """
         started_monotonic = time.monotonic()
 
@@ -2525,15 +2532,24 @@ class Chainseer:
         poq_scores = self._self_evaluate(report)
         report["poq_scores"] = poq_scores
 
-        progress("sealing_timechain", 90, "Running cognition, PoQ, and Timechain sealing")
-        self._seal_report(report)
-        report["performance"] = {
-            "total_duration_seconds": round(
-                time.monotonic() - started_monotonic, 3
-            ),
-            "progress_schema_version": "1.0",
-        }
-        progress("complete", 100, "Sealed analysis is ready")
+        if seal:
+            progress("sealing_timechain", 90, "Running cognition, PoQ, and Timechain sealing")
+            self._seal_report(report)
+            report["performance"] = {
+                "total_duration_seconds": round(
+                    time.monotonic() - started_monotonic, 3
+                ),
+                "progress_schema_version": "1.0",
+            }
+            progress("complete", 100, "Sealed analysis is ready")
+        else:
+            report["performance"] = {
+                "total_duration_seconds": round(
+                    time.monotonic() - started_monotonic, 3
+                ),
+                "progress_schema_version": "1.0",
+            }
+            progress("complete", 90, "Observational scan complete (sealing deferred)")
         print()
         if full_report:
             self._print_report(report)
@@ -4759,6 +4775,7 @@ class Chainseer:
                 "entity_graph_snapshot": entity_graph,
                 "uncertain_components": report["analysis"].get("uncertain_components", {}),
                 "cognitive_loop": cognition,
+                "idempotency_key": report.pop("_idempotency_key", None),
             },
         ))
         if ring is None:

@@ -56,6 +56,7 @@ from chainseer_controls import (
     WatchConfig,
     credential_safe_error,
 )
+from chainseer_deferred import DeferredQueueItem, DurableDeferredQueue
 from chainseer_memory import MemoryCore, MemoryCoreError
 from chainseer_solana_public import (
     SolanaMintError,
@@ -106,7 +107,20 @@ def _env_bool(name: str, default: bool = False) -> bool:
         return True
     if normalized in {"0", "false", "no", "off"}:
         return False
-    raise RuntimeError(f"{name} must be a boolean")
+    raise RuntimeError(f"{name} must be a boolean (0/1/true/false)")
+
+
+def _env_float(
+    name: str, default: float, minimum: float, maximum: float
+) -> float:
+    raw = os.environ.get(name, str(default))
+    try:
+        value = float(raw)
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a number") from exc
+    if not minimum <= value <= maximum:
+        raise RuntimeError(f"{name} must be between {minimum} and {maximum}")
+    return value
 
 
 def _cypher_tempre_runtime_status() -> dict[str, Any]:
@@ -320,6 +334,14 @@ class Settings:
             900,
             60,
             86400,
+        )
+    )
+    timechain_lock_timeout_seconds: float = field(
+        default_factory=lambda: _env_float(
+            "CHAINSEER_TIMECHAIN_LOCK_TIMEOUT_SECONDS",
+            5.0,
+            1.0,
+            30.0,
         )
     )
     memory_warning_mb: int = field(
@@ -573,6 +595,7 @@ class Job:
     benchmark_capture: dict[str, Any] | None = None
     error_code: str | None = None
     error_message: str | None = None
+    lock_retry_count: int = 0
 
     def public(self) -> dict[str, Any]:
         return {
@@ -849,6 +872,33 @@ class FullAuditCursor:
     errors: list[str] = field(default_factory=list)
 
 
+@dataclass(frozen=True)
+class PreparedWatcherCommit:
+    """Immutable watcher cognition prepared without owning the writer lane."""
+
+    queue_item: DeferredQueueItem
+    payload: dict[str, Any]
+    poq_scores: dict[str, Any]
+    policy_hash: str
+    registry_hash: str
+
+
+@dataclass
+class DeferredSealJob:
+    """Deprecated compatibility envelope; production uses DurableDeferredQueue."""
+
+    network: str
+    token_address: str
+    pinned_snapshot: dict[str, Any]
+    block_or_slot: int | None
+    evidence_hash: str
+    report_hash: str
+    analyzer_version: str
+    idempotency_key: str
+    prepared_head: int
+    enqueued_at: float
+
+
 class AnalysisService:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -865,11 +915,26 @@ class AnalysisService:
         self._maintenance_work: queue.Queue[MaintenanceTask | None] = (
             queue.Queue(maxsize=max(4, settings.queue_size * 2))
         )
+        # Lock-owner tracking for timeout diagnostics.
+        self._timechain_owner: threading.Thread | None = None
+        self._timechain_owner_since: float = 0.0
+        self._timechain_owner_reason: str = ""
+        self._deferred_queue = DurableDeferredQueue(
+            Path(settings.chain_root) / "deferred_commits.sqlite3"
+        )
+        # Compatibility-only seam for pre-durable-queue callers/tests.  No
+        # production path enqueues here.
+        self._deferred_seal_work: queue.Queue[DeferredSealJob | None] = (
+            queue.Queue(maxsize=64)
+        )
         self._analysis_active = threading.Event()
         self._timechain_lock = threading.RLock()
         self._agent: Chainseer | None = None
         self._base_agent: BasePublicAnalyzer | None = None
         self._solana_agent: SolanaPublicAnalyzer | None = None
+        self._watch_analysis_agent: Chainseer | None = None
+        self._base_watch_analysis_agent: BasePublicAnalyzer | None = None
+        self._solana_watch_analysis_agent: SolanaPublicAnalyzer | None = None
         self._memory: MemoryCore | None = None
         self._stopping = threading.Event()
         self._ready = threading.Event()
@@ -938,10 +1003,36 @@ class AnalysisService:
                 self.settings.base_rpc_url,
                 timechain_agent=self._agent,
             )
+        if (
+            self._watch_analysis_agent is None
+            and isinstance(self._agent, Chainseer)
+        ):
+            self._watch_analysis_agent = Chainseer(
+                rpc_url=self.settings.rpc_url,
+                timechain_agent=self._agent,
+            )
+        if (
+            self._base_watch_analysis_agent is None
+            and isinstance(self._agent, Chainseer)
+        ):
+            self._base_watch_analysis_agent = BasePublicAnalyzer(
+                self.settings.base_rpc_url,
+                timechain_agent=self._agent,
+            )
+        if (
+            self._solana_watch_analysis_agent is None
+            and isinstance(self._agent, Chainseer)
+        ):
+            self._solana_watch_analysis_agent = SolanaPublicAnalyzer(
+                self.settings.solana_rpc_url,
+                timechain_agent=self._agent,
+                jupiter_api_key=self.settings.jupiter_api_key or None,
+            )
         if self._watcher is None:
             self._watcher = ChainseerWatcher(
                 self._agent,
                 observer_rpc=RobinhoodRPC(self.settings.rpc_url),
+                analysis_agent=(self._watch_analysis_agent or self._agent),
                 control_root=self.settings.chain_root,
                 config=WatchConfig(
                     poll_seconds=self.settings.watcher_interval_seconds,
@@ -949,14 +1040,12 @@ class AnalysisService:
                 ),
             )
         if self._solana_watcher is None:
-            solana_observer = SolanaPublicAnalyzer(
-                self.settings.solana_rpc_url,
-                jupiter_api_key=self.settings.jupiter_api_key or None,
-            )
             self._solana_watcher = SolanaEventWatcher(
-                self._solana_agent,
+                (self._solana_watch_analysis_agent or self._solana_agent),
                 timechain_agent=self._agent,
-                observer_analyzer=solana_observer,
+                observer_analyzer=(
+                    self._solana_watch_analysis_agent or self._solana_agent
+                ),
                 control_root=self.settings.chain_root,
                 config=SolanaWatchConfig(
                     poll_seconds=self.settings.watcher_interval_seconds,
@@ -966,6 +1055,9 @@ class AnalysisService:
             self._base_watcher = ChainseerWatcher(
                 self._base_agent,
                 observer_rpc=RobinhoodRPC(self.settings.base_rpc_url),
+                analysis_agent=(
+                    self._base_watch_analysis_agent or self._base_agent
+                ),
                 control_root=self.settings.chain_root,
                 config=WatchConfig(
                     poll_seconds=self.settings.watcher_interval_seconds,
@@ -1095,7 +1187,9 @@ class AnalysisService:
             active_id = self.active_by_address.get(normalized)
             if active_id:
                 active = self.jobs.get(active_id)
-                if active and active.status in {"queued", "running"}:
+                if active and active.status in {
+                    "queued", "running", "waiting_for_timechain"
+                }:
                     return JobAccepted(
                         job_id=active.id,
                         status=active.status,
@@ -1289,6 +1383,7 @@ class AnalysisService:
             "timechain_integrity": dict(self._integrity_status),
             "cypher_tempre_runtime": dict(self._cypher_tempre_runtime),
             "maintenance_queue_depth": self._maintenance_work.qsize(),
+            "deferred_commits": self._deferred_queue.counts(),
             "faculty_pack": (
                 dict(getattr(self._agent, "faculty_pack_status", {}) or {})
                 if self._agent is not None
@@ -1484,6 +1579,40 @@ class AnalysisService:
                     self._watch_lock.release()
                 if acquired_timechain:
                     self._timechain_lock.release()
+        # Persist only envelopes produced by this cycle.  Never retain the full
+        # snapshots in public watcher status or replay a previous cycle's work.
+        for network in ("robinhood", "base", "solana"):
+            net_summary = summaries.get(network)
+            if not isinstance(net_summary, dict):
+                continue
+            pending_seals = list(net_summary.pop("pending_seals", []) or [])
+            for env in pending_seals:
+                try:
+                    token = str(env["token_address"])
+                    anchor = env.get("block_or_slot")
+                    payload = {
+                        **env,
+                        "anchor_kind": (
+                            "confirmed_slot"
+                            if network == "solana"
+                            else "confirmed_block"
+                        ),
+                        "anchor_value": anchor,
+                        "observed_at_epoch": env.get(
+                            "enqueued_at", time.time()
+                        ),
+                    }
+                    self._deferred_queue.enqueue(
+                        kind="watcher_commit",
+                        subject_key=f"{network}:{token}",
+                        payload=payload,
+                        priority=20,
+                    )
+                except Exception:
+                    LOGGER.exception(
+                        "failed to persist deferred watcher commit for %s",
+                        env.get("token_address"),
+                    )
         self._watcher_status = {
             "enabled": True,
             "last_cycle": summaries,
@@ -1492,18 +1621,58 @@ class AnalysisService:
         }
 
     @contextmanager
+    def _tracked_timechain_lock(self, reason: str):
+        """Acquire ``_timechain_lock`` with a configurable timeout.
+
+        Sets lock-owner tracking fields for diagnostics on timeout.
+        Raises ``TimeoutError`` with full context if the lock cannot be
+        acquired within ``timechain_lock_timeout_seconds``.
+        """
+        timeout = self.settings.timechain_lock_timeout_seconds
+        acquired = self._timechain_lock.acquire(timeout=timeout)
+        if not acquired:
+            owner = self._timechain_owner
+            since = self._timechain_owner_since
+            owner_reason = self._timechain_owner_reason
+            raise TimeoutError(
+                f"Timed out waiting for _timechain_lock ({timeout:.1f}s) "
+                f"for '{reason}'. "
+                f"Owner: {owner.name if owner else 'None'} "
+                f"reason='{owner_reason}' "
+                f"held={time.monotonic() - since:.1f}s"
+            )
+        me = threading.current_thread()
+        self._timechain_owner = me
+        self._timechain_owner_since = time.monotonic()
+        self._timechain_owner_reason = reason
+        try:
+            yield
+        finally:
+            self._timechain_owner = None
+            self._timechain_owner_since = 0.0
+            self._timechain_owner_reason = ""
+            self._timechain_lock.release()
+
+    @contextmanager
     def _watcher_timechain_lane(self):
         """Serialize watcher writes without doing index maintenance inline."""
-        with self._timechain_lock:
-            previous = os.environ.get("CT_AUTOINDEX")
-            os.environ["CT_AUTOINDEX"] = "0"
-            try:
-                yield
-            finally:
-                if previous is None:
-                    os.environ.pop("CT_AUTOINDEX", None)
-                else:
-                    os.environ["CT_AUTOINDEX"] = previous
+        timeout = self.settings.timechain_lock_timeout_seconds
+        acquired = self._timechain_lock.acquire(timeout=timeout)
+        if not acquired:
+            raise TimeoutError(
+                f"Watcher timechain_lane timed out ({timeout:.1f}s); "
+                f"analysis worker likely holding lock"
+            )
+        previous = os.environ.get("CT_AUTOINDEX")
+        os.environ["CT_AUTOINDEX"] = "0"
+        try:
+            yield
+        finally:
+            if previous is None:
+                os.environ.pop("CT_AUTOINDEX", None)
+            else:
+                os.environ["CT_AUTOINDEX"] = previous
+            self._timechain_lock.release()
 
     def _run_watchers(self) -> None:
         interval = max(0.1, float(self.settings.watcher_interval_seconds))
@@ -1677,9 +1846,18 @@ class AnalysisService:
                             f"ring {index}: prev_hash broken "
                             f"(expected {cursor.previous_hash[:12]}..)"
                         )
-                    recomputed = self._agent.timechain_module.compute_ring_hash(
-                        ring
+                    timechain_module = getattr(
+                        self._agent, "timechain_module", None
+                    ) or getattr(
+                        getattr(self._agent, "cognitive_loop", None),
+                        "timechain_module",
+                        None,
                     )
+                    if timechain_module is None:
+                        raise RuntimeError(
+                            "Timechain hash implementation is unavailable"
+                        )
+                    recomputed = timechain_module.compute_ring_hash(ring)
                     if recomputed != ring.get("ring_hash"):
                         cursor.errors.append(
                             f"ring {index}: ring_hash mismatch -> TAMPERED"
@@ -1772,6 +1950,433 @@ class AnalysisService:
         finally:
             self._timechain_lock.release()
 
+    def _drain_deferred_seals(self) -> None:
+        """Drain and coalesce pending deferred-seal jobs, then execute.
+
+        Coalescing keeps only the latest envelope per ``(network, token)``
+        so that rapid watcher rescans for the same subject don't queue
+        redundant seals.  The maintenance worker calls this once per loop
+        iteration, so the effective batch window is the maintenance poll
+        interval (~0.1–1 s).
+        """
+        # 1. Drain all pending jobs into a local list.
+        pending: list[DeferredSealJob] = []
+        while True:
+            try:
+                job = self._deferred_seal_work.get_nowait()
+            except queue.Empty:
+                break
+            if job is not None:
+                pending.append(job)
+            self._deferred_seal_work.task_done()
+
+        if not pending:
+            return
+
+        # 2. Coalesce: keep only the latest job per (network, token).
+        latest: dict[tuple[str, str], DeferredSealJob] = {}
+        for job in pending:
+            key = (job.network, job.token_address)
+            existing = latest.get(key)
+            if existing is None or job.enqueued_at > existing.enqueued_at:
+                latest[key] = job
+
+        # 3. Execute each coalesced job.
+        for job in latest.values():
+            try:
+                self._execute_deferred_seal(job)
+            except Exception:
+                LOGGER.exception(
+                    "deferred seal failed for %s:%s",
+                    job.network,
+                    job.token_address,
+                    extra={"idempotency_key": job.idempotency_key},
+                )
+
+    def _find_latest_token_ring(
+        self,
+        tc: Any,
+        network: str,
+        token_address: str,
+        limit: int = 500,
+    ) -> dict | None:
+        """Scan tail rings for the most recent ring matching *network+token*.
+
+        This is a read-only tail scan — safe to call without holding the
+        writer lock, and fast (bounded by *limit* lines from the JSONL).
+        """
+        for ring in reversed(tc.tail_rings(limit)):
+            payload = ring.get("payload") or {}
+            rtype = ring.get("ring_type", "")
+            # Match EVM and Solana analysis ring types
+            if rtype in ("token_analysis", "solana_token_analysis"):
+                p_net = payload.get("network")
+                p_tok = (
+                    payload.get("token_address")
+                    or payload.get("mint")
+                )
+                if p_net == network and p_tok == token_address:
+                    return ring
+        return None
+
+    def _cas_validate_deferred_seal(
+        self,
+        job: DeferredSealJob,
+        tc: Any,
+    ) -> str:
+        """Atomic CAS validation inside the writer lock.
+
+        Returns one of: ``"committed"``, ``"idempotent"``, ``"superseded"``,
+        or ``"discarded"``.
+
+        Protocol (all steps inside the writer lock):
+        1. Idempotency — if a ring with matching idempotency_key already
+           exists in the tail → ``"idempotent"`` (already committed).
+        2. Subject-scoped freshness — find the latest ring for the same
+           (network, token).  If its sealed block/slot is ≥ this job's
+           pinned block/slot → ``"superseded"``.  Unrelated head advancement
+           (different tokens) does NOT invalidate.
+        3. Hash verification — confirm the report now bears a valid
+           ``analysis_ring`` and ``analysis_ring_hash`` (set by Phase A).
+        4. Success → ``"committed"``.
+        """
+        # 1. Idempotency check (tail-only scan)
+        for ring in reversed(tc.tail_rings(200)):
+            payload = ring.get("payload") or {}
+            if payload.get("idempotency_key") == job.idempotency_key:
+                return "idempotent"
+
+        # 2. Subject-scoped freshness check
+        latest = self._find_latest_token_ring(
+            tc, job.network, job.token_address
+        )
+        if latest is not None:
+            lp = latest.get("payload") or {}
+            sealed_block = lp.get("block_pin")
+            if sealed_block is not None and job.block_or_slot is not None:
+                try:
+                    if int(sealed_block) >= int(job.block_or_slot):
+                        return "superseded"
+                except (TypeError, ValueError):
+                    pass
+
+        # 3. Hash verification — Phase A should have populated these
+        snapshot = job.pinned_snapshot
+        if snapshot.get("analysis_ring") is None:
+            return "discarded"
+
+        # 4. Committed
+        return "committed"
+
+    def _execute_deferred_seal(self, job: DeferredSealJob) -> None:
+        """Persist a legacy envelope for the durable prepare/commit worker."""
+        # Compatibility adapter only.  The former implementation called
+        # _seal_report() here, which appended before validation.  Persist the
+        # envelope instead; the durable prepare/commit worker owns all writes.
+        self._deferred_queue.enqueue(
+            kind="watcher_commit",
+            subject_key=f"{job.network}:{job.token_address}",
+            priority=20,
+            payload={
+                "network": job.network,
+                "token_address": job.token_address,
+                "pinned_snapshot": job.pinned_snapshot,
+                "block_or_slot": job.block_or_slot,
+                "anchor_kind": (
+                    "confirmed_slot"
+                    if job.network == "solana"
+                    else "confirmed_block"
+                ),
+                "anchor_value": job.block_or_slot,
+                "evidence_hash": job.evidence_hash,
+                "report_hash": job.report_hash,
+                "analyzer_version": job.analyzer_version,
+                "idempotency_key": job.idempotency_key,
+                "enqueued_at": job.enqueued_at,
+                "observed_at_epoch": job.enqueued_at,
+            },
+        )
+        return
+
+    @staticmethod
+    def _stable_hash(value: Any) -> str:
+        encoded = json.dumps(
+            value, sort_keys=True, separators=(",", ":"),
+            ensure_ascii=False, default=str,
+        )
+        return hashlib.sha256(encoded.encode("utf-8")).hexdigest()
+
+    def _current_commit_dependencies(self) -> tuple[str, str]:
+        if self._agent is None:
+            raise RuntimeError("canonical Timechain agent is unavailable")
+        loop = self._agent.cognitive_loop
+        registry = loop.epochs_module.registry_hashes(loop.root)
+        policy = self._agent.poq_module.PoQGate().t
+        return self._stable_hash(policy), self._stable_hash(registry)
+
+    def _prepare_watcher_commit(
+        self, item: DeferredQueueItem
+    ) -> PreparedWatcherCommit:
+        """Run bounded cognition and PoQ scoring without appending a ring."""
+        if self._agent is None:
+            raise RuntimeError("canonical Timechain agent is unavailable")
+        envelope = item.payload
+        report = json.loads(json.dumps(envelope["pinned_snapshot"], default=str))
+        if self._stable_hash(report) != envelope.get("report_hash"):
+            raise ValueError("watcher report hash mismatch")
+        facts = (report.get("provenance") or {}).get("facts") or []
+        if self._stable_hash(facts) != envelope.get("evidence_hash"):
+            raise ValueError("watcher evidence hash mismatch")
+        cognition = self._agent.cognitive_loop.prepare(report)
+        analysis = report.get("analysis") or {}
+        network = str(envelope["network"])
+        token = str(envelope["token_address"])
+        anchor_kind = str(envelope["anchor_kind"])
+        anchor_value = envelope.get("anchor_value")
+        candidate = (
+            f"Watcher observation for {network} subject {token} at "
+            f"{anchor_kind} {anchor_value}: risk "
+            f"{analysis.get('risk_level', 'Unknown')}, legitimacy "
+            f"{analysis.get('legitimacy_score', 'unknown')}."
+        )
+        context = json.dumps(
+            {
+                "network": network, "token_address": token,
+                "anchor_kind": anchor_kind, "anchor_value": anchor_value,
+                "analysis": analysis,
+                "provenance_hash": envelope["evidence_hash"],
+            }, sort_keys=True, default=str,
+        )
+        window = self._agent.poq_module.relevance_window(self._agent.tc)
+        verdict = self._agent.poq_module.PoQGate().evaluate(
+            candidate, window, context=context,
+            external_scores=report.get("poq_scores") or {},
+            span_guard=True, evidence_texts=[context], frame="assertion",
+        )
+        if verdict.get("decision") != "SEAL":
+            raise ValueError(
+                "watcher PoQ preparation refused: "
+                + str(verdict.get("decision"))
+            )
+        policy_hash, registry_hash = self._current_commit_dependencies()
+        payload = {
+            "summary": candidate,
+            "network": network,
+            "token_address": token,
+            "anchor_kind": anchor_kind,
+            "anchor_value": anchor_value,
+            "observed_at_epoch": envelope.get("observed_at_epoch"),
+            "risk_level": analysis.get("risk_level"),
+            "legitimacy_score": analysis.get("legitimacy_score"),
+            "action_label": analysis.get("action_label"),
+            "evidence_hash": envelope["evidence_hash"],
+            "report_hash": envelope["report_hash"],
+            "analyzer_version": envelope.get("analyzer_version"),
+            "idempotency_key": envelope["idempotency_key"],
+            "policy_hash": policy_hash,
+            "registry_hash": registry_hash,
+            "cognition": {
+                key: value for key, value in cognition.items()
+                if key != "growth"
+            },
+            "poq_verdict": {
+                "decision": verdict["decision"],
+                "cited_rings": verdict.get("cited_rings") or [],
+            },
+        }
+        return PreparedWatcherCommit(
+            item, payload, dict(verdict.get("scores") or {}),
+            policy_hash, registry_hash,
+        )
+
+    def _commit_prepared_watcher(self, prepared: PreparedWatcherCommit) -> str:
+        """Validate and append one minimal ring under the writer lock."""
+        item = prepared.queue_item
+        if self._analysis_active.is_set() or not self.work.empty():
+            return "retry"
+        if not self._timechain_lock.acquire(blocking=False):
+            return "retry"
+        try:
+            if self._analysis_active.is_set() or not self.work.empty():
+                return "retry"
+            if not self._deferred_queue.is_current(item):
+                return "superseded"
+            if self._agent is None:
+                return "retry"
+            ok, verification = self._agent.cognitive_loop.verify_incremental()
+            if not ok:
+                raise RuntimeError(
+                    "incremental Timechain verification failed: "
+                    + "; ".join(verification)
+                )
+            policy_hash, registry_hash = self._current_commit_dependencies()
+            if (policy_hash, registry_hash) != (
+                prepared.policy_hash, prepared.registry_hash
+            ):
+                return "retry"
+            payload = prepared.payload
+            key = payload["idempotency_key"]
+            subject = item.subject_key
+            fresh = (
+                int(payload.get("anchor_value") or -1),
+                float(payload.get("observed_at_epoch") or 0),
+            )
+            for ring in reversed(self._agent.tc.tail_rings(512)):
+                existing = ring.get("payload") or {}
+                if existing.get("idempotency_key") == key:
+                    return "idempotent"
+                existing_subject = (
+                    f"{existing.get('network')}:"
+                    f"{existing.get('token_address')}"
+                )
+                if existing_subject == subject:
+                    previous = (
+                        int(existing.get("anchor_value") or -1),
+                        float(existing.get("observed_at_epoch") or 0),
+                    )
+                    if previous >= fresh:
+                        return "superseded"
+                    break
+            previous_autoindex = os.environ.get("CT_AUTOINDEX")
+            os.environ["CT_AUTOINDEX"] = "0"
+            try:
+                ring = self._agent.tc.seal(
+                    "watcher_analysis", payload, poq=prepared.poq_scores
+                )
+            finally:
+                if previous_autoindex is None:
+                    os.environ.pop("CT_AUTOINDEX", None)
+                else:
+                    os.environ["CT_AUTOINDEX"] = previous_autoindex
+            self._agent.cognitive_loop.establish_trust()
+            LOGGER.debug(
+                "committed watcher observation %s at ring %s",
+                key, ring.get("index"),
+            )
+            return f"committed:{ring.get('index')}"
+        finally:
+            self._timechain_lock.release()
+
+    def _drain_durable_commits(self) -> None:
+        """Prepare one durable item and commit only while the user lane is idle."""
+        if self._analysis_active.is_set() or not self.work.empty():
+            return
+        item = self._deferred_queue.claim(
+            kinds=("watcher_commit", "watcher_outcome"), lease_seconds=30.0
+        )
+        if item is None:
+            return
+        try:
+            if item.kind == "watcher_outcome":
+                outcome = self._execute_deferred_outcome(item)
+                if outcome == "done":
+                    self._deferred_queue.transition(item, "done")
+                else:
+                    self._deferred_queue.retry(
+                        item, outcome, delay_seconds=0.25
+                    )
+                return
+            # A reclaimed lease may represent a crash after append but before
+            # SQLite acknowledgement.  Pay for a full read only on that rare
+            # recovery path so idempotency remains correct beyond any bounded
+            # tail window, without taxing ordinary commits or lock hold time.
+            if item.attempts > 1 and self._agent is not None:
+                key = item.payload.get("idempotency_key")
+                if any(
+                    (ring.get("payload") or {}).get("idempotency_key") == key
+                    for ring in self._agent.tc.load()
+                ):
+                    self._deferred_queue.transition(item, "idempotent")
+                    return
+            prepared = self._prepare_watcher_commit(item)
+            if not self._deferred_queue.transition(item, "ready"):
+                return
+            outcome = self._commit_prepared_watcher(prepared)
+            if outcome.startswith("committed:"):
+                ring_index = int(outcome.split(":", 1)[1])
+                self._deferred_queue.transition(item, "done")
+                envelope = item.payload
+                self._deferred_queue.enqueue(
+                    kind="watcher_outcome",
+                    subject_key=item.subject_key,
+                    priority=30,
+                    payload={
+                        "network": envelope["network"],
+                        "token_address": envelope["token_address"],
+                        "anchor_value": envelope.get("anchor_value"),
+                        "observed_at_epoch": envelope.get("observed_at_epoch"),
+                        "analysis_ring": ring_index,
+                        "pinned_snapshot": envelope["pinned_snapshot"],
+                    },
+                )
+            elif outcome in {"idempotent", "superseded"}:
+                self._deferred_queue.transition(item, outcome)
+            else:
+                self._deferred_queue.retry(
+                    item, "user analysis has priority", delay_seconds=0.1
+                )
+        except (ValueError, KeyError) as exc:
+            self._deferred_queue.transition(item, "discarded")
+            LOGGER.warning("discarded deferred watcher commit: %s", exc)
+        except Exception as exc:
+            self._deferred_queue.retry(item, str(exc), delay_seconds=0.25)
+            LOGGER.exception("deferred watcher commit failed")
+
+    def _execute_deferred_outcome(self, item: DeferredQueueItem) -> str:
+        """Restore sealed baselines and emit at most one due outcome per turn."""
+        payload = item.payload
+        network = str(payload["network"])
+        # Solana did not previously have an outcome collector.  Its committed
+        # watcher ring is still durable; no synthetic calibration is invented.
+        if network == "solana":
+            return "done"
+        watcher = (
+            self._base_watcher if network == "base" else self._watcher
+        )
+        if watcher is None or self._agent is None:
+            return "watcher unavailable"
+        if self._analysis_active.is_set() or not self.work.empty():
+            return "user analysis has priority"
+        if not self._watch_lock.acquire(blocking=False):
+            return "watch state busy"
+        acquired_timechain = False
+        try:
+            acquired_timechain = self._timechain_lock.acquire(blocking=False)
+            if not acquired_timechain:
+                return "timechain busy"
+            if self._analysis_active.is_set() or not self.work.empty():
+                return "user analysis has priority"
+            state = watcher.store.load()
+            token = str(payload["token_address"])
+            subscriptions = state.get("subscriptions") or {}
+            subscription = (
+                subscriptions.get(token.lower()) or subscriptions.get(token)
+            )
+            if subscription is None:
+                return "done"
+            report = json.loads(
+                json.dumps(payload["pinned_snapshot"], default=str)
+            )
+            report["analysis_ring"] = int(payload["analysis_ring"])
+            baselines = subscription.setdefault("analyses", [])
+            if baselines:
+                baselines[-1]["analysis_ring"] = int(payload["analysis_ring"])
+            emitted = watcher.outcomes.collect(
+                self._agent,
+                subscription,
+                report,
+                now=float(payload.get("observed_at_epoch") or time.time()),
+                horizons=watcher.config.outcome_horizons_seconds,
+                limit=1,
+            )
+            watcher.store.save(state)
+            LOGGER.debug("processed %d deferred outcomes", len(emitted))
+            return "done"
+        finally:
+            if acquired_timechain:
+                self._timechain_lock.release()
+            self._watch_lock.release()
+
     def _run_maintenance(self) -> None:
         next_audit = (
             time.monotonic() + self.settings.full_audit_interval_seconds
@@ -1852,6 +2457,7 @@ class AnalysisService:
                         finally:
                             self._timechain_lock.release()
                 self._maintenance_work.task_done()
+            self._drain_durable_commits()
             if time.monotonic() >= next_audit:
                 completed = self._run_full_audit()
                 next_audit = (
@@ -1881,6 +2487,7 @@ class AnalysisService:
                 job.updated_at = job.started_at
 
             self._analysis_active.set()
+            retrying = False
             try:
                 if self._integrity_status.get("status") == "failed":
                     raise PublicAnalysisError(
@@ -1905,7 +2512,7 @@ class AnalysisService:
                         18,
                         "Reading mint controls, markets, holders, and routes",
                     )
-                    with self._timechain_lock:
+                    with self._tracked_timechain_lock("user_analysis"):
                         report = self._solana_agent.analyze_token(job.address)
                 elif job.network == "base":
                     if self._base_agent is None:
@@ -1922,7 +2529,7 @@ class AnalysisService:
                             kwargs["progress_callback"] = progress
                     except (TypeError, ValueError):
                         pass
-                    with self._timechain_lock:
+                    with self._tracked_timechain_lock("user_analysis"):
                         report = method(job.address, **kwargs)
                 else:
                     method = self._agent.analyze_token
@@ -1935,7 +2542,7 @@ class AnalysisService:
                             kwargs["progress_callback"] = progress
                     except (TypeError, ValueError):
                         pass
-                    with self._timechain_lock:
+                    with self._tracked_timechain_lock("user_analysis"):
                         report = method(job.address, **kwargs)
                 if report.get("error"):
                     raise PublicAnalysisError(
@@ -1992,6 +2599,46 @@ class AnalysisService:
                     job.updated_at = time.time()
                     job.error_code = exc.code
                     job.error_message = exc.message
+            except TimeoutError as exc:
+                with self._lock:
+                    job.lock_retry_count += 1
+                    retries = job.lock_retry_count
+                LOGGER.warning(
+                    "Timechain lock timeout for job %s (attempt %d/3): %s",
+                    job.id,
+                    retries,
+                    exc,
+                )
+                if retries < 3:
+                    with self._lock:
+                        job.status = "waiting_for_timechain"
+                        job.stage = "waiting_for_timechain"
+                        job.stage_detail = (
+                            f"Waiting for timechain lock (attempt {retries}/3)"
+                        )
+                        job.updated_at = time.time()
+                    # Re-enqueue for retry.
+                    try:
+                        self.work.put_nowait(job.id)
+                        retrying = True
+                    except queue.Full:
+                        with self._lock:
+                            job.status = "failed"
+                            job.stage = "failed"
+                            job.stage_detail = (
+                                "Queue full after lock timeout retries"
+                            )
+                            job.updated_at = time.time()
+                else:
+                    with self._lock:
+                        job.status = "failed"
+                        job.stage = "failed"
+                        job.stage_detail = (
+                            f"Timechain lock unavailable after {retries} attempts"
+                        )
+                        job.updated_at = time.time()
+                        job.error_code = "timechain_lock_timeout"
+                        job.error_message = str(exc)
             except Exception:
                 LOGGER.exception(
                     "Analysis job failed",
@@ -2012,19 +2659,20 @@ class AnalysisService:
             finally:
                 self._analysis_active.clear()
                 with self._lock:
-                    job.finished_at = time.time()
-                    job.updated_at = job.finished_at
-                    self.active_by_address.pop(
-                        (
-                            f"{job.network}:"
-                            + (
-                                job.address.lower()
-                                if job.network in EVM_NETWORKS
-                                else job.address
-                            )
-                        ),
-                        None,
-                    )
+                    if not retrying:
+                        job.finished_at = time.time()
+                        job.updated_at = job.finished_at
+                        self.active_by_address.pop(
+                            (
+                                f"{job.network}:"
+                                + (
+                                    job.address.lower()
+                                    if job.network in EVM_NETWORKS
+                                    else job.address
+                                )
+                            ),
+                            None,
+                        )
                 self.work.task_done()
 
 

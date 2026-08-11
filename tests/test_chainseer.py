@@ -1273,7 +1273,9 @@ class AlertWiringTests(unittest.TestCase):
     unchanged)."""
 
     @staticmethod
-    def _run_analyze_token(stack, agent, token, basic_info, analysis):
+    def _run_analyze_token(
+        stack, agent, token, basic_info, analysis, **analyze_kwargs
+    ):
         """Patches every Phase 1-8 data-gathering/scoring call in
         analyze_token() so the pipeline can run end-to-end against a real
         agent without any network access, isolating the assertion to the
@@ -1320,16 +1322,20 @@ class AlertWiringTests(unittest.TestCase):
                     "consistency": 230, "depth": 220, "covenant": 245,
                 },
             ),
-            # The cognitive-completion/immune-guard pipeline inside
-            # _seal_report is exercised by test_report_seals_through_poq_
-            # with_provenance; it is out of scope here (this test isolates
-            # the alert_on_decision call site, which fires before sealing).
-            ("_seal_report", None),
             ("_print_summary", None),
         ):
             stack.enter_context(
                 patch.object(chainseer.Chainseer, method, return_value=value)
             )
+        # The cognitive-completion/immune-guard pipeline inside _seal_report is
+        # exercised by test_report_seals_through_poq_with_provenance; it is out
+        # of scope here. Bound separately from the loop above so callers can
+        # assert whether it ran -- that is the whole observable difference
+        # between seal=True and seal=False.
+        mocked_seal = stack.enter_context(
+            patch.object(chainseer.Chainseer, "_seal_report", return_value=None)
+        )
+        agent._mocked_seal_report = mocked_seal
         stack.enter_context(
             patch("chainseer_controls.build_extended_evidence", return_value={})
         )
@@ -1340,8 +1346,76 @@ class AlertWiringTests(unittest.TestCase):
             patch("chainseer.verify_entity_graph", return_value=(True, ""))
         )
         mocked_alert = stack.enter_context(patch("chainseer.alert_on_decision"))
-        report = agent.analyze_token(token)
+        report = agent.analyze_token(token, **analyze_kwargs)
         return report, mocked_alert
+
+    # --- seal= gate -------------------------------------------------------
+    #
+    # seal=False exists so the watcher can rescan observationally and defer
+    # the Timechain write to an idle-period commit. The failure mode is
+    # silent in both directions: seal=False leaking into the API path stops
+    # analyses being sealed at all, and a default that flipped to False would
+    # do the same to every caller without changing a single signature.
+
+    def _seal_probe(self, **analyze_kwargs):
+        analysis = {
+            "legitimacy_score": 88.0,
+            "risk_level": "Low",
+            "action_label": "OK",
+            "hard_stop_overrides": [],
+            "recommendation": "No hard stops.",
+            "green_flags": [],
+            "red_flags": [],
+            "component_scores": {"security": 90},
+            "confidence": "test",
+            "confidence_grade": "LIMITED",
+            "uncertain_components": {},
+        }
+        basic_info = {
+            "name": "Seal Probe",
+            "symbol": "SEAL",
+            "total_supply_raw": 1,
+            "total_supply": 1,
+        }
+        token = "0x" + "7" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                chainseer.RobinhoodRPC, "get_block_number", return_value=100
+            ):
+                agent = chainseer.Chainseer(chain_root=temp_dir)
+            with ExitStack() as stack:
+                report, _ = self._run_analyze_token(
+                    stack, agent, token, basic_info, analysis, **analyze_kwargs
+                )
+                return report, agent._mocked_seal_report
+
+    def test_analyze_token_seals_by_default(self):
+        """The default must stay True; every existing caller relies on it."""
+        _, mocked_seal = self._seal_probe()
+        mocked_seal.assert_called_once()
+
+    def test_analyze_token_seal_true_is_explicit_and_seals(self):
+        _, mocked_seal = self._seal_probe(seal=True)
+        mocked_seal.assert_called_once()
+
+    def test_analyze_token_seal_false_writes_no_timechain_ring(self):
+        _, mocked_seal = self._seal_probe(seal=False)
+        mocked_seal.assert_not_called()
+
+    def test_observational_scan_still_returns_a_usable_report(self):
+        """Deferring the seal must not hollow out the analysis itself.
+
+        The deferred-seal job carries this report as its pinned snapshot, so
+        a report missing its verdict would defer nothing worth committing.
+        """
+        report, mocked_seal = self._seal_probe(seal=False)
+        mocked_seal.assert_not_called()
+        self.assertIsInstance(report, dict)
+        self.assertIn("performance", report,
+                      "unsealed path skipped the performance block")
+        analysis = report.get("analysis") or {}
+        self.assertEqual(analysis.get("risk_level"), "Low",
+                         "unsealed report lost its verdict")
 
     def test_analyze_token_forwards_hard_stops_to_alert_hook(self):
         analysis = {
