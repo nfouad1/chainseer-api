@@ -781,7 +781,7 @@ class SolanaPublicAnalyzer:
             }
         return deployer_data, creator_data, facts
 
-    def _seal_report(self, report: dict) -> None:
+    def _seal_report(self, report: dict, *, defer_cognition: bool = False) -> None:
         agent = self.timechain_agent
         if agent is None:
             return
@@ -857,6 +857,7 @@ class SolanaPublicAnalyzer:
                 "entity_graph_snapshot": entity_graph,
                 "cognition": cognition,
                 "live_execution_enabled": False,
+                "idempotency_key": report.pop("_idempotency_key", None),
             },
         )
         if ring is None:
@@ -867,6 +868,21 @@ class SolanaPublicAnalyzer:
         report["analysis_ring"] = ring["index"]
         report["analysis_ring_hash"] = ring["ring_hash"]
         report["poq_verdict"] = verdict
+        report["_analysis_ring_record"] = ring
+        if defer_cognition:
+            cognition["status"] = "pending"
+            cognition["analysis_ring"] = ring["index"]
+            cognition["growth_status"] = "excluded_from_online_completion"
+            report["cognitive_completion"] = {
+                "status": "queued",
+                "analysis_ring": ring["index"],
+            }
+            report["temporal_entity_graph"] = {
+                "available": False,
+                "status": "queued",
+                "reason": "temporal_projection_pending",
+            }
+            return
         agent.cognitive_loop.finalize(report, ring)
         try:
             report["temporal_entity_graph"] = append_temporal_projection(
@@ -887,6 +903,8 @@ class SolanaPublicAnalyzer:
         mint: str,
         *,
         progress_callback: Callable[[str, int, str], None] | None = None,
+        seal: bool = True,
+        defer_cognition: bool = False,
     ) -> dict:
         def progress(stage: str, percent: int, detail: str) -> None:
             if progress_callback is not None:
@@ -1741,7 +1759,10 @@ class SolanaPublicAnalyzer:
         report["analysis"]["entity_insider_summary"] = (
             report["data"]["entity_graph"]["summary"]
         )
-        progress("sealing_timechain", 90, "Sealing the Timechain analysis")
-        self._seal_report(report)
-        progress("complete", 100, "Sealed analysis is ready")
+        if seal:
+            progress("sealing_timechain", 90, "Sealing the Timechain analysis")
+            self._seal_report(report, defer_cognition=defer_cognition)
+            progress("complete", 100, "Sealed analysis is ready")
+        else:
+            progress("complete", 90, "Observational scan complete (sealing deferred)")
         return report

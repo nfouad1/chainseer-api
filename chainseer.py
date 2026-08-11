@@ -96,10 +96,22 @@ from chainseer_outcome_ledger import (
 from chainseer_temporal_graph import (
     TemporalGraphStore,
     append_temporal_projection,
+    subject_temporal_view,
 )
 
 CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+#: Foreground cognition may consult recent Timechain history, but it must not
+#: make user latency grow with the lifetime of the ledger.  The current
+#: report's provenance is supplied directly to PoQ, so this window is context
+#: for cognitive comparison rather than the authority for the risk decision.
+#: Full-history indexing and consolidation belong to idle maintenance.
+ONLINE_COGNITIVE_RECALL_WINDOW = 121
+#: Historical scoring is an online read, so it must be bounded independently
+#: of both Timechain height and the lifetime of one frequently scanned token.
+#: The complete history remains in the rebuildable temporal projection for
+#: offline audits; foreground scoring consumes only the newest observations.
+ONLINE_TOKEN_TREND_HISTORY_LIMIT = 20
 #: Cambium actions that put a faculty into the ACTIVE registry (grown.json),
 #: and therefore require a governance record. `promote()` writes grown.json;
 #: `wake()` flips a dormant grown.json entry back to active. A "born" faculty
@@ -991,10 +1003,13 @@ class ChainseerCognitiveLoop:
             # Online analyses must have bounded latency.  Updating the
             # Hippocampus here can synchronously index every ring added since
             # its last checkpoint; large evidence-rich chains made an API
-            # request sit at 90% for minutes.  Bounded recent-ring recall keeps
-            # the cognitive check O(window), while the report's explicit
-            # provenance remains the authority for the token decision.
+            # request sit at 90% for minutes.  `use_index=False` alone is NOT
+            # bounded: Recall.retrieve() otherwise loads the whole Timechain.
+            # An explicit recent-ring window keeps this O(1) with respect to
+            # chain height, while the report's provenance remains the
+            # authority for the token decision.
             use_index=False,
+            scan_window=ONLINE_COGNITIVE_RECALL_WINDOW,
         )
         labels = recalled.get("query_labels") or self.recall.label(cognitive_input)
         computed = labels.get("computed") or {}
@@ -1025,6 +1040,69 @@ class ChainseerCognitiveLoop:
         report["cognition"] = cognition
         report["_cognitive_input"] = cognitive_input
         return cognition
+
+    def _seal_cognitive_completion(
+        self,
+        report: dict,
+        analysis_ring: dict,
+        cognition: dict,
+    ) -> dict:
+        cognition["status"] = "complete"
+        cognition["analysis_ring"] = analysis_ring["index"]
+        completion = self.recall.tc.seal(
+            "cognitive_completion",
+            {
+                "summary": (
+                    "Chainseer cognitive loop completed for token analysis "
+                    f"ring {analysis_ring['index']}"
+                ),
+                "frame": "assertion",
+                "analysis_ring": analysis_ring["index"],
+                "analysis_ring_hash": analysis_ring["ring_hash"],
+                "cognitive_loop": cognition,
+            },
+            poq={
+                "coherence": 235,
+                "relevance": 245,
+                "novelty": 220,
+                "consistency": 240,
+                "depth": 230,
+                "covenant": 250,
+            },
+        )
+        completion_guard = self._guard_ring(
+            completion,
+            input_text="Complete an evidence-bound Chainseer cognitive audit.",
+            lesson="Chainseer cognitive completion covenant guard",
+        )
+        if completion_guard.get("action") not in {None, "none", "clean"}:
+            raise RuntimeError(
+                "Cognitive completion guard rejected the analysis: "
+                + str(completion_guard.get("action"))
+            )
+        report["cognitive_ring"] = completion["index"]
+        report["cognitive_ring_hash"] = completion["ring_hash"]
+        return cognition
+
+    def finalize_deferred(self, report: dict, analysis_ring: dict) -> dict:
+        """Commit the bounded cognitive audit after publishing the result."""
+        cognition = report.get("cognition") or {}
+        if cognition.get("status") not in {"prepared", "pending"}:
+            raise RuntimeError("Deferred cognitive loop was not prepared")
+        guard = self._guard_ring(
+            analysis_ring,
+            input_text=report.pop("_cognitive_input", ""),
+            lesson="Chainseer deferred cognitive completion covenant guard",
+        )
+        if guard.get("action") not in {None, "none", "clean"}:
+            raise RuntimeError(
+                "Deferred cognitive guard rejected the analysis: "
+                + str(guard.get("action"))
+            )
+        self.verify_registry()
+        cognition["growth"] = []
+        cognition["growth_status"] = "excluded_from_online_completion"
+        return self._seal_cognitive_completion(report, analysis_ring, cognition)
 
     def finalize(self, report: dict, analysis_ring: dict) -> dict:
         cognition = report.get("cognition") or {}
@@ -1109,42 +1187,7 @@ class ChainseerCognitiveLoop:
                 reason=f"faculty change after analysis ring {analysis_ring['index']}"
             )
         self.verify_registry()
-        cognition["status"] = "complete"
-        cognition["analysis_ring"] = analysis_ring["index"]
-        completion = self.recall.tc.seal(
-            "cognitive_completion",
-            {
-                "summary": (
-                    "Chainseer cognitive loop completed for token analysis "
-                    f"ring {analysis_ring['index']}"
-                ),
-                "frame": "assertion",
-                "analysis_ring": analysis_ring["index"],
-                "analysis_ring_hash": analysis_ring["ring_hash"],
-                "cognitive_loop": cognition,
-            },
-            poq={
-                "coherence": 235,
-                "relevance": 245,
-                "novelty": 220,
-                "consistency": 240,
-                "depth": 230,
-                "covenant": 250,
-            },
-        )
-        completion_guard = self._guard_ring(
-            completion,
-            input_text="Complete an evidence-bound Chainseer cognitive audit.",
-            lesson="Chainseer cognitive completion covenant guard",
-        )
-        if completion_guard.get("action") not in {None, "none", "clean"}:
-            raise RuntimeError(
-                "Cognitive completion guard rejected the analysis: "
-                + str(completion_guard.get("action"))
-            )
-        report["cognitive_ring"] = completion["index"]
-        report["cognitive_ring_hash"] = completion["ring_hash"]
-        return cognition
+        return self._seal_cognitive_completion(report, analysis_ring, cognition)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2266,6 +2309,9 @@ class Chainseer:
         full_report: bool = False,
         block_pin: int | None = None,
         progress_callback: Callable[[str, int, str], None] | None = None,
+        *,
+        seal: bool = True,
+        defer_cognition: bool = False,
     ) -> dict:
         """Full token analysis with GoPlus + DexScreener + on-chain RPC.
 
@@ -2279,6 +2325,11 @@ class Chainseer:
                          if False (default), print the investor summary
             block_pin: optional historical/current block for all RPC reads;
                        mutable HTTP evidence remains timestamped, not historical
+            seal: if True (default), run cognitive sealing (prepare, PoQ
+                  gate, finalize) and append timechain rings.  If False,
+                  return the raw analysis report without any timechain
+                  writes — suitable for observational watcher rescans where
+                  sealing is deferred to an idle-period commit.
         """
         started_monotonic = time.monotonic()
 
@@ -2525,15 +2576,24 @@ class Chainseer:
         poq_scores = self._self_evaluate(report)
         report["poq_scores"] = poq_scores
 
-        progress("sealing_timechain", 90, "Running cognition, PoQ, and Timechain sealing")
-        self._seal_report(report)
-        report["performance"] = {
-            "total_duration_seconds": round(
-                time.monotonic() - started_monotonic, 3
-            ),
-            "progress_schema_version": "1.0",
-        }
-        progress("complete", 100, "Sealed analysis is ready")
+        if seal:
+            progress("sealing_timechain", 90, "Running cognition, PoQ, and Timechain sealing")
+            self._seal_report(report, defer_cognition=defer_cognition)
+            report["performance"] = {
+                "total_duration_seconds": round(
+                    time.monotonic() - started_monotonic, 3
+                ),
+                "progress_schema_version": "1.0",
+            }
+            progress("complete", 100, "Sealed analysis is ready")
+        else:
+            report["performance"] = {
+                "total_duration_seconds": round(
+                    time.monotonic() - started_monotonic, 3
+                ),
+                "progress_schema_version": "1.0",
+            }
+            progress("complete", 90, "Observational scan complete (sealing deferred)")
         print()
         if full_report:
             self._print_report(report)
@@ -3439,40 +3499,73 @@ class Chainseer:
                       "wash_trading", "lp_lock"]
 
     def _build_token_trend(self, token_address: str) -> dict:
-        """Query Timechain for past analyses of this token and build score trajectory.
+        """Build a bounded score trajectory from the derived subject projection.
 
         Uses M51 Underlying-Pattern Extraction to surface individual metric
         trajectories beyond overall score, and S110 Concentration-Distribution
         Sensing to detect structural shifts (holder concentration, volume decay).
 
+        The Timechain remains authoritative, but loading every ring here makes
+        request latency grow with the global ledger.  The temporal projection
+        is a hash-verified, rebuildable read model keyed by network and subject.
+        A missing or invalid projection therefore makes trend unavailable; it
+        never triggers an unbounded Timechain fallback on the request path.
+
         Returns ordered list of past analyses with scores, timestamps, and
         computed trend metrics (direction, delta, volatility, metric shifts).
         """
-        token_lower = token_address.lower()
         try:
-            all_rings = self.tc.load()
-        except Exception:
-            return {"available": False, "past_analyses": []}
+            projection = TemporalGraphStore(self.chain_root).load()
+            if projection is None:
+                return {
+                    "available": False,
+                    "past_count": 0,
+                    "past_analyses": [],
+                    "history_source": "temporal_projection",
+                    "reason": "projection_missing_or_invalid",
+                }
+            view = subject_temporal_view(
+                projection,
+                self.network_key,
+                token_address,
+                score_limit=ONLINE_TOKEN_TREND_HISTORY_LIMIT,
+                risk_ring_types={"token_analysis"},
+            )
+        except Exception as exc:
+            return {
+                "available": False,
+                "past_count": 0,
+                "past_analyses": [],
+                "history_source": "temporal_projection",
+                "reason": "projection_read_failed",
+                "error_type": type(exc).__name__,
+            }
 
-        # Filter for token_analysis rings matching this address
+        timeline = view.get("risk_timeline") or []
         past = []
-        for ring in all_rings:
-            if ring.get("ring_type") != "token_analysis":
-                continue
-            payload = ring.get("payload", {})
-            addr = payload.get("token_address", "")
-            if addr.lower() == token_lower:
-                past.append({
-                    "ring_index": ring.get("index"),
-                    "timestamp": payload.get("timestamp", ""),
-                    "legitimacy_score": payload.get("legitimacy_score"),
-                    "risk_level": payload.get("risk_level"),
-                    "component_scores": payload.get("component_scores", {}),
-                    "confidence": payload.get("confidence", ""),
-                })
+        for point in timeline:
+            analysis_ring = point.get("analysis_ring") or {}
+            past.append({
+                "ring_index": analysis_ring.get("index"),
+                "timestamp": (
+                    point.get("observed_at")
+                    or analysis_ring.get("timestamp")
+                    or ""
+                ),
+                "legitimacy_score": point.get("score"),
+                "risk_level": point.get("risk_level"),
+                "component_scores": point.get("component_scores") or {},
+                "confidence": point.get("confidence") or "",
+            })
 
         if len(past) < 2:
-            return {"available": False, "past_count": len(past), "past_analyses": past}
+            return {
+                "available": False,
+                "past_count": len(past),
+                "past_analyses": past,
+                "history_source": "temporal_projection",
+                "history_limit": ONLINE_TOKEN_TREND_HISTORY_LIMIT,
+            }
 
         # Sort by timestamp
         past.sort(key=lambda p: p["timestamp"])
@@ -3525,6 +3618,8 @@ class Chainseer:
             "available": True,
             "past_count": len(past),
             "past_analyses": past,
+            "history_source": "temporal_projection",
+            "history_limit": ONLINE_TOKEN_TREND_HISTORY_LIMIT,
             "first_score": first_score,
             "last_score": last_score,
             "delta": delta,
@@ -4665,7 +4760,7 @@ class Chainseer:
             else:
                 os.environ["CT_AUTOINDEX"] = previous
 
-    def _seal_report(self, report: dict):
+    def _seal_report(self, report: dict, *, defer_cognition: bool = False):
         cognition = self.cognitive_loop.prepare(report)
         poq = report.get("poq_scores", {})
         analysis = report["analysis"]
@@ -4759,6 +4854,7 @@ class Chainseer:
                 "entity_graph_snapshot": entity_graph,
                 "uncertain_components": report["analysis"].get("uncertain_components", {}),
                 "cognitive_loop": cognition,
+                "idempotency_key": report.pop("_idempotency_key", None),
             },
         ))
         if ring is None:
@@ -4769,6 +4865,21 @@ class Chainseer:
         report["analysis_ring"] = ring.get("index")
         report["analysis_ring_hash"] = ring.get("ring_hash")
         report["poq_verdict"] = verdict
+        report["_analysis_ring_record"] = ring
+        if defer_cognition:
+            cognition["status"] = "pending"
+            cognition["analysis_ring"] = ring["index"]
+            cognition["growth_status"] = "excluded_from_online_completion"
+            report["cognitive_completion"] = {
+                "status": "queued",
+                "analysis_ring": ring["index"],
+            }
+            report["temporal_entity_graph"] = {
+                "available": False,
+                "status": "queued",
+                "reason": "temporal_projection_pending",
+            }
+            return
         self._online_seal(lambda: self.cognitive_loop.finalize(report, ring))
         try:
             report["temporal_entity_graph"] = append_temporal_projection(

@@ -99,6 +99,10 @@ full audit passes (or the service restarts and verifies cleanly).
 `GET /v1/analyses/{job_id}` also returns `stage`, `stage_detail`, and
 `progress_percent`; these are non-authoritative operational hints. The report's
 ring/hash and evidence anchors remain the authoritative completion proof.
+Once the authoritative risk result is available, `cognitive_completion`
+separately reports `queued`, `running`, `retrying`, `complete`, or `failed`
+with its own detail and percentage. Temporal projection and this bounded
+cognitive append run after publication and cannot change the sealed score.
 
 Automatic capture does not assign outcomes. Reviewers append those later with
 the `chainseer_benchmark.py label` command described in `BENCHMARK.md`. Back up

@@ -1,11 +1,13 @@
 import base64
 import json
 import os
+import sqlite3
 import struct
 import tempfile
 import time
 import types
 import unittest
+from contextlib import closing
 from os import environ
 from pathlib import Path
 from unittest.mock import patch
@@ -406,6 +408,127 @@ class FakeDexScreener:
 
 
 class SolanaPrototypeTests(unittest.TestCase):
+    def test_outcome_observer_tracks_admitted_and_rejected_tokens(self):
+        launched = 2_000_000_000
+        admitted = candidate(block_time=launched)
+        rejected = candidate(
+            mint=chainseer_solana._b58encode(b58_bytes(21)),
+            symbol="NOPE",
+            block_time=launched,
+        )
+        with tempfile.TemporaryDirectory() as temp:
+            observer = chainseer_solana.SolanaOutcomeObserver(
+                Path(temp) / "outcomes.sqlite3", FakeDexScreener()
+            )
+            observer.register_many([admitted, rejected], tracked_at=launched)
+            observer.backfill_analyses([
+                {
+                    "candidate": admitted.to_dict(),
+                    "decision": {
+                        "admission_state": "graduated_market_ready",
+                        "evidence_state": "complete_safe",
+                        "shadow_entry_allowed": True,
+                        "hard_stops": [],
+                    },
+                },
+                {
+                    "candidate": rejected.to_dict(),
+                    "decision": {
+                        "admission_state": "graduated_market_unsafe",
+                        "evidence_state": "complete_unsafe",
+                        "shadow_entry_allowed": False,
+                        "hard_stops": ["top1_circulating_concentration_high"],
+                    },
+                },
+            ])
+
+            result = observer.observe_due(limit=2, now=launched + 15 * 60)
+
+            self.assertEqual(result["cycle"]["observed"], 2)
+            self.assertEqual(result["admitted_tracked"], 1)
+            self.assertEqual(result["rejected_tracked"], 1)
+            self.assertEqual(result["checkpoints_by_horizon"], {"15m": 2})
+
+    def test_outcome_observer_tracks_peak_and_maximum_favorable_excursion(self):
+        class RisingMarket(FakeDexScreener):
+            def __init__(self):
+                super().__init__()
+                self.market_caps = iter((100_000, 500_000))
+
+            def token_pairs(self, mint):
+                pairs = super().token_pairs(mint)
+                value = next(self.market_caps)
+                pairs[0]["marketCap"] = value
+                pairs[0]["fdv"] = value
+                return pairs
+
+        launched = 2_000_000_000
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "outcomes.sqlite3"
+            observer = chainseer_solana.SolanaOutcomeObserver(path, RisingMarket())
+            observer.register(candidate(block_time=launched), tracked_at=launched)
+
+            observer.observe_due(limit=1, now=launched + 15 * 60)
+            observer.observe_due(limit=1, now=launched + 60 * 60)
+
+            with closing(sqlite3.connect(path)) as connection:
+                token = connection.execute(
+                    "SELECT first_market_cap_usd, peak_market_cap_usd FROM tokens"
+                ).fetchone()
+                checkpoint = connection.execute(
+                    """
+                    SELECT market_cap_multiple, maximum_favorable_excursion_pct
+                    FROM checkpoints WHERE horizon_label = '1h'
+                    """
+                ).fetchone()
+            self.assertEqual(token, (100_000, 500_000))
+            self.assertEqual(checkpoint[0], 5.0)
+            self.assertEqual(checkpoint[1], 400.0)
+
+    def test_outcome_observer_does_not_fabricate_late_historical_checkpoints(self):
+        launched = 2_000_000_000
+        market = FakeDexScreener()
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "outcomes.sqlite3"
+            observer = chainseer_solana.SolanaOutcomeObserver(path, market)
+            observer.register(
+                candidate(block_time=launched),
+                tracked_at=launched + 10 * 24 * 60 * 60,
+            )
+
+            result = observer.observe_due(
+                limit=12, now=launched + 10 * 24 * 60 * 60
+            )
+
+            self.assertEqual(result["cycle"]["observed"], 0)
+            self.assertEqual(result["cycle"]["expired_missed"], 5)
+            self.assertEqual(result["checkpoint_statuses"], {"missed": 5})
+            self.assertEqual(market.calls, 0)
+            with closing(sqlite3.connect(path)) as connection:
+                eligible = connection.execute(
+                    "SELECT SUM(learning_eligible) FROM checkpoints"
+                ).fetchone()[0]
+            self.assertEqual(eligible, 0)
+
+    def test_outcome_observer_retries_infrastructure_failure(self):
+        launched = 2_000_000_000
+        market = FakeDexScreener(fail=True)
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "outcomes.sqlite3"
+            observer = chainseer_solana.SolanaOutcomeObserver(path, market)
+            observer.register(candidate(block_time=launched), tracked_at=launched)
+
+            first = observer.observe_due(limit=1, now=launched + 15 * 60)
+            too_soon = observer.observe_due(limit=1, now=launched + 15 * 60 + 30)
+            retry = observer.observe_due(limit=1, now=launched + 15 * 60 + 61)
+
+            self.assertEqual(first["cycle"]["infrastructure_failures"], 1)
+            self.assertEqual(too_soon["cycle"]["infrastructure_failures"], 0)
+            self.assertEqual(retry["cycle"]["infrastructure_failures"], 1)
+            with closing(sqlite3.connect(path)) as connection:
+                count = connection.execute("SELECT COUNT(*) FROM checkpoints").fetchone()[0]
+            self.assertEqual(count, 0)
+
     def test_atomic_json_retries_transient_windows_replace_lock(self):
         with tempfile.TemporaryDirectory() as temp:
             path = Path(temp) / "state.json"

@@ -36,6 +36,7 @@ from chainseer import (
     RPCError,
     RobinhoodRPC,
     ScanContext,
+    ONLINE_COGNITIVE_RECALL_WINDOW,
     _get_skill_dir,
     _http_get_json,
     _load_skill_module,
@@ -4378,7 +4379,12 @@ class PonsCognitiveLoop:
             budget_tokens=650,
             max_blocks=5,
             neighbors=0,
-            use_index=True,
+            # Foreground analysis must neither scan the complete Timechain nor
+            # synchronously catch up the Hippocampus index.  Current canonical
+            # evidence is passed directly into the PoQ seal; historical recall
+            # is bounded advisory context only.
+            use_index=False,
+            scan_window=ONLINE_COGNITIVE_RECALL_WINDOW,
         )
         labels = recalled.get("query_labels") or self.recall.label(safe_input)
         cognition = {

@@ -16,10 +16,12 @@ import math
 import os
 import random
 import re
+import sqlite3
 import struct
 import threading
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -152,6 +154,21 @@ SOLANA_LAUNCH_EXPLORATION_SHARE = 1
 # actually counts (43 of 50 when this was written). Draining oldest-first
 # would spend the budget on tokens whose markets are long dead.
 SOLANA_ANALYSIS_BACKLOG_LIMIT = 3
+
+# Market outcomes are deliberately independent of shadow admission. Every
+# launch gets the same observation horizons, including hard-stop refusals, so
+# calibration can answer the counterfactual question: "what happened to the
+# tokens we rejected?" A fixed per-cycle budget keeps this lane observational
+# and prevents it from becoming another unbounded enrichment backlog.
+SOLANA_OUTCOME_HORIZONS = (
+    ("15m", 15 * 60),
+    ("1h", 60 * 60),
+    ("6h", 6 * 60 * 60),
+    ("24h", 24 * 60 * 60),
+    ("7d", 7 * 24 * 60 * 60),
+)
+SOLANA_OUTCOME_OBSERVATION_LIMIT = 12
+SOLANA_OUTCOME_RETRY_SECONDS = 60
 
 # A sweep that stops on max_pages did not reach the previous cursor, so it is
 # not contiguous: launches between its oldest signature and that cursor are
@@ -2336,6 +2353,455 @@ class DexScreenerClient:
         }
 
 
+class SolanaOutcomeObserver:
+    """Bounded, admission-independent market outcome observation.
+
+    SQLite is intentional here. The launch catalog and analysis index already
+    demonstrate that rewriting a growing JSON object on every token does not
+    scale. This store updates one token/checkpoint at a time and WAL readers do
+    not block the learning writer.
+    """
+
+    def __init__(self, path: str | Path, dexscreener: DexScreenerClient):
+        self.path = Path(path)
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.dexscreener = dexscreener
+        self._initialize()
+
+    def _connect(self) -> sqlite3.Connection:
+        connection = sqlite3.connect(self.path, timeout=10)
+        connection.row_factory = sqlite3.Row
+        connection.execute("PRAGMA journal_mode=WAL")
+        connection.execute("PRAGMA busy_timeout=10000")
+        connection.execute("PRAGMA foreign_keys=ON")
+        return connection
+
+    @contextmanager
+    def _connection(self):
+        connection = self._connect()
+        try:
+            with connection:
+                yield connection
+        finally:
+            connection.close()
+
+    def _initialize(self) -> None:
+        with self._connection() as connection:
+            connection.executescript(
+                """
+                CREATE TABLE IF NOT EXISTS tokens (
+                    mint TEXT PRIMARY KEY,
+                    ecosystem TEXT NOT NULL,
+                    symbol TEXT,
+                    name TEXT,
+                    launched_at REAL NOT NULL,
+                    tracking_started_at REAL NOT NULL,
+                    admission_state TEXT,
+                    evidence_state TEXT,
+                    shadow_entry_allowed INTEGER,
+                    hard_stops_json TEXT NOT NULL DEFAULT '[]',
+                    first_market_cap_usd REAL,
+                    peak_market_cap_usd REAL,
+                    peak_fdv_usd REAL,
+                    peak_observed_at TEXT,
+                    last_observed_at TEXT,
+                    last_attempt_at REAL,
+                    attempt_count INTEGER NOT NULL DEFAULT 0,
+                    updated_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS checkpoints (
+                    mint TEXT NOT NULL,
+                    horizon_label TEXT NOT NULL,
+                    horizon_seconds INTEGER NOT NULL,
+                    target_at REAL NOT NULL,
+                    observed_at TEXT NOT NULL,
+                    observed_age_seconds REAL NOT NULL,
+                    status TEXT NOT NULL,
+                    learning_eligible INTEGER NOT NULL,
+                    lateness_seconds REAL NOT NULL,
+                    pair_address TEXT,
+                    dex_id TEXT,
+                    pair_symbol TEXT,
+                    price_usd REAL,
+                    liquidity_usd REAL,
+                    market_cap_usd REAL,
+                    fdv_usd REAL,
+                    market_cap_multiple REAL,
+                    maximum_favorable_excursion_pct REAL,
+                    source TEXT,
+                    PRIMARY KEY (mint, horizon_label),
+                    FOREIGN KEY (mint) REFERENCES tokens(mint)
+                );
+                CREATE INDEX IF NOT EXISTS idx_outcome_tokens_launched
+                    ON tokens(launched_at);
+                CREATE INDEX IF NOT EXISTS idx_outcome_checkpoints_status
+                    ON checkpoints(status, horizon_label);
+                """
+            )
+
+    @staticmethod
+    def _candidate_values(candidate: SolanaLaunchCandidate | dict) -> dict:
+        value = candidate.to_dict() if hasattr(candidate, "to_dict") else candidate
+        return {
+            "mint": str(value.get("mint") or ""),
+            "ecosystem": str(value.get("launch_ecosystem") or "unknown"),
+            "symbol": str(value.get("symbol") or ""),
+            "name": str(value.get("name") or ""),
+            "launched_at": float(_safe_int(value.get("block_time"))),
+        }
+
+    def register(
+        self,
+        candidate: SolanaLaunchCandidate | dict,
+        *,
+        tracked_at: float | None = None,
+    ) -> bool:
+        row = self._candidate_values(candidate)
+        if not row["mint"] or row["launched_at"] <= 0:
+            return False
+        current = float(time.time() if tracked_at is None else tracked_at)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                INSERT OR IGNORE INTO tokens (
+                    mint, ecosystem, symbol, name, launched_at,
+                    tracking_started_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    row["mint"], row["ecosystem"], row["symbol"], row["name"],
+                    row["launched_at"], current, _utc_now(),
+                ),
+            )
+            return cursor.rowcount > 0
+
+    def register_many(
+        self,
+        candidates: Iterable[SolanaLaunchCandidate | dict],
+        *,
+        tracked_at: float | None = None,
+    ) -> int:
+        current = float(time.time() if tracked_at is None else tracked_at)
+        rows = [self._candidate_values(value) for value in candidates]
+        rows = [row for row in rows if row["mint"] and row["launched_at"] > 0]
+        if not rows:
+            return 0
+        with self._connection() as connection:
+            before = connection.total_changes
+            connection.executemany(
+                """
+                INSERT OR IGNORE INTO tokens (
+                    mint, ecosystem, symbol, name, launched_at,
+                    tracking_started_at, updated_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                [
+                    (
+                        row["mint"], row["ecosystem"], row["symbol"], row["name"],
+                        row["launched_at"], current, _utc_now(),
+                    )
+                    for row in rows
+                ],
+            )
+            return connection.total_changes - before
+
+    def backfill_analyses(self, rows: Iterable[dict]) -> int:
+        values = []
+        for row in rows:
+            candidate = row.get("candidate") or {}
+            decision = row.get("decision") or {}
+            mint = candidate.get("mint")
+            if not mint:
+                continue
+            values.append(
+                (
+                    decision.get("admission_state"),
+                    decision.get("evidence_state"),
+                    (
+                        int(bool(decision.get("shadow_entry_allowed")))
+                        if "shadow_entry_allowed" in decision else None
+                    ),
+                    _canonical_json(decision.get("hard_stops") or []),
+                    _utc_now(),
+                    mint,
+                )
+            )
+        if not values:
+            return 0
+        with self._connection() as connection:
+            before = connection.total_changes
+            connection.executemany(
+                """
+                UPDATE tokens SET admission_state = ?, evidence_state = ?,
+                    shadow_entry_allowed = ?, hard_stops_json = ?, updated_at = ?
+                WHERE mint = ?
+                """,
+                values,
+            )
+            return connection.total_changes - before
+
+    def update_analysis(
+        self,
+        candidate: SolanaLaunchCandidate,
+        decision: SolanaRiskDecision,
+    ) -> None:
+        self.register(candidate)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                UPDATE tokens SET
+                    admission_state = ?, evidence_state = ?,
+                    shadow_entry_allowed = ?, hard_stops_json = ?,
+                    updated_at = ?
+                WHERE mint = ?
+                """,
+                (
+                    decision.admission_state,
+                    decision.evidence_state,
+                    int(bool(decision.shadow_entry_allowed)),
+                    _canonical_json(decision.hard_stops),
+                    _utc_now(),
+                    candidate.mint,
+                ),
+            )
+
+    @staticmethod
+    def _tolerance_seconds(horizon_seconds: int) -> float:
+        return float(max(5 * 60, horizon_seconds // 4))
+
+    def _expire_missed(self, now: float) -> int:
+        expired = 0
+        observed_at = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        with self._connection() as connection:
+            for label, horizon in SOLANA_OUTCOME_HORIZONS:
+                tolerance = self._tolerance_seconds(horizon)
+                cursor = connection.execute(
+                    """
+                    INSERT OR IGNORE INTO checkpoints (
+                        mint, horizon_label, horizon_seconds, target_at,
+                        observed_at, observed_age_seconds, status,
+                        learning_eligible, lateness_seconds, source
+                    )
+                    SELECT mint, ?, ?, launched_at + ?, ?, ? - launched_at,
+                           'missed', 0, ? - (launched_at + ?),
+                           'checkpoint_expired_before_observation'
+                    FROM tokens
+                    WHERE launched_at + ? + ? < ?
+                    """,
+                    (
+                        label, horizon, horizon, observed_at, now,
+                        now, horizon, horizon, tolerance, now,
+                    ),
+                )
+                expired += cursor.rowcount
+        return expired
+
+    @staticmethod
+    def _market_snapshot(mint: str, pairs: list[dict]) -> dict | None:
+        matches = []
+        for pair in pairs:
+            if str(pair.get("chainId") or "").lower() != "solana":
+                continue
+            base = pair.get("baseToken") or {}
+            if base.get("address") != mint:
+                continue
+            matches.append(pair)
+        if not matches:
+            return None
+        pair = max(
+            matches,
+            key=lambda value: _safe_float((value.get("liquidity") or {}).get("usd")),
+        )
+        base = pair.get("baseToken") or {}
+        market_cap = _safe_float(pair.get("marketCap"), None)
+        fdv = _safe_float(pair.get("fdv"), None)
+        return {
+            "pair_address": pair.get("pairAddress"),
+            "dex_id": pair.get("dexId"),
+            "pair_symbol": base.get("symbol"),
+            "price_usd": _safe_float(pair.get("priceUsd"), None),
+            "liquidity_usd": _safe_float((pair.get("liquidity") or {}).get("usd"), None),
+            "market_cap_usd": market_cap if market_cap and market_cap > 0 else None,
+            "fdv_usd": fdv if fdv and fdv > 0 else None,
+            "source": "dexscreener_token_pairs_exact_mint",
+        }
+
+    def _due(self, now: float, limit: int) -> list[dict]:
+        values = []
+        retry_before = now - SOLANA_OUTCOME_RETRY_SECONDS
+        with self._connection() as connection:
+            for label, horizon in SOLANA_OUTCOME_HORIZONS:
+                tolerance = self._tolerance_seconds(horizon)
+                rows = connection.execute(
+                    """
+                    SELECT t.*, ? AS horizon_label, ? AS horizon_seconds,
+                           t.launched_at + ? AS target_at
+                    FROM tokens t
+                    LEFT JOIN checkpoints c
+                      ON c.mint = t.mint AND c.horizon_label = ?
+                    WHERE c.mint IS NULL
+                      AND t.launched_at + ? <= ?
+                      AND t.launched_at + ? + ? >= ?
+                      AND (t.last_attempt_at IS NULL OR t.last_attempt_at <= ?)
+                    ORDER BY target_at, t.mint
+                    LIMIT ?
+                    """,
+                    (
+                        label, horizon, horizon, label, horizon, now,
+                        horizon, tolerance, now, retry_before, limit,
+                    ),
+                ).fetchall()
+                values.extend(dict(row) for row in rows)
+        values.sort(key=lambda row: (row["target_at"], row["mint"]))
+        selected = []
+        seen = set()
+        for row in values:
+            if row["mint"] in seen:
+                continue
+            selected.append(row)
+            seen.add(row["mint"])
+            if len(selected) >= limit:
+                break
+        return selected
+
+    def observe_due(self, *, limit: int, now: float | None = None) -> dict:
+        started = time.monotonic()
+        current = float(time.time() if now is None else now)
+        expired = self._expire_missed(current)
+        observed = no_market = failures = 0
+        for due in self._due(current, max(0, int(limit))):
+            mint = due["mint"]
+            try:
+                snapshot = self._market_snapshot(
+                    mint, self.dexscreener.token_pairs(mint)
+                )
+            except InfrastructureIndeterminateError:
+                failures += 1
+                with self._connection() as connection:
+                    connection.execute(
+                        """
+                        UPDATE tokens SET last_attempt_at = ?,
+                            attempt_count = attempt_count + 1, updated_at = ?
+                        WHERE mint = ?
+                        """,
+                        (current, _utc_now(), mint),
+                    )
+                continue
+            observed_at = datetime.fromtimestamp(current, timezone.utc).isoformat()
+            snapshot = snapshot or {
+                "pair_address": None, "dex_id": None, "pair_symbol": None,
+                "price_usd": None, "liquidity_usd": None,
+                "market_cap_usd": None, "fdv_usd": None,
+                "source": "dexscreener_token_pairs_exact_mint",
+            }
+            status = "observed" if snapshot["market_cap_usd"] or snapshot["fdv_usd"] else "no_market"
+            no_market += status == "no_market"
+            lateness = max(0.0, current - due["target_at"])
+            with self._connection() as connection:
+                token = connection.execute(
+                    "SELECT * FROM tokens WHERE mint = ?", (mint,)
+                ).fetchone()
+                market_cap = snapshot["market_cap_usd"]
+                first = token["first_market_cap_usd"] or market_cap
+                peak_market_cap = max(
+                    value for value in (token["peak_market_cap_usd"], market_cap, 0.0)
+                    if value is not None
+                ) or None
+                peak_fdv = max(
+                    value for value in (token["peak_fdv_usd"], snapshot["fdv_usd"], 0.0)
+                    if value is not None
+                ) or None
+                multiple = market_cap / first if market_cap and first else None
+                mfe = (
+                    (peak_market_cap / first - 1.0) * 100.0
+                    if peak_market_cap and first else None
+                )
+                connection.execute(
+                    """
+                    INSERT INTO checkpoints (
+                        mint, horizon_label, horizon_seconds, target_at,
+                        observed_at, observed_age_seconds, status,
+                        learning_eligible, lateness_seconds, pair_address,
+                        dex_id, pair_symbol, price_usd, liquidity_usd,
+                        market_cap_usd, fdv_usd, market_cap_multiple,
+                        maximum_favorable_excursion_pct, source
+                    ) VALUES (?, ?, ?, ?, ?, ?, ?, 1, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        mint, due["horizon_label"], due["horizon_seconds"],
+                        due["target_at"], observed_at, current - due["launched_at"],
+                        status, lateness, snapshot["pair_address"], snapshot["dex_id"],
+                        snapshot["pair_symbol"], snapshot["price_usd"],
+                        snapshot["liquidity_usd"], market_cap, snapshot["fdv_usd"],
+                        multiple, mfe, snapshot["source"],
+                    ),
+                )
+                connection.execute(
+                    """
+                    UPDATE tokens SET
+                        symbol = CASE WHEN symbol = '' AND ? IS NOT NULL THEN ? ELSE symbol END,
+                        first_market_cap_usd = ?, peak_market_cap_usd = ?,
+                        peak_fdv_usd = ?, peak_observed_at = CASE
+                            WHEN ? IS NOT NULL AND (? IS NULL OR ? >= ?) THEN ?
+                            ELSE peak_observed_at END,
+                        last_observed_at = ?, last_attempt_at = ?,
+                        attempt_count = attempt_count + 1, updated_at = ?
+                    WHERE mint = ?
+                    """,
+                    (
+                        snapshot["pair_symbol"], snapshot["pair_symbol"], first,
+                        peak_market_cap, peak_fdv, market_cap,
+                        token["peak_market_cap_usd"], market_cap,
+                        token["peak_market_cap_usd"] or 0.0, observed_at,
+                        observed_at, current, _utc_now(), mint,
+                    ),
+                )
+            observed += 1
+        return {**self.summary(), "cycle": {
+            "observed": observed,
+            "no_market": no_market,
+            "expired_missed": expired,
+            "infrastructure_failures": failures,
+            "limit": max(0, int(limit)),
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }}
+
+    def summary(self) -> dict:
+        with self._connection() as connection:
+            tokens = connection.execute(
+                """
+                SELECT COUNT(*) AS total,
+                       SUM(CASE WHEN shadow_entry_allowed = 1 THEN 1 ELSE 0 END) AS admitted,
+                       SUM(CASE WHEN shadow_entry_allowed = 0 THEN 1 ELSE 0 END) AS rejected,
+                       SUM(CASE WHEN peak_market_cap_usd >= 1000000 THEN 1 ELSE 0 END) AS million_peak
+                FROM tokens
+                """
+            ).fetchone()
+            checkpoints = {
+                row["status"]: row["count"]
+                for row in connection.execute(
+                    "SELECT status, COUNT(*) AS count FROM checkpoints GROUP BY status"
+                )
+            }
+            by_horizon = {
+                row["horizon_label"]: row["count"]
+                for row in connection.execute(
+                    "SELECT horizon_label, COUNT(*) AS count FROM checkpoints GROUP BY horizon_label"
+                )
+            }
+        return {
+            "schema_version": 1,
+            "tokens_tracked": tokens["total"] or 0,
+            "admitted_tracked": tokens["admitted"] or 0,
+            "rejected_tracked": tokens["rejected"] or 0,
+            "million_market_cap_peak_observed": tokens["million_peak"] or 0,
+            "checkpoint_statuses": checkpoints,
+            "checkpoints_by_horizon": by_horizon,
+            "horizons": [label for label, _seconds in SOLANA_OUTCOME_HORIZONS],
+            "paper_only": True,
+        }
+
+
 class SolanaRiskAnalyzer:
     def __init__(
         self,
@@ -4032,6 +4498,22 @@ class SolanaPrototypeEngine:
             jupiter_api_key, paper_taker=paper_taker
         )
         self.dexscreener = dexscreener or DexScreenerClient()
+        self.outcome_observer = SolanaOutcomeObserver(
+            self.root / "outcome_observations.sqlite3",
+            self.dexscreener,
+        )
+        if self.outcome_observer.summary()["tokens_tracked"] == 0:
+            catalog_rows = []
+            for catalog_name in ("catalog.json", "meteora_catalog.json"):
+                catalog = _read_json(self.root / catalog_name, {})
+                catalog_rows.extend((catalog.get("tokens") or {}).values())
+            self.outcome_observer.register_many(catalog_rows)
+            analysis = _read_json(self.root / "analysis_index.json", {})
+            analysis_rows = list((analysis.get("tokens") or {}).values())
+            self.outcome_observer.register_many(
+                [row.get("candidate") or {} for row in analysis_rows]
+            )
+            self.outcome_observer.backfill_analyses(analysis_rows)
         self.observer = PumpFunObserver(
             self.rpc, self.root, self.observation_ledger
         )
@@ -5120,6 +5602,7 @@ class SolanaPrototypeEngine:
         if self.timechain:
             self.timechain.seal_analysis(candidate, decision)
         self._record_analysis(candidate, decision, recovery=recovery)
+        self.outcome_observer.update_analysis(candidate, decision)
         before = len(self.shadow_ledger.load())
         position = self.trader.enter(candidate, decision) if shadow_enter else None
         if self.timechain and len(self.shadow_ledger.load()) > before:
@@ -5511,6 +5994,15 @@ class SolanaPrototypeEngine:
         max_pages: int = 10,
     ) -> dict:
         """The cycle body. Callers must hold the run lock -- see learn_once."""
+        # Outcomes run first and have their own small HTTP-only budget. Even if
+        # later RPC-heavy discovery or analysis exhausts the scheduler window,
+        # due checkpoints have already been durably recorded.
+        market_outcomes = self.outcome_observer.observe_due(
+            limit=SOLANA_OUTCOME_OBSERVATION_LIMIT
+        )
+        # Publish immediately. The rest of a Solana cycle can take many
+        # minutes, and outcome visibility must not wait for enrichment.
+        _atomic_json(self.root / "outcome_summary.json", market_outcomes)
         recovery_seeded = self._seed_recovery_queue()
         recovered = self._recover_indeterminate(
             limit=max(0, recovery_limit), shadow_enter=True
@@ -5522,6 +6014,9 @@ class SolanaPrototypeEngine:
         meteora_discovered, meteora_sync_error = self._safe_observer_sync(
             self.meteora_observer,
             signature_limit=signature_limit, slot_span=slot_span, max_pages=max_pages,
+        )
+        outcome_tokens_registered = self.outcome_observer.register_many(
+            [*discovered, *meteora_discovered]
         )
         observer_health = self._record_observer_health(
             {
@@ -5634,6 +6129,7 @@ class SolanaPrototypeEngine:
                 "new_launches": len(discovered) + len(meteora_discovered),
                 "new_launches_pump_fun": len(discovered),
                 "new_launches_meteora_dbc": len(meteora_discovered),
+                "outcome_tokens_registered": outcome_tokens_registered,
                 "sync_errors": {
                     "pump_fun": pump_sync_error,
                     "meteora_dbc": meteora_sync_error,
@@ -5716,6 +6212,7 @@ class SolanaPrototypeEngine:
             "rpc_health": rpc_health,
             "jupiter_health": self._jupiter_health(),
             "dexscreener_health": self._dexscreener_health(),
+            "market_outcomes": market_outcomes,
             "paper_only": True,
             "live_execution_enabled": False,
         }

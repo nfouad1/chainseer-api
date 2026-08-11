@@ -87,6 +87,35 @@ def ring(
 
 
 class TemporalEntityGraphTests(unittest.TestCase):
+    def test_subject_view_filters_ring_types_before_applying_score_limit(self):
+        projection = build_temporal_projection([
+            ring(0, TOKEN_A, evm_graph(TOKEN_A), score=40),
+            ring(1, TOKEN_A, evm_graph(TOKEN_A), score=50),
+            ring(2, TOKEN_A, evm_graph(TOKEN_A), score=60),
+        ])
+        timeline = projection["subjects"][f"robinhood:{TOKEN_A}"]["risk_timeline"]
+        timeline.insert(2, {
+            **copy.deepcopy(timeline[1]),
+            "analysis_ring": {
+                **copy.deepcopy(timeline[1]["analysis_ring"]),
+                "index": 99,
+                "type": "pons_launch_analysis",
+            },
+        })
+
+        view = subject_temporal_view(
+            projection,
+            "robinhood",
+            TOKEN_A,
+            score_limit=2,
+            risk_ring_types={"token_analysis"},
+        )
+
+        self.assertEqual(
+            [point["analysis_ring"]["index"] for point in view["risk_timeline"]],
+            [1, 2],
+        )
+
     def test_tracks_appearance_change_and_defensible_disappearance(self):
         first = evm_graph(TOKEN_A, pin=100)
         changed = copy.deepcopy(first)

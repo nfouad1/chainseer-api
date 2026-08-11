@@ -166,6 +166,46 @@ type PublicReport = {
 
 type ScanState = "idle" | "submitting" | "analyzing" | "succeeded" | "failed";
 
+type ActiveScan = {
+  jobId: string;
+  address: string;
+  network: Network;
+  acceptedAt: number;
+};
+
+type AnalysisJob = {
+  status?: string;
+  progress_percent?: number;
+  stage_detail?: string;
+  result?: PublicReport;
+  cognitive_completion?: CognitiveCompletion;
+  error?: { message?: string };
+};
+
+const ACTIVE_SCAN_STORAGE_KEY = "chainseer-active-scan-v1";
+const ACTIVE_SCAN_MAX_AGE_MS = 15 * 60 * 1_000;
+
+class RecoverableScanError extends Error {}
+
+function scanTelemetry(event: string, jobId: string, reconnectAttempts: number) {
+  void fetch("/api/telemetry/scan", {
+    method: "POST",
+    cache: "no-store",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      event,
+      job_id: jobId,
+      reconnect_attempts: reconnectAttempts,
+    }),
+  }).catch(() => undefined);
+}
+
+type CognitiveCompletion = {
+  status: string;
+  stage_detail: string;
+  progress_percent: number;
+};
+
 type TokenMonitor = {
   key: string;
   network: Network;
@@ -325,6 +365,12 @@ function errorMessage(body: unknown, fallback: string) {
 
 function delay(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function formatAge(seconds: number) {
+  if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s old`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m old`;
+  return `${Math.round(seconds / 3600)}h old`;
 }
 
 function formatMoney(value: number | string | null | undefined) {
@@ -1336,6 +1382,9 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [scanState, setScanState] = useState<ScanState>("idle");
   const [scanProgress, setScanProgress] = useState(0);
+  const [forceRefresh, setForceRefresh] = useState(false);
+  const [cognitiveCompletion, setCognitiveCompletion] =
+    useState<CognitiveCompletion | null>(null);
   const [liveReport, setLiveReport] = useState<PublicReport | null>(null);
   const [showExample, setShowExample] = useState(false);
   const [monitors, setMonitors] = useState<TokenMonitor[]>([]);
@@ -1343,6 +1392,56 @@ export default function Home() {
   const [criticalAlerts, setCriticalAlerts] = useState<CriticalAlert[]>([]);
   const [monitorBusy, setMonitorBusy] = useState(false);
   const [monitorNotice, setMonitorNotice] = useState("");
+
+  useEffect(() => {
+    let active = true;
+    queueMicrotask(() => {
+      if (!active) return;
+      try {
+        const saved = JSON.parse(
+          window.localStorage.getItem(ACTIVE_SCAN_STORAGE_KEY) || "null",
+        ) as ActiveScan | null;
+        const valid =
+          saved &&
+          /^[a-f0-9]{32}$/.test(saved.jobId) &&
+          (saved.network === "robinhood" ||
+            saved.network === "base" ||
+            saved.network === "solana") &&
+          typeof saved.address === "string" &&
+          Date.now() - saved.acceptedAt < ACTIVE_SCAN_MAX_AGE_MS;
+        if (!valid || !saved) {
+          window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+          return;
+        }
+        setNetwork(saved.network);
+        setAddress(saved.address);
+        setScanState("analyzing");
+        setScanProgress(2);
+        setNotice("Reconnecting to the accepted scan…");
+        void continueAcceptedScan(saved, true).catch((error) => {
+          if (!active) return;
+          const recoverable = error instanceof RecoverableScanError;
+          setScanState(recoverable ? "analyzing" : "failed");
+          if (!recoverable) {
+            setScanProgress(0);
+            window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+          }
+          setNotice(
+            error instanceof Error
+              ? error.message
+              : "The accepted scan could not be recovered.",
+          );
+        });
+      } catch {
+        window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+      }
+    });
+    return () => {
+      active = false;
+    };
+    // This recovery intentionally runs once when the page mounts.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   useEffect(() => {
     let active = true;
@@ -1565,6 +1664,119 @@ export default function Home() {
     }
   }
 
+  async function continueAcceptedScan(activeScan: ActiveScan, recovered = false) {
+    let reconnectAttempts = 0;
+    let resultPublished = false;
+    const deadline = activeScan.acceptedAt + ACTIVE_SCAN_MAX_AGE_MS;
+    while (Date.now() < deadline) {
+      if (reconnectAttempts === 0) await delay(2_000);
+      try {
+        const response = await fetch(
+          `/api/analyses?job=${encodeURIComponent(activeScan.jobId)}`,
+          { cache: "no-store" },
+        );
+        const job = (await response.json().catch(() => null)) as AnalysisJob | null;
+        const transient =
+          response.status === 429 ||
+          response.status === 502 ||
+          response.status === 503 ||
+          response.status === 504 ||
+          job?.error?.message?.includes("connection was interrupted");
+        if (!response.ok && transient) {
+          throw new TypeError("temporary polling interruption");
+        }
+        if (!response.ok || !job) {
+          window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+          throw new Error(
+            errorMessage(job, "The analysis status could not be retrieved."),
+          );
+        }
+        if (reconnectAttempts > 0) {
+          scanTelemetry("reconnect_success", activeScan.jobId, reconnectAttempts);
+          reconnectAttempts = 0;
+        }
+        if (
+          (job.status === "queued" || job.status === "running") &&
+          typeof job.progress_percent === "number"
+        ) {
+          setScanProgress(Math.max(0, Math.min(100, job.progress_percent)));
+          if (typeof job.stage_detail === "string" && job.stage_detail) {
+            setNotice(`${job.stage_detail} · ${Math.round(job.progress_percent)}%`);
+          }
+        }
+        if (job.status === "succeeded" && job.result) {
+          setLiveReport(job.result);
+          setScanState("succeeded");
+          setScanProgress(100);
+          const cognitive = job.cognitive_completion;
+          if (cognitive && typeof cognitive.status === "string") {
+            setCognitiveCompletion({
+              status: cognitive.status,
+              stage_detail:
+                typeof cognitive.stage_detail === "string"
+                  ? cognitive.stage_detail
+                  : "Cognitive audit is continuing",
+              progress_percent:
+                typeof cognitive.progress_percent === "number"
+                  ? Math.max(0, Math.min(100, cognitive.progress_percent))
+                  : 0,
+            });
+          }
+          if (!resultPublished) {
+            resultPublished = true;
+            setNotice(
+              `Risk result sealed to Timechain Ring ${job.result.timechain?.ring ?? "—"}.`,
+            );
+            if (recovered) {
+              scanTelemetry("recovered_completed", activeScan.jobId, 0);
+            }
+            window.setTimeout(() => {
+              document.getElementById("live-report")?.scrollIntoView({
+                behavior: "smooth",
+                block: "start",
+              });
+            }, 50);
+          }
+          if (
+            !cognitive ||
+            cognitive.status === "complete" ||
+            cognitive.status === "failed"
+          ) {
+            window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+            return;
+          }
+        } else if (job.status === "failed") {
+          window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+          throw new Error(
+            errorMessage(job, "The analysis failed without publishing a result."),
+          );
+        }
+      } catch (error) {
+        if (error instanceof TypeError) {
+          reconnectAttempts += 1;
+          if (reconnectAttempts === 1) {
+            scanTelemetry("poll_interruption", activeScan.jobId, reconnectAttempts);
+          }
+          setScanState("analyzing");
+          setNotice(
+            `Connection interrupted; the accepted scan is still being checked. Reconnecting (${reconnectAttempts})…`,
+          );
+          const backoff = Math.min(
+            10_000,
+            1_000 * (2 ** Math.min(3, reconnectAttempts - 1)),
+          );
+          await delay(backoff);
+          continue;
+        }
+        throw error;
+      }
+    }
+    scanTelemetry("recovery_deadline_exceeded", activeScan.jobId, reconnectAttempts);
+    throw new RecoverableScanError(
+      "The scan is still saved, but the connection could not be restored yet. Reload this page to check the accepted job again.",
+    );
+  }
+
   async function submitScan(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     const normalizedAddress = address.trim();
@@ -1585,6 +1797,7 @@ export default function Home() {
 
     setScanState("submitting");
     setScanProgress(1);
+    setCognitiveCompletion(null);
     setLiveReport(null);
     setShowExample(false);
     setNotice("Submitting the token to the serialized analysis queue…");
@@ -1594,7 +1807,11 @@ export default function Home() {
         method: "POST",
         cache: "no-store",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: normalizedAddress, network }),
+        body: JSON.stringify({
+          address: normalizedAddress,
+          network,
+          force_refresh: forceRefresh,
+        }),
       });
       const submissionBody = await submission.json().catch(() => null);
       if (!submission.ok) {
@@ -1610,66 +1827,62 @@ export default function Home() {
         throw new Error("The analysis service returned an invalid job identifier.");
       }
 
-      setScanState("analyzing");
-      setScanProgress(2);
-      setNotice(
-        submissionBody.cached
-          ? "Loading the recent sealed result…"
-          : network === "solana"
-            ? "Analyzing SPL mint controls, markets, holders, Jupiter routes, and provenance…"
-            : network === "base"
-              ? "Analyzing Base contract, liquidity, holders, deployer history, and provenance…"
-              : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
+      const activeScan: ActiveScan = {
+        jobId,
+        address: normalizedAddress,
+        network,
+        acceptedAt: Date.now(),
+      };
+      window.localStorage.setItem(
+        ACTIVE_SCAN_STORAGE_KEY,
+        JSON.stringify(activeScan),
       );
 
-      for (let attempt = 0; attempt < 150; attempt += 1) {
-        if (attempt > 0) await delay(2_000);
-        const response = await fetch(
-          `/api/analyses?job=${encodeURIComponent(jobId)}`,
-          { cache: "no-store" },
+      const previousResult =
+        submissionBody &&
+        submissionBody.previous_result &&
+        typeof submissionBody.previous_result === "object"
+          ? (submissionBody.previous_result as PublicReport)
+          : null;
+      const previousAge =
+        submissionBody &&
+        typeof submissionBody.previous_result_age_seconds === "number"
+          ? submissionBody.previous_result_age_seconds
+          : 0;
+
+      setScanState("analyzing");
+      setScanProgress(2);
+      if (previousResult) {
+        setLiveReport(previousResult);
+        const anchor = previousResult.evidence.block_pin?.toLocaleString() ?? "unknown";
+        const ring = previousResult.timechain.ring ?? "unknown";
+        setNotice(
+          `Showing sealed Ring ${ring} at block/slot ${anchor} (${formatAge(previousAge)}) while a fresh scan runs.`,
         );
-        const job = await response.json().catch(() => null);
-        if (!response.ok) {
-          throw new Error(
-            errorMessage(job, "The analysis status could not be retrieved."),
-          );
-        }
-        if (
-          (job.status === "queued" || job.status === "running") &&
-          typeof job.progress_percent === "number"
-        ) {
-          setScanProgress(Math.max(0, Math.min(100, job.progress_percent)));
-          if (typeof job.stage_detail === "string" && job.stage_detail) {
-            setNotice(
-              `${job.stage_detail} · ${Math.round(job.progress_percent)}%`,
-            );
-          }
-        }
-        if (job.status === "succeeded" && job.result) {
-          setLiveReport(job.result as PublicReport);
-          setScanState("succeeded");
-          setScanProgress(100);
-          setNotice(
-            `Analysis sealed to Timechain Ring ${job.result.timechain?.ring ?? "—"}.`,
-          );
-          window.setTimeout(() => {
-            document.getElementById("live-report")?.scrollIntoView({
-              behavior: "smooth",
-              block: "start",
-            });
-          }, 50);
-          return;
-        }
-        if (job.status === "failed") {
-          throw new Error(
-            errorMessage(job, "The analysis failed without publishing a result."),
-          );
-        }
+        window.setTimeout(() => {
+          document.getElementById("live-report")?.scrollIntoView({
+            behavior: "smooth",
+            block: "start",
+          });
+        }, 50);
+      } else {
+        setNotice(
+          submissionBody.cached
+            ? "Loading the recent sealed result…"
+            : network === "solana"
+              ? "Analyzing SPL mint controls, markets, holders, Jupiter routes, and provenance…"
+              : network === "base"
+                ? "Analyzing Base contract, liquidity, holders, deployer history, and provenance…"
+                : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
+        );
       }
-      throw new Error("The analysis is taking longer than expected. Try again shortly.");
+      setForceRefresh(false);
+
+      await continueAcceptedScan(activeScan);
     } catch (error) {
-      setScanState("failed");
-      setScanProgress(0);
+      const recoverable = error instanceof RecoverableScanError;
+      setScanState(recoverable ? "analyzing" : "failed");
+      if (!recoverable) setScanProgress(0);
       setNotice(
         error instanceof Error
           ? error.message
@@ -1683,6 +1896,7 @@ export default function Home() {
     setNotice("Demo report opened. Its token, evidence, score, and Timechain proof are fictional.");
     setScanState("idle");
     setScanProgress(0);
+    setCognitiveCompletion(null);
     setLiveReport(null);
     document.getElementById("report")?.scrollIntoView({ behavior: "smooth" });
   }
@@ -1695,6 +1909,7 @@ export default function Home() {
     setLiveReport(null);
     setScanState("idle");
     setScanProgress(0);
+    setCognitiveCompletion(null);
   }
 
   return (
@@ -1825,6 +2040,15 @@ export default function Home() {
           <span>No wallet connection</span>
           <span>No signature</span>
           <span>Evidence anchored to block or slot</span>
+          <label className="force-refresh-control">
+            <input
+              type="checkbox"
+              checked={forceRefresh}
+              onChange={(event) => setForceRefresh(event.target.checked)}
+              disabled={scanState === "submitting" || scanState === "analyzing"}
+            />
+            Force fresh scan
+          </label>
           <button type="button" onClick={loadExample}>Open demo report →</button>
         </div>
         {notice && <p className="scan-notice" role="status">{notice}</p>}
@@ -1838,6 +2062,25 @@ export default function Home() {
             aria-valuenow={Math.round(scanProgress)}
           >
             <span style={{ width: `${scanProgress}%` }} />
+          </div>
+        )}
+        {scanState === "succeeded" && cognitiveCompletion && (
+          <div className="cognitive-progress" role="status" aria-live="polite">
+            <div>
+              <strong>Cognitive audit</strong>
+              <span>{cognitiveCompletion.stage_detail}</span>
+              <b>{Math.round(cognitiveCompletion.progress_percent)}%</b>
+            </div>
+            <div
+              className="scan-progress"
+              role="progressbar"
+              aria-label="Cognitive sealing progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(cognitiveCompletion.progress_percent)}
+            >
+              <span style={{ width: `${cognitiveCompletion.progress_percent}%` }} />
+            </div>
           </div>
         )}
       </section>

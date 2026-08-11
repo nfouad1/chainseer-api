@@ -13,6 +13,9 @@ from pydantic import ValidationError
 from chainseer_api import (
     AnalysisService,
     AnalyzeRequest,
+    DeferredSealJob,
+    Job,
+    PreparedWatcherCommit,
     MemoryQueryRequest,
     Settings,
     SingleProcessLease,
@@ -20,10 +23,12 @@ from chainseer_api import (
     WatcherBusyError,
     WatchRequest,
     _cypher_tempre_runtime_status,
+    _env_float,
     _server_port,
     build_public_report,
     deterministic_benchmark_split,
 )
+from chainseer_deferred import DeferredQueueItem
 from chainseer_benchmark import load_jsonl
 from chainseer_entity_graph import build_robinhood_entity_graph
 
@@ -627,6 +632,10 @@ class TrustedHostCheckTests(unittest.TestCase):
                 "commit": "abc123",
             },
             "maintenance_queue_depth": 0,
+            "maintenance_telemetry": {
+                "full_audit_deferred_analysis": 2,
+                "full_audit_deferred_memory": 1,
+            },
             "faculty_pack": {"status": "verified"},
             "memory": {"warning": False},
         }
@@ -641,6 +650,10 @@ class TrustedHostCheckTests(unittest.TestCase):
         self.assertEqual(
             response.json()["cypher_tempre_runtime"],
             health["cypher_tempre_runtime"],
+        )
+        self.assertEqual(
+            response.json()["maintenance_telemetry"],
+            health["maintenance_telemetry"],
         )
 
     def test_other_routes_still_reject_untrusted_host_header(self):
@@ -723,8 +736,60 @@ class ServiceTests(unittest.TestCase):
                 cached_job = service.get(cached.job_id)
                 self.assertTrue(cached.cached)
                 self.assertEqual(cached_job.status, "succeeded")
-                self.assertEqual(fake.calls, 1)
             finally:
+                service.stop()
+            self.assertEqual(fake.calls, 1)
+
+    def test_client_can_recover_same_job_after_polling_gap_at_ninety_percent(self):
+        reached_ninety = threading.Event()
+        release_analysis = threading.Event()
+
+        class BlockingAgent(FakeAgent):
+            def analyze_token(
+                self, address, full_report=False, progress_callback=None
+            ):
+                self.calls += 1
+                if progress_callback:
+                    progress_callback(
+                        "sealing_timechain", 90, "Sealing Timechain"
+                    )
+                reached_ninety.set()
+                self.assert_released = release_analysis.wait(2)
+                report = sample_internal_report()
+                report["token_address"] = address
+                return report
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            agent = BlockingAgent()
+            service._agent = agent
+            service.start()
+            try:
+                accepted = service.submit(TOKEN)
+                self.assertTrue(reached_ninety.wait(1))
+                interrupted_poll = service.get(accepted.job_id)
+                self.assertEqual(interrupted_poll.progress_percent, 90)
+
+                # A retrying/reloaded client must keep the accepted ID. Even
+                # if it submits again, active-job deduplication returns that
+                # same job and does not start another analysis.
+                duplicate = service.submit(TOKEN)
+                self.assertEqual(duplicate.job_id, accepted.job_id)
+                self.assertEqual(agent.calls, 1)
+
+                release_analysis.set()
+                deadline = time.time() + 2
+                recovered = service.get(accepted.job_id)
+                while recovered.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    recovered = service.get(accepted.job_id)
+                self.assertTrue(agent.assert_released)
+                self.assertEqual(recovered.status, "succeeded")
+                self.assertIsNotNone(recovered.result)
+                self.assertEqual(agent.calls, 1)
+            finally:
+                release_analysis.set()
                 service.stop()
 
     def test_single_process_lease(self):
@@ -911,11 +976,13 @@ class ServiceTests(unittest.TestCase):
                     service.work.put_nowait("priority-analysis")
                 return ring["ring_hash"]
 
+            # Production Chainseer exposes the hash module through its
+            # cognitive loop rather than directly on the analyzer.
+            cognitive_loop.timechain_module = SimpleNamespace(
+                compute_ring_hash=compute_ring_hash
+            )
             service._agent = SimpleNamespace(
                 tc=AuditTimechain(root, rings),
-                timechain_module=SimpleNamespace(
-                    compute_ring_hash=compute_ring_hash
-                ),
                 cognitive_loop=cognitive_loop,
             )
             service._watch_lock.acquire()
@@ -960,6 +1027,30 @@ class ServiceTests(unittest.TestCase):
                 service._integrity_status["last_error"],
             )
             self.assertEqual(cognitive_loop.registry_checks, 1)
+
+    def test_full_audit_defers_under_memory_pressure_with_telemetry(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            service._agent = SimpleNamespace(tc=object())
+            service._last_memory_rss_mb = service.settings.memory_warning_mb + 1
+
+            completed = service._run_full_audit()
+
+            self.assertTrue(completed)
+            self.assertEqual(
+                service._integrity_status["full_audit_deferred_reason"],
+                "memory_pressure",
+            )
+            self.assertEqual(
+                service.health_status()["maintenance_telemetry"]
+                ["full_audit_deferred_memory"],
+                1,
+            )
+            service._run_full_audit()
+            self.assertEqual(
+                service._maintenance_telemetry["full_audit_deferred_memory"],
+                1,
+            )
 
     def test_watcher_releases_lane_between_networks_for_new_analysis(self):
         class FirstWatcher:
@@ -1435,6 +1526,587 @@ class ServiceTests(unittest.TestCase):
                 )
             finally:
                 service.stop()
+
+
+class EnvFloatTests(unittest.TestCase):
+    """_env_float parses and bounds-checks; nothing else covered it."""
+
+    def test_returns_default_when_unset(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("CS_PROBE_FLOAT", None)
+            self.assertEqual(_env_float("CS_PROBE_FLOAT", 2.5, 0.0, 10.0), 2.5)
+
+    def test_parses_configured_value(self):
+        with patch.dict(os.environ, {"CS_PROBE_FLOAT": "7.25"}, clear=False):
+            self.assertEqual(_env_float("CS_PROBE_FLOAT", 2.5, 0.0, 10.0), 7.25)
+
+    def test_rejects_non_numeric(self):
+        with patch.dict(os.environ, {"CS_PROBE_FLOAT": "soon"}, clear=False):
+            with self.assertRaises(RuntimeError) as ctx:
+                _env_float("CS_PROBE_FLOAT", 2.5, 0.0, 10.0)
+            self.assertIn("must be a number", str(ctx.exception))
+
+    def test_rejects_out_of_range_both_ends(self):
+        for raw in ("-0.5", "11"):
+            with patch.dict(os.environ, {"CS_PROBE_FLOAT": raw}, clear=False):
+                with self.assertRaises(RuntimeError) as ctx:
+                    _env_float("CS_PROBE_FLOAT", 2.5, 0.0, 10.0)
+                self.assertIn("must be between", str(ctx.exception))
+
+    def test_boundaries_are_inclusive(self):
+        # A timeout configured at exactly its documented limit must be
+        # accepted; an off-by-one here silently refuses a legal setting.
+        for raw, expected in (("0.0", 0.0), ("10.0", 10.0)):
+            with patch.dict(os.environ, {"CS_PROBE_FLOAT": raw}, clear=False):
+                self.assertEqual(
+                    _env_float("CS_PROBE_FLOAT", 2.5, 0.0, 10.0), expected
+                )
+
+
+class _FakeTimechain:
+    """Minimal tail_rings source for CAS tests."""
+
+    def __init__(self, rings=None):
+        self._rings = list(rings or [])
+
+    def tail_rings(self, k):
+        return self._rings[-k:]
+
+
+def _ring(ring_type, *, network=None, token=None, block=None, key=None):
+    payload = {}
+    if network is not None:
+        payload["network"] = network
+    if token is not None:
+        payload["token_address"] = token
+    if block is not None:
+        payload["block_pin"] = block
+    if key is not None:
+        payload["idempotency_key"] = key
+    return {"ring_type": ring_type, "payload": payload}
+
+
+def _job(**overrides):
+    base = dict(
+        network="robinhood",
+        token_address="0xabc",
+        pinned_snapshot={"analysis_ring": 12, "analysis_ring_hash": "aa" * 32},
+        block_or_slot=100,
+        evidence_hash="e" * 64,
+        report_hash="r" * 64,
+        analyzer_version="test",
+        idempotency_key="robinhood:0xabc:100",
+        prepared_head=11,
+        enqueued_at=1.0,
+    )
+    base.update(overrides)
+    return DeferredSealJob(**base)
+
+
+class DeferredSealCoalescingTests(unittest.TestCase):
+    """Draining must keep exactly one job per subject -- the newest.
+
+    Coalescing is what stops rapid watcher rescans queueing redundant seals.
+    If it kept the OLDEST, a burst would seal a stale snapshot and discard the
+    fresh one, which looks identical from outside: one ring per token either
+    way.
+    """
+
+    def _service(self, root):
+        return AnalysisService(
+            Settings(
+                environment="test",
+                api_token="",
+                chain_root=root,
+                queue_size=4,
+                result_ttl_seconds=3600,
+                cache_ttl_seconds=300,
+                rate_limit_per_minute=6,
+                shutdown_grace_seconds=10,
+                watcher_enabled=False,
+            )
+        )
+
+    def test_keeps_only_the_newest_job_per_subject(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            executed = []
+            service._execute_deferred_seal = executed.append
+            old = _job(block_or_slot=100, enqueued_at=1.0)
+            new = _job(block_or_slot=200, enqueued_at=2.0)
+            service._deferred_seal_work.put(old)
+            service._deferred_seal_work.put(new)
+
+            service._drain_deferred_seals()
+
+            self.assertEqual(len(executed), 1, "coalescing kept both jobs")
+            self.assertEqual(
+                executed[0].block_or_slot, 200,
+                "kept the stale snapshot and discarded the fresh one",
+            )
+
+    def test_distinct_subjects_are_not_coalesced(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            executed = []
+            service._execute_deferred_seal = executed.append
+            service._deferred_seal_work.put(_job(token_address="0xaaa"))
+            service._deferred_seal_work.put(_job(token_address="0xbbb"))
+            service._deferred_seal_work.put(
+                _job(network="solana", token_address="0xaaa")
+            )
+
+            service._drain_deferred_seals()
+
+            self.assertEqual(len(executed), 3, "distinct subjects collapsed")
+
+    def test_empty_queue_is_a_noop(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            called = []
+            service._execute_deferred_seal = called.append
+            service._drain_deferred_seals()
+            self.assertEqual(called, [])
+
+    def test_one_failing_job_does_not_abort_the_batch(self):
+        """A single bad subject must not strand every other pending seal."""
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            seen = []
+
+            def flaky(job):
+                seen.append(job.token_address)
+                if job.token_address == "0xbad":
+                    raise RuntimeError("seal exploded")
+
+            service._execute_deferred_seal = flaky
+            service._deferred_seal_work.put(_job(token_address="0xbad"))
+            service._deferred_seal_work.put(_job(token_address="0xgood"))
+
+            service._drain_deferred_seals()
+
+            self.assertIn("0xgood", seen, "a failing job aborted the batch")
+
+
+class CasValidateDeferredSealTests(unittest.TestCase):
+    """The CAS verdict decides whether a deferred seal counts.
+
+    Each branch has a distinct consequence and none were exercised: an
+    idempotent miss double-seals, a missed supersede commits a stale
+    snapshot over a newer one, and an over-eager supersede silently drops
+    fresh analyses.
+    """
+
+    def _service(self, root):
+        return AnalysisService(
+            Settings(
+                environment="test",
+                api_token="",
+                chain_root=root,
+                queue_size=4,
+                result_ttl_seconds=3600,
+                cache_ttl_seconds=300,
+                rate_limit_per_minute=6,
+                shutdown_grace_seconds=10,
+                watcher_enabled=False,
+            )
+        )
+
+    def test_matching_idempotency_key_is_idempotent(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            tc = _FakeTimechain([
+                _ring("token_analysis", network="robinhood",
+                      token="0xabc", block=100, key="robinhood:0xabc:100")
+            ])
+            self.assertEqual(
+                service._cas_validate_deferred_seal(_job(), tc), "idempotent"
+            )
+
+    def test_newer_sealed_block_supersedes(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            tc = _FakeTimechain([
+                _ring("token_analysis", network="robinhood",
+                      token="0xabc", block=250)
+            ])
+            self.assertEqual(
+                service._cas_validate_deferred_seal(
+                    _job(block_or_slot=100), tc
+                ),
+                "superseded",
+            )
+
+    def test_equal_block_supersedes(self):
+        """>= not >: re-sealing the same block adds nothing."""
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            tc = _FakeTimechain([
+                _ring("token_analysis", network="robinhood",
+                      token="0xabc", block=100)
+            ])
+            self.assertEqual(
+                service._cas_validate_deferred_seal(
+                    _job(block_or_slot=100), tc
+                ),
+                "superseded",
+            )
+
+    def test_other_tokens_advancing_does_not_supersede(self):
+        """Head movement on unrelated subjects must not invalidate a job.
+
+        This is the whole point of a subject-scoped check rather than a
+        head-index one: on a busy chain any other token's seal would
+        otherwise cancel a pending analysis.
+        """
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            tc = _FakeTimechain([
+                _ring("token_analysis", network="robinhood",
+                      token="0xOTHER", block=9999),
+                _ring("token_analysis", network="solana",
+                      token="0xabc", block=9999),
+            ])
+            self.assertEqual(
+                service._cas_validate_deferred_seal(_job(), tc), "committed"
+            )
+
+    def test_missing_analysis_ring_is_discarded(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            tc = _FakeTimechain([])
+            self.assertEqual(
+                service._cas_validate_deferred_seal(
+                    _job(pinned_snapshot={"analysis_ring": None}), tc
+                ),
+                "discarded",
+            )
+
+    def test_empty_chain_commits(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            self.assertEqual(
+                service._cas_validate_deferred_seal(_job(), _FakeTimechain([])),
+                "committed",
+            )
+
+    def test_unparseable_sealed_block_does_not_supersede(self):
+        """A corrupt block_pin must not silently cancel a valid seal."""
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            tc = _FakeTimechain([
+                _ring("token_analysis", network="robinhood",
+                      token="0xabc", block="not-a-number")
+            ])
+            self.assertEqual(
+                service._cas_validate_deferred_seal(_job(), tc), "committed"
+            )
+
+
+class PreparedWatcherCommitTests(unittest.TestCase):
+    def test_unrelated_head_advancement_allows_exactly_one_minimal_append(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(Settings(
+                environment="test", api_token="", chain_root=root,
+                queue_size=4, result_ttl_seconds=3600,
+                cache_ttl_seconds=300, rate_limit_per_minute=6,
+                shutdown_grace_seconds=10, watcher_enabled=False,
+            ))
+
+            class TC:
+                def __init__(self):
+                    self.seals = []
+
+                def tail_rings(self, _limit):
+                    return [{
+                        "ring_type": "token_analysis",
+                        "payload": {
+                            "network": "base",
+                            "token_address": "0xother",
+                        },
+                    }]
+
+                def seal(self, ring_type, payload, poq=None):
+                    self.seals.append((ring_type, payload, poq))
+                    return {"index": 77}
+
+            tc = TC()
+            loop = SimpleNamespace(
+                verify_incremental=lambda: (True, []),
+                establish_trust=lambda: None,
+            )
+            service._agent = SimpleNamespace(tc=tc, cognitive_loop=loop)
+            service._current_commit_dependencies = lambda: ("policy", "registry")
+            generation = service._deferred_queue.enqueue(
+                kind="watcher_commit", subject_key=f"base:{TOKEN}",
+                priority=20,
+                payload={"anchor_value": 100, "observed_at_epoch": 1.0},
+                now=1.0,
+            )
+            claimed = service._deferred_queue.claim(now=2.0)
+            self.assertEqual(claimed.generation, generation)
+            prepared = PreparedWatcherCommit(
+                queue_item=claimed,
+                payload={
+                    "network": "base", "token_address": TOKEN,
+                    "anchor_value": 100, "observed_at_epoch": 1.0,
+                    "idempotency_key": f"base:{TOKEN}:100",
+                },
+                poq_scores={"coherence": 230},
+                policy_hash="policy", registry_hash="registry",
+            )
+
+            result = service._commit_prepared_watcher(prepared)
+
+            self.assertEqual(result, "committed:77")
+            self.assertEqual(len(tc.seals), 1)
+            self.assertEqual(tc.seals[0][0], "watcher_analysis")
+
+
+class HybridCognitiveCompletionTests(unittest.TestCase):
+    def _service(self, root):
+        return AnalysisService(Settings(
+            environment="test", api_token="", chain_root=root,
+            queue_size=4, result_ttl_seconds=3600,
+            cache_ttl_seconds=300, rate_limit_per_minute=6,
+            shutdown_grace_seconds=10, watcher_enabled=False,
+        ))
+
+    def _install_agent(self, service, *, analysis_hash="analysis-hash"):
+        class TC:
+            def __init__(self):
+                self.rings = [{
+                    "index": 7,
+                    "ring_type": "token_analysis",
+                    "ring_hash": analysis_hash,
+                    "payload": {"token_address": TOKEN},
+                }]
+
+            def tail_rings(self, limit):
+                return self.rings[-limit:]
+
+            def iter_rings(self):
+                yield from self.rings
+
+        tc = TC()
+
+        class Loop:
+            def verify_incremental(self):
+                return True, []
+
+            def finalize_deferred(self, report, ring):
+                cognition = report["cognition"]
+                cognition["status"] = "complete"
+                cognition["analysis_ring"] = ring["index"]
+                tc.rings.append({
+                    "index": 8,
+                    "ring_type": "cognitive_completion",
+                    "ring_hash": "completion-hash",
+                    "payload": {
+                        "analysis_ring": ring["index"],
+                        "analysis_ring_hash": ring["ring_hash"],
+                        "cognitive_loop": cognition,
+                    },
+                })
+
+            def establish_trust(self):
+                return None
+
+        service._agent = SimpleNamespace(tc=tc, cognitive_loop=Loop())
+        return tc
+
+    def _enqueue(self, service):
+        job = Job(id="job-1", address=TOKEN, status="succeeded")
+        job.result = {"timechain": {"ring": 7, "ring_hash": "analysis-hash"}}
+        service.jobs[job.id] = job
+        report = {
+            "token_address": TOKEN,
+            "chain_id": 4663,
+            "analysis_ring": 7,
+            "analysis_ring_hash": "analysis-hash",
+            "cognition": {"status": "pending", "growth": []},
+            "_cognitive_input": "trusted structured facts",
+        }
+        service._enqueue_cognitive_completion(job, report)
+        return job
+
+    def test_result_is_published_before_idle_completion_and_then_updated(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            tc = self._install_agent(service)
+            job = self._enqueue(service)
+            self.assertEqual(job.cognition_status, "queued")
+            self.assertEqual(len(tc.rings), 1)
+
+            service._analysis_active.set()
+            service._drain_durable_commits()
+            self.assertEqual(len(tc.rings), 1)
+            self.assertEqual(job.cognition_status, "queued")
+
+            service._analysis_active.clear()
+            service._drain_durable_commits()
+            self.assertEqual(len(tc.rings), 2)
+            self.assertEqual(job.cognition_status, "complete")
+            self.assertEqual(job.cognition_progress_percent, 100)
+            self.assertEqual(job.result["timechain"]["cognitive_ring"], 8)
+            self.assertEqual(
+                service._deferred_queue.counts()["done"], 1
+            )
+
+    def test_analysis_hash_collision_discards_completion(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            self._install_agent(service, analysis_hash="different-hash")
+            job = self._enqueue(service)
+
+            service._drain_durable_commits()
+
+            self.assertEqual(job.cognition_status, "failed")
+            self.assertEqual(
+                service._deferred_queue.counts()["discarded"], 1
+            )
+
+
+class TrackedTimechainLockTests(unittest.TestCase):
+    """The lock's timeout path carries the diagnostics it promises.
+
+    A deadlock here stalls sealing estate-wide, and the error message is the
+    only evidence of who held it -- so the message content is the feature.
+    """
+
+    def _service(self, root, timeout=0.05):
+        settings = Settings(
+            environment="test",
+            api_token="",
+            chain_root=root,
+            queue_size=4,
+            result_ttl_seconds=3600,
+            cache_ttl_seconds=300,
+            rate_limit_per_minute=6,
+            shutdown_grace_seconds=10,
+            watcher_enabled=False,
+        )
+        object.__setattr__(
+            settings, "timechain_lock_timeout_seconds", timeout
+        ) if hasattr(settings, "timechain_lock_timeout_seconds") else None
+        return AnalysisService(settings)
+
+    def test_timeout_names_the_holder_and_reason(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            service.settings = service.settings.model_copy(
+                update={"timechain_lock_timeout_seconds": 0.05}
+            ) if hasattr(service.settings, "model_copy") else service.settings
+            holding = threading.Event()
+            release = threading.Event()
+
+            def holder():
+                with service._tracked_timechain_lock("holder-work"):
+                    holding.set()
+                    release.wait(2)
+
+            t = threading.Thread(target=holder, daemon=True)
+            t.start()
+            self.assertTrue(holding.wait(2), "holder never acquired")
+            try:
+                with self.assertRaises(TimeoutError) as ctx:
+                    with service._tracked_timechain_lock("second-work"):
+                        pass
+                message = str(ctx.exception)
+                self.assertIn("second-work", message)
+                self.assertIn("holder-work", message,
+                              "timeout does not say who held the lock")
+            finally:
+                release.set()
+                t.join(2)
+
+    def test_lock_is_released_when_the_body_raises(self):
+        """A leaked lock would wedge every later seal, not just this one."""
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            with self.assertRaises(ValueError):
+                with service._tracked_timechain_lock("boom"):
+                    raise ValueError("body failed")
+            acquired = service._timechain_lock.acquire(timeout=1)
+            self.assertTrue(acquired, "lock leaked after an exception")
+            if acquired:
+                service._timechain_lock.release()
+            self.assertIsNone(
+                service._timechain_owner,
+                "owner tracking not cleared after an exception",
+            )
+
+    def test_worker_survives_timeout_and_retries_same_active_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            service._agent = FakeAgent()
+            attempts = {"count": 0}
+
+            class LockAttempt:
+                def __enter__(self):
+                    attempts["count"] += 1
+                    if attempts["count"] == 1:
+                        raise TimeoutError("synthetic contention")
+
+                def __exit__(self, *_args):
+                    return False
+
+            service._tracked_timechain_lock = lambda _reason: LockAttempt()
+            service.start()
+            try:
+                accepted = service.submit(TOKEN)
+                deadline = time.time() + 3
+                job = service.get(accepted.job_id)
+                while job and job.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    job = service.get(accepted.job_id)
+                self.assertEqual(job.status, "succeeded")
+                self.assertEqual(job.lock_retry_count, 1)
+                self.assertTrue(service._worker.is_alive())
+                self.assertNotIn(f"robinhood:{TOKEN.lower()}", service.active_by_address)
+            finally:
+                service.stop()
+
+    def test_persisted_result_is_returned_while_repeat_scan_refreshes(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            service._deferred_queue.put_public_result(
+                "base",
+                TOKEN.lower(),
+                {"timechain": {"ring": 44}, "evidence": {"block_pin": 123}},
+                now=time.time() - 30,
+            )
+
+            accepted = service.submit(TOKEN, "base")
+
+            self.assertTrue(accepted.refreshing)
+            self.assertFalse(accepted.cached)
+            self.assertEqual(accepted.previous_result["timechain"]["ring"], 44)
+            self.assertGreaterEqual(accepted.previous_result_age_seconds, 29)
+            self.assertEqual(service.get(accepted.job_id).status, "queued")
+
+    def test_force_refresh_bypasses_hot_cache_and_reuses_active_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            old = Job(id="a" * 32, address=TOKEN, status="succeeded")
+            old.result = {"timechain": {"ring": 9}}
+            service.jobs[old.id] = old
+            service.cache[f"robinhood:{TOKEN.lower()}"] = (
+                time.time() + 300,
+                old.id,
+            )
+            service._deferred_queue.put_public_result(
+                "robinhood", TOKEN.lower(), old.result
+            )
+
+            forced = service.submit(TOKEN, force_refresh=True)
+            duplicate = service.submit(TOKEN, force_refresh=True)
+
+            self.assertNotEqual(forced.job_id, old.id)
+            self.assertTrue(forced.refreshing)
+            self.assertEqual(duplicate.job_id, forced.job_id)
+            self.assertEqual(duplicate.previous_result["timechain"]["ring"], 9)
 
 
 if __name__ == "__main__":

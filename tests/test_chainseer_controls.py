@@ -29,7 +29,11 @@ class FakeTimechain:
 
 
 class FakePoQ:
+    def __init__(self):
+        self.calls = []
+
     def gate_and_seal(self, tc, _candidate, **kwargs):
+        self.calls.append(kwargs)
         ring = {
             "index": len(tc.rings),
             "ring_hash": f"ring-{len(tc.rings)}",
@@ -90,7 +94,7 @@ class FakeAgent:
         self.scan_count = 0
         self.sell_tax = "0"
 
-    def analyze_token(self, token, full_report=False, block_pin=None):
+    def analyze_token(self, token, full_report=False, block_pin=None, seal=True):
         self.scan_count += 1
         score = 90 if self.scan_count == 1 else 82
         ring = {
@@ -104,12 +108,13 @@ class FakeAgent:
                 "analysis_version": "7.1",
             },
         }
-        self.tc.rings.append(ring)
+        if seal:
+            self.tc.rings.append(ring)
         return {
             "token_address": token,
             "timestamp": controls.utc_now_iso(),
-            "analysis_ring": ring["index"],
-            "analysis_ring_hash": ring["ring_hash"],
+            "analysis_ring": ring["index"] if seal else None,
+            "analysis_ring_hash": ring["ring_hash"] if seal else None,
             "provenance": {"block_pin": block_pin, "fact_count": 8},
             "analysis": {
                 "risk_level": "Low",
@@ -255,7 +260,7 @@ class FakeSolanaAnalyzer:
     def _market_pair(_mint, pairs):
         return pairs[0] if pairs else None
 
-    def analyze_token(self, mint):
+    def analyze_token(self, mint, seal=True):
         self.scan_count += 1
         ring = {
             "index": len(self.timechain_agent.tc.rings),
@@ -263,12 +268,13 @@ class FakeSolanaAnalyzer:
             "ring_type": "solana_token_analysis",
             "payload": {},
         }
-        self.timechain_agent.tc.rings.append(ring)
+        if seal:
+            self.timechain_agent.tc.rings.append(ring)
         return {
             "token_address": mint,
             "timestamp": controls.utc_now_iso(),
-            "analysis_ring": ring["index"],
-            "analysis_ring_hash": ring["ring_hash"],
+            "analysis_ring": ring["index"] if seal else None,
+            "analysis_ring_hash": ring["ring_hash"] if seal else None,
             "provenance": {"block_pin": self.rpc.slot},
             "analysis": {
                 "risk_level": (
@@ -491,6 +497,122 @@ class WatcherAndOutcomeTests(unittest.TestCase):
         self.assertAlmostEqual(result["liquidity_removed_pct"], 60.0)
         self.assertNotIn("rug_pull", result)
 
+    # --- deferred sealing -------------------------------------------------
+    #
+    # The watcher now rescans observationally (seal=False) and hands the
+    # Timechain write to the maintenance worker as a pending_seals envelope.
+    # The fakes were taught about seal= but nothing asserted the behaviour,
+    # so all three failure modes were unguarded: a watcher that still seals
+    # inline (defeating the change), an envelope that never gets built (the
+    # write is simply lost), and outcomes collected against an unsealed
+    # report (an outcome referencing an analysis_ring that does not exist).
+
+    def _deferring_watcher(self, temp_dir):
+        agent = FakeAgent()
+        agent.chain_root = temp_dir
+        watcher = controls.ChainseerWatcher(
+            agent,
+            control_root=temp_dir,
+            config=controls.WatchConfig(
+                confirmations=2,
+                holder_rescan_blocks=12,
+                max_rescan_blocks=120,
+                score_alert_delta=5,
+            ),
+        )
+        watcher.store.subscribe(TOKEN)
+        return agent, watcher
+
+    def test_watcher_rescan_is_observational_and_writes_no_ring(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent, watcher = self._deferring_watcher(temp_dir)
+            rings_before = len(agent.tc.rings)
+
+            summary = watcher.run_once()
+
+            self.assertEqual(summary["rescans"], 1)
+            self.assertEqual(
+                len(agent.tc.rings), rings_before,
+                "watcher sealed inline; the deferral never happened",
+            )
+
+    def test_observational_full_rescan_does_not_enter_timechain_lane(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, watcher = self._deferring_watcher(temp_dir)
+            entries = []
+
+            class Lane:
+                def __enter__(self):
+                    entries.append("entered")
+
+                def __exit__(self, *_args):
+                    return False
+
+            result = watcher.run_once(timechain_lane=Lane)
+            self.assertEqual(result["rescans"], 1)
+            self.assertEqual(
+                entries, [],
+                "observational analyzer held the user Timechain lane",
+            )
+
+    def test_watcher_emits_a_pending_seal_envelope(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, watcher = self._deferring_watcher(temp_dir)
+
+            summary = watcher.run_once()
+
+            pending = summary.get("pending_seals")
+            self.assertTrue(
+                pending,
+                "rescan produced no pending_seals envelope, so the deferred "
+                "write is lost rather than deferred",
+            )
+            envelope = pending[0]
+            self.assertEqual(envelope.get("token_address"), TOKEN)
+            for field in ("network", "token_address", "idempotency_key"):
+                self.assertIn(field, envelope)
+
+    def test_idempotency_key_is_stable_for_the_same_subject_and_block(self):
+        """The key is what stops a redelivered envelope double-sealing."""
+        with tempfile.TemporaryDirectory() as temp_dir:
+            _, watcher = self._deferring_watcher(temp_dir)
+            first = watcher.run_once()["pending_seals"][0]["idempotency_key"]
+        with tempfile.TemporaryDirectory() as temp_dir2:
+            _, watcher2 = self._deferring_watcher(temp_dir2)
+            second = watcher2.run_once()["pending_seals"][0]["idempotency_key"]
+        self.assertEqual(
+            first, second,
+            "identical subject+block produced different idempotency keys, so "
+            "the CAS dedup cannot recognise a repeat",
+        )
+
+    def test_outcomes_are_not_collected_for_an_unsealed_report(self):
+        """An outcome must never cite an analysis_ring that was never written.
+
+        collect() is guarded on analysis_ring being present. Without that
+        guard the outcome ledger accumulates records whose
+        analysis_reference points at nothing, which verify_outcome_record
+        would later reject -- after the fact, in bulk.
+        """
+        with tempfile.TemporaryDirectory() as temp_dir:
+            agent, watcher = self._deferring_watcher(temp_dir)
+            called = []
+            original = watcher.outcomes.collect
+
+            def spy(*args, **kwargs):
+                called.append(True)
+                return original(*args, **kwargs)
+
+            watcher.outcomes.collect = spy
+
+            watcher.run_once()
+
+            self.assertEqual(
+                called, [],
+                "outcomes were collected from an observational scan whose "
+                "analysis_ring is None",
+            )
+
     def test_watcher_rescans_on_fingerprint_change_and_seals_alert(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             agent = FakeAgent()
@@ -525,6 +647,7 @@ class WatcherAndOutcomeTests(unittest.TestCase):
                 "authority",
             )
             self.assertIsNotNone(alert["timechain"]["ring"])
+            self.assertFalse(agent.poq_module.calls[-1]["use_index"])
 
     def test_evm_watcher_yields_before_subscription_work(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -581,6 +704,7 @@ class WatcherAndOutcomeTests(unittest.TestCase):
                 token,
                 full_report=False,
                 block_pin=None,
+                seal=True,
                 progress_callback=None,
             ):
                 self.scan_count += 1
@@ -737,6 +861,9 @@ class WatcherAndOutcomeTests(unittest.TestCase):
             self.assertEqual(
                 timechain_agent.tc.rings[-1]["ring_type"],
                 "solana_watch_transition",
+            )
+            self.assertFalse(
+                timechain_agent.poq_module.calls[-1]["use_index"]
             )
 
     def test_solana_watcher_yields_before_subscription_work(self):
