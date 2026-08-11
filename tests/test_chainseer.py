@@ -32,6 +32,7 @@ except ImportError:
     sys.modules["requests"] = requests_stub
 
 import chainseer
+from chainseer_temporal_graph import build_temporal_projection
 
 
 class FakeResponse:
@@ -91,6 +92,117 @@ class FakePoQ:
     def gate_and_seal(self, tc, candidate, **kwargs):
         self.kwargs = kwargs
         return {"decision": "SEAL"}, {"index": 10, "ring_hash": "abc"}
+
+
+class BoundedTokenTrendTests(unittest.TestCase):
+    TOKEN = "0x" + "1" * 40
+
+    @staticmethod
+    def _ring(index, token, score, *, network="robinhood"):
+        timestamp = f"2026-01-01T00:{index:02d}:00+00:00"
+        return {
+            "index": index,
+            "ring_type": "token_analysis",
+            "timestamp": timestamp,
+            "ring_hash": f"{index + 1:064x}",
+            "payload": {
+                "network": network,
+                "token_address": token,
+                "timestamp": timestamp,
+                "legitimacy_score": score,
+                "risk_level": "Low" if score >= 70 else "High",
+                "component_scores": {
+                    "security": score,
+                    "liquidity": score - 5,
+                },
+                "confidence": "high",
+                "evidence_state": "token_evidence",
+                "evidence_hash": "e" * 64,
+            },
+        }
+
+    @staticmethod
+    def _agent(root, network):
+        class NoFullChainReads:
+            def load(self):
+                raise AssertionError("online trend must not load the Timechain")
+
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.chain_root = root
+        agent.network_key = network
+        agent.tc = NoFullChainReads()
+        return agent
+
+    def test_uses_latest_bounded_subject_history_without_loading_timechain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rings = [
+                self._ring(index, self.TOKEN, 50 + index)
+                for index in range(25)
+            ]
+            # Many unrelated subjects may exist in the projection, but none
+            # may enter this token's trend or cause a Timechain scan.
+            rings.extend(
+                self._ring(
+                    100 + index,
+                    "0x" + f"{index + 2:040x}",
+                    10,
+                )
+                for index in range(100)
+            )
+            chainseer.TemporalGraphStore(temporary).write(
+                build_temporal_projection(rings)
+            )
+
+            trend = self._agent(temporary, "robinhood")._build_token_trend(
+                self.TOKEN.upper()
+            )
+
+            self.assertTrue(trend["available"])
+            self.assertEqual(trend["history_source"], "temporal_projection")
+            self.assertEqual(
+                trend["history_limit"],
+                chainseer.ONLINE_TOKEN_TREND_HISTORY_LIMIT,
+            )
+            self.assertEqual(trend["past_count"], 20)
+            self.assertEqual(
+                [item["ring_index"] for item in trend["past_analyses"]],
+                list(range(5, 25)),
+            )
+            self.assertEqual(trend["first_score"], 55.0)
+            self.assertEqual(trend["last_score"], 74.0)
+            self.assertEqual(trend["direction"], "improving")
+            self.assertEqual(trend["metric_shifts"][0]["metric"], "security")
+
+    def test_same_address_is_scoped_to_requested_network(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rings = [
+                self._ring(0, self.TOKEN, 20, network="robinhood"),
+                self._ring(1, self.TOKEN, 30, network="robinhood"),
+                self._ring(2, self.TOKEN, 80, network="base"),
+                self._ring(3, self.TOKEN, 90, network="base"),
+            ]
+            chainseer.TemporalGraphStore(temporary).write(
+                build_temporal_projection(rings)
+            )
+
+            trend = self._agent(temporary, "base")._build_token_trend(self.TOKEN)
+
+            self.assertEqual(trend["past_count"], 2)
+            self.assertEqual(trend["first_score"], 80.0)
+            self.assertEqual(trend["last_score"], 90.0)
+
+    def test_missing_or_invalid_projection_never_falls_back_to_timechain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "temporal_entity_graph-v1.json"
+            path.write_text("not valid json", encoding="utf-8")
+
+            trend = self._agent(temporary, "robinhood")._build_token_trend(
+                self.TOKEN
+            )
+
+            self.assertFalse(trend["available"])
+            self.assertEqual(trend["reason"], "projection_missing_or_invalid")
+            self.assertEqual(trend["past_analyses"], [])
 
 
 class FailOnLPTokenRPC:

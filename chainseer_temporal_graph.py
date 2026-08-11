@@ -841,6 +841,7 @@ def subject_temporal_view(
     subject: str,
     *,
     score_limit: int = 20,
+    risk_ring_types: Iterable[str] | None = None,
     event_limit: int = 40,
     shared_entity_limit: int = 20,
 ) -> dict[str, Any]:
@@ -880,6 +881,20 @@ def subject_temporal_view(
         (projection.get("relationships") or {}).get(identifier) or {}
         for identifier in item.get("relationship_ids") or []
     ]
+    allowed_ring_types = (
+        {str(value) for value in risk_ring_types}
+        if risk_ring_types is not None
+        else None
+    )
+    risk_timeline = []
+    for point in reversed(item.get("risk_timeline") or []):
+        ring_type = ((point.get("analysis_ring") or {}).get("type"))
+        if allowed_ring_types is not None and ring_type not in allowed_ring_types:
+            continue
+        risk_timeline.append(point)
+        if len(risk_timeline) >= max(1, score_limit):
+            break
+    risk_timeline.reverse()
     relationship_summary = {
         "known": len(relationships),
         "active": sum(value.get("state") == "active" for value in relationships),
@@ -901,7 +916,7 @@ def subject_temporal_view(
         "last_observed": item.get("last_observed"),
         "analysis_count": item.get("analysis_count", 0),
         "risk_evolution": item.get("risk_evolution") or {},
-        "risk_timeline": (item.get("risk_timeline") or [])[-max(1, score_limit):],
+        "risk_timeline": risk_timeline,
         "relationship_summary": relationship_summary,
         "relationship_events": (item.get("relationship_events") or [])[-max(1, event_limit):],
         "shared_entities": shared_entities[:max(1, shared_entity_limit)],

@@ -96,6 +96,7 @@ from chainseer_outcome_ledger import (
 from chainseer_temporal_graph import (
     TemporalGraphStore,
     append_temporal_projection,
+    subject_temporal_view,
 )
 
 CHAINSEER_VERSION = "7.1"
@@ -106,6 +107,11 @@ ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
 #: for cognitive comparison rather than the authority for the risk decision.
 #: Full-history indexing and consolidation belong to idle maintenance.
 ONLINE_COGNITIVE_RECALL_WINDOW = 121
+#: Historical scoring is an online read, so it must be bounded independently
+#: of both Timechain height and the lifetime of one frequently scanned token.
+#: The complete history remains in the rebuildable temporal projection for
+#: offline audits; foreground scoring consumes only the newest observations.
+ONLINE_TOKEN_TREND_HISTORY_LIMIT = 20
 #: Cambium actions that put a faculty into the ACTIVE registry (grown.json),
 #: and therefore require a governance record. `promote()` writes grown.json;
 #: `wake()` flips a dormant grown.json entry back to active. A "born" faculty
@@ -3464,40 +3470,73 @@ class Chainseer:
                       "wash_trading", "lp_lock"]
 
     def _build_token_trend(self, token_address: str) -> dict:
-        """Query Timechain for past analyses of this token and build score trajectory.
+        """Build a bounded score trajectory from the derived subject projection.
 
         Uses M51 Underlying-Pattern Extraction to surface individual metric
         trajectories beyond overall score, and S110 Concentration-Distribution
         Sensing to detect structural shifts (holder concentration, volume decay).
 
+        The Timechain remains authoritative, but loading every ring here makes
+        request latency grow with the global ledger.  The temporal projection
+        is a hash-verified, rebuildable read model keyed by network and subject.
+        A missing or invalid projection therefore makes trend unavailable; it
+        never triggers an unbounded Timechain fallback on the request path.
+
         Returns ordered list of past analyses with scores, timestamps, and
         computed trend metrics (direction, delta, volatility, metric shifts).
         """
-        token_lower = token_address.lower()
         try:
-            all_rings = self.tc.load()
-        except Exception:
-            return {"available": False, "past_analyses": []}
+            projection = TemporalGraphStore(self.chain_root).load()
+            if projection is None:
+                return {
+                    "available": False,
+                    "past_count": 0,
+                    "past_analyses": [],
+                    "history_source": "temporal_projection",
+                    "reason": "projection_missing_or_invalid",
+                }
+            view = subject_temporal_view(
+                projection,
+                self.network_key,
+                token_address,
+                score_limit=ONLINE_TOKEN_TREND_HISTORY_LIMIT,
+                risk_ring_types={"token_analysis"},
+            )
+        except Exception as exc:
+            return {
+                "available": False,
+                "past_count": 0,
+                "past_analyses": [],
+                "history_source": "temporal_projection",
+                "reason": "projection_read_failed",
+                "error_type": type(exc).__name__,
+            }
 
-        # Filter for token_analysis rings matching this address
+        timeline = view.get("risk_timeline") or []
         past = []
-        for ring in all_rings:
-            if ring.get("ring_type") != "token_analysis":
-                continue
-            payload = ring.get("payload", {})
-            addr = payload.get("token_address", "")
-            if addr.lower() == token_lower:
-                past.append({
-                    "ring_index": ring.get("index"),
-                    "timestamp": payload.get("timestamp", ""),
-                    "legitimacy_score": payload.get("legitimacy_score"),
-                    "risk_level": payload.get("risk_level"),
-                    "component_scores": payload.get("component_scores", {}),
-                    "confidence": payload.get("confidence", ""),
-                })
+        for point in timeline:
+            analysis_ring = point.get("analysis_ring") or {}
+            past.append({
+                "ring_index": analysis_ring.get("index"),
+                "timestamp": (
+                    point.get("observed_at")
+                    or analysis_ring.get("timestamp")
+                    or ""
+                ),
+                "legitimacy_score": point.get("score"),
+                "risk_level": point.get("risk_level"),
+                "component_scores": point.get("component_scores") or {},
+                "confidence": point.get("confidence") or "",
+            })
 
         if len(past) < 2:
-            return {"available": False, "past_count": len(past), "past_analyses": past}
+            return {
+                "available": False,
+                "past_count": len(past),
+                "past_analyses": past,
+                "history_source": "temporal_projection",
+                "history_limit": ONLINE_TOKEN_TREND_HISTORY_LIMIT,
+            }
 
         # Sort by timestamp
         past.sort(key=lambda p: p["timestamp"])
@@ -3550,6 +3589,8 @@ class Chainseer:
             "available": True,
             "past_count": len(past),
             "past_analyses": past,
+            "history_source": "temporal_projection",
+            "history_limit": ONLINE_TOKEN_TREND_HISTORY_LIMIT,
             "first_score": first_score,
             "last_score": last_score,
             "delta": delta,
