@@ -100,6 +100,12 @@ from chainseer_temporal_graph import (
 
 CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+#: Foreground cognition may consult recent Timechain history, but it must not
+#: make user latency grow with the lifetime of the ledger.  The current
+#: report's provenance is supplied directly to PoQ, so this window is context
+#: for cognitive comparison rather than the authority for the risk decision.
+#: Full-history indexing and consolidation belong to idle maintenance.
+ONLINE_COGNITIVE_RECALL_WINDOW = 121
 #: Cambium actions that put a faculty into the ACTIVE registry (grown.json),
 #: and therefore require a governance record. `promote()` writes grown.json;
 #: `wake()` flips a dormant grown.json entry back to active. A "born" faculty
@@ -991,10 +997,13 @@ class ChainseerCognitiveLoop:
             # Online analyses must have bounded latency.  Updating the
             # Hippocampus here can synchronously index every ring added since
             # its last checkpoint; large evidence-rich chains made an API
-            # request sit at 90% for minutes.  Bounded recent-ring recall keeps
-            # the cognitive check O(window), while the report's explicit
-            # provenance remains the authority for the token decision.
+            # request sit at 90% for minutes.  `use_index=False` alone is NOT
+            # bounded: Recall.retrieve() otherwise loads the whole Timechain.
+            # An explicit recent-ring window keeps this O(1) with respect to
+            # chain height, while the report's provenance remains the
+            # authority for the token decision.
             use_index=False,
+            scan_window=ONLINE_COGNITIVE_RECALL_WINDOW,
         )
         labels = recalled.get("query_labels") or self.recall.label(cognitive_input)
         computed = labels.get("computed") or {}

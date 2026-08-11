@@ -615,6 +615,10 @@ class ChainseerInfrastructureTests(unittest.TestCase):
                 agent._seal_report(report)
 
             self.assertFalse(retrieve.call_args.kwargs["use_index"])
+            self.assertEqual(
+                retrieve.call_args.kwargs["scan_window"],
+                chainseer.ONLINE_COGNITIVE_RECALL_WINDOW,
+            )
             self.assertFalse(gate_and_seal.call_args.kwargs["use_index"])
             self.assertNotIn("CT_AUTOINDEX", os.environ)
 
@@ -1565,6 +1569,47 @@ class FacultyGovernanceActivationTests(unittest.TestCase):
         self.assertEqual(
             chainseer_pons._REGISTRY_EPOCH_ACTIONS,
             chainseer._REGISTRY_EPOCH_ACTIONS,
+        )
+
+    def test_all_foreground_cognitive_recall_is_bounded(self):
+        """EVM/Base/Solana and Pons must share the same request-path cap.
+
+        Robinhood, Base, and public Solana use ChainseerCognitiveLoop. Pons has
+        its own loop, so exercise that seam independently to prevent either
+        implementation from regressing to a full-chain scan or index catch-up.
+        """
+        import chainseer_pons
+
+        self.assertEqual(chainseer.ONLINE_COGNITIVE_RECALL_WINDOW, 121)
+
+        loop = object.__new__(chainseer_pons.PonsCognitiveLoop)
+        loop.verify_registry = lambda: None
+        loop._safe_input = lambda *_args: '{"risk_level":"Low"}'
+        loop.immune = types.SimpleNamespace(
+            screen=lambda _text: {"blocked": False, "covenant": "admitted"}
+        )
+        calls = []
+
+        def retrieve(_query, **kwargs):
+            calls.append(kwargs)
+            return {
+                "query_labels": {
+                    "senses": [{"id": 1, "name": "Evidence"}],
+                    "modalities": [],
+                    "computed": {},
+                },
+                "blocks": [],
+            }
+
+        loop.recall = types.SimpleNamespace(retrieve=retrieve)
+        _, cognition = loop.prepare(None, None)
+
+        self.assertEqual(cognition["status"], "prepared")
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["use_index"])
+        self.assertEqual(
+            calls[0]["scan_window"],
+            chainseer.ONLINE_COGNITIVE_RECALL_WINDOW,
         )
 
     def test_migration_heals_an_ungoverned_born_faculty(self):
