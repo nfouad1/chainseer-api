@@ -988,6 +988,11 @@ class AnalysisService:
         self._cypher_tempre_runtime = _cypher_tempre_runtime_status()
         self._last_memory_rss_mb: float | None = None
         self._memory_warning_active = False
+        self._maintenance_telemetry = {
+            "full_audit_deferred_analysis": 0,
+            "full_audit_deferred_memory": 0,
+        }
+        self._last_full_audit_deferred_reason: str | None = None
 
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
@@ -1469,6 +1474,7 @@ class AnalysisService:
                 "warning_threshold_mb": self.settings.memory_warning_mb,
                 "warning": self._memory_warning_active,
             },
+            "maintenance_telemetry": dict(self._maintenance_telemetry),
         }
 
     @contextmanager
@@ -1874,12 +1880,18 @@ class AnalysisService:
         """
         if resource is None:
             return
-        # ru_maxrss is the process's peak RSS in KB on Linux (the platform
-        # this actually runs on) -- a high-water mark, not current usage, but
-        # that's the right semantic for "has this process ever gotten close
-        # to the OOM line", and it means a crossing is reported exactly once
-        # until settings.memory_warning_mb itself is exceeded again higher.
+        # Prefer current Linux RSS so a deferred audit can resume after
+        # pressure subsides. Fall back to the resource high-water mark on
+        # platforms without procfs.
         rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        try:
+            with Path("/proc/self/status").open(encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        rss_mb = float(line.split()[1]) / 1024
+                        break
+        except (OSError, ValueError, IndexError):
+            pass
         self._last_memory_rss_mb = round(rss_mb, 1)
         over_threshold = rss_mb >= self.settings.memory_warning_mb
         if over_threshold and not self._memory_warning_active:
@@ -1889,6 +1901,16 @@ class AnalysisService:
                 "(prior OOM kill threshold is the machine's total memory)",
                 rss_mb,
                 self.settings.memory_warning_mb,
+            )
+        elif (
+            self._memory_warning_active
+            and rss_mb < self.settings.memory_warning_mb * 0.9
+        ):
+            self._memory_warning_active = False
+            LOGGER.info(
+                "Memory pressure cleared: RSS %.1fMB < recovery threshold %.1fMB",
+                rss_mb,
+                self.settings.memory_warning_mb * 0.9,
             )
 
     def _run_full_audit(self, *, batch_rings: int = 8) -> bool:
@@ -1912,13 +1934,36 @@ class AnalysisService:
             }
             return True
         if self._analysis_active.is_set() or not self.work.empty():
+            if self._last_full_audit_deferred_reason != "analysis":
+                self._maintenance_telemetry[
+                    "full_audit_deferred_analysis"
+                ] += 1
+                self._last_full_audit_deferred_reason = "analysis"
             return False
+        if (
+            self._last_memory_rss_mb is not None
+            and self._last_memory_rss_mb >= self.settings.memory_warning_mb
+        ):
+            if self._last_full_audit_deferred_reason != "memory":
+                self._maintenance_telemetry[
+                    "full_audit_deferred_memory"
+                ] += 1
+                self._last_full_audit_deferred_reason = "memory"
+            self._integrity_status = {
+                **self._integrity_status,
+                "full_audit_deferred_reason": "memory_pressure",
+            }
+            # Treat this interval as deliberately deferred so maintenance
+            # does not spin every 100ms while the process is under pressure.
+            return True
         if not self._timechain_lock.acquire(blocking=False):
             return False
         try:
             # Close the race between the priority check and lock acquisition.
             if self._analysis_active.is_set() or not self.work.empty():
                 return False
+            self._last_full_audit_deferred_reason = None
+            self._integrity_status.pop("full_audit_deferred_reason", None)
             tc = self._agent.tc
             cursor = self._full_audit_cursor
             if cursor is None:

@@ -968,6 +968,30 @@ class ServiceTests(unittest.TestCase):
             )
             self.assertEqual(cognitive_loop.registry_checks, 1)
 
+    def test_full_audit_defers_under_memory_pressure_with_telemetry(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            service._agent = SimpleNamespace(tc=object())
+            service._last_memory_rss_mb = service.settings.memory_warning_mb + 1
+
+            completed = service._run_full_audit()
+
+            self.assertTrue(completed)
+            self.assertEqual(
+                service._integrity_status["full_audit_deferred_reason"],
+                "memory_pressure",
+            )
+            self.assertEqual(
+                service.health_status()["maintenance_telemetry"]
+                ["full_audit_deferred_memory"],
+                1,
+            )
+            service._run_full_audit()
+            self.assertEqual(
+                service._maintenance_telemetry["full_audit_deferred_memory"],
+                1,
+            )
+
     def test_watcher_releases_lane_between_networks_for_new_analysis(self):
         class FirstWatcher:
             def __init__(self, service):

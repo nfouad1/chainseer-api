@@ -68,6 +68,7 @@ async function proxy(
   path: string,
   init?: RequestInit,
   identity?: string,
+  operation: "submit" | "poll" = "submit",
 ) {
   const { baseUrl, token } = configuration();
   if (!baseUrl || !token) return unavailable();
@@ -98,13 +99,24 @@ async function proxy(
         ...(retryAfter ? { "Retry-After": retryAfter } : {}),
       },
     });
-  } catch {
+  } catch (error) {
+    console.warn(JSON.stringify({
+      event: "analysis_proxy_unreachable",
+      operation,
+      request_id: requestId,
+      error_type: error instanceof Error ? error.name : "unknown",
+    }));
     return NextResponse.json(
       {
         error: {
-          code: "analysis_service_unreachable",
+          code:
+            operation === "poll"
+              ? "analysis_poll_temporarily_unreachable"
+              : "analysis_service_unreachable",
           message:
-            "The analysis service is temporarily unreachable. No result was published.",
+            operation === "poll"
+              ? "The connection was interrupted while checking this scan. The accepted job may still be running."
+              : "The analysis service is temporarily unreachable. No scan was accepted.",
         },
       },
       {
@@ -209,5 +221,5 @@ export async function GET(request: NextRequest) {
       { status: 404 },
     );
   }
-  return proxy(`/v1/analyses/${job}`);
+  return proxy(`/v1/analyses/${job}`, undefined, undefined, "poll");
 }
