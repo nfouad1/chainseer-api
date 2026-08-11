@@ -736,8 +736,60 @@ class ServiceTests(unittest.TestCase):
                 cached_job = service.get(cached.job_id)
                 self.assertTrue(cached.cached)
                 self.assertEqual(cached_job.status, "succeeded")
-                self.assertEqual(fake.calls, 1)
             finally:
+                service.stop()
+            self.assertEqual(fake.calls, 1)
+
+    def test_client_can_recover_same_job_after_polling_gap_at_ninety_percent(self):
+        reached_ninety = threading.Event()
+        release_analysis = threading.Event()
+
+        class BlockingAgent(FakeAgent):
+            def analyze_token(
+                self, address, full_report=False, progress_callback=None
+            ):
+                self.calls += 1
+                if progress_callback:
+                    progress_callback(
+                        "sealing_timechain", 90, "Sealing Timechain"
+                    )
+                reached_ninety.set()
+                self.assert_released = release_analysis.wait(2)
+                report = sample_internal_report()
+                report["token_address"] = address
+                return report
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(self.settings(root))
+            agent = BlockingAgent()
+            service._agent = agent
+            service.start()
+            try:
+                accepted = service.submit(TOKEN)
+                self.assertTrue(reached_ninety.wait(1))
+                interrupted_poll = service.get(accepted.job_id)
+                self.assertEqual(interrupted_poll.progress_percent, 90)
+
+                # A retrying/reloaded client must keep the accepted ID. Even
+                # if it submits again, active-job deduplication returns that
+                # same job and does not start another analysis.
+                duplicate = service.submit(TOKEN)
+                self.assertEqual(duplicate.job_id, accepted.job_id)
+                self.assertEqual(agent.calls, 1)
+
+                release_analysis.set()
+                deadline = time.time() + 2
+                recovered = service.get(accepted.job_id)
+                while recovered.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    recovered = service.get(accepted.job_id)
+                self.assertTrue(agent.assert_released)
+                self.assertEqual(recovered.status, "succeeded")
+                self.assertIsNotNone(recovered.result)
+                self.assertEqual(agent.calls, 1)
+            finally:
+                release_analysis.set()
                 service.stop()
 
     def test_single_process_lease(self):
