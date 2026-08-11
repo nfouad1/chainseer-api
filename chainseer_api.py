@@ -63,7 +63,10 @@ from chainseer_solana_public import (
     SolanaPublicAnalyzer,
     validate_solana_mint,
 )
-from chainseer_temporal_graph import refresh_temporal_projection
+from chainseer_temporal_graph import (
+    append_temporal_projection,
+    refresh_temporal_projection,
+)
 from chainseer_wallet_convergence import WalletConvergenceTracker
 
 LOGGER = logging.getLogger("chainseer.api")
@@ -596,6 +599,10 @@ class Job:
     error_code: str | None = None
     error_message: str | None = None
     lock_retry_count: int = 0
+    cognition_status: str = "not_started"
+    cognition_stage_detail: str = "Cognitive completion starts after analysis"
+    cognition_progress_percent: int = 0
+    cognition_updated_at: float | None = None
 
     def public(self) -> dict[str, Any]:
         return {
@@ -612,6 +619,12 @@ class Job:
             "finished_at": _iso(self.finished_at),
             "result": self.result,
             "benchmark_capture": self.benchmark_capture,
+            "cognitive_completion": {
+                "status": self.cognition_status,
+                "stage_detail": self.cognition_stage_detail,
+                "progress_percent": self.cognition_progress_percent,
+                "updated_at": _iso(self.cognition_updated_at),
+            },
             "error": (
                 {
                     "code": self.error_code,
@@ -855,6 +868,7 @@ class MaintenanceTask:
     report: dict[str, Any]
     public_report: dict[str, Any]
     benchmark_done: bool = False
+    projection_done: bool = False
 
 
 @dataclass
@@ -1728,6 +1742,68 @@ class AnalysisService:
                     "status": "deferred_queue_full"
                 }
 
+    def _set_cognitive_progress(
+        self,
+        job_id: str,
+        status: str,
+        percent: int,
+        detail: str,
+    ) -> None:
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return
+            job.cognition_status = str(status)[:40]
+            job.cognition_stage_detail = str(detail)[:240]
+            job.cognition_progress_percent = max(0, min(100, int(percent)))
+            job.cognition_updated_at = time.time()
+            job.updated_at = job.cognition_updated_at
+
+    def _enqueue_cognitive_completion(
+        self,
+        job: Job,
+        report: dict[str, Any],
+    ) -> None:
+        """Persist the bounded post-publication cognitive commit."""
+        ring_index = report.get("analysis_ring")
+        ring_hash = report.get("analysis_ring_hash")
+        cognition = report.get("cognition") or {}
+        if ring_index is None or not ring_hash or cognition.get("status") != "pending":
+            job.cognition_status = "complete"
+            job.cognition_stage_detail = "Cognitive audit completed inline"
+            job.cognition_progress_percent = 100
+            job.cognition_updated_at = time.time()
+            return
+        completion_report = {
+            "token_address": report.get("token_address"),
+            "chain_id": report.get("chain_id"),
+            "cognition": json.loads(json.dumps(cognition, default=str)),
+            "_cognitive_input": str(report.get("_cognitive_input") or ""),
+        }
+        canonical = json.dumps(
+            completion_report, sort_keys=True, separators=(",", ":")
+        )
+        self._deferred_queue.enqueue(
+            kind="cognitive_completion",
+            subject_key=f"{job.network}:{job.address}:{ring_index}",
+            priority=5,
+            payload={
+                "job_id": job.id,
+                "network": job.network,
+                "token_address": job.address,
+                "analysis_ring": int(ring_index),
+                "analysis_ring_hash": str(ring_hash),
+                "anchor_value": int(ring_index),
+                "observed_at_epoch": time.time(),
+                "report_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                "completion_report": completion_report,
+            },
+        )
+        job.cognition_status = "queued"
+        job.cognition_stage_detail = "Risk result ready; cognitive audit queued"
+        job.cognition_progress_percent = 0
+        job.cognition_updated_at = time.time()
+
     def _check_memory_usage(self) -> None:
         """Log an edge-triggered warning when RSS crosses the configured
         threshold. A ring-import batch or a /v1/memory/status rebuild has
@@ -2262,11 +2338,35 @@ class AnalysisService:
         if self._analysis_active.is_set() or not self.work.empty():
             return
         item = self._deferred_queue.claim(
-            kinds=("watcher_commit", "watcher_outcome"), lease_seconds=30.0
+            kinds=(
+                "cognitive_completion",
+                "watcher_commit",
+                "watcher_outcome",
+            ),
+            lease_seconds=30.0,
         )
         if item is None:
             return
         try:
+            if item.kind == "cognitive_completion":
+                outcome = self._execute_cognitive_completion(item)
+                if outcome in {"done", "idempotent"}:
+                    self._deferred_queue.transition(item, outcome)
+                else:
+                    self._deferred_queue.retry(
+                        item, outcome, delay_seconds=0.1
+                    )
+                    self._set_cognitive_progress(
+                        str(item.payload.get("job_id") or ""),
+                        "failed" if item.attempts >= 5 else "retrying",
+                        0 if item.attempts >= 5 else 15,
+                        (
+                            "Cognitive completion needs operator attention"
+                            if item.attempts >= 5
+                            else "Cognitive completion yielded to newer analysis work"
+                        ),
+                    )
+                return
             if item.kind == "watcher_outcome":
                 outcome = self._execute_deferred_outcome(item)
                 if outcome == "done":
@@ -2317,10 +2417,146 @@ class AnalysisService:
                 )
         except (ValueError, KeyError) as exc:
             self._deferred_queue.transition(item, "discarded")
-            LOGGER.warning("discarded deferred watcher commit: %s", exc)
+            if item.kind == "cognitive_completion":
+                self._set_cognitive_progress(
+                    str(item.payload.get("job_id") or ""),
+                    "failed",
+                    0,
+                    "Cognitive completion failed its integrity check",
+                )
+            LOGGER.warning("discarded deferred commit: %s", exc)
         except Exception as exc:
             self._deferred_queue.retry(item, str(exc), delay_seconds=0.25)
-            LOGGER.exception("deferred watcher commit failed")
+            if item.kind == "cognitive_completion":
+                self._set_cognitive_progress(
+                    str(item.payload.get("job_id") or ""),
+                    "retrying",
+                    15,
+                    "Cognitive completion will retry while the lane is idle",
+                )
+            LOGGER.exception("deferred commit failed")
+
+    def _execute_cognitive_completion(
+        self,
+        item: DeferredQueueItem,
+    ) -> str:
+        """Append one bounded completion linked to an immutable analysis ring."""
+        if self._agent is None or not hasattr(self._agent, "tc"):
+            return "timechain unavailable"
+        if self._analysis_active.is_set() or not self.work.empty():
+            return "user analysis has priority"
+        payload = item.payload
+        expected_index = int(payload["analysis_ring"])
+        expected_hash = str(payload["analysis_ring_hash"])
+        tail = self._agent.tc.tail_rings(512)
+
+        def completion_for(rings: list[dict[str, Any]]) -> dict[str, Any] | None:
+            return next(
+                (
+                    ring for ring in reversed(rings)
+                    if ring.get("ring_type") == "cognitive_completion"
+                    and (ring.get("payload") or {}).get("analysis_ring")
+                    == expected_index
+                    and (ring.get("payload") or {}).get("analysis_ring_hash")
+                    == expected_hash
+                ),
+                None,
+            )
+
+        existing = completion_for(tail)
+        analysis_ring = next(
+            (ring for ring in tail if ring.get("index") == expected_index),
+            None,
+        )
+        if (existing is None or analysis_ring is None) and item.attempts > 1:
+            # Crash recovery is uncommon. Stream the full ledger outside the
+            # writer lane only when the bounded tail cannot prove state.
+            for ring in self._agent.tc.iter_rings():
+                if analysis_ring is None and ring.get("index") == expected_index:
+                    analysis_ring = ring
+                ring_payload = ring.get("payload") or {}
+                if (
+                    existing is None
+                    and ring.get("ring_type") == "cognitive_completion"
+                    and ring_payload.get("analysis_ring") == expected_index
+                    and ring_payload.get("analysis_ring_hash") == expected_hash
+                ):
+                    existing = ring
+        if existing is not None:
+            self._publish_cognitive_completion(payload, existing)
+            return "idempotent"
+        if analysis_ring is None:
+            return "analysis ring not visible in bounded tail"
+        if analysis_ring.get("ring_hash") != expected_hash:
+            raise ValueError("analysis ring hash collision")
+        if not self._deferred_queue.transition(item, "ready"):
+            return "queue generation changed"
+        if not self._timechain_lock.acquire(blocking=False):
+            return "timechain busy"
+        try:
+            if self._analysis_active.is_set() or not self.work.empty():
+                return "user analysis has priority"
+            if not self._deferred_queue.is_current(item):
+                return "queue generation changed"
+            latest_match = next(
+                (
+                    ring for ring in self._agent.tc.tail_rings(512)
+                    if ring.get("index") == expected_index
+                ),
+                None,
+            )
+            if latest_match is None or latest_match.get("ring_hash") != expected_hash:
+                raise ValueError("analysis ring changed before cognitive append")
+            ok, verification = self._agent.cognitive_loop.verify_incremental()
+            if not ok:
+                raise RuntimeError(
+                    "incremental Timechain verification failed: "
+                    + "; ".join(verification)
+                )
+            self._set_cognitive_progress(
+                str(payload.get("job_id") or ""),
+                "running",
+                60,
+                "Verifying and sealing the cognitive audit",
+            )
+            completion_report = json.loads(
+                json.dumps(payload["completion_report"])
+            )
+            self._agent.cognitive_loop.finalize_deferred(
+                completion_report, latest_match
+            )
+            completed = completion_for(self._agent.tc.tail_rings(8))
+            if completed is None:
+                raise RuntimeError("cognitive completion ring was not appended")
+            self._agent.cognitive_loop.establish_trust()
+            self._publish_cognitive_completion(payload, completed)
+            return "done"
+        finally:
+            self._timechain_lock.release()
+
+    def _publish_cognitive_completion(
+        self,
+        payload: dict[str, Any],
+        completion_ring: dict[str, Any],
+    ) -> None:
+        job_id = str(payload.get("job_id") or "")
+        cognition = (completion_ring.get("payload") or {}).get(
+            "cognitive_loop"
+        ) or {}
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if job is None:
+                return
+            if job.result is not None:
+                timechain = job.result.setdefault("timechain", {})
+                timechain["cognition"] = cognition
+                timechain["cognitive_ring"] = completion_ring.get("index")
+                timechain["cognitive_ring_hash"] = completion_ring.get("ring_hash")
+            job.cognition_status = "complete"
+            job.cognition_stage_detail = "Cognitive audit sealed"
+            job.cognition_progress_percent = 100
+            job.cognition_updated_at = time.time()
+            job.updated_at = job.cognition_updated_at
 
     def _execute_deferred_outcome(self, item: DeferredQueueItem) -> str:
         """Restore sealed baselines and emit at most one due outcome per turn."""
@@ -2411,6 +2647,10 @@ class AnalysisService:
                         if job is not None:
                             job.benchmark_capture = capture
                             job.updated_at = time.time()
+                # The bounded cognitive append has higher user-visible value
+                # than a potentially large temporal read-model update. Give
+                # it the first idle writer-lane opportunity.
+                self._drain_durable_commits()
                 temporal = task.report.get("temporal_entity_graph") or {}
                 needs_rebuild = not temporal.get("available", False)
                 if needs_rebuild and self._analysis_active.is_set():
@@ -2425,15 +2665,21 @@ class AnalysisService:
                     and hasattr(self._agent, "tc")
                     and hasattr(self._agent, "cognitive_loop")
                 ):
-                    acquired = self._timechain_lock.acquire(blocking=False)
-                    if not acquired:
-                        try:
-                            self._maintenance_work.put_nowait(task)
-                        except queue.Full:
-                            pass
-                        self._stopping.wait(0.1)
-                    else:
-                        try:
+                    try:
+                        analysis_ring = task.report.get("_analysis_ring_record")
+                        if analysis_ring is not None:
+                            task.report["temporal_entity_graph"] = (
+                                append_temporal_projection(
+                                    self.settings.chain_root,
+                                    analysis_ring,
+                                    network=task.network,
+                                    subject=task.address,
+                                )
+                            )
+                        else:
+                            # Compatibility fallback for imported/legacy
+                            # reports. It is intentionally outside the writer
+                            # lane, so read-model work cannot block a scan.
                             task.report["temporal_entity_graph"] = (
                                 refresh_temporal_projection(
                                     self._agent.tc,
@@ -2442,20 +2688,25 @@ class AnalysisService:
                                     subject=task.address,
                                 )
                             )
-                            self._agent.cognitive_loop.establish_trust()
-                            refreshed = build_public_report(task.report)
-                            with self._lock:
-                                job = self.jobs.get(task.job_id)
-                                if job is not None:
-                                    job.result = refreshed
-                                    job.updated_at = time.time()
-                        except Exception:
-                            LOGGER.exception(
-                                "Deferred temporal projection rebuild failed",
-                                extra={"job_id": task.job_id},
-                            )
-                        finally:
-                            self._timechain_lock.release()
+                        task.projection_done = True
+                        refreshed = build_public_report(task.report)
+                        with self._lock:
+                            job = self.jobs.get(task.job_id)
+                            if job is not None:
+                                # Preserve a completion that may have landed
+                                # while the projection was being prepared.
+                                prior_timechain = (
+                                    (job.result or {}).get("timechain") or {}
+                                )
+                                if prior_timechain.get("cognitive_ring"):
+                                    refreshed["timechain"] = prior_timechain
+                                job.result = refreshed
+                                job.updated_at = time.time()
+                    except Exception:
+                        LOGGER.exception(
+                            "Deferred temporal projection refresh failed",
+                            extra={"job_id": task.job_id},
+                        )
                 self._maintenance_work.task_done()
             self._drain_durable_commits()
             if time.monotonic() >= next_audit:
@@ -2512,8 +2763,18 @@ class AnalysisService:
                         18,
                         "Reading mint controls, markets, holders, and routes",
                     )
+                    method = self._solana_agent.analyze_token
+                    kwargs: dict[str, Any] = {}
+                    try:
+                        parameters = inspect.signature(method).parameters
+                        if "progress_callback" in parameters:
+                            kwargs["progress_callback"] = progress
+                        if "defer_cognition" in parameters:
+                            kwargs["defer_cognition"] = True
+                    except (TypeError, ValueError):
+                        pass
                     with self._tracked_timechain_lock("user_analysis"):
-                        report = self._solana_agent.analyze_token(job.address)
+                        report = method(job.address, **kwargs)
                 elif job.network == "base":
                     if self._base_agent is None:
                         raise RuntimeError(
@@ -2527,6 +2788,8 @@ class AnalysisService:
                             in inspect.signature(method).parameters
                         ):
                             kwargs["progress_callback"] = progress
+                        if "defer_cognition" in inspect.signature(method).parameters:
+                            kwargs["defer_cognition"] = True
                     except (TypeError, ValueError):
                         pass
                     with self._tracked_timechain_lock("user_analysis"):
@@ -2540,6 +2803,8 @@ class AnalysisService:
                             in inspect.signature(method).parameters
                         ):
                             kwargs["progress_callback"] = progress
+                        if "defer_cognition" in inspect.signature(method).parameters:
+                            kwargs["defer_cognition"] = True
                     except (TypeError, ValueError):
                         pass
                     with self._tracked_timechain_lock("user_analysis"):
@@ -2553,6 +2818,19 @@ class AnalysisService:
                     98,
                     "Preparing the privacy-safe sealed report",
                 )
+                try:
+                    self._enqueue_cognitive_completion(job, report)
+                except Exception:
+                    LOGGER.exception(
+                        "Could not persist cognitive completion",
+                        extra={"job_id": job.id},
+                    )
+                    job.cognition_status = "failed"
+                    job.cognition_stage_detail = (
+                        "Risk result is sealed; cognitive completion could not be queued"
+                    )
+                    job.cognition_progress_percent = 0
+                    job.cognition_updated_at = time.time()
                 public_report = build_public_report(report)
                 with self._lock:
                     job.result = public_report
@@ -2563,7 +2841,11 @@ class AnalysisService:
                     )
                     job.status = "succeeded"
                     job.stage = "complete"
-                    job.stage_detail = "Sealed analysis ready"
+                    job.stage_detail = (
+                        "Sealed analysis ready; cognitive audit continues in background"
+                        if job.cognition_status == "queued"
+                        else "Sealed analysis ready"
+                    )
                     job.progress_percent = 100
                     job.updated_at = time.time()
                     job.analysis_latency_ms = max(

@@ -316,11 +316,15 @@ class UnavailableJupiter:
 
 
 class FakeCognitiveLoop:
+    def __init__(self):
+        self.finalize_calls = 0
+
     def prepare(self, report):
         report["cognition"] = {"status": "prepared"}
         return report["cognition"]
 
     def finalize(self, report, ring):
+        self.finalize_calls += 1
         report["cognition"]["status"] = "complete"
         report["cognitive_ring"] = ring["index"] + 1
         report["cognitive_ring_hash"] = "c" * 64
@@ -488,6 +492,28 @@ class SolanaPublicAnalyzerTests(unittest.TestCase):
                 "live_execution_enabled"
             ]
         )
+
+    def test_hybrid_mode_publishes_analysis_before_cognitive_completion(self):
+        agent = FakeTimechainAgent()
+        analyzer = SolanaPublicAnalyzer(
+            "https://example.invalid",
+            rpc=FakeRPC(),
+            dexscreener=FakeDexScreener(),
+            jupiter=FakeJupiter(),
+            timechain_agent=agent,
+        )
+
+        report = analyzer.analyze_token(MINT, defer_cognition=True)
+
+        self.assertEqual(report["analysis_ring"], 77)
+        self.assertEqual(report["cognition"]["status"], "pending")
+        self.assertEqual(report["cognitive_completion"]["status"], "queued")
+        self.assertEqual(
+            report["temporal_entity_graph"]["reason"],
+            "temporal_projection_pending",
+        )
+        self.assertEqual(agent.cognitive_loop.finalize_calls, 0)
+        self.assertNotIn("cognitive_ring", report)
 
 
 class ProvenanceScoringTests(unittest.TestCase):

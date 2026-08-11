@@ -14,6 +14,7 @@ from chainseer_api import (
     AnalysisService,
     AnalyzeRequest,
     DeferredSealJob,
+    Job,
     PreparedWatcherCommit,
     MemoryQueryRequest,
     Settings,
@@ -1776,6 +1777,110 @@ class PreparedWatcherCommitTests(unittest.TestCase):
             self.assertEqual(result, "committed:77")
             self.assertEqual(len(tc.seals), 1)
             self.assertEqual(tc.seals[0][0], "watcher_analysis")
+
+
+class HybridCognitiveCompletionTests(unittest.TestCase):
+    def _service(self, root):
+        return AnalysisService(Settings(
+            environment="test", api_token="", chain_root=root,
+            queue_size=4, result_ttl_seconds=3600,
+            cache_ttl_seconds=300, rate_limit_per_minute=6,
+            shutdown_grace_seconds=10, watcher_enabled=False,
+        ))
+
+    def _install_agent(self, service, *, analysis_hash="analysis-hash"):
+        class TC:
+            def __init__(self):
+                self.rings = [{
+                    "index": 7,
+                    "ring_type": "token_analysis",
+                    "ring_hash": analysis_hash,
+                    "payload": {"token_address": TOKEN},
+                }]
+
+            def tail_rings(self, limit):
+                return self.rings[-limit:]
+
+            def iter_rings(self):
+                yield from self.rings
+
+        tc = TC()
+
+        class Loop:
+            def verify_incremental(self):
+                return True, []
+
+            def finalize_deferred(self, report, ring):
+                cognition = report["cognition"]
+                cognition["status"] = "complete"
+                cognition["analysis_ring"] = ring["index"]
+                tc.rings.append({
+                    "index": 8,
+                    "ring_type": "cognitive_completion",
+                    "ring_hash": "completion-hash",
+                    "payload": {
+                        "analysis_ring": ring["index"],
+                        "analysis_ring_hash": ring["ring_hash"],
+                        "cognitive_loop": cognition,
+                    },
+                })
+
+            def establish_trust(self):
+                return None
+
+        service._agent = SimpleNamespace(tc=tc, cognitive_loop=Loop())
+        return tc
+
+    def _enqueue(self, service):
+        job = Job(id="job-1", address=TOKEN, status="succeeded")
+        job.result = {"timechain": {"ring": 7, "ring_hash": "analysis-hash"}}
+        service.jobs[job.id] = job
+        report = {
+            "token_address": TOKEN,
+            "chain_id": 4663,
+            "analysis_ring": 7,
+            "analysis_ring_hash": "analysis-hash",
+            "cognition": {"status": "pending", "growth": []},
+            "_cognitive_input": "trusted structured facts",
+        }
+        service._enqueue_cognitive_completion(job, report)
+        return job
+
+    def test_result_is_published_before_idle_completion_and_then_updated(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            tc = self._install_agent(service)
+            job = self._enqueue(service)
+            self.assertEqual(job.cognition_status, "queued")
+            self.assertEqual(len(tc.rings), 1)
+
+            service._analysis_active.set()
+            service._drain_durable_commits()
+            self.assertEqual(len(tc.rings), 1)
+            self.assertEqual(job.cognition_status, "queued")
+
+            service._analysis_active.clear()
+            service._drain_durable_commits()
+            self.assertEqual(len(tc.rings), 2)
+            self.assertEqual(job.cognition_status, "complete")
+            self.assertEqual(job.cognition_progress_percent, 100)
+            self.assertEqual(job.result["timechain"]["cognitive_ring"], 8)
+            self.assertEqual(
+                service._deferred_queue.counts()["done"], 1
+            )
+
+    def test_analysis_hash_collision_discards_completion(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            self._install_agent(service, analysis_hash="different-hash")
+            job = self._enqueue(service)
+
+            service._drain_durable_commits()
+
+            self.assertEqual(job.cognition_status, "failed")
+            self.assertEqual(
+                service._deferred_queue.counts()["discarded"], 1
+            )
 
 
 class TrackedTimechainLockTests(unittest.TestCase):

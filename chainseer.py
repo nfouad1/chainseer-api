@@ -1041,6 +1041,69 @@ class ChainseerCognitiveLoop:
         report["_cognitive_input"] = cognitive_input
         return cognition
 
+    def _seal_cognitive_completion(
+        self,
+        report: dict,
+        analysis_ring: dict,
+        cognition: dict,
+    ) -> dict:
+        cognition["status"] = "complete"
+        cognition["analysis_ring"] = analysis_ring["index"]
+        completion = self.recall.tc.seal(
+            "cognitive_completion",
+            {
+                "summary": (
+                    "Chainseer cognitive loop completed for token analysis "
+                    f"ring {analysis_ring['index']}"
+                ),
+                "frame": "assertion",
+                "analysis_ring": analysis_ring["index"],
+                "analysis_ring_hash": analysis_ring["ring_hash"],
+                "cognitive_loop": cognition,
+            },
+            poq={
+                "coherence": 235,
+                "relevance": 245,
+                "novelty": 220,
+                "consistency": 240,
+                "depth": 230,
+                "covenant": 250,
+            },
+        )
+        completion_guard = self._guard_ring(
+            completion,
+            input_text="Complete an evidence-bound Chainseer cognitive audit.",
+            lesson="Chainseer cognitive completion covenant guard",
+        )
+        if completion_guard.get("action") not in {None, "none", "clean"}:
+            raise RuntimeError(
+                "Cognitive completion guard rejected the analysis: "
+                + str(completion_guard.get("action"))
+            )
+        report["cognitive_ring"] = completion["index"]
+        report["cognitive_ring_hash"] = completion["ring_hash"]
+        return cognition
+
+    def finalize_deferred(self, report: dict, analysis_ring: dict) -> dict:
+        """Commit the bounded cognitive audit after publishing the result."""
+        cognition = report.get("cognition") or {}
+        if cognition.get("status") not in {"prepared", "pending"}:
+            raise RuntimeError("Deferred cognitive loop was not prepared")
+        guard = self._guard_ring(
+            analysis_ring,
+            input_text=report.pop("_cognitive_input", ""),
+            lesson="Chainseer deferred cognitive completion covenant guard",
+        )
+        if guard.get("action") not in {None, "none", "clean"}:
+            raise RuntimeError(
+                "Deferred cognitive guard rejected the analysis: "
+                + str(guard.get("action"))
+            )
+        self.verify_registry()
+        cognition["growth"] = []
+        cognition["growth_status"] = "excluded_from_online_completion"
+        return self._seal_cognitive_completion(report, analysis_ring, cognition)
+
     def finalize(self, report: dict, analysis_ring: dict) -> dict:
         cognition = report.get("cognition") or {}
         if cognition.get("status") != "prepared":
@@ -1124,42 +1187,7 @@ class ChainseerCognitiveLoop:
                 reason=f"faculty change after analysis ring {analysis_ring['index']}"
             )
         self.verify_registry()
-        cognition["status"] = "complete"
-        cognition["analysis_ring"] = analysis_ring["index"]
-        completion = self.recall.tc.seal(
-            "cognitive_completion",
-            {
-                "summary": (
-                    "Chainseer cognitive loop completed for token analysis "
-                    f"ring {analysis_ring['index']}"
-                ),
-                "frame": "assertion",
-                "analysis_ring": analysis_ring["index"],
-                "analysis_ring_hash": analysis_ring["ring_hash"],
-                "cognitive_loop": cognition,
-            },
-            poq={
-                "coherence": 235,
-                "relevance": 245,
-                "novelty": 220,
-                "consistency": 240,
-                "depth": 230,
-                "covenant": 250,
-            },
-        )
-        completion_guard = self._guard_ring(
-            completion,
-            input_text="Complete an evidence-bound Chainseer cognitive audit.",
-            lesson="Chainseer cognitive completion covenant guard",
-        )
-        if completion_guard.get("action") not in {None, "none", "clean"}:
-            raise RuntimeError(
-                "Cognitive completion guard rejected the analysis: "
-                + str(completion_guard.get("action"))
-            )
-        report["cognitive_ring"] = completion["index"]
-        report["cognitive_ring_hash"] = completion["ring_hash"]
-        return cognition
+        return self._seal_cognitive_completion(report, analysis_ring, cognition)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -2283,6 +2311,7 @@ class Chainseer:
         progress_callback: Callable[[str, int, str], None] | None = None,
         *,
         seal: bool = True,
+        defer_cognition: bool = False,
     ) -> dict:
         """Full token analysis with GoPlus + DexScreener + on-chain RPC.
 
@@ -2549,7 +2578,7 @@ class Chainseer:
 
         if seal:
             progress("sealing_timechain", 90, "Running cognition, PoQ, and Timechain sealing")
-            self._seal_report(report)
+            self._seal_report(report, defer_cognition=defer_cognition)
             report["performance"] = {
                 "total_duration_seconds": round(
                     time.monotonic() - started_monotonic, 3
@@ -4731,7 +4760,7 @@ class Chainseer:
             else:
                 os.environ["CT_AUTOINDEX"] = previous
 
-    def _seal_report(self, report: dict):
+    def _seal_report(self, report: dict, *, defer_cognition: bool = False):
         cognition = self.cognitive_loop.prepare(report)
         poq = report.get("poq_scores", {})
         analysis = report["analysis"]
@@ -4836,6 +4865,21 @@ class Chainseer:
         report["analysis_ring"] = ring.get("index")
         report["analysis_ring_hash"] = ring.get("ring_hash")
         report["poq_verdict"] = verdict
+        report["_analysis_ring_record"] = ring
+        if defer_cognition:
+            cognition["status"] = "pending"
+            cognition["analysis_ring"] = ring["index"]
+            cognition["growth_status"] = "excluded_from_online_completion"
+            report["cognitive_completion"] = {
+                "status": "queued",
+                "analysis_ring": ring["index"],
+            }
+            report["temporal_entity_graph"] = {
+                "available": False,
+                "status": "queued",
+                "reason": "temporal_projection_pending",
+            }
+            return
         self._online_seal(lambda: self.cognitive_loop.finalize(report, ring))
         try:
             report["temporal_entity_graph"] = append_temporal_projection(

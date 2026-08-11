@@ -166,6 +166,12 @@ type PublicReport = {
 
 type ScanState = "idle" | "submitting" | "analyzing" | "succeeded" | "failed";
 
+type CognitiveCompletion = {
+  status: string;
+  stage_detail: string;
+  progress_percent: number;
+};
+
 type TokenMonitor = {
   key: string;
   network: Network;
@@ -1336,6 +1342,8 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [scanState, setScanState] = useState<ScanState>("idle");
   const [scanProgress, setScanProgress] = useState(0);
+  const [cognitiveCompletion, setCognitiveCompletion] =
+    useState<CognitiveCompletion | null>(null);
   const [liveReport, setLiveReport] = useState<PublicReport | null>(null);
   const [showExample, setShowExample] = useState(false);
   const [monitors, setMonitors] = useState<TokenMonitor[]>([]);
@@ -1585,6 +1593,7 @@ export default function Home() {
 
     setScanState("submitting");
     setScanProgress(1);
+    setCognitiveCompletion(null);
     setLiveReport(null);
     setShowExample(false);
     setNotice("Submitting the token to the serialized analysis queue…");
@@ -1622,6 +1631,7 @@ export default function Home() {
               : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
       );
 
+      let resultPublished = false;
       for (let attempt = 0; attempt < 150; attempt += 1) {
         if (attempt > 0) await delay(2_000);
         const response = await fetch(
@@ -1649,16 +1659,40 @@ export default function Home() {
           setLiveReport(job.result as PublicReport);
           setScanState("succeeded");
           setScanProgress(100);
-          setNotice(
-            `Analysis sealed to Timechain Ring ${job.result.timechain?.ring ?? "—"}.`,
-          );
-          window.setTimeout(() => {
-            document.getElementById("live-report")?.scrollIntoView({
-              behavior: "smooth",
-              block: "start",
+          const cognitive = job.cognitive_completion;
+          if (cognitive && typeof cognitive.status === "string") {
+            setCognitiveCompletion({
+              status: cognitive.status,
+              stage_detail:
+                typeof cognitive.stage_detail === "string"
+                  ? cognitive.stage_detail
+                  : "Cognitive audit is continuing",
+              progress_percent:
+                typeof cognitive.progress_percent === "number"
+                  ? Math.max(0, Math.min(100, cognitive.progress_percent))
+                  : 0,
             });
-          }, 50);
-          return;
+          }
+          if (!resultPublished) {
+            resultPublished = true;
+            setNotice(
+              `Risk result sealed to Timechain Ring ${job.result.timechain?.ring ?? "—"}.`,
+            );
+            window.setTimeout(() => {
+              document.getElementById("live-report")?.scrollIntoView({
+                behavior: "smooth",
+                block: "start",
+              });
+            }, 50);
+          }
+          if (
+            !cognitive ||
+            cognitive.status === "complete" ||
+            cognitive.status === "failed"
+          ) {
+            return;
+          }
+          continue;
         }
         if (job.status === "failed") {
           throw new Error(
@@ -1683,6 +1717,7 @@ export default function Home() {
     setNotice("Demo report opened. Its token, evidence, score, and Timechain proof are fictional.");
     setScanState("idle");
     setScanProgress(0);
+    setCognitiveCompletion(null);
     setLiveReport(null);
     document.getElementById("report")?.scrollIntoView({ behavior: "smooth" });
   }
@@ -1695,6 +1730,7 @@ export default function Home() {
     setLiveReport(null);
     setScanState("idle");
     setScanProgress(0);
+    setCognitiveCompletion(null);
   }
 
   return (
@@ -1838,6 +1874,25 @@ export default function Home() {
             aria-valuenow={Math.round(scanProgress)}
           >
             <span style={{ width: `${scanProgress}%` }} />
+          </div>
+        )}
+        {scanState === "succeeded" && cognitiveCompletion && (
+          <div className="cognitive-progress" role="status" aria-live="polite">
+            <div>
+              <strong>Cognitive audit</strong>
+              <span>{cognitiveCompletion.stage_detail}</span>
+              <b>{Math.round(cognitiveCompletion.progress_percent)}%</b>
+            </div>
+            <div
+              className="scan-progress"
+              role="progressbar"
+              aria-label="Cognitive sealing progress"
+              aria-valuemin={0}
+              aria-valuemax={100}
+              aria-valuenow={Math.round(cognitiveCompletion.progress_percent)}
+            >
+              <span style={{ width: `${cognitiveCompletion.progress_percent}%` }} />
+            </div>
           </div>
         )}
       </section>

@@ -757,6 +757,51 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             )
             self.assertEqual(report["cognitive_ring"], completion["index"])
 
+    def test_hybrid_seal_stops_after_authoritative_analysis_ring(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(chainseer.RobinhoodRPC, "get_block_number", return_value=100):
+                agent = chainseer.Chainseer(chain_root=temp_dir)
+            report = {
+                "token_address": "0x" + "4" * 40,
+                "token_name": "Hybrid Test",
+                "timestamp": "2026-08-11T00:00:00+00:00",
+                "analysis": {
+                    "legitimacy_score": 70,
+                    "risk_level": "Medium",
+                    "recommendation": "Review evidence.",
+                    "green_flags": [],
+                    "red_flags": [],
+                    "component_scores": {"security": 70},
+                    "confidence": "test",
+                    "uncertain_components": {},
+                },
+                "provenance": {"block_pin": 100, "fact_count": 0, "facts": []},
+                "claim_evidence": {},
+                "poq_scores": {
+                    "coherence": 230, "relevance": 240, "novelty": 210,
+                    "consistency": 230, "depth": 220, "covenant": 245,
+                },
+            }
+
+            with patch.object(agent.cognitive_loop, "finalize") as finalize:
+                agent._seal_report(report, defer_cognition=True)
+
+            self.assertEqual(finalize.call_count, 0)
+            self.assertEqual(report["cognition"]["status"], "pending")
+            self.assertEqual(report["cognitive_completion"]["status"], "queued")
+            self.assertEqual(
+                report["temporal_entity_graph"]["reason"],
+                "temporal_projection_pending",
+            )
+            self.assertIn("_analysis_ring_record", report)
+            self.assertNotIn("cognitive_ring", report)
+            self.assertEqual(
+                [ring["ring_type"] for ring in agent.tc.load()].count(
+                    "cognitive_completion"
+                ),
+                0,
+            )
+
     def test_partial_faculty_registry_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
             registry = Path(temp_dir) / "registry"

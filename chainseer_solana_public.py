@@ -781,7 +781,7 @@ class SolanaPublicAnalyzer:
             }
         return deployer_data, creator_data, facts
 
-    def _seal_report(self, report: dict) -> None:
+    def _seal_report(self, report: dict, *, defer_cognition: bool = False) -> None:
         agent = self.timechain_agent
         if agent is None:
             return
@@ -868,6 +868,21 @@ class SolanaPublicAnalyzer:
         report["analysis_ring"] = ring["index"]
         report["analysis_ring_hash"] = ring["ring_hash"]
         report["poq_verdict"] = verdict
+        report["_analysis_ring_record"] = ring
+        if defer_cognition:
+            cognition["status"] = "pending"
+            cognition["analysis_ring"] = ring["index"]
+            cognition["growth_status"] = "excluded_from_online_completion"
+            report["cognitive_completion"] = {
+                "status": "queued",
+                "analysis_ring": ring["index"],
+            }
+            report["temporal_entity_graph"] = {
+                "available": False,
+                "status": "queued",
+                "reason": "temporal_projection_pending",
+            }
+            return
         agent.cognitive_loop.finalize(report, ring)
         try:
             report["temporal_entity_graph"] = append_temporal_projection(
@@ -889,6 +904,7 @@ class SolanaPublicAnalyzer:
         *,
         progress_callback: Callable[[str, int, str], None] | None = None,
         seal: bool = True,
+        defer_cognition: bool = False,
     ) -> dict:
         def progress(stage: str, percent: int, detail: str) -> None:
             if progress_callback is not None:
@@ -1745,7 +1761,7 @@ class SolanaPublicAnalyzer:
         )
         if seal:
             progress("sealing_timechain", 90, "Sealing the Timechain analysis")
-            self._seal_report(report)
+            self._seal_report(report, defer_cognition=defer_cognition)
             progress("complete", 100, "Sealed analysis is ready")
         else:
             progress("complete", 90, "Observational scan complete (sealing deferred)")
