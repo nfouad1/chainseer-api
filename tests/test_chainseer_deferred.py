@@ -14,6 +14,30 @@ def payload(anchor, observed=1.0, report_hash="hash"):
 
 
 class DurableDeferredQueueTests(unittest.TestCase):
+    def test_latest_public_result_survives_reopen_and_is_detached(self):
+        with tempfile.TemporaryDirectory() as root:
+            path = Path(root) / "queue.sqlite3"
+            queue = DurableDeferredQueue(path)
+            result = {"timechain": {"ring": 7}, "decision": {"score": 81}}
+            queue.put_public_result("base", "0xabc", result, now=100.0)
+            result["timechain"]["ring"] = 99
+
+            stored = DurableDeferredQueue(path).get_public_result(
+                "base", "0xabc", max_age_seconds=60, now=125.0
+            )
+
+            self.assertEqual(stored["result"]["timechain"]["ring"], 7)
+            self.assertEqual(stored["stored_at"], 100.0)
+            self.assertEqual(stored["age_seconds"], 25.0)
+
+    def test_latest_public_result_honors_max_age(self):
+        with tempfile.TemporaryDirectory() as root:
+            queue = DurableDeferredQueue(Path(root) / "queue.sqlite3")
+            queue.put_public_result("solana", "mint", {"ok": True}, now=10.0)
+            self.assertIsNone(queue.get_public_result(
+                "solana", "mint", max_age_seconds=5, now=16.0
+            ))
+
     def test_coalesces_to_freshest_subject_generation(self):
         with tempfile.TemporaryDirectory() as root:
             queue = DurableDeferredQueue(Path(root) / "queue.sqlite3")

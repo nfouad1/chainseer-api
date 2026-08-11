@@ -333,6 +333,12 @@ function delay(milliseconds: number) {
   return new Promise((resolve) => setTimeout(resolve, milliseconds));
 }
 
+function formatAge(seconds: number) {
+  if (seconds < 60) return `${Math.max(0, Math.round(seconds))}s old`;
+  if (seconds < 3600) return `${Math.round(seconds / 60)}m old`;
+  return `${Math.round(seconds / 3600)}h old`;
+}
+
 function formatMoney(value: number | string | null | undefined) {
   const amount = Number(value);
   if (!Number.isFinite(amount) || amount <= 0) return "Unknown";
@@ -1342,6 +1348,7 @@ export default function Home() {
   const [notice, setNotice] = useState("");
   const [scanState, setScanState] = useState<ScanState>("idle");
   const [scanProgress, setScanProgress] = useState(0);
+  const [forceRefresh, setForceRefresh] = useState(false);
   const [cognitiveCompletion, setCognitiveCompletion] =
     useState<CognitiveCompletion | null>(null);
   const [liveReport, setLiveReport] = useState<PublicReport | null>(null);
@@ -1603,7 +1610,11 @@ export default function Home() {
         method: "POST",
         cache: "no-store",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ address: normalizedAddress, network }),
+        body: JSON.stringify({
+          address: normalizedAddress,
+          network,
+          force_refresh: forceRefresh,
+        }),
       });
       const submissionBody = await submission.json().catch(() => null);
       if (!submission.ok) {
@@ -1619,17 +1630,45 @@ export default function Home() {
         throw new Error("The analysis service returned an invalid job identifier.");
       }
 
+      const previousResult =
+        submissionBody &&
+        submissionBody.previous_result &&
+        typeof submissionBody.previous_result === "object"
+          ? (submissionBody.previous_result as PublicReport)
+          : null;
+      const previousAge =
+        submissionBody &&
+        typeof submissionBody.previous_result_age_seconds === "number"
+          ? submissionBody.previous_result_age_seconds
+          : 0;
+
       setScanState("analyzing");
       setScanProgress(2);
-      setNotice(
-        submissionBody.cached
-          ? "Loading the recent sealed result…"
-          : network === "solana"
-            ? "Analyzing SPL mint controls, markets, holders, Jupiter routes, and provenance…"
-            : network === "base"
-              ? "Analyzing Base contract, liquidity, holders, deployer history, and provenance…"
-              : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
-      );
+      if (previousResult) {
+        setLiveReport(previousResult);
+        const anchor = previousResult.evidence.block_pin?.toLocaleString() ?? "unknown";
+        const ring = previousResult.timechain.ring ?? "unknown";
+        setNotice(
+          `Showing sealed Ring ${ring} at block/slot ${anchor} (${formatAge(previousAge)}) while a fresh scan runs.`,
+        );
+        window.setTimeout(() => {
+          document.getElementById("live-report")?.scrollIntoView({
+            behavior: "smooth",
+            block: "start",
+          });
+        }, 50);
+      } else {
+        setNotice(
+          submissionBody.cached
+            ? "Loading the recent sealed result…"
+            : network === "solana"
+              ? "Analyzing SPL mint controls, markets, holders, Jupiter routes, and provenance…"
+              : network === "base"
+                ? "Analyzing Base contract, liquidity, holders, deployer history, and provenance…"
+                : "Analyzing contract, liquidity, holders, deployer history, and provenance…",
+        );
+      }
+      setForceRefresh(false);
 
       let resultPublished = false;
       for (let attempt = 0; attempt < 150; attempt += 1) {
@@ -1861,6 +1900,15 @@ export default function Home() {
           <span>No wallet connection</span>
           <span>No signature</span>
           <span>Evidence anchored to block or slot</span>
+          <label className="force-refresh-control">
+            <input
+              type="checkbox"
+              checked={forceRefresh}
+              onChange={(event) => setForceRefresh(event.target.checked)}
+              disabled={scanState === "submitting" || scanState === "analyzing"}
+            />
+            Force fresh scan
+          </label>
           <button type="button" onClick={loadExample}>Open demo report →</button>
         </div>
         {notice && <p className="scan-notice" role="status">{notice}</p>}

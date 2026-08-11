@@ -101,6 +101,69 @@ class DurableDeferredQueue:
                 ON deferred_jobs(state, available_at, priority, updated_at)
                 """
             )
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS latest_public_results (
+                    network TEXT NOT NULL,
+                    subject_key TEXT NOT NULL,
+                    result_json TEXT NOT NULL,
+                    stored_at REAL NOT NULL,
+                    PRIMARY KEY(network, subject_key)
+                )
+                """
+            )
+
+    def put_public_result(
+        self,
+        network: str,
+        subject_key: str,
+        result: dict[str, Any],
+        *,
+        now: float | None = None,
+    ) -> None:
+        """Persist the latest sealed public report for instant repeat display."""
+        if not isinstance(result, dict):
+            raise TypeError("public result must be an object")
+        stamp = time.time() if now is None else float(now)
+        with self._connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO latest_public_results(
+                    network, subject_key, result_json, stored_at
+                ) VALUES (?, ?, ?, ?)
+                ON CONFLICT(network, subject_key) DO UPDATE SET
+                    result_json=excluded.result_json,
+                    stored_at=excluded.stored_at
+                """,
+                (str(network), str(subject_key), _canonical_json(result), stamp),
+            )
+
+    def get_public_result(
+        self,
+        network: str,
+        subject_key: str,
+        *,
+        max_age_seconds: float | None = None,
+        now: float | None = None,
+    ) -> dict[str, Any] | None:
+        """Return a detached latest-result envelope when it is still usable."""
+        stamp = time.time() if now is None else float(now)
+        with self._connection() as connection:
+            row = connection.execute(
+                """SELECT result_json, stored_at FROM latest_public_results
+                   WHERE network=? AND subject_key=?""",
+                (str(network), str(subject_key)),
+            ).fetchone()
+        if row is None:
+            return None
+        stored_at = float(row["stored_at"])
+        age_seconds = max(0.0, stamp - stored_at)
+        if max_age_seconds is not None and age_seconds > max_age_seconds:
+            return None
+        result = json.loads(row["result_json"])
+        if not isinstance(result, dict):
+            return None
+        return {"result": result, "stored_at": stored_at, "age_seconds": age_seconds}
 
     @staticmethod
     def _freshness(payload: dict[str, Any]) -> tuple[int, float]:

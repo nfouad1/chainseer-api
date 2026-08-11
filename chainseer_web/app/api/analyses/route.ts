@@ -163,6 +163,11 @@ export async function POST(request: NextRequest) {
       : requestedNetwork === "base"
         ? "base"
         : "robinhood";
+  const forceRefresh =
+    typeof payload === "object" &&
+    payload !== null &&
+    "force_refresh" in payload &&
+    payload.force_refresh === true;
 
   const validAddress =
     network === "solana"
@@ -187,7 +192,7 @@ export async function POST(request: NextRequest) {
   const identity = token ? await clientIdentity(request, token) : undefined;
   return proxy("/v1/analyses", {
     method: "POST",
-    body: JSON.stringify({ address, network }),
+    body: JSON.stringify({ address, network, force_refresh: forceRefresh }),
   }, identity);
 }
 

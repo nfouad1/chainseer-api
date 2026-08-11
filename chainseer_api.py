@@ -227,6 +227,11 @@ class Settings:
             "CHAINSEER_SCAN_CACHE_TTL_SECONDS", 300, 0, 3600
         )
     )
+    stale_result_ttl_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "CHAINSEER_STALE_RESULT_TTL_SECONDS", 86400, 300, 604800
+        )
+    )
     rate_limit_per_minute: int = field(
         default_factory=lambda: _env_int(
             "CHAINSEER_RATE_LIMIT_PER_MINUTE", 6, 1, 120
@@ -479,6 +484,7 @@ class Settings:
 class AnalyzeRequest(BaseModel):
     network: str = Field(default="robinhood", min_length=4, max_length=16)
     address: str = Field(min_length=32, max_length=44)
+    force_refresh: bool = False
 
     @field_validator("network")
     @classmethod
@@ -560,6 +566,9 @@ class JobAccepted(BaseModel):
     job_id: str
     status: str
     cached: bool = False
+    refreshing: bool = False
+    previous_result: dict[str, Any] | None = None
+    previous_result_age_seconds: float | None = None
 
 
 class RingImportItem(BaseModel):
@@ -918,7 +927,7 @@ class AnalysisService:
         self.settings = settings
         self.jobs: dict[str, Job] = {}
         self.active_by_address: dict[str, str] = {}
-        self.cache: dict[str, tuple[float, dict[str, Any]]] = {}
+        self.cache: dict[str, tuple[float, str]] = {}
         self.work: queue.Queue[str | None] = queue.Queue(
             maxsize=settings.queue_size
         )
@@ -1166,7 +1175,11 @@ class AnalysisService:
         )
 
     def submit(
-        self, address: str, network: str = "robinhood"
+        self,
+        address: str,
+        network: str = "robinhood",
+        *,
+        force_refresh: bool = False,
     ) -> JobAccepted:
         if self._integrity_status.get("status") == "failed":
             raise IntegrityUnavailableError(
@@ -1177,10 +1190,42 @@ class AnalysisService:
         )
         normalized = f"{network}:{normalized_address}"
         now = time.time()
+        # Keep the common hot-repeat path entirely in memory. Durable storage
+        # is only consulted for a stale/forced refresh or after a restart.
+        if not force_refresh:
+            with self._lock:
+                self._prune(now)
+                cached = self.cache.get(normalized)
+                if cached and cached[0] > now:
+                    cached_job = self.jobs.get(cached[1])
+                    if cached_job is not None:
+                        return JobAccepted(
+                            job_id=cached_job.id,
+                            status=cached_job.status,
+                            cached=True,
+                        )
+                    self.cache.pop(normalized, None)
+        previous = self._deferred_queue.get_public_result(
+            network,
+            normalized_address,
+            max_age_seconds=self.settings.stale_result_ttl_seconds,
+            now=now,
+        )
+
+        def accepted_with_previous(job: Job) -> JobAccepted:
+            return JobAccepted(
+                job_id=job.id,
+                status=job.status,
+                cached=False,
+                refreshing=True,
+                previous_result=(previous or {}).get("result"),
+                previous_result_age_seconds=(previous or {}).get("age_seconds"),
+            )
+
         with self._lock:
             self._prune(now)
             cached = self.cache.get(normalized)
-            if cached and cached[0] > now:
+            if not force_refresh and cached and cached[0] > now:
                 cached_job = self.jobs.get(cached[1])
                 if cached_job is not None:
                     # Serve the existing completed job rather than minting a
@@ -1204,11 +1249,7 @@ class AnalysisService:
                 if active and active.status in {
                     "queued", "running", "waiting_for_timechain"
                 }:
-                    return JobAccepted(
-                        job_id=active.id,
-                        status=active.status,
-                        cached=False,
-                    )
+                    return accepted_with_previous(active)
 
             if self.work.full():
                 raise QueueFullError
@@ -1221,7 +1262,27 @@ class AnalysisService:
             self.jobs[job.id] = job
             self.active_by_address[normalized] = job.id
             self.work.put_nowait(job.id)
+            if previous is not None:
+                return accepted_with_previous(job)
             return JobAccepted(job_id=job.id, status=job.status)
+
+    def _persist_public_result(self, job: Job) -> None:
+        """Store a detached public snapshot without extending job lifetime."""
+        with self._lock:
+            if job.result is None:
+                return
+            subject = (
+                job.address.lower() if job.network in EVM_NETWORKS else job.address
+            )
+            network = job.network
+            snapshot = json.loads(json.dumps(job.result, default=str))
+        try:
+            self._deferred_queue.put_public_result(network, subject, snapshot)
+        except Exception:
+            LOGGER.exception(
+                "Could not persist latest public result",
+                extra={"job_id": job.id, "network": network},
+            )
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
@@ -2557,6 +2618,7 @@ class AnalysisService:
             job.cognition_progress_percent = 100
             job.cognition_updated_at = time.time()
             job.updated_at = job.cognition_updated_at
+        self._persist_public_result(job)
 
     def _execute_deferred_outcome(self, item: DeferredQueueItem) -> str:
         """Restore sealed baselines and emit at most one due outcome per turn."""
@@ -2702,6 +2764,8 @@ class AnalysisService:
                                     refreshed["timechain"] = prior_timechain
                                 job.result = refreshed
                                 job.updated_at = time.time()
+                        if job is not None:
+                            self._persist_public_result(job)
                     except Exception:
                         LOGGER.exception(
                             "Deferred temporal projection refresh failed",
@@ -2955,6 +3019,8 @@ class AnalysisService:
                             ),
                             None,
                         )
+                if not retrying and job.status == "succeeded":
+                    self._persist_public_result(job)
                 self.work.task_done()
 
 
@@ -3538,7 +3604,11 @@ async def create_analysis(
             headers={"Retry-After": "60"},
         )
     try:
-        return SERVICE.submit(payload.address, payload.network)
+        return SERVICE.submit(
+            payload.address,
+            payload.network,
+            force_refresh=payload.force_refresh,
+        )
     except IntegrityUnavailableError as exc:
         raise HTTPException(
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,

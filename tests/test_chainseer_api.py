@@ -1984,6 +1984,46 @@ class TrackedTimechainLockTests(unittest.TestCase):
             finally:
                 service.stop()
 
+    def test_persisted_result_is_returned_while_repeat_scan_refreshes(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            service._deferred_queue.put_public_result(
+                "base",
+                TOKEN.lower(),
+                {"timechain": {"ring": 44}, "evidence": {"block_pin": 123}},
+                now=time.time() - 30,
+            )
+
+            accepted = service.submit(TOKEN, "base")
+
+            self.assertTrue(accepted.refreshing)
+            self.assertFalse(accepted.cached)
+            self.assertEqual(accepted.previous_result["timechain"]["ring"], 44)
+            self.assertGreaterEqual(accepted.previous_result_age_seconds, 29)
+            self.assertEqual(service.get(accepted.job_id).status, "queued")
+
+    def test_force_refresh_bypasses_hot_cache_and_reuses_active_job(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            old = Job(id="a" * 32, address=TOKEN, status="succeeded")
+            old.result = {"timechain": {"ring": 9}}
+            service.jobs[old.id] = old
+            service.cache[f"robinhood:{TOKEN.lower()}"] = (
+                time.time() + 300,
+                old.id,
+            )
+            service._deferred_queue.put_public_result(
+                "robinhood", TOKEN.lower(), old.result
+            )
+
+            forced = service.submit(TOKEN, force_refresh=True)
+            duplicate = service.submit(TOKEN, force_refresh=True)
+
+            self.assertNotEqual(forced.job_id, old.id)
+            self.assertTrue(forced.refreshing)
+            self.assertEqual(duplicate.job_id, forced.job_id)
+            self.assertEqual(duplicate.previous_result["timechain"]["ring"], 9)
+
 
 if __name__ == "__main__":
     unittest.main()
