@@ -12,6 +12,7 @@ import hashlib
 import json
 import random
 import sqlite3
+import threading
 import time
 from contextlib import contextmanager
 from dataclasses import dataclass
@@ -33,6 +34,10 @@ from chainseer import (
 )
 from chainseer_base import LearningRunLock
 from chainseer_core import atomic_json_write, read_json, safe_float, safe_int
+from chainseer_robinhood_reflection import (
+    RobinhoodReflectionCoordinator,
+    default_skill_root,
+)
 
 
 PAIR_CREATED_TOPIC = (
@@ -46,6 +51,7 @@ V4_SWAP_TOPIC = "0x40e9cecb9f5f1f1c5b9c97dec2917b7ee92e57ba5563708daca94dd84ad71
 V4_GET_LIQUIDITY_SELECTOR = "fa6793d5"
 V4_GET_SLOT0_SELECTOR = "c815641c"
 SOURCE_V2 = "uniswap_v2"
+SOURCE_V3 = "uniswap_v3"
 SOURCE_V4 = "uniswap_v4"
 HORIZONS = (
     ("15m", 15 * 60),
@@ -61,15 +67,56 @@ DEFAULT_DISCOVERY_LOOKBACK_BLOCKS = 5_000
 DEFAULT_DISCOVERY_BLOCK_LIMIT = 5_000
 DEFAULT_ANALYSIS_LIMIT = 1
 DEFAULT_OUTCOME_LIMIT = 12
+DEFAULT_MARKET_RECHECK_LIMIT = 4
 MAXIMUM_ANALYSIS_ATTEMPTS = 3
 OUTCOME_RETRY_SECONDS = 60
+
+# Two nominal learn cycles. See OutcomeStore.tolerance for why one was not
+# enough: a 15m checkpoint had a 300s window against a 300s median cadence.
+CHECKPOINT_TOLERANCE_MINIMUM_SECONDS = 10 * 60
+# A mark landing later than this fraction of its horizon is recorded but not
+# learned from -- a 15m outcome observed at 27m is measuring something else.
+CHECKPOINT_LEARNING_LATENESS_FRACTION = 0.5
 MINIMUM_ENTRY_SCORE = 70.0
 MINIMUM_ENTRY_LIQUIDITY_USD = 10_000.0
+ENTRY_PRIORITY_PENALTY_MARKET_CAP_USD = 5_000_000.0
+MAXIMUM_ENTRY_MARKET_CAP_USD = 10_000_000.0
+REENTRY_MOMENTUM_MULTIPLE = 1.05
+MOMENTUM_PRIORITY_MULTIPLE = 2.0
+MOMENTUM_PRIORITY_MINIMUM_HORIZON_SECONDS = 60 * 60
+MOMENTUM_PRIORITY_MAXIMUM_MARKET_CAP_USD = 100_000_000_000.0
+MOMENTUM_PRIORITY_MAXIMUM_CAP_TO_LIQUIDITY = 1_000.0
+EXECUTABLE_MARKET_RECHECK_SECONDS = 15 * 60
+EXECUTABLE_MARKET_WATCH_SECONDS = 7 * 24 * 60 * 60
+EXECUTABLE_MARKET_MAXIMUM_POOLS_PER_TOKEN = 8
+TEMPORARY_EXECUTION_STOPS = {"V4_MARKET_STATE_UNVERIFIED"}
+PAPER_DECISION_ADMITTED = "admitted"
+PAPER_DECISION_REJECTED = "rejected"
+PAPER_DECISION_WATCHING = "watching_for_executable_market"
+PAPER_DECISION_EXPIRED = "expired_no_executable_market"
+PAPER_DECISION_ABOVE_CAP = "observing_above_entry_ceiling"
+PAPER_DECISION_REENTRY = "waiting_for_reentry_momentum"
+# A position whose price has fallen to this fraction of entry is not a market
+# to exit, it is a token that stopped existing. Held separately from
+# STOP_LOSS_MULTIPLE so the two causes stay distinguishable in every downstream
+# audit: a stop loss is a decline the exit rules are meant to catch, a price
+# collapse is a rug the entry rules should have refused.
+PRICE_COLLAPSE_MULTIPLE = 0.02
+
 PAPER_COST_USD = 100.0
 MAXIMUM_POSITIONS = 50
 STOP_LOSS_MULTIPLE = 0.65
-TAKE_PROFIT_MULTIPLE = 3.0
+STAGE_ONE_MULTIPLE = 2.0
+STAGE_TWO_MULTIPLE = 3.0
+STAGE_ONE_ORIGINAL_FRACTION = 0.50
+STAGE_TWO_ORIGINAL_FRACTION = 0.25
+RUNNER_TRAILING_DRAWDOWN = 0.35
+STAGNATION_MINIMUM_MULTIPLE = 1.25
+STAGNATION_EXIT_SECONDS = 24 * 60 * 60
 MAXIMUM_HOLD_SECONDS = 7 * 24 * 60 * 60
+SHADOW_POLICY_FIXED_3X = "fixed_3x"
+SHADOW_POLICY_PURE_TRAILING = "pure_trailing"
+PURE_TRAILING_ACTIVATION_MULTIPLE = 1.25
 ZERO_ADDRESS = "0x" + "0" * 40
 REMOTE_RETRY_ATTEMPTS = 4
 REMOTE_RETRY_BASE_SECONDS = 0.25
@@ -129,6 +176,11 @@ def _remote_call(operation: str, callback, *, attempts: int = REMOTE_RETRY_ATTEM
             return callback()
         except Exception as exc:
             last_error = exc
+            # Retrying an oversized eth_getLogs window cannot change the
+            # provider's deterministic result. Callers that support adaptive
+            # windowing can split immediately after this error is wrapped.
+            if "exceeds limit of 10000" in str(exc).lower():
+                break
             if attempt + 1 >= max(1, attempts):
                 break
             ceiling = min(
@@ -283,6 +335,19 @@ class RobinhoodLearningStore:
                     status TEXT NOT NULL,
                     summary_json TEXT
                 );
+                CREATE TABLE IF NOT EXISTS position_policy_states (
+                    token_address TEXT NOT NULL,
+                    policy TEXT NOT NULL,
+                    status TEXT NOT NULL DEFAULT 'open',
+                    high_multiple REAL NOT NULL DEFAULT 1,
+                    exit_price_usd REAL,
+                    exit_value_usd REAL,
+                    exit_reason TEXT,
+                    closed_at REAL,
+                    net_multiple REAL,
+                    last_mark_at REAL,
+                    PRIMARY KEY (token_address, policy)
+                );
                 CREATE TABLE IF NOT EXISTS v4_pools (
                     pool_id TEXT PRIMARY KEY,
                     currency0 TEXT NOT NULL,
@@ -310,6 +375,8 @@ class RobinhoodLearningStore:
                     ON checkpoints(status, horizon_label);
                 CREATE INDEX IF NOT EXISTS idx_positions_status
                     ON positions(status, opened_at);
+                CREATE INDEX IF NOT EXISTS idx_position_policy_status
+                    ON position_policy_states(status, policy);
                 CREATE INDEX IF NOT EXISTS idx_v4_activation
                     ON v4_pools(promoted, modified_block, swapped_block);
                 """
@@ -322,10 +389,145 @@ class RobinhoodLearningStore:
                 "fee_tier": "INTEGER",
                 "tick_spacing": "INTEGER",
                 "market_evidence_json": "TEXT NOT NULL DEFAULT '{}'",
+                "analysis_priority_reason": "TEXT",
+                "analysis_queue_age_seconds": "REAL",
+                "paper_decision": "TEXT",
+                "market_watch_started_at": "REAL",
+                "market_watch_last_checked_at": "REAL",
+                "market_watch_checks": "INTEGER NOT NULL DEFAULT 0",
+                "market_watch_expires_at": "REAL",
+                "market_watch_reason": "TEXT",
+                "market_watch_reference_price_usd": "REAL",
+                "market_watch_reference_market_cap_usd": "REAL",
+                "market_watch_reference_at": "REAL",
             }
             for name, declaration in migrations.items():
                 if name not in columns:
                     connection.execute(f"ALTER TABLE candidates ADD COLUMN {name} {declaration}")
+            position_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(positions)")
+            }
+            position_migrations = {
+                "entry_market_cap_usd": "REAL",
+                "last_market_cap_usd": "REAL",
+                "last_market_observed_at": "TEXT",
+                "original_quantity": "REAL",
+                "realized_value_usd": "REAL NOT NULL DEFAULT 0",
+                "stage_one_sold_at": "REAL",
+                "stage_two_sold_at": "REAL",
+                "runner_high_multiple": "REAL",
+                "entry_policy_version": "TEXT",
+                "grandfathered_above_cap": "INTEGER NOT NULL DEFAULT 0",
+            }
+            for name, declaration in position_migrations.items():
+                if name not in position_columns:
+                    connection.execute(
+                        f"ALTER TABLE positions ADD COLUMN {name} {declaration}"
+                    )
+            connection.execute(
+                """
+                UPDATE positions SET
+                    original_quantity=COALESCE(original_quantity,quantity),
+                    realized_value_usd=COALESCE(realized_value_usd,0),
+                    runner_high_multiple=COALESCE(runner_high_multiple,high_multiple,1),
+                    entry_policy_version=COALESCE(entry_policy_version,'legacy_grandfathered'),
+                    grandfathered_above_cap=CASE
+                        WHEN entry_market_cap_usd>? THEN 1
+                        ELSE COALESCE(grandfathered_above_cap,0)
+                    END
+                """,
+                (MAXIMUM_ENTRY_MARKET_CAP_USD,),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO position_policy_states (
+                    token_address,policy,status,high_multiple,last_mark_at
+                ) SELECT token_address,?,status,high_multiple,last_mark_at FROM positions
+                """,
+                (SHADOW_POLICY_FIXED_3X,),
+            )
+            connection.execute(
+                """
+                INSERT OR IGNORE INTO position_policy_states (
+                    token_address,policy,status,high_multiple,last_mark_at
+                ) SELECT token_address,?,status,high_multiple,last_mark_at FROM positions
+                """,
+                (SHADOW_POLICY_PURE_TRAILING,),
+            )
+            connection.execute(
+                """
+                UPDATE candidates SET paper_decision=CASE
+                    WHEN paper_entry_allowed=1 THEN ?
+                    WHEN paper_entry_allowed=0 THEN ?
+                    ELSE paper_decision
+                END
+                WHERE paper_decision IS NULL
+                """,
+                (PAPER_DECISION_ADMITTED, PAPER_DECISION_REJECTED),
+            )
+            # Earlier versions treated a temporarily unverifiable V4 market as
+            # a terminal rejection. Preserve the analysis result but migrate
+            # otherwise-qualified, hook-free candidates into a bounded market
+            # watch. Any eventual entry is priced at its future executable
+            # snapshot; this never creates a retroactive paper fill.
+            now = time.time()
+            legacy_watch_rows = connection.execute(
+                """
+                SELECT token_address,hard_stops_json FROM candidates
+                WHERE analysis_status='complete' AND paper_entry_allowed=0
+                  AND paper_decision=? AND score>=?
+                  AND risk_level IN ('Low','Medium')
+                  AND source_version=? AND LOWER(COALESCE(hooks_address,?))=?
+                """,
+                (
+                    PAPER_DECISION_REJECTED, MINIMUM_ENTRY_SCORE, SOURCE_V4,
+                    ZERO_ADDRESS, ZERO_ADDRESS,
+                ),
+            ).fetchall()
+            for row in legacy_watch_rows:
+                try:
+                    stops = set(json.loads(row["hard_stops_json"] or "[]"))
+                except (TypeError, ValueError):
+                    stops = set()
+                if stops and stops <= TEMPORARY_EXECUTION_STOPS:
+                    connection.execute(
+                        """
+                        UPDATE candidates SET paper_decision=?,
+                            market_watch_started_at=COALESCE(market_watch_started_at,?),
+                            market_watch_expires_at=COALESCE(market_watch_expires_at,?),
+                            market_watch_reason=? WHERE token_address=?
+                        """,
+                        (
+                            PAPER_DECISION_WATCHING, now,
+                            now + EXECUTABLE_MARKET_WATCH_SECONDS,
+                            "market_state_unverified", row["token_address"],
+                        ),
+                    )
+            # Positions created before entry-market-cap persistence can be
+            # reconstructed from the exact analysis-time market evidence used
+            # to open them. Never substitute the earlier launch checkpoint.
+            legacy = connection.execute(
+                """
+                SELECT p.token_address,c.market_evidence_json,p.opened_at
+                FROM positions p JOIN candidates c USING(token_address)
+                WHERE p.entry_market_cap_usd IS NULL
+                """
+            ).fetchall()
+            for row in legacy:
+                try:
+                    evidence = json.loads(row["market_evidence_json"] or "{}")
+                except (TypeError, ValueError):
+                    evidence = {}
+                market_cap = safe_float(evidence.get("market_cap_usd"), 0.0) or None
+                connection.execute(
+                    """
+                    UPDATE positions SET entry_market_cap_usd=?,
+                        last_market_cap_usd=COALESCE(last_market_cap_usd,?),
+                        last_market_observed_at=COALESCE(last_market_observed_at,?)
+                    WHERE token_address=?
+                    """,
+                    (market_cap, market_cap, _utc_now(), row["token_address"]),
+                )
 
     def add_candidates(self, candidates: list[dict]) -> int:
         if not candidates:
@@ -419,18 +621,77 @@ class RobinhoodLearningStore:
             return dict(row) if row else None
 
     def pending_analysis(self, limit: int) -> list[dict]:
+        limit = max(0, limit)
+        if not limit:
+            return []
         with self.connection() as connection:
-            return [dict(row) for row in connection.execute(
+            rows = [dict(row) for row in connection.execute(
                 """
-                SELECT * FROM candidates
-                WHERE analysis_status IN ('pending','retry')
-                  AND analysis_attempts < ?
-                ORDER BY CASE analysis_status WHEN 'pending' THEN 0 ELSE 1 END,
-                         block_number, log_index LIMIT ?
-                """, (MAXIMUM_ANALYSIS_ATTEMPTS, max(0, limit))
+                SELECT c.*,
+                    MAX(CASE
+                        WHEN cp.status='observed'
+                         AND cp.learning_eligible=1
+                         AND cp.horizon_seconds>=?
+                         AND cp.market_cap_multiple>=?
+                         AND cp.liquidity_usd>=?
+                         AND cp.market_cap_usd>0
+                         AND cp.market_cap_usd<=?
+                         AND cp.market_cap_usd/cp.liquidity_usd<=?
+                        THEN cp.market_cap_multiple * CASE
+                            WHEN cp.market_cap_usd>=? THEN 0.5 ELSE 1.0 END
+                    END) momentum_priority_multiple
+                FROM candidates c
+                LEFT JOIN checkpoints cp ON cp.token_address=c.token_address
+                WHERE c.analysis_status IN ('pending','retry')
+                  AND c.analysis_attempts < ?
+                GROUP BY c.token_address
+                """,
+                (
+                    MOMENTUM_PRIORITY_MINIMUM_HORIZON_SECONDS,
+                    MOMENTUM_PRIORITY_MULTIPLE,
+                    MINIMUM_ENTRY_LIQUIDITY_USD,
+                    MAXIMUM_ENTRY_MARKET_CAP_USD,
+                    MOMENTUM_PRIORITY_MAXIMUM_CAP_TO_LIQUIDITY,
+                    ENTRY_PRIORITY_PENALTY_MARKET_CAP_USD,
+                    MAXIMUM_ANALYSIS_ATTEMPTS,
+                ),
             )]
+        oldest = sorted(
+            rows,
+            key=lambda row: (
+                0 if row["analysis_status"] == "pending" else 1,
+                row["block_number"],
+                row["log_index"],
+            ),
+        )
+        momentum = sorted(
+            (row for row in rows if row.get("momentum_priority_multiple") is not None),
+            key=lambda row: (
+                0 if row["analysis_status"] == "pending" else 1,
+                -safe_float(row.get("momentum_priority_multiple"), 0.0),
+                row["block_number"],
+            ),
+        )
+        selected = []
+        if momentum:
+            selected.append(momentum[0])
+        for row in oldest:
+            if len(selected) >= limit:
+                break
+            if any(item["token_address"] == row["token_address"] for item in selected):
+                continue
+            selected.append(row)
+        return selected
 
-    def record_analysis(self, token: str, analysis: dict, market: dict) -> None:
+    def record_analysis(
+        self,
+        token: str,
+        analysis: dict,
+        market: dict,
+        *,
+        priority_reason: str | None = None,
+        queue_age_seconds: float | None = None,
+    ) -> None:
         hard_stops = [
             (item.get("code") or item.get("reason")) if isinstance(item, dict) else str(item)
             for item in analysis.get("hard_stop_overrides") or []
@@ -441,13 +702,47 @@ class RobinhoodLearningStore:
         price = safe_float(market.get("price_usd"), 0.0)
         market_cap = safe_float(market.get("market_cap_usd"), 0.0) or None
         fdv = safe_float(market.get("fdv_usd"), 0.0) or None
+        # The floor may have been raised by the closed-position audit. Read it
+        # per call rather than caching: the audit runs in the same process and
+        # a stale in-memory copy would silently ignore a tightening it just
+        # applied. max() is the guarantee -- the adaptive value can only ever
+        # raise the module constant, never lower it, so a corrupt or hostile
+        # policy file cannot loosen admission.
+        minimum_entry_score = self._effective_minimum_entry_score()
+        token_quality_passes = bool(
+            score >= minimum_entry_score and risk in {"Low", "Medium"}
+        )
+        permanent_stops = set(hard_stops) - TEMPORARY_EXECUTION_STOPS
+        above_cap = bool(
+            market_cap is not None
+            and market_cap > MAXIMUM_ENTRY_MARKET_CAP_USD
+        )
         allowed = bool(
-            score >= MINIMUM_ENTRY_SCORE
-            and risk in {"Low", "Medium"}
+            token_quality_passes
             and not hard_stops
             and liquidity >= MINIMUM_ENTRY_LIQUIDITY_USD
             and price > 0
+            and market_cap is not None
+            and not above_cap
         )
+        watching = bool(
+            token_quality_passes and not permanent_stops and not allowed
+            and (
+                not price or liquidity < MINIMUM_ENTRY_LIQUIDITY_USD
+                or market_cap is None
+            )
+        )
+        observing_above_cap = bool(
+            token_quality_passes and not permanent_stops and above_cap
+            and liquidity >= MINIMUM_ENTRY_LIQUIDITY_USD and price > 0
+        )
+        watched = watching or observing_above_cap
+        decision = (
+            PAPER_DECISION_ADMITTED if allowed else
+            PAPER_DECISION_ABOVE_CAP if observing_above_cap else
+            PAPER_DECISION_WATCHING if watching else PAPER_DECISION_REJECTED
+        )
+        now = time.time()
         with self.connection() as connection:
             connection.execute(
                 """
@@ -458,14 +753,117 @@ class RobinhoodLearningStore:
                     entry_liquidity_usd=?, first_market_cap_usd=COALESCE(first_market_cap_usd,?),
                     peak_market_cap_usd=MAX(COALESCE(peak_market_cap_usd,0),COALESCE(?,0)),
                     peak_fdv_usd=MAX(COALESCE(peak_fdv_usd,0),COALESCE(?,0)), updated_at=?
-                    ,market_evidence_json=?
+                    ,market_evidence_json=?,analysis_priority_reason=?,
+                    analysis_queue_age_seconds=?,paper_decision=?,
+                    market_watch_started_at=CASE WHEN ? THEN COALESCE(market_watch_started_at,?) ELSE market_watch_started_at END,
+                    market_watch_last_checked_at=market_watch_last_checked_at,
+                    market_watch_checks=market_watch_checks,
+                    market_watch_expires_at=CASE WHEN ? THEN COALESCE(market_watch_expires_at,?) ELSE market_watch_expires_at END,
+                    market_watch_reason=CASE WHEN ? THEN ? ELSE market_watch_reason END,
+                    market_watch_reference_price_usd=CASE WHEN ? THEN ? ELSE market_watch_reference_price_usd END,
+                    market_watch_reference_market_cap_usd=CASE WHEN ? THEN ? ELSE market_watch_reference_market_cap_usd END,
+                    market_watch_reference_at=CASE WHEN ? THEN ? ELSE market_watch_reference_at END
                 WHERE token_address=?
                 """,
                 (
                     _utc_now(), score, risk, analysis.get("action_label"),
                     _canonical(hard_stops), int(allowed), price or None,
                     liquidity or None, market_cap, market_cap, fdv, _utc_now(),
-                    _canonical(market), token.lower(),
+                    _canonical(market), priority_reason, queue_age_seconds, decision,
+                    int(watched), now, int(watched),
+                    now + EXECUTABLE_MARKET_WATCH_SECONDS, int(watched),
+                    (
+                        "above_entry_market_cap_ceiling" if observing_above_cap
+                        else "market_unverified" if not price
+                        else "market_cap_unavailable" if market_cap is None
+                        else "liquidity_below_minimum"
+                    ),
+                    int(observing_above_cap), price or None,
+                    int(observing_above_cap), market_cap,
+                    int(observing_above_cap), now,
+                    token.lower(),
+                ),
+            )
+
+    def pending_market_watches(self, now: float, limit: int) -> list[dict]:
+        if limit <= 0:
+            return []
+        with self.connection() as connection:
+            connection.execute(
+                """
+                UPDATE candidates SET paper_decision=?,market_watch_reason='watch_expired',
+                    updated_at=? WHERE paper_decision IN (?,?,?) AND market_watch_expires_at<=?
+                """,
+                (
+                    PAPER_DECISION_EXPIRED, _utc_now(), PAPER_DECISION_WATCHING,
+                    PAPER_DECISION_ABOVE_CAP, PAPER_DECISION_REENTRY, now,
+                ),
+            )
+            return [dict(row) for row in connection.execute(
+                """
+                SELECT * FROM candidates WHERE paper_decision IN (?,?,?)
+                  AND market_watch_expires_at>?
+                  AND (market_watch_last_checked_at IS NULL OR market_watch_last_checked_at<=?)
+                ORDER BY COALESCE(market_watch_last_checked_at,0),market_watch_started_at,token_address
+                LIMIT ?
+                """,
+                (
+                    PAPER_DECISION_WATCHING, PAPER_DECISION_ABOVE_CAP,
+                    PAPER_DECISION_REENTRY, now,
+                    now - EXECUTABLE_MARKET_RECHECK_SECONDS, limit,
+                ),
+            )]
+
+    def record_market_watch_check(
+        self, token: str, market: dict | None = None, *, reason: str | None = None,
+        update_reference: bool = False, decision: str | None = None,
+    ) -> None:
+        evidence = _canonical(market or {})
+        reason = reason or (
+            "executable_market_found" if market else "no_executable_market"
+        )
+        with self.connection() as connection:
+            connection.execute(
+                """
+                UPDATE candidates SET market_watch_last_checked_at=?,
+                    market_watch_checks=market_watch_checks+1,market_watch_reason=?,
+                    market_evidence_json=CASE WHEN ? THEN ? ELSE market_evidence_json END,
+                    market_watch_reference_price_usd=CASE WHEN ? THEN ? ELSE market_watch_reference_price_usd END,
+                    market_watch_reference_market_cap_usd=CASE WHEN ? THEN ? ELSE market_watch_reference_market_cap_usd END,
+                    market_watch_reference_at=CASE WHEN ? THEN ? ELSE market_watch_reference_at END,
+                    paper_decision=COALESCE(?,paper_decision),
+                    updated_at=? WHERE token_address=?
+                """,
+                (
+                    time.time(), reason, int(bool(market)), evidence,
+                    int(update_reference), safe_float((market or {}).get("price_usd"), 0.0) or None,
+                    int(update_reference), safe_float((market or {}).get("market_cap_usd"), 0.0) or None,
+                    int(update_reference), time.time(), decision, _utc_now(), token.lower(),
+                ),
+            )
+
+    def select_execution_pool(self, token: str, market: dict) -> None:
+        source_version = str(market.get("source_version") or SOURCE_V2)
+        pair_address = str(market.get("pair_address") or "").lower()
+        pool_id = pair_address if source_version == SOURCE_V4 else None
+        hooks_address = ZERO_ADDRESS
+        fee_tier = tick_spacing = None
+        if pool_id:
+            pool = self.v4_pool(pool_id)
+            if pool:
+                hooks_address = pool.get("hooks_address") or ZERO_ADDRESS
+                fee_tier = pool.get("fee_tier")
+                tick_spacing = pool.get("tick_spacing")
+        with self.connection() as connection:
+            connection.execute(
+                """
+                UPDATE candidates SET pair_address=?,source_version=?,pool_id=?,
+                    hooks_address=?,fee_tier=?,tick_spacing=?,updated_at=?
+                WHERE token_address=?
+                """,
+                (
+                    pair_address, source_version, pool_id, hooks_address,
+                    fee_tier, tick_spacing, _utc_now(), token.lower(),
                 ),
             )
 
@@ -492,7 +890,39 @@ class RobinhoodLearningStore:
 
     @staticmethod
     def tolerance(horizon: int) -> float:
-        return float(max(5 * 60, horizon // 4))
+        """How late a mark may land and still be recorded rather than expired.
+
+        The old floor was 5 minutes, which for the 15m horizon is a window
+        exactly ONE learn cycle wide (measured cadence: median 300s, max
+        1,125s). A single slow cycle therefore expired the checkpoint outright,
+        and the miss rate tracked the window width exactly: 24.6% at 15m, 12.1%
+        at 1h, 0.3% at 6h. RH-REFLECT-MARKET-COVERAGE has reported this as a
+        31.7% observation-failure ratio since checkpoint 15.
+
+        The floor is now two nominal cycles, so ordinary jitter no longer
+        destroys an observation. Widening a tolerance normally trades accuracy
+        for coverage -- a mark arriving late measures a later moment than the
+        horizon names -- so it is paired with the learning-eligibility cutoff
+        below: late marks are RECORDED but excluded from learning. Coverage and
+        measurement integrity are separate concerns and are now separately
+        controlled.
+        """
+        return float(max(CHECKPOINT_TOLERANCE_MINIMUM_SECONDS, horizon // 4))
+
+    @staticmethod
+    def learning_eligible(horizon: int, lateness: float) -> int:
+        """Whether a recorded mark is timely enough to learn from.
+
+        Previously hardcoded to 1 on every observation, so a mark that landed
+        near the edge of its window fed calibration identically to one on time.
+        A 15m outcome measured at 27m is not a 15m outcome.
+        """
+        if horizon <= 0:
+            return 1
+        return int(
+            max(0.0, float(lateness))
+            <= horizon * CHECKPOINT_LEARNING_LATENESS_FRACTION
+        )
 
     def expire_missed(self, now: float) -> int:
         expired = 0
@@ -570,11 +1000,15 @@ class RobinhoodLearningStore:
                     observed_at,status,learning_eligible,lateness_seconds,
                     price_usd,liquidity_usd,market_cap_usd,fdv_usd,
                     market_cap_multiple,maximum_favorable_excursion_pct
-                ) VALUES (?,?,?,?,?,?,1,?,?,?,?,?,?,?)
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     token,due["horizon_label"],due["horizon_seconds"],due["target_at"],
-                    _utc_now(),status,max(0,now-due["target_at"]),
+                    _utc_now(),status,
+                    self.learning_eligible(
+                        due["horizon_seconds"], max(0, now-due["target_at"])
+                    ),
+                    max(0,now-due["target_at"]),
                     market.get("price_usd"),market.get("liquidity_usd"),cap,fdv,
                     multiple,mfe,
                 ),
@@ -599,7 +1033,11 @@ class RobinhoodLearningStore:
             return False
         price = safe_float(market.get("price_usd"), 0.0)
         liquidity = safe_float(market.get("liquidity_usd"), 0.0)
-        if price <= 0 or liquidity < MINIMUM_ENTRY_LIQUIDITY_USD:
+        market_cap = safe_float(market.get("market_cap_usd"), 0.0) or None
+        if (
+            price <= 0 or liquidity < MINIMUM_ENTRY_LIQUIDITY_USD
+            or market_cap is None or market_cap > MAXIMUM_ENTRY_MARKET_CAP_USD
+        ):
             return False
         with self.connection() as connection:
             if connection.execute("SELECT 1 FROM positions WHERE token_address=?", (candidate["token_address"],)).fetchone():
@@ -615,21 +1053,120 @@ class RobinhoodLearningStore:
                 INSERT INTO positions (
                     token_address,symbol,status,opened_at,entry_price_usd,
                     entry_liquidity_usd,cost_usd,quantity,entry_friction_bps,
-                    high_multiple,last_price_usd,last_liquidity_usd,last_mark_at
-                ) VALUES (?,?,'open',?,?,?,?,?,?,1,?,?,?)
+                    entry_market_cap_usd,high_multiple,last_price_usd,
+                    last_liquidity_usd,last_market_cap_usd,last_market_observed_at,
+                    last_mark_at,original_quantity,realized_value_usd,
+                    runner_high_multiple,entry_policy_version,grandfathered_above_cap
+                ) VALUES (?,?,'open',?,?,?,?,?,?,?,1,?,?,?,?,?,?,0,1,?,0)
                 """,
                 (
                     candidate["token_address"],candidate.get("symbol") or "",time.time(),
                     price,liquidity,PAPER_COST_USD,quantity,friction_bps,
-                    price,liquidity,time.time(),
+                    market_cap,price,liquidity,market_cap,_utc_now(),time.time(),
+                    quantity,"staged_v1",
                 ),
             )
+            connection.executemany(
+                """
+                INSERT INTO position_policy_states (
+                    token_address,policy,status,high_multiple,last_mark_at
+                ) VALUES (?,?,'open',1,?)
+                """,
+                [
+                    (candidate["token_address"], SHADOW_POLICY_FIXED_3X, time.time()),
+                    (candidate["token_address"], SHADOW_POLICY_PURE_TRAILING, time.time()),
+                ],
+            )
             return True
+
+    def _effective_minimum_entry_score(self) -> float:
+        """Module constant, or a higher floor set by the closed-position audit.
+
+        Clamped with max() so this can only tighten. A missing, unreadable or
+        malformed file falls back to the constant rather than failing open.
+        """
+        try:
+            # self.path is the sqlite file; the policy sits beside it in
+            # the learning root.
+            state = read_json(
+                self.path.parent / "adaptive_policy.json", {}
+            ) or {}
+            adaptive = safe_float(state.get("minimum_entry_score"), 0.0)
+        except Exception:
+            return MINIMUM_ENTRY_SCORE
+        return max(MINIMUM_ENTRY_SCORE, adaptive)
+
+    @staticmethod
+    def _liquidation_value(quantity: float, price: float, liquidity: float) -> float:
+        gross = max(0.0, quantity) * max(0.0, price)
+        impact_bps = min(
+            5_000.0,
+            100.0 + gross / max(1.0, 2 * liquidity) * 10_000,
+        )
+        return gross * (1 - impact_bps / 10_000)
+
+    def _mark_shadow_policies(
+        self, connection, position, price: float, liquidity: float, now: float,
+    ) -> None:
+        full_value = self._liquidation_value(
+            safe_float(position["original_quantity"], position["quantity"]),
+            price, liquidity,
+        )
+        multiple = full_value / max(0.01, position["cost_usd"])
+        age = now - position["opened_at"]
+        for state in connection.execute(
+            "SELECT * FROM position_policy_states WHERE token_address=? AND status='open'",
+            (position["token_address"],),
+        ).fetchall():
+            high = max(safe_float(state["high_multiple"], 1.0), multiple)
+            reason = None
+            # Same cause-before-ordering classification as the live path; the
+            # shadow policies exist to be compared against it, so they have to
+            # label an exit the same way or the comparison measures taxonomy
+            # rather than policy.
+            price_multiple = price / max(1e-30, position["entry_price_usd"])
+            if price_multiple <= PRICE_COLLAPSE_MULTIPLE:
+                reason = "price_collapse"
+            elif multiple <= STOP_LOSS_MULTIPLE:
+                reason = "stop_loss"
+            elif liquidity < MINIMUM_ENTRY_LIQUIDITY_USD:
+                reason = "liquidity_below_minimum"
+            elif age >= MAXIMUM_HOLD_SECONDS:
+                reason = "maximum_hold"
+            elif state["policy"] == SHADOW_POLICY_FIXED_3X and multiple >= 3.0:
+                reason = "fixed_take_profit_3x"
+            elif (
+                state["policy"] == SHADOW_POLICY_PURE_TRAILING
+                and high >= PURE_TRAILING_ACTIVATION_MULTIPLE
+                and multiple <= high * (1 - RUNNER_TRAILING_DRAWDOWN)
+            ):
+                reason = "pure_trailing_stop"
+            if reason:
+                connection.execute(
+                    """
+                    UPDATE position_policy_states SET status='closed',high_multiple=?,
+                        exit_price_usd=?,exit_value_usd=?,exit_reason=?,closed_at=?,
+                        net_multiple=?,last_mark_at=? WHERE token_address=? AND policy=?
+                    """,
+                    (
+                        high, price, full_value, reason, now, multiple, now,
+                        position["token_address"], state["policy"],
+                    ),
+                )
+            else:
+                connection.execute(
+                    """
+                    UPDATE position_policy_states SET high_multiple=?,last_mark_at=?
+                    WHERE token_address=? AND policy=?
+                    """,
+                    (high, now, position["token_address"], state["policy"]),
+                )
 
     def mark_position(self, token: str, market: dict, now: float) -> dict | None:
         price = safe_float(market.get("price_usd"), 0.0)
         liquidity = safe_float(market.get("liquidity_usd"), 0.0)
-        if price <= 0:
+        market_cap = safe_float(market.get("market_cap_usd"), 0.0) or None
+        if price <= 0 and not market.get("source"):
             return None
         with self.connection() as connection:
             position = connection.execute(
@@ -637,36 +1174,108 @@ class RobinhoodLearningStore:
             ).fetchone()
             if not position:
                 return None
-            exit_impact = min(5_000.0, 100.0 + PAPER_COST_USD/max(1.0,2*liquidity)*10_000)
-            value = position["quantity"]*price*(1-exit_impact/10_000)
-            multiple = value/position["cost_usd"]
-            high = max(position["high_multiple"],multiple)
+            self._mark_shadow_policies(connection, position, price, liquidity, now)
+            original = safe_float(position["original_quantity"], position["quantity"])
+            remaining = safe_float(position["quantity"], 0.0)
+            realized = safe_float(position["realized_value_usd"], 0.0)
+            marked_remaining = self._liquidation_value(remaining, price, liquidity)
+            value = realized + marked_remaining
+            multiple = value / max(0.01, position["cost_usd"])
+            high = max(safe_float(position["high_multiple"], 1.0), multiple)
             age = now-position["opened_at"]
+            price_multiple = price / max(1e-30, position["entry_price_usd"])
             reason = None
-            if liquidity <= 0:
-                reason = "liquidity_unavailable"
+            partial_exits = []
+            # Classify by CAUSE, not by which branch happens to be first.
+            #
+            # A rug satisfies both the liquidity and the stop-loss condition at
+            # once, so ordering alone decided the label: liquidity_below_minimum
+            # was checked first and absorbed every one. Measured on the first 8
+            # closes, 5 exited with that label at exactly 0.0x and
+            # high_multiple 1.0 -- entry liquidity $51k-$155k, price straight to
+            # zero, never a cent above entry. Those are rugs, not thin markets,
+            # and stop_loss had never once fired, so the stop was untested
+            # rather than working.
+            #
+            # price_multiple is the discriminator: it is the token's own price
+            # against entry, independent of pool depth and of the size-based
+            # slippage in _liquidation_value (capped at 50%, so slippage alone
+            # can never reach zero). A collapsed price with drained liquidity is
+            # a rug; healthy price with thin liquidity is an exit-liquidity
+            # problem; a real decline is a stop loss.
+            if price_multiple <= PRICE_COLLAPSE_MULTIPLE:
+                reason = "price_collapse"
             elif multiple <= STOP_LOSS_MULTIPLE:
                 reason = "stop_loss"
-            elif multiple >= TAKE_PROFIT_MULTIPLE:
-                reason = "take_profit"
+            elif liquidity < MINIMUM_ENTRY_LIQUIDITY_USD:
+                reason = "liquidity_below_minimum"
+            elif age >= STAGNATION_EXIT_SECONDS and high < STAGNATION_MINIMUM_MULTIPLE:
+                reason = "stagnation_24h"
             elif age >= MAXIMUM_HOLD_SECONDS:
                 reason = "maximum_hold"
+            if not reason and position["stage_one_sold_at"] is None and price_multiple >= STAGE_ONE_MULTIPLE:
+                sold = min(remaining, original * STAGE_ONE_ORIGINAL_FRACTION)
+                proceeds = self._liquidation_value(sold, price, liquidity)
+                remaining -= sold; realized += proceeds
+                partial_exits.append({"stage":"recover_principal_2x","quantity":sold,"value_usd":proceeds})
+            if not reason and position["stage_two_sold_at"] is None and price_multiple >= STAGE_TWO_MULTIPLE:
+                sold = min(remaining, original * STAGE_TWO_ORIGINAL_FRACTION)
+                proceeds = self._liquidation_value(sold, price, liquidity)
+                remaining -= sold; realized += proceeds
+                partial_exits.append({"stage":"take_profit_3x","quantity":sold,"value_usd":proceeds})
+            runner_high = max(
+                safe_float(position["runner_high_multiple"], 1.0), price_multiple
+            )
+            stage_two_at = position["stage_two_sold_at"] or (
+                now if any(item["stage"] == "take_profit_3x" for item in partial_exits) else None
+            )
+            if (
+                not reason and stage_two_at is not None
+                and price_multiple <= runner_high * (1 - RUNNER_TRAILING_DRAWDOWN)
+            ):
+                reason = "runner_trailing_stop"
             if reason:
+                realized += self._liquidation_value(remaining, price, liquidity)
+                remaining = 0.0
+                value = realized
+                multiple = value / max(0.01, position["cost_usd"])
                 connection.execute(
                     """
                     UPDATE positions SET status='closed',high_multiple=?,last_price_usd=?,
-                        last_liquidity_usd=?,last_mark_at=?,exit_price_usd=?,exit_value_usd=?,
-                        exit_reason=?,closed_at=?,net_multiple=? WHERE token_address=?
-                    """, (high,price,liquidity,now,price,value,reason,now,multiple,token.lower())
+                        last_liquidity_usd=?,last_market_cap_usd=?,
+                        last_market_observed_at=?,last_mark_at=?,exit_price_usd=?,exit_value_usd=?,
+                        exit_reason=?,closed_at=?,net_multiple=?,quantity=?,realized_value_usd=?,
+                        stage_one_sold_at=COALESCE(stage_one_sold_at,?),
+                        stage_two_sold_at=COALESCE(stage_two_sold_at,?),runner_high_multiple=?
+                    WHERE token_address=?
+                    """, (high,price,liquidity,market_cap,_utc_now(),now,price,value,
+                            reason,now,multiple,remaining,realized,
+                            now if any(item["stage"] == "recover_principal_2x" for item in partial_exits) else None,
+                            now if any(item["stage"] == "take_profit_3x" for item in partial_exits) else None,
+                            runner_high,token.lower())
                 )
             else:
+                value = realized + self._liquidation_value(remaining, price, liquidity)
+                multiple = value / max(0.01, position["cost_usd"])
                 connection.execute(
                     """
                     UPDATE positions SET high_multiple=?,last_price_usd=?,
-                        last_liquidity_usd=?,last_mark_at=? WHERE token_address=?
-                    """, (high,price,liquidity,now,token.lower())
-                )
-            return {"token_address":token.lower(),"multiple":multiple,"reason":reason,"value_usd":value}
+                        last_liquidity_usd=?,last_market_cap_usd=?,
+                        last_market_observed_at=?,last_mark_at=?,quantity=?,realized_value_usd=?,
+                        stage_one_sold_at=COALESCE(stage_one_sold_at,?),
+                        stage_two_sold_at=COALESCE(stage_two_sold_at,?),runner_high_multiple=?
+                    WHERE token_address=?
+                    """, (
+                        high,price,liquidity,market_cap,_utc_now(),now,remaining,realized,
+                        now if any(item["stage"] == "recover_principal_2x" for item in partial_exits) else None,
+                        now if any(item["stage"] == "take_profit_3x" for item in partial_exits) else None,
+                        runner_high,token.lower(),
+                    ))
+            return {
+                "token_address":token.lower(),"multiple":multiple,"reason":reason,
+                "value_usd":value,"partial_exits":partial_exits,
+                "remaining_fraction":remaining/max(original,1e-30),
+            }
 
     def summary(self) -> dict:
         with self.connection() as connection:
@@ -677,7 +1286,11 @@ class RobinhoodLearningStore:
                   SUM(analysis_status IN ('pending','retry')) pending,
                   SUM(analysis_status='failed') failed,
                   SUM(paper_entry_allowed=1) admitted,
-                  SUM(paper_entry_allowed=0) rejected,
+                  SUM(paper_decision='rejected') rejected,
+                  SUM(paper_decision='watching_for_executable_market') watching,
+                  SUM(paper_decision='observing_above_entry_ceiling') above_entry_ceiling,
+                  SUM(paper_decision='waiting_for_reentry_momentum') waiting_reentry_momentum,
+                  SUM(paper_decision='expired_no_executable_market') watch_expired,
                   SUM(peak_market_cap_usd>=1000000) million_peak
                 FROM candidates
                 """
@@ -689,7 +1302,10 @@ class RobinhoodLearningStore:
                 """
                 SELECT COUNT(*) opened,SUM(status='open') open,SUM(status='closed') closed,
                   SUM(CASE WHEN status='closed' AND net_multiple>1 THEN 1 ELSE 0 END) winners,
-                  AVG(CASE WHEN status='closed' THEN net_multiple END) average_multiple
+                  AVG(CASE WHEN status='closed' THEN net_multiple END) average_multiple,
+                  SUM(stage_one_sold_at IS NOT NULL) stage_one_exits,
+                  SUM(stage_two_sold_at IS NOT NULL) stage_two_exits,
+                  SUM(grandfathered_above_cap=1) grandfathered_above_cap
                 FROM positions
                 """
             ).fetchone()
@@ -705,7 +1321,11 @@ class RobinhoodLearningStore:
             "live_execution_enabled": False,
         }
 
-    def recent_positions(self, limit: int = 50) -> list[dict]:
+    def recent_positions(
+        self,
+        limit: int = 50,
+        live_markets: dict[str, dict] | None = None,
+    ) -> list[dict]:
         """Return browser-safe paper marks, newest first.
 
         Open gains use the same estimated exit friction as mark_position, so the
@@ -714,41 +1334,67 @@ class RobinhoodLearningStore:
         with self.connection() as connection:
             rows = connection.execute(
                 """
-                SELECT p.*, c.name, c.pair_address, c.source_version,c.first_market_cap_usd,
-                       cp.market_cap_usd current_market_cap_usd,
-                       cp.observed_at market_observed_at
+                SELECT p.*, c.name, c.pair_address, c.source_version,
+                       c.first_market_cap_usd launch_market_cap_usd
                 FROM positions p
                 JOIN candidates c ON c.token_address=p.token_address
-                LEFT JOIN checkpoints cp ON cp.rowid=(
-                    SELECT latest.rowid FROM checkpoints latest
-                    WHERE latest.token_address=p.token_address
-                      AND latest.status='observed'
-                    ORDER BY latest.target_at DESC LIMIT 1
-                )
                 ORDER BY p.opened_at DESC LIMIT ?
                 """,
                 (max(0, limit),),
             ).fetchall()
+            policy_rows = connection.execute(
+                "SELECT * FROM position_policy_states"
+            ).fetchall()
+        policies_by_token: dict[str, list[dict]] = {}
+        for policy in policy_rows:
+            policies_by_token.setdefault(policy["token_address"], []).append(dict(policy))
         positions = []
+        live_markets = live_markets or {}
         for raw in rows:
             row = dict(raw)
-            current_price = safe_float(row.get("last_price_usd"), 0.0)
-            current_liquidity = safe_float(row.get("last_liquidity_usd"), 0.0)
+            live = (
+                live_markets.get(row["token_address"], {})
+                if row.get("status") == "open"
+                else {}
+            )
+            current_price = safe_float(
+                live.get("price_usd") or row.get("last_price_usd"), 0.0
+            )
+            current_liquidity = safe_float(
+                live.get("liquidity_usd") or row.get("last_liquidity_usd"), 0.0
+            )
+            current_market_cap = (
+                safe_float(live.get("market_cap_usd"), 0.0)
+                or row.get("last_market_cap_usd")
+            )
             if row.get("status") == "closed" and row.get("net_multiple") is not None:
                 multiple = safe_float(row.get("net_multiple"), 0.0)
             elif current_price > 0:
-                exit_friction_bps = min(
-                    5_000.0,
-                    100.0 + PAPER_COST_USD / max(1.0, 2 * current_liquidity) * 10_000,
-                )
-                marked_value = (
-                    safe_float(row.get("quantity"), 0.0)
-                    * current_price
-                    * (1 - exit_friction_bps / 10_000)
+                marked_value = safe_float(row.get("realized_value_usd"), 0.0) + self._liquidation_value(
+                    safe_float(row.get("quantity"), 0.0), current_price,
+                    current_liquidity,
                 )
                 multiple = marked_value / max(0.01, safe_float(row.get("cost_usd"), PAPER_COST_USD))
             else:
                 multiple = None
+            policy_results = []
+            for policy in policies_by_token.get(row["token_address"], []):
+                policy_multiple = policy.get("net_multiple")
+                if policy_multiple is None and current_price > 0:
+                    policy_multiple = self._liquidation_value(
+                        safe_float(row.get("original_quantity"), row.get("quantity")),
+                        current_price, current_liquidity,
+                    ) / max(0.01, safe_float(row.get("cost_usd"), PAPER_COST_USD))
+                policy_results.append({
+                    "policy": policy["policy"], "status": policy["status"],
+                    "multiple": policy_multiple,
+                    "gain_pct": (policy_multiple - 1) * 100 if policy_multiple is not None else None,
+                    "high_multiple": policy.get("high_multiple"),
+                    "exit_reason": policy.get("exit_reason"),
+                })
+            original_quantity = safe_float(
+                row.get("original_quantity"), row.get("quantity")
+            )
             positions.append({
                 "token_address": row["token_address"],
                 "pair_address": row.get("pair_address"),
@@ -758,16 +1404,28 @@ class RobinhoodLearningStore:
                 "status": row.get("status"),
                 "opened_at": row.get("opened_at"),
                 "entry_price_usd": row.get("entry_price_usd"),
-                "current_price_usd": row.get("last_price_usd"),
-                "entry_market_cap_usd": row.get("first_market_cap_usd"),
-                "current_market_cap_usd": (
-                    row.get("current_market_cap_usd") or row.get("first_market_cap_usd")
-                ),
+                "exit_price_usd": row.get("exit_price_usd"),
+                "exit_value_usd": row.get("exit_value_usd"),
+                "closed_at": row.get("closed_at"),
+                "current_price_usd": current_price or None,
+                "launch_market_cap_usd": row.get("launch_market_cap_usd"),
+                "entry_market_cap_usd": row.get("entry_market_cap_usd"),
+                "current_market_cap_usd": current_market_cap,
                 "gain_pct": (multiple - 1) * 100 if multiple is not None else None,
                 "multiple": multiple,
                 "high_multiple": row.get("high_multiple"),
+                "remaining_fraction": safe_float(row.get("quantity"), 0.0) / max(original_quantity, 1e-30),
+                "realized_value_usd": row.get("realized_value_usd"),
+                "stage_one_sold": row.get("stage_one_sold_at") is not None,
+                "stage_two_sold": row.get("stage_two_sold_at") is not None,
+                "entry_policy_version": row.get("entry_policy_version"),
+                "grandfathered_above_cap": bool(row.get("grandfathered_above_cap")),
+                "counterfactual_policies": policy_results,
                 "last_mark_at": row.get("last_mark_at"),
-                "market_observed_at": row.get("market_observed_at"),
+                "market_observed_at": (
+                    live.get("observed_at") or row.get("last_market_observed_at")
+                ),
+                "market_source": live.get("source") or "stored_paper_mark",
                 "exit_reason": row.get("exit_reason"),
                 "paper_only": True,
             })
@@ -778,7 +1436,10 @@ class RobinhoodLearningStore:
             rows = connection.execute(
                 """
                 SELECT token_address,pair_address,name,symbol,analyzed_at,score,
-                       risk_level,action_label,paper_entry_allowed,source_version,pool_id
+                       risk_level,action_label,paper_entry_allowed,source_version,pool_id,
+                       paper_decision,hard_stops_json,market_watch_checks,
+                       market_watch_last_checked_at,market_watch_expires_at,
+                       market_watch_reason
                 FROM candidates
                 WHERE analysis_status='complete'
                 ORDER BY analyzed_at DESC,block_number DESC LIMIT ?
@@ -796,6 +1457,14 @@ class RobinhoodLearningStore:
                 "risk_level": row["risk_level"],
                 "action_label": row["action_label"],
                 "paper_entry_allowed": bool(row["paper_entry_allowed"]),
+                "paper_decision": row["paper_decision"] or (
+                    PAPER_DECISION_ADMITTED if row["paper_entry_allowed"] else PAPER_DECISION_REJECTED
+                ),
+                "hard_stops": json.loads(row["hard_stops_json"] or "[]"),
+                "market_watch_checks": row["market_watch_checks"] or 0,
+                "market_watch_last_checked_at": row["market_watch_last_checked_at"],
+                "market_watch_expires_at": row["market_watch_expires_at"],
+                "market_watch_reason": row["market_watch_reason"],
                 "source_version": row["source_version"],
                 "pool_id": row["pool_id"],
             }
@@ -885,19 +1554,49 @@ class RobinhoodV4Observer:
     def _state(self) -> dict:
         return read_json(self.state_path, {}) or {}
 
+    def _adaptive_logs(self, start: int, end: int) -> tuple[list[dict], int]:
+        """Split deterministic provider-limit failures without moving the cursor."""
+        pending = [(start, end)]
+        logs: list[dict] = []
+        successful_windows = 0
+        while pending:
+            window_start, window_end = pending.pop()
+            try:
+                window_logs = _remote_call(
+                    f"Robinhood V4 logs {window_start}-{window_end}",
+                    lambda window_start=window_start, window_end=window_end: self.rpc.get_logs(
+                        window_start,
+                        window_end,
+                        address=UNISWAP_V4_POOL_MANAGER,
+                        topics=[[
+                            V4_INITIALIZE_TOPIC,
+                            V4_MODIFY_LIQUIDITY_TOPIC,
+                            V4_SWAP_TOPIC,
+                        ]],
+                    ),
+                )
+            except RuntimeError as exc:
+                if (
+                    "exceeds limit of 10000" not in str(exc).lower()
+                    or window_start >= window_end
+                ):
+                    raise
+                midpoint = (window_start + window_end) // 2
+                # LIFO order keeps requests and accumulated events chronological.
+                pending.append((midpoint + 1, window_end))
+                pending.append((window_start, midpoint))
+                continue
+            logs.extend(window_logs or [])
+            successful_windows += 1
+        return logs, successful_windows
+
     def sync(self, *, block_limit: int, lookback: int) -> tuple[list[dict], dict]:
         latest = _remote_call("Robinhood latest block", self.rpc.get_block_number)
         state = self._state()
         start = safe_int(state.get("next_block"), max(0, latest - lookback))
         start = min(start, latest)
         end = min(latest, start + max(1, block_limit) - 1)
-        logs = _remote_call(
-            f"Robinhood V4 logs {start}-{end}",
-            lambda: self.rpc.get_logs(
-                start, end, address=UNISWAP_V4_POOL_MANAGER,
-                topics=[[V4_INITIALIZE_TOPIC, V4_MODIFY_LIQUIDITY_TOPIC, V4_SWAP_TOPIC]],
-            ),
-        )
+        logs, rpc_windows = self._adaptive_logs(start, end)
         anchors = {WETH_ADDRESS.lower(), USDG_ADDRESS.lower()}
         known_pool_ids = self.store.known_v4_pool_ids()
         events = []
@@ -985,6 +1684,7 @@ class RobinhoodV4Observer:
         coverage = {
             "from_block": start, "to_block": end, "latest_block": latest,
             "blocks_scanned": end-start+1, "logs_seen": len(logs or []),
+            "rpc_windows": rpc_windows,
             "initialize_events": counts["initialize"], "liquidity_events": counts["modify"],
             "swap_events": counts["swap"], "activated_pools": len(candidates),
             "caught_up": end >= latest, "blocks_behind": max(0, latest-end),
@@ -999,7 +1699,7 @@ class RobinhoodMarketClient:
         self.timeout=timeout
         self.session=requests.Session()
 
-    def snapshot(self, token: str, pair_address: str | None = None) -> dict:
+    def snapshots(self, token: str) -> list[dict]:
         response = _remote_call(
             "DexScreener token market",
             lambda: self.session.get(
@@ -1018,22 +1718,37 @@ class RobinhoodMarketClient:
             # match would silently mark the wrapped-native asset as this token.
             if token.lower() != base:
                 continue
-            if pair_address and str(pair.get("pairAddress") or "").lower()==pair_address.lower():
-                matches.append((1,pair))
-            else:
-                matches.append((0,pair))
+            labels = [str(value).lower() for value in pair.get("labels") or []]
+            version = (
+                SOURCE_V4 if "v4" in labels else
+                SOURCE_V3 if "v3" in labels else SOURCE_V2
+            )
+            matches.append({
+                "pair_address":pair.get("pairAddress"),"dex_id":pair.get("dexId"),
+                "price_usd":safe_float(pair.get("priceUsd"),0.0) or None,
+                "liquidity_usd":safe_float((pair.get("liquidity") or {}).get("usd"),0.0) or None,
+                "market_cap_usd":safe_float(pair.get("marketCap"),0.0) or None,
+                "fdv_usd":safe_float(pair.get("fdv"),0.0) or None,
+                "pair_symbol":(pair.get("baseToken") or {}).get("symbol"),
+                "source":"dexscreener_exact_chain_token_pair",
+                "source_version": version,
+                "labels": labels,
+            })
+        return matches
+
+    def snapshot(self, token: str, pair_address: str | None = None) -> dict:
+        matches = self.snapshots(token)
         if not matches:
             return {}
-        pair=max(matches,key=lambda item:(item[0],safe_float((item[1].get("liquidity") or {}).get("usd"),0.0)))[1]
-        return {
-            "pair_address":pair.get("pairAddress"),"dex_id":pair.get("dexId"),
-            "price_usd":safe_float(pair.get("priceUsd"),0.0) or None,
-            "liquidity_usd":safe_float((pair.get("liquidity") or {}).get("usd"),0.0) or None,
-            "market_cap_usd":safe_float(pair.get("marketCap"),0.0) or None,
-            "fdv_usd":safe_float(pair.get("fdv"),0.0) or None,
-            "pair_symbol":(pair.get("baseToken") or {}).get("symbol"),
-            "source":"dexscreener_exact_chain_token_pair",
-        }
+        exact = [
+            market for market in matches
+            if pair_address and str(market.get("pair_address") or "").lower() == pair_address.lower()
+        ]
+        choices = exact or matches
+        return max(
+            choices,
+            key=lambda market: safe_float(market.get("liquidity_usd"), 0.0),
+        )
 
     def wrapped_native_usd(self) -> tuple[float, str]:
         """Resolve ETH/USD independently of Robinhood pair indexing."""
@@ -1165,6 +1880,117 @@ class RobinhoodLearningEngine:
             )
         return self.analyzer
 
+    def _best_executable_market(self, candidate: dict) -> dict:
+        """Find the most liquid safely identifiable venue for a watched token."""
+        choices = []
+        for market in self.market.snapshots(candidate["token_address"]):
+            version = market.get("source_version")
+            if version == SOURCE_V4:
+                pool = self.store.v4_pool(str(market.get("pair_address") or ""))
+                # Unknown V4 pools cannot be assumed hook-free.
+                if not pool or str(pool.get("hooks_address") or ZERO_ADDRESS).lower() != ZERO_ADDRESS:
+                    continue
+            if (
+                safe_float(market.get("price_usd"), 0.0) > 0
+                and safe_float(market.get("liquidity_usd"), 0.0)
+                    >= MINIMUM_ENTRY_LIQUIDITY_USD
+            ):
+                choices.append(market)
+        if not choices:
+            return {}
+        return max(
+            choices,
+            key=lambda market: safe_float(market.get("liquidity_usd"), 0.0),
+        )
+
+    def recheck_executable_markets(self, now: float, limit: int) -> dict:
+        checked = executable = entries = failures = 0
+        for candidate in self.store.pending_market_watches(now, limit):
+            checked += 1
+            try:
+                market = self._best_executable_market(candidate)
+                if not market:
+                    self.store.record_market_watch_check(candidate["token_address"])
+                    continue
+                market_cap = safe_float(market.get("market_cap_usd"), 0.0)
+                price = safe_float(market.get("price_usd"), 0.0)
+                if market_cap <= 0 or market_cap > MAXIMUM_ENTRY_MARKET_CAP_USD:
+                    self.store.record_market_watch_check(
+                        candidate["token_address"], market,
+                        reason="above_entry_market_cap_ceiling",
+                        update_reference=True, decision=PAPER_DECISION_ABOVE_CAP,
+                    )
+                    continue
+                if candidate.get("paper_decision") in {
+                    PAPER_DECISION_ABOVE_CAP, PAPER_DECISION_REENTRY,
+                }:
+                    reference_price = safe_float(
+                        candidate.get("market_watch_reference_price_usd"), 0.0
+                    )
+                    reference_cap = safe_float(
+                        candidate.get("market_watch_reference_market_cap_usd"), 0.0
+                    )
+                    if (
+                        reference_cap > MAXIMUM_ENTRY_MARKET_CAP_USD
+                        or reference_price <= 0
+                        or price < reference_price * REENTRY_MOMENTUM_MULTIPLE
+                    ):
+                        self.store.record_market_watch_check(
+                            candidate["token_address"], market,
+                            reason="waiting_for_reentry_momentum",
+                            update_reference=True, decision=PAPER_DECISION_REENTRY,
+                        )
+                        continue
+                self.store.record_market_watch_check(
+                    candidate["token_address"], market,
+                    reason="executable_market_found",
+                )
+                executable += 1
+                self.store.select_execution_pool(candidate["token_address"], market)
+                current = self.store.candidate(candidate["token_address"])
+                report = self._analyzer().analyze_token(
+                    current["token_address"], seal=False, defer_cognition=True,
+                )
+                if report.get("error"):
+                    raise RuntimeError(report["error"])
+                analysis = dict(report.get("analysis") or {})
+                stops = list(analysis.get("hard_stop_overrides") or [])
+                if current.get("source_version") == SOURCE_V4:
+                    pool = self.store.v4_pool(current.get("pool_id") or "")
+                    if not pool or str(pool.get("hooks_address") or ZERO_ADDRESS).lower() != ZERO_ADDRESS:
+                        stops.append({
+                            "code": "V4_HOOK_UNAUDITED", "severity": "High",
+                            "reason": "The selected V4 pool hook could not be verified as absent",
+                            "action": "AVOID",
+                        })
+                analysis["hard_stop_overrides"] = stops
+                self.store.record_analysis(
+                    current["token_address"], analysis, market,
+                    priority_reason="executable_market_recheck",
+                    queue_age_seconds=max(
+                        0.0, now - safe_float(current.get("market_watch_started_at"), now)
+                    ),
+                )
+                latest = self.store.candidate(current["token_address"])
+                if self.store.open_position(latest, market):
+                    entries += 1
+                    self.ledger.append("robinhood_paper_buy", {
+                        "token_address": current["token_address"],
+                        "symbol": latest.get("symbol"),
+                        "score": latest.get("score"),
+                        "price_usd": market.get("price_usd"),
+                        "liquidity_usd": market.get("liquidity_usd"),
+                        "market_cap_usd": market.get("market_cap_usd"),
+                        "entry_trigger": "future_executable_market_recheck",
+                        "paper_only": True,
+                    })
+            except Exception:
+                failures += 1
+        return {
+            "checked": checked, "executable_markets_found": executable,
+            "paper_entries": entries, "failures": failures, "limit": limit,
+        }
+
     def observe_outcomes(self, now: float, limit: int) -> dict:
         expired=self.store.expire_missed(now)
         observed=no_market=failures=marks=0
@@ -1177,16 +2003,50 @@ class RobinhoodLearningEngine:
                 self.store.outcome_failure(due["token_address"],now)
                 continue
             self.store.record_outcome(due,market,now)
-            mark=self.store.mark_position(due["token_address"],market,now)
-            if mark:
-                marks+=1
-                self.ledger.append("robinhood_paper_mark",mark)
             observed+=1
             no_market+=not bool(market)
         return {"observed":observed,"no_market":no_market,"failures":failures,"expired_missed":expired,"position_marks":marks,"limit":limit}
 
+    def evaluate_open_positions(self, now: float) -> dict:
+        """Evaluate every open paper position independently of outcome horizons."""
+        with self.store.connection() as connection:
+            candidates = [dict(row) for row in connection.execute(
+                """
+                SELECT c.* FROM candidates c JOIN positions p USING(token_address)
+                WHERE p.status='open' ORDER BY p.opened_at
+                """
+            )]
+        checked = marked = closed = partial_exits = failures = 0
+        for candidate in candidates:
+            checked += 1
+            try:
+                market = (
+                    self.v4_market.snapshot(candidate)
+                    if candidate.get("source_version") == SOURCE_V4
+                    else self.market.snapshot(
+                        candidate["token_address"], candidate["pair_address"]
+                    )
+                )
+                mark = self.store.mark_position(
+                    candidate["token_address"], market, now
+                )
+                if not mark:
+                    continue
+                marked += 1
+                closed += bool(mark.get("reason"))
+                partial_exits += len(mark.get("partial_exits") or [])
+                self.ledger.append("robinhood_paper_mark", mark)
+            except Exception:
+                failures += 1
+        return {
+            "checked": checked, "marked": marked, "closed": closed,
+            "partial_exits": partial_exits, "failures": failures,
+            "cadence": "every_learning_cycle",
+        }
+
     def run_once(self, *, discovery_block_limit=DEFAULT_DISCOVERY_BLOCK_LIMIT,
                  analysis_limit=DEFAULT_ANALYSIS_LIMIT,outcome_limit=DEFAULT_OUTCOME_LIMIT,
+                 market_recheck_limit=DEFAULT_MARKET_RECHECK_LIMIT,
                  lookback=DEFAULT_DISCOVERY_LOOKBACK_BLOCKS,now:float|None=None) -> dict:
         started = time.monotonic()
         now = time.time() if now is None else now
@@ -1208,9 +2068,24 @@ class RobinhoodLearningEngine:
                 self.store.mark_v4_promoted(
                     [row["pool_id"] for row in v4_discovered]
                 )
-                analyses = analysis_failures = entries = 0
+                position_evaluations = self.evaluate_open_positions(now)
+                market_rechecks = self.recheck_executable_markets(
+                    now, market_recheck_limit
+                )
+                analyses = analysis_failures = entries = momentum_analyses = 0
+                queue_ages = []
                 for candidate in self.store.pending_analysis(analysis_limit):
                     try:
+                        priority_reason = (
+                            "liquid_momentum"
+                            if candidate.get("momentum_priority_multiple") is not None
+                            else "oldest_fairness"
+                        )
+                        discovered_at = _timestamp(candidate.get("discovered_at"))
+                        queue_age = (
+                            max(0.0, time.time() - discovered_at)
+                            if discovered_at is not None else None
+                        )
                         report = self._analyzer().analyze_token(
                             candidate["token_address"],
                             seal=False,
@@ -1248,8 +2123,13 @@ class RobinhoodLearningEngine:
                                 candidate["pair_address"],
                             )
                         self.store.record_analysis(
-                            candidate["token_address"], analysis, market
+                            candidate["token_address"], analysis, market,
+                            priority_reason=priority_reason,
+                            queue_age_seconds=queue_age,
                         )
+                        momentum_analyses += priority_reason == "liquid_momentum"
+                        if queue_age is not None:
+                            queue_ages.append(queue_age)
                         latest = self.store.candidate(candidate["token_address"])
                         if self.store.open_position(latest, market):
                             entries += 1
@@ -1275,8 +2155,14 @@ class RobinhoodLearningEngine:
                         "pair_events_seen": len(discovered),
                         "v4_activations_seen": len(v4_discovered),
                         "analyses": analyses,
+                        "momentum_analyses": momentum_analyses,
+                        "maximum_analysis_queue_age_seconds": (
+                            round(max(queue_ages), 3) if queue_ages else None
+                        ),
                         "analysis_failures": analysis_failures,
-                        "paper_entries": entries,
+                        "paper_entries": entries + market_rechecks["paper_entries"],
+                        "market_rechecks": market_rechecks,
+                        "position_evaluations": position_evaluations,
                         "outcomes": outcomes,
                         "duration_seconds": round(time.monotonic() - started, 3),
                     },
@@ -1314,15 +2200,30 @@ class RobinhoodLearningEngine:
         return {"ok":ledger_ok and sqlite_ok,"ledger":ledger_report,"sqlite_integrity":sqlite_ok,"paper_only":True}
 
 
-def dashboard_snapshot(root: str | Path) -> dict:
+def dashboard_snapshot(
+    root: str | Path,
+    *,
+    live_position_markets: dict[str, dict] | None = None,
+    market_refresh_errors: dict[str, str] | None = None,
+) -> dict:
     root=Path(root)
     store=RobinhoodLearningStore(root/"learning.sqlite3")
     summary=read_json(root/"learning_summary.json",{}) or {}
     cursor=read_json(root/"discovery_cursor.json",{}) or {}
     v4_cursor=read_json(root/"discovery_v4_cursor.json",{}) or {}
+    reflection_state=read_json(root/"reflection_state.json",{}) or {}
+    reflection_result=read_json(
+        reflection_state.get("latest_result") or root/"reflection_missing.json", {}
+    ) or {}
+    counterfactual_audit=read_json(root/"counterfactual_audit.json",{}) or {}
+    positions = store.recent_positions(live_markets=live_position_markets)
     return {
         "timestamp":_utc_now(),"network":"robinhood","chain_id":ROBINHOOD_NETWORK.chain_id,
-        "learning":store.summary(),"positions":store.recent_positions(),
+        "learning":store.summary(),
+        "positions":[position for position in positions if position.get("status") == "open"],
+        "closed_positions":[
+            position for position in positions if position.get("status") == "closed"
+        ],
         "analyzed_tokens":store.recent_analyzed_tokens(),
         "last_cycle":summary.get("cycle") or {},
         "discovery_coverage":cursor.get("coverage") or summary.get("discovery_coverage") or {},
@@ -1331,19 +2232,65 @@ def dashboard_snapshot(root: str | Path) -> dict:
             "uniswap_v4":v4_cursor.get("coverage") or {},
         },
         "paper_only":True,"live_execution_enabled":False,
+        "market_refresh_errors": market_refresh_errors or {},
+        "reflection": {
+            "last_checkpoint": reflection_state.get("last_checkpoint", 0),
+            "next_checkpoint": reflection_state.get("next_checkpoint", 15),
+            "winner": reflection_result.get("winner"),
+            "recommendations": reflection_result.get("recommendations") or [],
+            "counterfactual_audit": counterfactual_audit,
+        },
     }
+
+
+class RobinhoodDashboardMarketRefresher:
+    """Fetch exact-pool marks for every open position on each dashboard update."""
+
+    def __init__(self, root: str | Path, *, engine=None):
+        self.engine = engine or RobinhoodLearningEngine(root)
+        self.lock = threading.Lock()
+
+    def snapshot(self) -> dict:
+        markets: dict[str, dict] = {}
+        errors: dict[str, str] = {}
+        with self.lock:
+            with self.engine.store.connection() as connection:
+                candidates = [dict(row) for row in connection.execute(
+                    """
+                    SELECT c.* FROM candidates c JOIN positions p USING(token_address)
+                    WHERE p.status='open' ORDER BY p.opened_at
+                    """
+                )]
+            for candidate in candidates:
+                token = candidate["token_address"]
+                try:
+                    market = (
+                        self.engine.v4_market.snapshot(candidate)
+                        if candidate.get("source_version") == SOURCE_V4
+                        else self.engine.market.snapshot(token, candidate["pair_address"])
+                    )
+                    if market:
+                        markets[token] = {**market, "observed_at": _utc_now()}
+                except Exception as exc:
+                    errors[token] = str(exc)
+        return dashboard_snapshot(
+            self.engine.root,
+            live_position_markets=markets,
+            market_refresh_errors=errors,
+        )
 
 
 def serve_dashboard(root: str | Path, host: str, port: int) -> None:
     if host not in {"127.0.0.1","localhost"}:
         raise ValueError("Robinhood dashboard is local-only")
     html_path=Path(__file__).with_name("robinhood_dashboard.html")
+    refresher=RobinhoodDashboardMarketRefresher(root)
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path in {"/","/index.html"}:
                 content=html_path.read_bytes(); content_type="text/html; charset=utf-8"
             elif self.path=="/api/status":
-                content=json.dumps(dashboard_snapshot(root)).encode(); content_type="application/json"
+                content=json.dumps(refresher.snapshot()).encode(); content_type="application/json"
             else:
                 self.send_error(404); return
             self.send_response(200); self.send_header("Content-Type",content_type)
@@ -1362,14 +2309,25 @@ def serve_dashboard(root: str | Path, host: str, port: int) -> None:
 def main() -> None:
     ensure_utf8_runtime()
     parser=argparse.ArgumentParser(description="Robinhood Chain paper learning")
-    parser.add_argument("command",choices=("learn-once","status","dashboard","verify"))
+    parser.add_argument(
+        "command",
+        choices=("learn-once","status","dashboard","verify","reflect","audit"),
+    )
     parser.add_argument("--root",default=DEFAULT_ROOT)
     parser.add_argument("--host",default="127.0.0.1")
     parser.add_argument("--port",type=int,default=DEFAULT_DASHBOARD_PORT)
     parser.add_argument("--discovery-block-limit",type=int,default=DEFAULT_DISCOVERY_BLOCK_LIMIT)
     parser.add_argument("--analysis-limit",type=int,default=DEFAULT_ANALYSIS_LIMIT)
     parser.add_argument("--outcome-limit",type=int,default=DEFAULT_OUTCOME_LIMIT)
+    parser.add_argument(
+        "--market-recheck-limit", type=int,
+        default=DEFAULT_MARKET_RECHECK_LIMIT,
+    )
     parser.add_argument("--lookback",type=int,default=DEFAULT_DISCOVERY_LOOKBACK_BLOCKS)
+    parser.add_argument(
+        "--todo", default=str(Path(__file__).with_name("TODO.md"))
+    )
+    parser.add_argument("--skill-root",default=str(default_skill_root()))
     args=parser.parse_args()
     if args.command=="dashboard":
         serve_dashboard(args.root,args.host,args.port); return
@@ -1378,11 +2336,32 @@ def main() -> None:
     engine=RobinhoodLearningEngine(args.root)
     if args.command=="verify":
         result=engine.verify(); print(json.dumps(result,indent=2)); raise SystemExit(0 if result["ok"] else 1)
+    reflection = RobinhoodReflectionCoordinator(
+        args.root,
+        engine.store,
+        todo_path=args.todo,
+        skill_root=args.skill_root,
+    )
+    if args.command=="reflect":
+        print(json.dumps(reflection.run_if_due(),indent=2)); return
+    if args.command=="audit":
+        print(json.dumps(reflection.audit_all(),indent=2)); return
     summary=engine.run_once(
         discovery_block_limit=max(1,args.discovery_block_limit),
         analysis_limit=max(0,args.analysis_limit),outcome_limit=max(0,args.outcome_limit),
+        market_recheck_limit=max(0,args.market_recheck_limit),
         lookback=max(1,args.lookback),
     )
+    try:
+        summary["reflection"] = reflection.run_if_due()
+    except Exception as exc:
+        # Reflection is retried from the same durable checkpoint next cycle. A
+        # sealing/tooling failure must not turn completed paper learning into a
+        # failed analysis cycle.
+        summary["reflection"] = {
+            "status": "retry_pending",
+            "error": str(exc),
+        }
     print(json.dumps(summary,indent=2))
 
 
