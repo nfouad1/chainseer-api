@@ -468,6 +468,141 @@ async def cmd_reflection(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text)
 
 
+ROBINHOOD_LEARNING_ROOT = (
+    chainseer_solana._environment_setting("CHAINSEER_ROBINHOOD_ROOT")
+    or "robinhood_learning"
+)
+
+
+def _robinhood_status_text() -> str:
+    """Plain-text Robinhood learning status for the bot.
+
+    Reads the same snapshot the local dashboard serves, so the two can never
+    disagree about what the learner is doing. Everything comes from persisted
+    state -- no RPC -- so a slow or rate-limited endpoint cannot make a status
+    request hang or fail.
+    """
+    from pathlib import Path as _Path
+    import chainseer_robinhood as _rh
+
+    snapshot = _rh.dashboard_snapshot(_Path(ROBINHOOD_LEARNING_ROOT))
+    learning = snapshot.get("learning") or {}
+    positions = learning.get("positions") or {}
+    candidates = learning.get("candidates") or {}
+    checkpoints = learning.get("checkpoints") or {}
+    cycle = snapshot.get("last_cycle") or {}
+
+    closed = int(positions.get("closed") or 0)
+    winners = int(positions.get("winners") or 0)
+    average = positions.get("average_multiple")
+
+    lines = [
+        "Chainseer — Robinhood Chain learning",
+        "",
+        "-- Paper positions --",
+        f"open {positions.get('open', 0)} · closed {closed} · "
+        f"opened {positions.get('opened', 0)}",
+        f"winners {winners}"
+        + (f" of {closed} ({winners * 100 // closed}%)" if closed else "")
+        + (f" · average {float(average):.3f}x" if average is not None else ""),
+    ]
+
+    # Total losses are the failure class the entry gate could have refused, so
+    # they are reported separately from a merely bad exit.
+    closed_rows = snapshot.get("closed_positions") or []
+    zeros = [
+        r for r in closed_rows
+        if float(r.get("multiple") or 0.0) <= 0.01
+    ]
+    if closed_rows:
+        lines.append(
+            f"total losses {len(zeros)} of {len(closed_rows)}"
+            + (f" — {', '.join(str(r.get('symbol') or '?') for r in zeros[:5])}"
+               if zeros else "")
+        )
+
+    lines += [
+        "",
+        "-- Funnel --",
+        f"seen {candidates.get('total', 0)} · analysed {candidates.get('analyzed', 0)}"
+        f" · admitted {candidates.get('admitted', 0)}"
+        f" · rejected {candidates.get('rejected', 0)}",
+        f"pending {candidates.get('pending', 0)} · watching {candidates.get('watching', 0)}",
+    ]
+
+    observed = int(checkpoints.get("observed") or 0)
+    missed = int(checkpoints.get("missed") or 0)
+    no_market = int(checkpoints.get("no_market") or 0)
+    total_marks = observed + missed + no_market
+    lines += [
+        "",
+        "-- Marks --",
+        f"observed {observed} · missed {missed} · no market {no_market}"
+        + (f" ({missed * 100 // total_marks}% missed)" if total_marks else ""),
+    ]
+
+    lines.append("")
+    lines.append("-- Discovery --")
+    for source, coverage in (snapshot.get("discovery_coverage_by_source") or {}).items():
+        behind = coverage.get("blocks_behind")
+        caught = coverage.get("caught_up")
+        lines.append(
+            f"{source}: "
+            + ("caught up" if caught else f"{behind:,} blocks behind"
+               if isinstance(behind, int) else "unknown")
+        )
+
+    if cycle:
+        lines += [
+            "",
+            "-- Last cycle --",
+            f"duration {cycle.get('duration_seconds', '?')}s · "
+            f"analyses {cycle.get('analyses', 0)} · "
+            f"new candidates {cycle.get('new_candidates', 0)}",
+        ]
+
+    # An adaptive floor above the module default means the closed-position
+    # audit has autonomously tightened admission; say so rather than let the
+    # gate move silently.
+    try:
+        import json as _json
+        policy = _json.loads(
+            (_Path(ROBINHOOD_LEARNING_ROOT) / "adaptive_policy.json")
+            .read_text(encoding="utf-8")
+        )
+        floor = float(policy.get("minimum_entry_score") or 0.0)
+        if floor > float(_rh.MINIMUM_ENTRY_SCORE):
+            lines += [
+                "",
+                f"NOTE: entry score floor raised to {floor:g} "
+                f"(default {_rh.MINIMUM_ENTRY_SCORE:g}) by "
+                f"{policy.get('updated_by', 'the closed-position audit')}",
+            ]
+    except Exception:
+        pass
+
+    lines += [
+        "",
+        f"paper only: {snapshot.get('paper_only')} · "
+        f"live execution: {snapshot.get('live_execution_enabled')}",
+    ]
+    return "\n".join(lines)
+
+
+async def cmd_status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Robinhood learning status on demand, for the owner."""
+    if not _is_owner(update):
+        await update.message.reply_text("❌ This command is restricted to the bot owner.")
+        return
+    try:
+        text = await asyncio.to_thread(_robinhood_status_text)
+    except Exception as e:
+        logger.exception("robinhood status failed")
+        await update.message.reply_text(f"❌ Could not read learning status: {str(e)[:200]}")
+        return
+    await update.message.reply_text(text)
+
+
 async def cmd_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if not _is_owner(update):
         await update.message.reply_text("❌ This command is restricted to the bot owner.")
@@ -498,6 +633,13 @@ async def cmd_ack(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text or ""
+    # Bare "status" is deliberately supported alongside /status: the owner
+    # asked to type the word, and a plain message is what a phone keyboard
+    # produces without hunting for the slash menu. Owner-gated inside
+    # cmd_status like every other privileged command.
+    if text.strip().lower() in {"status", "learning", "learning status"}:
+        await cmd_status(update, context)
+        return
     addr = extract_address(text)
     if addr:
         await send_analysis(update, addr, full=False)
@@ -529,6 +671,7 @@ def main():
     app.add_handler(CommandHandler("full", cmd_full))
     app.add_handler(CommandHandler("reflection", cmd_reflection))
     app.add_handler(CommandHandler("ack", cmd_ack))
+    app.add_handler(CommandHandler("status", cmd_status))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
     if not OWNER_CHAT_ID:
         print(

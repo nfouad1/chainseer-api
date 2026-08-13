@@ -1133,3 +1133,74 @@ class AdaptiveEntryFloorTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class AutonomousTightenCooldownTests(unittest.TestCase):
+    """A tighten must be justified by closes that are new since the last one.
+
+    Without a cooldown the audit stepped on every reflection checkpoint --
+    they fire every 15 analyses -- and walked the floor 70 -> 85 in eight
+    consecutive steps inside twenty minutes, each re-reading substantially the
+    same closed book. The step size and ceiling were bounded; the RATE was not.
+    """
+
+    def _coordinator(self, root, closed):
+        import chainseer_robinhood_reflection as R
+        c = R.RobinhoodReflectionCoordinator.__new__(R.RobinhoodReflectionCoordinator)
+        c.policy_path = Path(root) / "adaptive_policy.json"
+        c._closed_position_metrics = lambda: {"closed": closed}
+        return c
+
+    @staticmethod
+    def _finding(closed):
+        return {
+            "code": "RH-REFLECT-TOTAL-LOSS-RATE",
+            "autonomous_action": "tighten_admission",
+            "metrics": {"closed": closed},
+            "evidence": "test",
+        }
+
+    def test_first_tighten_applies(self):
+        with tempfile.TemporaryDirectory() as root:
+            c = self._coordinator(root, 20)
+            applied = c._apply_autonomous_actions([self._finding(20)], 1)
+            self.assertEqual(applied[0]["status"], "applied")
+            self.assertEqual(applied[0]["minimum_entry_score"], 72.0)
+
+    def test_second_tighten_without_new_closes_is_refused(self):
+        with tempfile.TemporaryDirectory() as root:
+            c = self._coordinator(root, 20)
+            c._apply_autonomous_actions([self._finding(20)], 1)
+            again = c._apply_autonomous_actions([self._finding(20)], 2)
+            self.assertEqual(
+                again[0]["status"], "cooldown",
+                "tightened twice on the same closed book",
+            )
+            self.assertEqual(again[0]["minimum_entry_score"], 72.0)
+
+    def test_tighten_resumes_once_enough_new_closes_arrive(self):
+        import chainseer_robinhood_reflection as R
+        with tempfile.TemporaryDirectory() as root:
+            c = self._coordinator(root, 20)
+            c._apply_autonomous_actions([self._finding(20)], 1)
+            later = 20 + R.CLOSED_AUDIT_COOLDOWN_CLOSES
+            c._closed_position_metrics = lambda: {"closed": later}
+            resumed = c._apply_autonomous_actions([self._finding(later)], 3)
+            self.assertEqual(resumed[0]["status"], "applied")
+            self.assertEqual(resumed[0]["minimum_entry_score"], 74.0)
+
+    def test_a_run_of_checkpoints_cannot_walk_to_the_ceiling(self):
+        """The exact failure observed in production."""
+        import chainseer_robinhood_reflection as R
+        with tempfile.TemporaryDirectory() as root:
+            c = self._coordinator(root, 20)
+            for checkpoint in range(8):
+                c._apply_autonomous_actions([self._finding(20)], checkpoint)
+            floor = json.loads(
+                (Path(root) / "adaptive_policy.json").read_text(encoding="utf-8")
+            )["minimum_entry_score"]
+            self.assertLess(
+                floor, R.CLOSED_AUDIT_SCORE_CEILING,
+                "eight checkpoints on one closed book still reached the ceiling",
+            )
+            self.assertEqual(floor, 72.0)

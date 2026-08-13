@@ -57,6 +57,12 @@ CLOSED_AUDIT_TOTAL_LOSS_RATIO = 0.25
 # controls and never relax them; loosening stays a human decision.
 CLOSED_AUDIT_SCORE_STEP = 2.0
 CLOSED_AUDIT_SCORE_CEILING = 85.0
+# New closed positions required before tightening again. Without this the
+# audit stepped on EVERY checkpoint -- checkpoints fire every 15 analyses, so
+# it walked 70 -> 85 in eight consecutive steps inside twenty minutes, each one
+# re-reading substantially the same closed book. A tighten must be justified by
+# evidence that did not exist at the previous tighten.
+CLOSED_AUDIT_COOLDOWN_CLOSES = 5
 
 
 class RobinhoodReflectionCoordinator:
@@ -453,6 +459,10 @@ class RobinhoodReflectionCoordinator:
                     f"{closed['by_exit_reason']}; affected {closed['worst_symbols']}."
                 ),
                 "autonomous_action": "tighten_admission",
+                # Carried so the executor need not re-query the store, and so
+                # the action's cooldown is judged against the same closed count
+                # that justified the finding.
+                "metrics": {"closed": closed.get("closed", 0)},
             })
         if metrics["market_observation_failure_ratio"] >= 0.2:
             findings.append({
@@ -637,6 +647,21 @@ class RobinhoodReflectionCoordinator:
                 state.get("minimum_entry_score")
                 or _default_minimum_entry_score()
             )
+            # Only act on closes that arrived since the last tightening.
+            closed_now = int(
+                ((item.get("metrics") or {}).get("closed"))
+                or self._closed_position_metrics().get("closed", 0)
+            )
+            closed_at_last = int(state.get("closed_at_last_action") or 0)
+            if closed_now - closed_at_last < CLOSED_AUDIT_COOLDOWN_CLOSES:
+                applied.append({
+                    "checkpoint": checkpoint, "code": item["code"],
+                    "action": "tighten_admission", "status": "cooldown",
+                    "closed_since_last_action": closed_now - closed_at_last,
+                    "required": CLOSED_AUDIT_COOLDOWN_CLOSES,
+                    "minimum_entry_score": current,
+                })
+                continue
             if current >= CLOSED_AUDIT_SCORE_CEILING:
                 applied.append({
                     "checkpoint": checkpoint, "code": item["code"],
@@ -648,6 +673,7 @@ class RobinhoodReflectionCoordinator:
                 CLOSED_AUDIT_SCORE_CEILING, current + CLOSED_AUDIT_SCORE_STEP
             )
             state["minimum_entry_score"] = proposed
+            state["closed_at_last_action"] = closed_now
             state["updated_at"] = _now_iso()
             state["updated_by"] = item["code"]
             state["checkpoint"] = checkpoint
