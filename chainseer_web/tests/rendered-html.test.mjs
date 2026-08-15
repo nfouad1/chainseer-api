@@ -89,9 +89,10 @@ test("publishes robots and sitemap metadata", async () => {
 });
 
 test("keeps secrets server-side and removes the starter preview", async () => {
-  const [page, apiRoute, watchRoute, memoryRoute, styles, packageJson] = await Promise.all([
+  const [page, apiRoute, scanTelemetryRoute, watchRoute, memoryRoute, styles, packageJson] = await Promise.all([
     readFile(new URL("../app/page.tsx", import.meta.url), "utf8"),
     readFile(new URL("../app/api/analyses/route.ts", import.meta.url), "utf8"),
+    readFile(new URL("../app/api/telemetry/scan/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/watch/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/api/memory/route.ts", import.meta.url), "utf8"),
     readFile(new URL("../app/globals.css", import.meta.url), "utf8"),
@@ -170,7 +171,15 @@ test("keeps secrets server-side and removes the starter preview", async () => {
   assert.doesNotMatch(page, /ring_000751/);
   assert.match(apiRoute, /CHAINSEER_API_TOKEN/);
   assert.match(apiRoute, /validSolanaMint/);
-  assert.match(apiRoute, /JSON\.stringify\(\{ address, network \}\)/);
+  assert.match(apiRoute, /force_refresh: forceRefresh/);
+  assert.match(apiRoute, /analysis_poll_temporarily_unreachable/);
+  assert.doesNotMatch(apiRoute, /No result was published/);
+  assert.match(page, /chainseer-active-scan-v1/);
+  assert.match(page, /Reconnecting to the accepted scan/);
+  assert.match(page, /reconnect_success/);
+  assert.match(page, /recovered_completed/);
+  assert.match(page, /window\.localStorage\.removeItem\(ACTIVE_SCAN_STORAGE_KEY\)/);
+  assert.match(scanTelemetryRoute, /scan_\$\{event\}/);
   assert.match(watchRoute, /CHAINSEER_API_TOKEN/);
   assert.match(watchRoute, /chainseer_monitor_device/);
   assert.match(watchRoute, /httpOnly: true/);

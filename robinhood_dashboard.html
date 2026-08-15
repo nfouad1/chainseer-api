@@ -1,0 +1,55 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <title>Robinhood Chain Learning</title>
+  <style>
+    :root { color-scheme: dark; --bg:#07110d; --panel:#101d17; --line:#284536; --muted:#91aa9d; --ink:#eaf8ef; --green:#46e18b; --amber:#f2be5c; }
+    * { box-sizing:border-box } body { margin:0; font:15px/1.45 system-ui,-apple-system,sans-serif; color:var(--ink); background:radial-gradient(circle at 85% 0,#173828 0,transparent 33%),var(--bg) }
+    main { width:min(1100px,calc(100% - 28px)); margin:30px auto 60px }
+    header { display:flex; align-items:flex-start; justify-content:space-between; gap:18px; margin-bottom:22px }
+    h1 { margin:0; font-size:clamp(25px,5vw,42px); letter-spacing:-.04em } p { color:var(--muted); margin:.45rem 0 0 }
+    .badge { border:1px solid var(--green); color:var(--green); border-radius:999px; padding:7px 11px; white-space:nowrap; font-size:12px; font-weight:750 }
+    .grid { display:grid; grid-template-columns:repeat(4,1fr); gap:12px } .card { min-height:116px; padding:17px; background:color-mix(in srgb,var(--panel) 94%,transparent); border:1px solid var(--line); border-radius:16px }
+    .label { color:var(--muted); font-size:12px; letter-spacing:.08em; text-transform:uppercase } .value { margin-top:9px; font-size:30px; font-weight:760; letter-spacing:-.04em }
+    .wide { grid-column:span 2 } .bar { height:8px; margin-top:18px; background:#07100c; border-radius:99px; overflow:hidden } .bar i { display:block; height:100%; width:0; background:linear-gradient(90deg,var(--green),#b3f079); transition:width .4s }
+    footer { display:flex; justify-content:space-between; gap:16px; color:var(--muted); margin-top:14px; font-size:12px }
+    .positions { margin-top:22px; padding:18px; background:var(--panel); border:1px solid var(--line); border-radius:16px; overflow:hidden }
+    .positions h2 { margin:0 0 3px; font-size:19px } .table-wrap { overflow-x:auto; margin-top:15px }
+    table { width:100%; border-collapse:collapse; min-width:760px } th,td { padding:12px 10px; border-bottom:1px solid var(--line); text-align:right; white-space:nowrap } th { color:var(--muted); font-size:11px; text-transform:uppercase; letter-spacing:.07em } th:first-child,td:first-child { text-align:left } tbody tr:last-child td { border-bottom:0 }
+    .token strong { display:block } .token small { color:var(--muted) } .positive { color:var(--green); font-weight:750 } .negative { color:#ff7c83; font-weight:750 } .empty { padding:23px 0 8px; color:var(--muted); text-align:center }
+    .address { font:12px ui-monospace,SFMono-Regular,Consolas,monospace; color:var(--muted) } .risk-high { color:#ff7c83 } .risk-medium { color:var(--amber) } .risk-low { color:var(--green) }
+    .warn { color:var(--amber) } @media(max-width:760px){.grid{grid-template-columns:repeat(2,1fr)}.wide{grid-column:span 2}} @media(max-width:430px){header{display:block}.badge{display:inline-block;margin-top:14px}.grid{grid-template-columns:1fr}.wide{grid-column:span 1}}
+  </style>
+</head>
+<body><main>
+  <header><div><h1>Robinhood Chain learning</h1><p>Launch observation, counterfactual decisions, and paper positions.</p></div><div class="badge">PAPER ONLY · READ ONLY</div></header>
+  <section class="grid">
+    <article class="card"><div class="label">Candidates</div><div class="value" id="candidates">—</div></article>
+    <article class="card"><div class="label">Analyzed</div><div class="value" id="analyzed">—</div></article>
+    <article class="card"><div class="label">Paper positions</div><div class="value" id="positions">—</div></article>
+    <article class="card"><div class="label">Outcome marks</div><div class="value" id="outcomes">—</div></article>
+    <article class="card wide"><div class="label">Discovery coverage</div><div class="value" id="coverage">—</div><p id="scope">Uniswap V2 + activated V4 WETH/USDG pools</p><div class="bar"><i id="coveragebar"></i></div></article>
+    <article class="card"><div class="label">Pending analysis</div><div class="value" id="pending">—</div></article>
+    <article class="card"><div class="label">Last cycle</div><div class="value" id="duration">—</div></article>
+    <article class="card"><div class="label">Admitted</div><div class="value" id="admitted">—</div></article>
+    <article class="card"><div class="label">Rejected</div><div class="value" id="rejected">—</div></article>
+    <article class="card"><div class="label">Open</div><div class="value" id="open">—</div></article>
+    <article class="card"><div class="label">Closed / winners</div><div class="value" id="closed">—</div></article>
+  </section>
+  <section class="positions"><h2>Analyzed tokens</h2><p>Every token that completed contract analysis, including tokens rejected for paper trading.</p><div class="table-wrap"><table id="analyzedtable" hidden><thead><tr><th>Token</th><th>Contract address</th><th>Source</th><th>Score</th><th>Risk</th><th>Paper decision</th></tr></thead><tbody id="analyzedrows"></tbody></table><div class="empty" id="analyzedempty">No token has completed analysis yet.</div></div></section>
+  <section class="positions"><h2>Paper positions</h2><p>Prices, market caps, and gains update at outcome marks. Gains include estimated entry and exit friction.</p><div class="table-wrap"><table id="positiontable" hidden><thead><tr><th>Token</th><th>Status</th><th>Entry price</th><th>Current price</th><th>Entry market cap</th><th>Current market cap</th><th>Gain</th></tr></thead><tbody id="positionrows"></tbody></table><div class="empty" id="positionempty">No token has qualified for a paper position yet.</div></div></section>
+  <footer><span id="updated">Waiting for local learner…</span><span id="health">No wallet, signing, or execution path</span></footer>
+</main><script>
+const $=id=>document.getElementById(id), number=v=>Number(v||0).toLocaleString();
+const money=v=>v==null?'—':new Intl.NumberFormat(undefined,{style:'currency',currency:'USD',notation:Math.abs(Number(v))>=100000?'compact':'standard',maximumFractionDigits:Math.abs(Number(v))<.01?8:2}).format(v);
+function renderPositions(items){const body=$('positionrows');body.replaceChildren();$('positiontable').hidden=!items.length;$('positionempty').hidden=!!items.length;for(const p of items){const tr=document.createElement('tr'),cells=[];const token=document.createElement('td');token.className='token';const strong=document.createElement('strong');strong.textContent=p.symbol||p.name||'Unknown';const small=document.createElement('small');small.textContent=`${(p.token_address||'').slice(0,8)}…${(p.token_address||'').slice(-6)}`;token.append(strong,small);tr.append(token);cells.push(p.status||'—',money(p.entry_price_usd),money(p.current_price_usd),money(p.entry_market_cap_usd),money(p.current_market_cap_usd));for(const value of cells){const td=document.createElement('td');td.textContent=value;tr.append(td)}const gain=document.createElement('td');gain.textContent=p.gain_pct==null?'—':`${p.gain_pct>=0?'+':''}${Number(p.gain_pct).toFixed(2)}%`;gain.className=p.gain_pct==null?'':p.gain_pct>=0?'positive':'negative';tr.append(gain);body.append(tr)}}
+function renderAnalyzed(items){const body=$('analyzedrows');body.replaceChildren();$('analyzedtable').hidden=!items.length;$('analyzedempty').hidden=!!items.length;for(const t of items){const tr=document.createElement('tr');const token=document.createElement('td');token.className='token';const strong=document.createElement('strong');strong.textContent=t.name||t.symbol||'Unknown token';const small=document.createElement('small');small.textContent=t.symbol||'No symbol';token.append(strong,small);tr.append(token);const address=document.createElement('td');address.className='address';address.textContent=t.token_address||'—';tr.append(address);const source=document.createElement('td');source.textContent=t.source_version==='uniswap_v4'?'Uniswap V4':'Uniswap V2';tr.append(source);const score=document.createElement('td');score.textContent=t.score==null?'—':Number(t.score).toFixed(1);tr.append(score);const risk=document.createElement('td');risk.textContent=t.risk_level||'Unknown';risk.className=`risk-${String(t.risk_level||'').toLowerCase()}`;tr.append(risk);const decision=document.createElement('td');decision.textContent=t.paper_entry_allowed?'Admitted':'Rejected';decision.className=t.paper_entry_allowed?'positive':'negative';tr.append(decision);body.append(tr)}}
+async function refresh(){try{const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);const d=await r.json(),c=d.learning?.candidates||{},p=d.learning?.positions||{},cp=d.learning?.checkpoints||{},sources=d.discovery_coverage_by_source||{},v2=sources.uniswap_v2||d.discovery_coverage||{},v4=sources.uniswap_v4||{},v={blocks_scanned:Number(v2.blocks_scanned||0)+Number(v4.blocks_scanned||0),blocks_behind:Math.max(Number(v2.blocks_behind||0),Number(v4.blocks_behind||0)),caught_up:Boolean(v2.caught_up)&&Boolean(v4.caught_up)},cycle=d.last_cycle||{};
+  $('candidates').textContent=number(c.total); $('analyzed').textContent=number(c.analyzed); $('pending').textContent=number(c.pending); $('admitted').textContent=number(c.admitted); $('rejected').textContent=number(c.rejected);
+  $('positions').textContent=number(p.opened); $('open').textContent=number(p.open); $('closed').textContent=`${number(p.closed)} / ${number(p.winners)}`; $('outcomes').textContent=number((cp.observed||0)+(cp.no_market||0)+(cp.missed||0));
+  $('duration').textContent=cycle.duration_seconds==null?'—':`${Number(cycle.duration_seconds).toFixed(1)}s`; $('coverage').textContent=v.caught_up?'Caught up':`${number(v.blocks_behind)} blocks behind`;
+  renderAnalyzed(d.analyzed_tokens||[]);renderPositions(d.positions||[]);const done=Number(v.blocks_scanned||0), behind=Number(v.blocks_behind||0), pct=done+behind?100*done/(done+behind):0; $('coveragebar').style.width=`${Math.max(0,Math.min(100,pct))}%`; $('updated').textContent=`Updated ${new Date(d.timestamp).toLocaleTimeString()}`; $('health').textContent=d.live_execution_enabled?'WARNING: execution enabled':'No wallet, signing, or execution path'; $('health').className=d.live_execution_enabled?'warn':'';
+}catch(e){$('updated').textContent=`Dashboard API unavailable: ${e.message}`; $('updated').className='warn'}} refresh();setInterval(refresh,5000);
+</script></body></html>

@@ -1296,13 +1296,17 @@ class OutcomeCollector:
         *,
         now: float,
         horizons: tuple[int, ...],
+        limit: int | None = None,
     ) -> list[dict[str, Any]]:
         current = _analysis_view(current_report)
         emitted = []
         completed = set(subscription.get("completed_outcomes") or [])
-        for horizon, baseline in self.due_horizons(
+        due = self.due_horizons(
             subscription, now=now, horizons=horizons
-        ):
+        )
+        if limit is not None:
+            due = due[:max(0, int(limit))]
+        for horizon, baseline in due:
             key = f"{baseline['analysis_ring']}:{horizon}"
             outcome = self.outcomes(
                 baseline, current, horizon_seconds=horizon
@@ -1332,6 +1336,71 @@ class OutcomeCollector:
             )
         subscription["completed_outcomes"] = sorted(completed)
         return emitted
+
+    def prepare(
+        self,
+        agent: Any,
+        subscription: dict[str, Any],
+        current_report: dict[str, Any],
+        *,
+        now: float,
+        horizons: tuple[int, ...],
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """PoQ-score due outcomes without mutating state or appending rings."""
+        current = _analysis_view(current_report)
+        due = self.due_horizons(subscription, now=now, horizons=horizons)
+        if limit is not None:
+            due = due[:max(0, int(limit))]
+        prepared: list[dict[str, Any]] = []
+        for horizon, baseline in due:
+            key = f"{baseline['analysis_ring']}:{horizon}"
+            outcome = self.outcomes(
+                baseline, current, horizon_seconds=horizon
+            )
+            outcome_provenance = current_report.get("provenance") or {}
+            evidence_fact_ids = [
+                str(fact.get("fact_id"))
+                for fact in outcome_provenance.get("facts") or []
+                if isinstance(fact, dict) and fact.get("fact_id")
+            ]
+            reflection = agent.prepare_analysis_reflection(
+                int(baseline["analysis_ring"]),
+                outcome,
+                evidence_fact_ids=evidence_fact_ids,
+                observed_at=utc_now_iso(now),
+                outcome_provenance=outcome_provenance,
+            )
+            prepared.append(
+                {
+                    "key": key,
+                    "analysis_ring": baseline["analysis_ring"],
+                    "horizon_seconds": horizon,
+                    "reflection": reflection,
+                }
+            )
+        return prepared
+
+    @staticmethod
+    def commit_prepared(
+        agent: Any,
+        subscription: dict[str, Any],
+        prepared: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append one prepared outcome and mark its horizon complete."""
+        reflection = agent.commit_prepared_analysis_reflection(
+            prepared["reflection"]
+        )
+        completed = set(subscription.get("completed_outcomes") or [])
+        completed.add(prepared["key"])
+        subscription["completed_outcomes"] = sorted(completed)
+        return {
+            "key": prepared["key"],
+            "analysis_ring": prepared["analysis_ring"],
+            "outcome_ring": reflection["ring"].get("index"),
+            "horizon_seconds": prepared["horizon_seconds"],
+            "calibration": reflection["calibration"],
+        }
 
 
 @dataclass(frozen=True)
@@ -1921,8 +1990,13 @@ class ChainseerWatcher:
         clock: Callable[[], float] = time.time,
         network: str | None = None,
         observer_rpc: Any | None = None,
+        analysis_agent: Any | None = None,
     ):
         self.agent = agent
+        # Observational rescans have mutable request-local RPC/provenance state.
+        # Keep them on a dedicated analyzer so they can run concurrently with a
+        # user scan without sharing that state or entering the Timechain lane.
+        self.analysis_agent = analysis_agent or agent
         self.network = network or getattr(
             agent, "network_key", "robinhood"
         )
@@ -2086,6 +2160,10 @@ class ChainseerWatcher:
                 "covenant": 250,
             },
             declared_evidence=1,
+            # The alert already carries the complete confirmed transition as
+            # declared evidence. A watcher seal must never rebuild or query
+            # the global relevance index while holding the writer lane.
+            use_index=False,
             extra_payload=alert,
         )
         if ring is None:
@@ -2133,6 +2211,7 @@ class ChainseerWatcher:
             "outcomes": 0,
             "errors": [],
             "deferred_subscriptions": 0,
+            "pending_seals": [],
         }
         subscriptions = list(state["subscriptions"].items())
         for index, (key, subscription) in enumerate(subscriptions):
@@ -2241,12 +2320,13 @@ class ChainseerWatcher:
                     analyze_kwargs: dict[str, Any] = {
                         "full_report": False,
                         "block_pin": safe_block,
+                        "seal": False,
                     }
                     try:
                         if (
                             "progress_callback"
                             in inspect.signature(
-                                self.agent.analyze_token
+                                self.analysis_agent.analyze_token
                             ).parameters
                         ):
                             analyze_kwargs["progress_callback"] = (
@@ -2255,16 +2335,11 @@ class ChainseerWatcher:
                     except (TypeError, ValueError):
                         pass
                     try:
-                        with (
-                            timechain_lane()
-                            if timechain_lane is not None
-                            else nullcontext()
-                        ):
-                            if should_yield is not None and should_yield():
-                                raise WatcherPreempted
-                            report = self.agent.analyze_token(
-                                token, **analyze_kwargs
-                            )
+                        if should_yield is not None and should_yield():
+                            raise WatcherPreempted
+                        report = self.analysis_agent.analyze_token(
+                            token, **analyze_kwargs
+                        )
                     except WatcherPreempted:
                         summary["deferred_subscriptions"] = (
                             len(subscriptions) - index
@@ -2272,6 +2347,27 @@ class ChainseerWatcher:
                         break
                     if report.get("error"):
                         raise RuntimeError(report["error"])
+                    # Build deferred-seal envelope for the maintenance worker.
+                    provenance = report.get("provenance") or {}
+                    evidence_hash = canonical_hash(
+                        provenance.get("facts") or []
+                    )
+                    report_hash = canonical_hash(report)
+                    summary["pending_seals"].append({
+                        "network": self.network,
+                        "token_address": token,
+                        "block_or_slot": safe_block,
+                        "evidence_hash": evidence_hash,
+                        "report_hash": report_hash,
+                        "analyzer_version": report.get(
+                            "analysis_version", "unknown"
+                        ),
+                        "idempotency_key": (
+                            f"{self.network}:{token}:{safe_block}"
+                        ),
+                        "enqueued_at": now,
+                        "pinned_snapshot": report,
+                    })
                     current = _analysis_view(report)
                     current_pair = current.get("pair_address")
                     if current_pair != pair:
@@ -2279,18 +2375,22 @@ class ChainseerWatcher:
                             token, safe_block, current_pair
                         )
                     drift = _diff_views(latest or None, current)
-                    with (
-                        timechain_lane()
-                        if timechain_lane is not None
-                        else nullcontext()
-                    ):
-                        emitted = self.outcomes.collect(
-                            self.agent,
-                            subscription,
-                            report,
-                            now=now,
-                            horizons=self.config.outcome_horizons_seconds,
-                        )
+                    # Outcomes require a sealed analysis_ring; skip when
+                    # the report is an observational scan (seal=False).
+                    emitted: list[dict[str, Any]] = []
+                    if report.get("analysis_ring") is not None:
+                        with (
+                            timechain_lane()
+                            if timechain_lane is not None
+                            else nullcontext()
+                        ):
+                            emitted = self.outcomes.collect(
+                                self.agent,
+                                subscription,
+                                report,
+                                now=now,
+                                horizons=self.config.outcome_horizons_seconds,
+                            )
                     summary["outcomes"] += len(emitted)
                     summary["rescans"] += 1
                     subscription["latest_analysis"] = current
@@ -2853,6 +2953,9 @@ class SolanaEventWatcher:
                 "covenant": 252,
             },
             declared_evidence=max(1, len(alert.get("events") or [])),
+            # Confirmed event evidence is self-contained; global recall is
+            # unbounded maintenance and cannot run inside the watcher lane.
+            use_index=False,
             extra_payload=alert,
         )
         if ring is None:
@@ -2894,6 +2997,7 @@ class SolanaEventWatcher:
             "infrastructure_indeterminate": [],
             "errors": [],
             "deferred_subscriptions": 0,
+            "pending_seals": [],
         }
         subscriptions = list(state["subscriptions"].items())
         for index, (mint, subscription) in enumerate(subscriptions):
@@ -2991,7 +3095,9 @@ class SolanaEventWatcher:
                         if should_yield is not None and should_yield():
                             raise WatcherPreempted
 
-                    analyze_kwargs: dict[str, Any] = {}
+                    analyze_kwargs: dict[str, Any] = {
+                        "seal": False,
+                    }
                     try:
                         if (
                             "progress_callback"
@@ -3005,21 +3111,35 @@ class SolanaEventWatcher:
                     except (TypeError, ValueError):
                         pass
                     try:
-                        with (
-                            timechain_lane()
-                            if timechain_lane is not None
-                            else nullcontext()
-                        ):
-                            if should_yield is not None and should_yield():
-                                raise WatcherPreempted
-                            report = self.analyzer.analyze_token(
-                                mint, **analyze_kwargs
-                            )
+                        if should_yield is not None and should_yield():
+                            raise WatcherPreempted
+                        report = self.analyzer.analyze_token(
+                            mint, **analyze_kwargs
+                        )
                     except WatcherPreempted:
                         summary["deferred_subscriptions"] = (
                             len(subscriptions) - index
                         )
                         break
+                    # Build deferred-seal envelope for the maintenance worker.
+                    provenance = report.get("provenance") or {}
+                    evidence_hash = canonical_hash(
+                        provenance.get("facts") or []
+                    )
+                    report_hash = canonical_hash(report)
+                    summary["pending_seals"].append({
+                        "network": "solana",
+                        "token_address": mint,
+                        "block_or_slot": head_slot,
+                        "evidence_hash": evidence_hash,
+                        "report_hash": report_hash,
+                        "analyzer_version": report.get(
+                            "analysis_version", "unknown"
+                        ),
+                        "idempotency_key": f"solana:{mint}:{head_slot}",
+                        "enqueued_at": now,
+                        "pinned_snapshot": report,
+                    })
                     current = _solana_analysis_view(report)
                     drift = _solana_diff_views(latest or None, current)
                     summary["rescans"] += 1

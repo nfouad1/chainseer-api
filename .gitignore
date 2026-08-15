@@ -30,6 +30,8 @@ pons_chain/
 pons_chain_smoke/
 pons_learning/
 pons_prototype_smoke/
+robinhood_learning/
+robinhood_learning_chain/
 solana_chain/
 solana_learning/
 solana_prototype_smoke/
@@ -61,6 +63,7 @@ scratch_test*.txt
 node_modules/
 .next/
 out/
+*.tsbuildinfo
 
 # Local agent/dev tooling
 .claude/

@@ -32,6 +32,7 @@ except ImportError:
     sys.modules["requests"] = requests_stub
 
 import chainseer
+from chainseer_temporal_graph import build_temporal_projection
 
 
 class FakeResponse:
@@ -83,6 +84,20 @@ class FakeTimechain:
     def verify(self):
         return True, "verified"
 
+    def tail_rings(self, count):
+        return self._rings[-count:]
+
+    def seal(self, ring_type, payload, poq=None):
+        ring = {
+            "index": len(self._rings),
+            "ring_hash": f"{len(self._rings) + 1:064x}",
+            "ring_type": ring_type,
+            "payload": payload,
+            "poq": poq,
+        }
+        self._rings.append(ring)
+        return ring
+
 
 class FakePoQ:
     def __init__(self):
@@ -91,6 +106,135 @@ class FakePoQ:
     def gate_and_seal(self, tc, candidate, **kwargs):
         self.kwargs = kwargs
         return {"decision": "SEAL"}, {"index": 10, "ring_hash": "abc"}
+
+    def PoQGate(self):
+        parent = self
+
+        class Gate:
+            def evaluate(self, _candidate, _rings, **kwargs):
+                parent.kwargs = kwargs
+                return {
+                    "decision": "SEAL",
+                    "scores": kwargs["external_scores"],
+                    "cited_rings": [7],
+                }
+
+        return Gate()
+
+    @staticmethod
+    def relevance_window(_tc, relevant_rings=None):
+        return list(relevant_rings or [])
+
+
+class BoundedTokenTrendTests(unittest.TestCase):
+    TOKEN = "0x" + "1" * 40
+
+    @staticmethod
+    def _ring(index, token, score, *, network="robinhood"):
+        timestamp = f"2026-01-01T00:{index:02d}:00+00:00"
+        return {
+            "index": index,
+            "ring_type": "token_analysis",
+            "timestamp": timestamp,
+            "ring_hash": f"{index + 1:064x}",
+            "payload": {
+                "network": network,
+                "token_address": token,
+                "timestamp": timestamp,
+                "legitimacy_score": score,
+                "risk_level": "Low" if score >= 70 else "High",
+                "component_scores": {
+                    "security": score,
+                    "liquidity": score - 5,
+                },
+                "confidence": "high",
+                "evidence_state": "token_evidence",
+                "evidence_hash": "e" * 64,
+            },
+        }
+
+    @staticmethod
+    def _agent(root, network):
+        class NoFullChainReads:
+            def load(self):
+                raise AssertionError("online trend must not load the Timechain")
+
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.chain_root = root
+        agent.network_key = network
+        agent.tc = NoFullChainReads()
+        return agent
+
+    def test_uses_latest_bounded_subject_history_without_loading_timechain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rings = [
+                self._ring(index, self.TOKEN, 50 + index)
+                for index in range(25)
+            ]
+            # Many unrelated subjects may exist in the projection, but none
+            # may enter this token's trend or cause a Timechain scan.
+            rings.extend(
+                self._ring(
+                    100 + index,
+                    "0x" + f"{index + 2:040x}",
+                    10,
+                )
+                for index in range(100)
+            )
+            chainseer.TemporalGraphStore(temporary).write(
+                build_temporal_projection(rings)
+            )
+
+            trend = self._agent(temporary, "robinhood")._build_token_trend(
+                self.TOKEN.upper()
+            )
+
+            self.assertTrue(trend["available"])
+            self.assertEqual(trend["history_source"], "temporal_projection")
+            self.assertEqual(
+                trend["history_limit"],
+                chainseer.ONLINE_TOKEN_TREND_HISTORY_LIMIT,
+            )
+            self.assertEqual(trend["past_count"], 20)
+            self.assertEqual(
+                [item["ring_index"] for item in trend["past_analyses"]],
+                list(range(5, 25)),
+            )
+            self.assertEqual(trend["first_score"], 55.0)
+            self.assertEqual(trend["last_score"], 74.0)
+            self.assertEqual(trend["direction"], "improving")
+            self.assertEqual(trend["metric_shifts"][0]["metric"], "security")
+
+    def test_same_address_is_scoped_to_requested_network(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            rings = [
+                self._ring(0, self.TOKEN, 20, network="robinhood"),
+                self._ring(1, self.TOKEN, 30, network="robinhood"),
+                self._ring(2, self.TOKEN, 80, network="base"),
+                self._ring(3, self.TOKEN, 90, network="base"),
+            ]
+            chainseer.TemporalGraphStore(temporary).write(
+                build_temporal_projection(rings)
+            )
+
+            trend = self._agent(temporary, "base")._build_token_trend(self.TOKEN)
+
+            self.assertEqual(trend["past_count"], 2)
+            self.assertEqual(trend["first_score"], 80.0)
+            self.assertEqual(trend["last_score"], 90.0)
+
+    def test_missing_or_invalid_projection_never_falls_back_to_timechain(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "temporal_entity_graph-v1.json"
+            path.write_text("not valid json", encoding="utf-8")
+
+            trend = self._agent(temporary, "robinhood")._build_token_trend(
+                self.TOKEN
+            )
+
+            self.assertFalse(trend["available"])
+            self.assertEqual(trend["reason"], "projection_missing_or_invalid")
+            self.assertEqual(trend["past_analyses"], [])
 
 
 class FailOnLPTokenRPC:
@@ -615,6 +759,10 @@ class ChainseerInfrastructureTests(unittest.TestCase):
                 agent._seal_report(report)
 
             self.assertFalse(retrieve.call_args.kwargs["use_index"])
+            self.assertEqual(
+                retrieve.call_args.kwargs["scan_window"],
+                chainseer.ONLINE_COGNITIVE_RECALL_WINDOW,
+            )
             self.assertFalse(gate_and_seal.call_args.kwargs["use_index"])
             self.assertNotIn("CT_AUTOINDEX", os.environ)
 
@@ -640,6 +788,51 @@ class ChainseerInfrastructureTests(unittest.TestCase):
                 completion["payload"]["analysis_ring"], report["analysis_ring"]
             )
             self.assertEqual(report["cognitive_ring"], completion["index"])
+
+    def test_hybrid_seal_stops_after_authoritative_analysis_ring(self):
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(chainseer.RobinhoodRPC, "get_block_number", return_value=100):
+                agent = chainseer.Chainseer(chain_root=temp_dir)
+            report = {
+                "token_address": "0x" + "4" * 40,
+                "token_name": "Hybrid Test",
+                "timestamp": "2026-08-11T00:00:00+00:00",
+                "analysis": {
+                    "legitimacy_score": 70,
+                    "risk_level": "Medium",
+                    "recommendation": "Review evidence.",
+                    "green_flags": [],
+                    "red_flags": [],
+                    "component_scores": {"security": 70},
+                    "confidence": "test",
+                    "uncertain_components": {},
+                },
+                "provenance": {"block_pin": 100, "fact_count": 0, "facts": []},
+                "claim_evidence": {},
+                "poq_scores": {
+                    "coherence": 230, "relevance": 240, "novelty": 210,
+                    "consistency": 230, "depth": 220, "covenant": 245,
+                },
+            }
+
+            with patch.object(agent.cognitive_loop, "finalize") as finalize:
+                agent._seal_report(report, defer_cognition=True)
+
+            self.assertEqual(finalize.call_count, 0)
+            self.assertEqual(report["cognition"]["status"], "pending")
+            self.assertEqual(report["cognitive_completion"]["status"], "queued")
+            self.assertEqual(
+                report["temporal_entity_graph"]["reason"],
+                "temporal_projection_pending",
+            )
+            self.assertIn("_analysis_ring_record", report)
+            self.assertNotIn("cognitive_ring", report)
+            self.assertEqual(
+                [ring["ring_type"] for ring in agent.tc.load()].count(
+                    "cognitive_completion"
+                ),
+                0,
+            )
 
     def test_partial_faculty_registry_fails_closed(self):
         with tempfile.TemporaryDirectory() as temp_dir:
@@ -1252,7 +1445,7 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             evidence_fact_ids=["F0001"],
         )
 
-        payload = agent.poq_module.kwargs["extra_payload"]
+        payload = result["ring"]["payload"]
         self.assertTrue(result["calibration"]["dangerous_false_negative"])
         self.assertEqual(payload["security_outcomes"], {"rug_pull": True})
         self.assertEqual(payload["market_outcomes"], {"price_return_pct": -90})
@@ -1273,7 +1466,9 @@ class AlertWiringTests(unittest.TestCase):
     unchanged)."""
 
     @staticmethod
-    def _run_analyze_token(stack, agent, token, basic_info, analysis):
+    def _run_analyze_token(
+        stack, agent, token, basic_info, analysis, **analyze_kwargs
+    ):
         """Patches every Phase 1-8 data-gathering/scoring call in
         analyze_token() so the pipeline can run end-to-end against a real
         agent without any network access, isolating the assertion to the
@@ -1320,16 +1515,20 @@ class AlertWiringTests(unittest.TestCase):
                     "consistency": 230, "depth": 220, "covenant": 245,
                 },
             ),
-            # The cognitive-completion/immune-guard pipeline inside
-            # _seal_report is exercised by test_report_seals_through_poq_
-            # with_provenance; it is out of scope here (this test isolates
-            # the alert_on_decision call site, which fires before sealing).
-            ("_seal_report", None),
             ("_print_summary", None),
         ):
             stack.enter_context(
                 patch.object(chainseer.Chainseer, method, return_value=value)
             )
+        # The cognitive-completion/immune-guard pipeline inside _seal_report is
+        # exercised by test_report_seals_through_poq_with_provenance; it is out
+        # of scope here. Bound separately from the loop above so callers can
+        # assert whether it ran -- that is the whole observable difference
+        # between seal=True and seal=False.
+        mocked_seal = stack.enter_context(
+            patch.object(chainseer.Chainseer, "_seal_report", return_value=None)
+        )
+        agent._mocked_seal_report = mocked_seal
         stack.enter_context(
             patch("chainseer_controls.build_extended_evidence", return_value={})
         )
@@ -1340,8 +1539,76 @@ class AlertWiringTests(unittest.TestCase):
             patch("chainseer.verify_entity_graph", return_value=(True, ""))
         )
         mocked_alert = stack.enter_context(patch("chainseer.alert_on_decision"))
-        report = agent.analyze_token(token)
+        report = agent.analyze_token(token, **analyze_kwargs)
         return report, mocked_alert
+
+    # --- seal= gate -------------------------------------------------------
+    #
+    # seal=False exists so the watcher can rescan observationally and defer
+    # the Timechain write to an idle-period commit. The failure mode is
+    # silent in both directions: seal=False leaking into the API path stops
+    # analyses being sealed at all, and a default that flipped to False would
+    # do the same to every caller without changing a single signature.
+
+    def _seal_probe(self, **analyze_kwargs):
+        analysis = {
+            "legitimacy_score": 88.0,
+            "risk_level": "Low",
+            "action_label": "OK",
+            "hard_stop_overrides": [],
+            "recommendation": "No hard stops.",
+            "green_flags": [],
+            "red_flags": [],
+            "component_scores": {"security": 90},
+            "confidence": "test",
+            "confidence_grade": "LIMITED",
+            "uncertain_components": {},
+        }
+        basic_info = {
+            "name": "Seal Probe",
+            "symbol": "SEAL",
+            "total_supply_raw": 1,
+            "total_supply": 1,
+        }
+        token = "0x" + "7" * 40
+        with tempfile.TemporaryDirectory() as temp_dir:
+            with patch.object(
+                chainseer.RobinhoodRPC, "get_block_number", return_value=100
+            ):
+                agent = chainseer.Chainseer(chain_root=temp_dir)
+            with ExitStack() as stack:
+                report, _ = self._run_analyze_token(
+                    stack, agent, token, basic_info, analysis, **analyze_kwargs
+                )
+                return report, agent._mocked_seal_report
+
+    def test_analyze_token_seals_by_default(self):
+        """The default must stay True; every existing caller relies on it."""
+        _, mocked_seal = self._seal_probe()
+        mocked_seal.assert_called_once()
+
+    def test_analyze_token_seal_true_is_explicit_and_seals(self):
+        _, mocked_seal = self._seal_probe(seal=True)
+        mocked_seal.assert_called_once()
+
+    def test_analyze_token_seal_false_writes_no_timechain_ring(self):
+        _, mocked_seal = self._seal_probe(seal=False)
+        mocked_seal.assert_not_called()
+
+    def test_observational_scan_still_returns_a_usable_report(self):
+        """Deferring the seal must not hollow out the analysis itself.
+
+        The deferred-seal job carries this report as its pinned snapshot, so
+        a report missing its verdict would defer nothing worth committing.
+        """
+        report, mocked_seal = self._seal_probe(seal=False)
+        mocked_seal.assert_not_called()
+        self.assertIsInstance(report, dict)
+        self.assertIn("performance", report,
+                      "unsealed path skipped the performance block")
+        analysis = report.get("analysis") or {}
+        self.assertEqual(analysis.get("risk_level"), "Low",
+                         "unsealed report lost its verdict")
 
     def test_analyze_token_forwards_hard_stops_to_alert_hook(self):
         analysis = {
@@ -1493,6 +1760,47 @@ class FacultyGovernanceActivationTests(unittest.TestCase):
             chainseer._REGISTRY_EPOCH_ACTIONS,
         )
 
+    def test_all_foreground_cognitive_recall_is_bounded(self):
+        """EVM/Base/Solana and Pons must share the same request-path cap.
+
+        Robinhood, Base, and public Solana use ChainseerCognitiveLoop. Pons has
+        its own loop, so exercise that seam independently to prevent either
+        implementation from regressing to a full-chain scan or index catch-up.
+        """
+        import chainseer_pons
+
+        self.assertEqual(chainseer.ONLINE_COGNITIVE_RECALL_WINDOW, 121)
+
+        loop = object.__new__(chainseer_pons.PonsCognitiveLoop)
+        loop.verify_registry = lambda: None
+        loop._safe_input = lambda *_args: '{"risk_level":"Low"}'
+        loop.immune = types.SimpleNamespace(
+            screen=lambda _text: {"blocked": False, "covenant": "admitted"}
+        )
+        calls = []
+
+        def retrieve(_query, **kwargs):
+            calls.append(kwargs)
+            return {
+                "query_labels": {
+                    "senses": [{"id": 1, "name": "Evidence"}],
+                    "modalities": [],
+                    "computed": {},
+                },
+                "blocks": [],
+            }
+
+        loop.recall = types.SimpleNamespace(retrieve=retrieve)
+        _, cognition = loop.prepare(None, None)
+
+        self.assertEqual(cognition["status"], "prepared")
+        self.assertEqual(len(calls), 1)
+        self.assertFalse(calls[0]["use_index"])
+        self.assertEqual(
+            calls[0]["scan_window"],
+            chainseer.ONLINE_COGNITIVE_RECALL_WINDOW,
+        )
+
     def test_migration_heals_an_ungoverned_born_faculty(self):
         from chainseer_governance import (
             migrate_cognitive_faculty_governance,
@@ -1530,3 +1838,60 @@ class FacultyGovernanceActivationTests(unittest.TestCase):
 
             ok, _ = verify_governance_registry(root)
             self.assertTrue(ok)
+
+
+class PreparedOutcomeReflectionTests(unittest.TestCase):
+    class FakeTimechain:
+        def __init__(self, head):
+            self.current_head = head
+            self.sealed = []
+
+        def tail_rings(self, _count):
+            return [self.current_head] if self.current_head else []
+
+        def seal(self, ring_type, payload, poq=None):
+            ring = {
+                "index": self.current_head["index"] + 1,
+                "ring_hash": "sealed-hash",
+                "ring_type": ring_type,
+                "payload": payload,
+                "poq": poq,
+            }
+            self.sealed.append(ring)
+            self.current_head = ring
+            return ring
+
+    @staticmethod
+    def _prepared(index=4, ring_hash="expected-hash"):
+        return {
+            "candidate": "Observed bounded outcome.",
+            "context": "test",
+            "payload": {"analysis_ring": 2},
+            "poq_scores": {"coherence": 235},
+            "verdict": {"decision": "SEAL", "cited_rings": [2]},
+            "calibration": {"adverse_security_event": False},
+            "outcome_record": {"schema_version": "1"},
+            "prepared_head_index": index,
+            "prepared_head_hash": ring_hash,
+            "head_stable_during_prepare": True,
+        }
+
+    def test_commit_discards_prepared_reflection_when_head_advanced(self):
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.tc = self.FakeTimechain({"index": 5, "ring_hash": "new-head"})
+
+        with self.assertRaisesRegex(RuntimeError, "head advanced"):
+            agent.commit_prepared_analysis_reflection(self._prepared())
+
+        self.assertEqual(agent.tc.sealed, [])
+
+    def test_commit_appends_when_prepared_head_is_still_current(self):
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.tc = self.FakeTimechain(
+            {"index": 4, "ring_hash": "expected-hash"}
+        )
+
+        result = agent.commit_prepared_analysis_reflection(self._prepared())
+
+        self.assertEqual(result["ring"]["ring_type"], "analysis_outcome")
+        self.assertEqual(len(agent.tc.sealed), 1)
