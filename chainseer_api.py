@@ -942,6 +942,8 @@ class AnalysisService:
         self._timechain_owner: threading.Thread | None = None
         self._timechain_owner_since: float = 0.0
         self._timechain_owner_reason: str = ""
+        self._timechain_owner_depth: int = 0
+        self._timechain_owner_guard = threading.Lock()
         self._deferred_queue = DurableDeferredQueue(
             Path(settings.chain_root) / "deferred_commits.sqlite3"
         )
@@ -1419,7 +1421,7 @@ class AnalysisService:
         tc = self._agent.tc
         results: list[dict[str, Any]] = []
         previous_autoindex = os.environ.get("CT_AUTOINDEX")
-        with self._timechain_lock:
+        with self._tracked_timechain_lock("base_analysis_import"):
             os.environ["CT_AUTOINDEX"] = "0"
             try:
                 if self._base_analysis_idempotency_keys is None:
@@ -1602,8 +1604,8 @@ class AnalysisService:
                 supports_scoped_lane = False
             acquired_timechain = False
             if not supports_scoped_lane:
-                acquired_timechain = self._timechain_lock.acquire(
-                    blocking=False
+                acquired_timechain = self._acquire_timechain(
+                    f"legacy_{network}_watcher_cycle", blocking=False
                 )
                 if not acquired_timechain:
                     deferred[network] = {
@@ -1659,7 +1661,7 @@ class AnalysisService:
                 if acquired_watch:
                     self._watch_lock.release()
                 if acquired_timechain:
-                    self._timechain_lock.release()
+                    self._release_timechain()
         # Persist only envelopes produced by this cycle.  Never retain the full
         # snapshots in public watcher status or replay a previous cycle's work.
         for network in ("robinhood", "base", "solana"):
@@ -1701,6 +1703,75 @@ class AnalysisService:
             "last_deferred": deferred or None,
         }
 
+    def _acquire_timechain(
+        self,
+        reason: str,
+        *,
+        blocking: bool = True,
+        timeout: float | None = None,
+    ) -> bool:
+        """Acquire the writer lock and atomically publish its real owner."""
+        if not blocking:
+            acquired = self._timechain_lock.acquire(blocking=False)
+        elif timeout is None:
+            acquired = self._timechain_lock.acquire()
+        else:
+            acquired = self._timechain_lock.acquire(timeout=timeout)
+        if not acquired:
+            return False
+        me = threading.current_thread()
+        with self._timechain_owner_guard:
+            if self._timechain_owner is me:
+                self._timechain_owner_depth += 1
+            else:
+                self._timechain_owner = me
+                self._timechain_owner_since = time.monotonic()
+                self._timechain_owner_reason = reason
+                self._timechain_owner_depth = 1
+        return True
+
+    def _release_timechain(self) -> None:
+        """Release one writer-lock level without erasing a newer owner."""
+        me = threading.current_thread()
+        self._timechain_lock.release()
+        with self._timechain_owner_guard:
+            if self._timechain_owner is not me:
+                return
+            self._timechain_owner_depth -= 1
+            if self._timechain_owner_depth <= 0:
+                self._timechain_owner = None
+                self._timechain_owner_since = 0.0
+                self._timechain_owner_reason = ""
+                self._timechain_owner_depth = 0
+
+    def _timechain_owner_snapshot(
+        self,
+    ) -> tuple[threading.Thread | None, float, str]:
+        with self._timechain_owner_guard:
+            return (
+                self._timechain_owner,
+                self._timechain_owner_since,
+                self._timechain_owner_reason,
+            )
+
+    @contextmanager
+    def _try_timechain_lane(
+        self,
+        reason: str,
+        *,
+        blocking: bool = False,
+        timeout: float | None = None,
+    ):
+        """Yield whether a consistently tracked writer-lane acquire succeeded."""
+        acquired = self._acquire_timechain(
+            reason, blocking=blocking, timeout=timeout
+        )
+        try:
+            yield acquired
+        finally:
+            if acquired:
+                self._release_timechain()
+
     @contextmanager
     def _tracked_timechain_lock(self, reason: str):
         """Acquire ``_timechain_lock`` with a configurable timeout.
@@ -1710,35 +1781,33 @@ class AnalysisService:
         acquired within ``timechain_lock_timeout_seconds``.
         """
         timeout = self.settings.timechain_lock_timeout_seconds
-        acquired = self._timechain_lock.acquire(timeout=timeout)
+        acquired = self._acquire_timechain(reason, timeout=timeout)
         if not acquired:
-            owner = self._timechain_owner
-            since = self._timechain_owner_since
-            owner_reason = self._timechain_owner_reason
+            owner, since, owner_reason = self._timechain_owner_snapshot()
+            held = (
+                f"{max(0.0, time.monotonic() - since):.1f}s"
+                if owner is not None and since > 0
+                else "unknown"
+            )
             raise TimeoutError(
                 f"Timed out waiting for _timechain_lock ({timeout:.1f}s) "
                 f"for '{reason}'. "
                 f"Owner: {owner.name if owner else 'None'} "
                 f"reason='{owner_reason}' "
-                f"held={time.monotonic() - since:.1f}s"
+                f"held={held}"
             )
-        me = threading.current_thread()
-        self._timechain_owner = me
-        self._timechain_owner_since = time.monotonic()
-        self._timechain_owner_reason = reason
         try:
             yield
         finally:
-            self._timechain_owner = None
-            self._timechain_owner_since = 0.0
-            self._timechain_owner_reason = ""
-            self._timechain_lock.release()
+            self._release_timechain()
 
     @contextmanager
     def _watcher_timechain_lane(self):
         """Serialize watcher writes without doing index maintenance inline."""
         timeout = self.settings.timechain_lock_timeout_seconds
-        acquired = self._timechain_lock.acquire(timeout=timeout)
+        acquired = self._acquire_timechain(
+            "watcher_timechain_lane", timeout=timeout
+        )
         if not acquired:
             raise TimeoutError(
                 f"Watcher timechain_lane timed out ({timeout:.1f}s); "
@@ -1753,7 +1822,7 @@ class AnalysisService:
                 os.environ.pop("CT_AUTOINDEX", None)
             else:
                 os.environ["CT_AUTOINDEX"] = previous
-            self._timechain_lock.release()
+            self._release_timechain()
 
     def _run_watchers(self) -> None:
         interval = max(0.1, float(self.settings.watcher_interval_seconds))
@@ -1956,7 +2025,7 @@ class AnalysisService:
             # Treat this interval as deliberately deferred so maintenance
             # does not spin every 100ms while the process is under pressure.
             return True
-        if not self._timechain_lock.acquire(blocking=False):
+        if not self._acquire_timechain("full_timechain_audit", blocking=False):
             return False
         try:
             # Close the race between the priority check and lock acquisition.
@@ -2130,7 +2199,7 @@ class AnalysisService:
             self._full_audit_cursor = None
             return True
         finally:
-            self._timechain_lock.release()
+            self._release_timechain()
 
     def _drain_deferred_seals(self) -> None:
         """Drain and coalesce pending deferred-seal jobs, then execute.
@@ -2376,7 +2445,7 @@ class AnalysisService:
         item = prepared.queue_item
         if self._analysis_active.is_set() or not self.work.empty():
             return "retry"
-        if not self._timechain_lock.acquire(blocking=False):
+        if not self._acquire_timechain("watcher_commit", blocking=False):
             return "retry"
         try:
             if self._analysis_active.is_set() or not self.work.empty():
@@ -2437,7 +2506,7 @@ class AnalysisService:
             )
             return f"committed:{ring.get('index')}"
         finally:
-            self._timechain_lock.release()
+            self._release_timechain()
 
     def _drain_durable_commits(self) -> None:
         """Prepare one durable item and commit only while the user lane is idle."""
@@ -2597,7 +2666,7 @@ class AnalysisService:
             raise ValueError("analysis ring hash collision")
         if not self._deferred_queue.transition(item, "ready"):
             return "queue generation changed"
-        if not self._timechain_lock.acquire(blocking=False):
+        if not self._acquire_timechain("cognitive_completion", blocking=False):
             return "timechain busy"
         try:
             if self._analysis_active.is_set() or not self.work.empty():
@@ -2638,7 +2707,7 @@ class AnalysisService:
             self._publish_cognitive_completion(payload, completed)
             return "done"
         finally:
-            self._timechain_lock.release()
+            self._release_timechain()
 
     def _publish_cognitive_completion(
         self,
@@ -2666,7 +2735,7 @@ class AnalysisService:
         self._persist_public_result(job)
 
     def _execute_deferred_outcome(self, item: DeferredQueueItem) -> str:
-        """Restore sealed baselines and emit at most one due outcome per turn."""
+        """Prepare watcher cognition off-lane; append only its bounded result."""
         payload = item.payload
         network = str(payload["network"])
         # Solana did not previously have an outcome collector.  Its committed
@@ -2682,13 +2751,7 @@ class AnalysisService:
             return "user analysis has priority"
         if not self._watch_lock.acquire(blocking=False):
             return "watch state busy"
-        acquired_timechain = False
         try:
-            acquired_timechain = self._timechain_lock.acquire(blocking=False)
-            if not acquired_timechain:
-                return "timechain busy"
-            if self._analysis_active.is_set() or not self.work.empty():
-                return "user analysis has priority"
             state = watcher.store.load()
             token = str(payload["token_address"])
             subscriptions = state.get("subscriptions") or {}
@@ -2704,21 +2767,73 @@ class AnalysisService:
             baselines = subscription.setdefault("analyses", [])
             if baselines:
                 baselines[-1]["analysis_ring"] = int(payload["analysis_ring"])
-            emitted = watcher.outcomes.collect(
-                self._agent,
-                subscription,
-                report,
-                now=float(payload.get("observed_at_epoch") or time.time()),
-                horizons=watcher.config.outcome_horizons_seconds,
-                limit=1,
+            # Binding the observational baseline to its committed ring is
+            # watcher state only; it must not occupy the Timechain writer lane.
+            watcher.store.save(state)
+            subscription_snapshot = json.loads(json.dumps(subscription))
+        finally:
+            self._watch_lock.release()
+
+        if self._analysis_active.is_set() or not self.work.empty():
+            return "user analysis has priority"
+        prepared = watcher.outcomes.prepare(
+            self._agent,
+            subscription_snapshot,
+            report,
+            now=float(payload.get("observed_at_epoch") or time.time()),
+            horizons=watcher.config.outcome_horizons_seconds,
+            limit=1,
+        )
+        if not prepared:
+            return "done"
+
+        # A concurrent user seal invalidates the PoQ window/head anchor.  Do
+        # not append stale cognition; a retry will re-prepare from the new head.
+        reflection = prepared[0]["reflection"]
+        if not reflection.get("head_stable_during_prepare"):
+            return "timechain advanced during outcome preparation"
+        if self._analysis_active.is_set() or not self.work.empty():
+            return "user analysis has priority"
+        if not self._acquire_timechain("watcher_outcome_append", blocking=False):
+            return "timechain busy"
+        acquired_watch = False
+
+        try:
+            if self._analysis_active.is_set() or not self.work.empty():
+                return "user analysis has priority"
+            acquired_watch = self._watch_lock.acquire(blocking=False)
+            if not acquired_watch:
+                return "watch state busy"
+            if not self._deferred_queue.is_current(item):
+                return "queue generation changed"
+            state = watcher.store.load()
+            subscriptions = state.get("subscriptions") or {}
+            current_subscription = (
+                subscriptions.get(token.lower()) or subscriptions.get(token)
+            )
+            if current_subscription is None:
+                return "done"
+            if prepared[0]["key"] in set(
+                current_subscription.get("completed_outcomes") or []
+            ):
+                return "done"
+            emitted = watcher.outcomes.commit_prepared(
+                self._agent, current_subscription, prepared[0]
             )
             watcher.store.save(state)
-            LOGGER.debug("processed %d deferred outcomes", len(emitted))
+            LOGGER.debug(
+                "processed deferred outcome %s at ring %s",
+                emitted["key"], emitted["outcome_ring"],
+            )
             return "done"
+        except RuntimeError as exc:
+            if "Timechain" in str(exc) and "advanced" in str(exc):
+                return "timechain advanced before outcome append"
+            raise
         finally:
-            if acquired_timechain:
-                self._timechain_lock.release()
-            self._watch_lock.release()
+            if acquired_watch:
+                self._watch_lock.release()
+            self._release_timechain()
 
     def _run_maintenance(self) -> None:
         next_audit = (

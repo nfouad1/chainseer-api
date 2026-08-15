@@ -1337,6 +1337,71 @@ class OutcomeCollector:
         subscription["completed_outcomes"] = sorted(completed)
         return emitted
 
+    def prepare(
+        self,
+        agent: Any,
+        subscription: dict[str, Any],
+        current_report: dict[str, Any],
+        *,
+        now: float,
+        horizons: tuple[int, ...],
+        limit: int | None = None,
+    ) -> list[dict[str, Any]]:
+        """PoQ-score due outcomes without mutating state or appending rings."""
+        current = _analysis_view(current_report)
+        due = self.due_horizons(subscription, now=now, horizons=horizons)
+        if limit is not None:
+            due = due[:max(0, int(limit))]
+        prepared: list[dict[str, Any]] = []
+        for horizon, baseline in due:
+            key = f"{baseline['analysis_ring']}:{horizon}"
+            outcome = self.outcomes(
+                baseline, current, horizon_seconds=horizon
+            )
+            outcome_provenance = current_report.get("provenance") or {}
+            evidence_fact_ids = [
+                str(fact.get("fact_id"))
+                for fact in outcome_provenance.get("facts") or []
+                if isinstance(fact, dict) and fact.get("fact_id")
+            ]
+            reflection = agent.prepare_analysis_reflection(
+                int(baseline["analysis_ring"]),
+                outcome,
+                evidence_fact_ids=evidence_fact_ids,
+                observed_at=utc_now_iso(now),
+                outcome_provenance=outcome_provenance,
+            )
+            prepared.append(
+                {
+                    "key": key,
+                    "analysis_ring": baseline["analysis_ring"],
+                    "horizon_seconds": horizon,
+                    "reflection": reflection,
+                }
+            )
+        return prepared
+
+    @staticmethod
+    def commit_prepared(
+        agent: Any,
+        subscription: dict[str, Any],
+        prepared: dict[str, Any],
+    ) -> dict[str, Any]:
+        """Append one prepared outcome and mark its horizon complete."""
+        reflection = agent.commit_prepared_analysis_reflection(
+            prepared["reflection"]
+        )
+        completed = set(subscription.get("completed_outcomes") or [])
+        completed.add(prepared["key"])
+        subscription["completed_outcomes"] = sorted(completed)
+        return {
+            "key": prepared["key"],
+            "analysis_ring": prepared["analysis_ring"],
+            "outcome_ring": reflection["ring"].get("index"),
+            "horizon_seconds": prepared["horizon_seconds"],
+            "calibration": reflection["calibration"],
+        }
+
 
 @dataclass(frozen=True)
 class CalibrationPolicy:
