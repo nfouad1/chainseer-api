@@ -4912,15 +4912,22 @@ class Chainseer:
             + json.dumps(ANALYSIS_OUTPUT_SCHEMA, sort_keys=True)
         )
 
-    def reflect_on_analysis(self, analysis_ring: int, outcomes: dict,
-                            evidence_fact_ids: list = None,
-                            observed_at: str = None,
-                            outcome_provenance: dict = None) -> dict:
-        """Append a real-world outcome without rewriting the original analysis.
+    def prepare_analysis_reflection(self, analysis_ring: int, outcomes: dict,
+                                    evidence_fact_ids: list = None,
+                                    observed_at: str = None,
+                                    outcome_provenance: dict = None) -> dict:
+        """Prepare and PoQ-score an outcome without appending to the Timechain.
 
-        Security outcomes and market outcomes stay separate so price movement does
-        not incorrectly train the agent to equate an unprofitable token with a rug.
+        This deliberately leaves the expensive full-chain verification, outcome
+        construction, and PoQ evaluation outside the service writer lane.  The
+        returned head anchor must still match immediately before commit.
         """
+        head_before = (
+            self.tc.tail_rings(1)
+            if hasattr(self.tc, "tail_rings")
+            else self.tc.load()[-1:]
+        )
+        prepared_head_before = head_before[-1] if head_before else None
         chain_ok, chain_report = self.tc.verify()
         if not chain_ok:
             raise RuntimeError(
@@ -4972,47 +4979,131 @@ class Chainseer:
             f"Adverse security event: {adverse_security_event}. "
             "Market performance is recorded separately from security correctness."
         )
-        verdict, ring = self.poq_module.gate_and_seal(
-            self.tc,
+        context = "Real-world Chainseer outcome reflection"
+        extra_payload = {
+            "analysis_ring": analysis_ring,
+            "analysis_ring_hash": original.get("ring_hash"),
+            "original_evidence_hash": analysis_reference[
+                "original_evidence_hash"
+            ],
+            "anchor_type": analysis_reference["anchor_type"],
+            "anchor_value": analysis_reference["anchor_value"],
+            "token_address": token,
+            "observed_at": observed_timestamp,
+            "security_outcomes": security,
+            "market_outcomes": market,
+            "infrastructure_outcomes": infrastructure,
+            "other_outcomes": other,
+            "evidence_fact_ids": list(evidence_fact_ids or []),
+            "calibration": calibration,
+            "outcome_ledger_schema_version": outcome_record[
+                "schema_version"
+            ],
+            "outcome_record_hash": outcome_record["record_hash"],
+            "learning_eligible": outcome_record["learning"]["eligible"],
+            "outcome_record": outcome_record,
+        }
+        gate = self.poq_module.PoQGate()
+        relevant = self.poq_module.relevance_window(
+            self.tc, relevant_rings=[original]
+        )
+        evidence_texts = None
+        if hasattr(self.poq_module, "ring_text"):
+            evidence_texts = [self.poq_module.ring_text(original)]
+        verdict = gate.evaluate(
             candidate,
-            context="Real-world Chainseer outcome reflection",
-            ring_type="analysis_outcome",
+            relevant,
+            context=context,
             external_scores={"coherence": 235, "relevance": 245, "novelty": 225,
                              "consistency": 235, "depth": 220, "covenant": 245},
-            relevant_rings=[original],
+            span_guard=True,
             declared_evidence=1,
-            extra_payload={
-                "analysis_ring": analysis_ring,
-                "analysis_ring_hash": original.get("ring_hash"),
-                "original_evidence_hash": analysis_reference[
-                    "original_evidence_hash"
-                ],
-                "anchor_type": analysis_reference["anchor_type"],
-                "anchor_value": analysis_reference["anchor_value"],
-                "token_address": token,
-                "observed_at": observed_timestamp,
-                "security_outcomes": security,
-                "market_outcomes": market,
-                "infrastructure_outcomes": infrastructure,
-                "other_outcomes": other,
-                "evidence_fact_ids": list(evidence_fact_ids or []),
-                "calibration": calibration,
-                "outcome_ledger_schema_version": outcome_record[
-                    "schema_version"
-                ],
-                "outcome_record_hash": outcome_record["record_hash"],
-                "learning_eligible": outcome_record["learning"]["eligible"],
-                "outcome_record": outcome_record,
-            },
+            evidence_texts=evidence_texts,
         )
-        if ring is None:
+        if verdict.get("decision") != "SEAL":
             raise RuntimeError(f"PoQ refused outcome reflection: {verdict.get('decision')}")
+        head_after = (
+            self.tc.tail_rings(1)
+            if hasattr(self.tc, "tail_rings")
+            else self.tc.load()[-1:]
+        )
+        prepared_head_after = head_after[-1] if head_after else None
+        before_anchor = (
+            prepared_head_before.get("index"),
+            prepared_head_before.get("ring_hash"),
+        ) if prepared_head_before else (None, None)
+        after_anchor = (
+            prepared_head_after.get("index"),
+            prepared_head_after.get("ring_hash"),
+        ) if prepared_head_after else (None, None)
         return {
-            "ring": ring,
+            "candidate": candidate,
+            "context": context,
+            "payload": extra_payload,
+            "poq_scores": dict(verdict.get("scores") or {}),
             "verdict": verdict,
             "calibration": calibration,
             "outcome_record": outcome_record,
+            "prepared_head_index": after_anchor[0],
+            "prepared_head_hash": after_anchor[1],
+            "head_stable_during_prepare": before_anchor == after_anchor,
         }
+
+    def commit_prepared_analysis_reflection(self, prepared: dict) -> dict:
+        """Append a prepared outcome only if its observed Timechain head is current."""
+        tail = (
+            self.tc.tail_rings(1)
+            if hasattr(self.tc, "tail_rings")
+            else self.tc.load()[-1:]
+        )
+        head = tail[-1] if tail else None
+        current_anchor = (
+            head.get("index"), head.get("ring_hash")
+        ) if head else (None, None)
+        expected_anchor = (
+            prepared.get("prepared_head_index"),
+            prepared.get("prepared_head_hash"),
+        )
+        if not prepared.get("head_stable_during_prepare"):
+            raise RuntimeError("Timechain advanced while outcome reflection was prepared")
+        if current_anchor != expected_anchor:
+            raise RuntimeError("Timechain head advanced before outcome reflection append")
+        payload = {
+            "summary": prepared["candidate"],
+            "context": prepared["context"],
+            "poq_verdict": {
+                "decision": prepared["verdict"]["decision"],
+                "cited_rings": prepared["verdict"].get("cited_rings") or [],
+            },
+            **prepared["payload"],
+        }
+        if prepared["verdict"].get("span_grounding"):
+            payload["poq_verdict"]["span_grounding"] = prepared["verdict"][
+                "span_grounding"
+            ]
+        ring = self.tc.seal(
+            "analysis_outcome", payload, poq=prepared["poq_scores"]
+        )
+        return {
+            "ring": ring,
+            "verdict": prepared["verdict"],
+            "calibration": prepared["calibration"],
+            "outcome_record": prepared["outcome_record"],
+        }
+
+    def reflect_on_analysis(self, analysis_ring: int, outcomes: dict,
+                            evidence_fact_ids: list = None,
+                            observed_at: str = None,
+                            outcome_provenance: dict = None) -> dict:
+        """Append a real-world outcome without rewriting the original analysis."""
+        prepared = self.prepare_analysis_reflection(
+            analysis_ring,
+            outcomes,
+            evidence_fact_ids=evidence_fact_ids,
+            observed_at=observed_at,
+            outcome_provenance=outcome_provenance,
+        )
+        return self.commit_prepared_analysis_reflection(prepared)
 
     def verify_outcome_ledger(self) -> dict:
         """Verify every canonical outcome record against its analysis ring."""

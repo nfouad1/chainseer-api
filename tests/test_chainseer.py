@@ -84,6 +84,20 @@ class FakeTimechain:
     def verify(self):
         return True, "verified"
 
+    def tail_rings(self, count):
+        return self._rings[-count:]
+
+    def seal(self, ring_type, payload, poq=None):
+        ring = {
+            "index": len(self._rings),
+            "ring_hash": f"{len(self._rings) + 1:064x}",
+            "ring_type": ring_type,
+            "payload": payload,
+            "poq": poq,
+        }
+        self._rings.append(ring)
+        return ring
+
 
 class FakePoQ:
     def __init__(self):
@@ -92,6 +106,24 @@ class FakePoQ:
     def gate_and_seal(self, tc, candidate, **kwargs):
         self.kwargs = kwargs
         return {"decision": "SEAL"}, {"index": 10, "ring_hash": "abc"}
+
+    def PoQGate(self):
+        parent = self
+
+        class Gate:
+            def evaluate(self, _candidate, _rings, **kwargs):
+                parent.kwargs = kwargs
+                return {
+                    "decision": "SEAL",
+                    "scores": kwargs["external_scores"],
+                    "cited_rings": [7],
+                }
+
+        return Gate()
+
+    @staticmethod
+    def relevance_window(_tc, relevant_rings=None):
+        return list(relevant_rings or [])
 
 
 class BoundedTokenTrendTests(unittest.TestCase):
@@ -1413,7 +1445,7 @@ class ChainseerInfrastructureTests(unittest.TestCase):
             evidence_fact_ids=["F0001"],
         )
 
-        payload = agent.poq_module.kwargs["extra_payload"]
+        payload = result["ring"]["payload"]
         self.assertTrue(result["calibration"]["dangerous_false_negative"])
         self.assertEqual(payload["security_outcomes"], {"rug_pull": True})
         self.assertEqual(payload["market_outcomes"], {"price_return_pct": -90})
@@ -1806,3 +1838,60 @@ class FacultyGovernanceActivationTests(unittest.TestCase):
 
             ok, _ = verify_governance_registry(root)
             self.assertTrue(ok)
+
+
+class PreparedOutcomeReflectionTests(unittest.TestCase):
+    class FakeTimechain:
+        def __init__(self, head):
+            self.current_head = head
+            self.sealed = []
+
+        def tail_rings(self, _count):
+            return [self.current_head] if self.current_head else []
+
+        def seal(self, ring_type, payload, poq=None):
+            ring = {
+                "index": self.current_head["index"] + 1,
+                "ring_hash": "sealed-hash",
+                "ring_type": ring_type,
+                "payload": payload,
+                "poq": poq,
+            }
+            self.sealed.append(ring)
+            self.current_head = ring
+            return ring
+
+    @staticmethod
+    def _prepared(index=4, ring_hash="expected-hash"):
+        return {
+            "candidate": "Observed bounded outcome.",
+            "context": "test",
+            "payload": {"analysis_ring": 2},
+            "poq_scores": {"coherence": 235},
+            "verdict": {"decision": "SEAL", "cited_rings": [2]},
+            "calibration": {"adverse_security_event": False},
+            "outcome_record": {"schema_version": "1"},
+            "prepared_head_index": index,
+            "prepared_head_hash": ring_hash,
+            "head_stable_during_prepare": True,
+        }
+
+    def test_commit_discards_prepared_reflection_when_head_advanced(self):
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.tc = self.FakeTimechain({"index": 5, "ring_hash": "new-head"})
+
+        with self.assertRaisesRegex(RuntimeError, "head advanced"):
+            agent.commit_prepared_analysis_reflection(self._prepared())
+
+        self.assertEqual(agent.tc.sealed, [])
+
+    def test_commit_appends_when_prepared_head_is_still_current(self):
+        agent = chainseer.Chainseer.__new__(chainseer.Chainseer)
+        agent.tc = self.FakeTimechain(
+            {"index": 4, "ring_hash": "expected-hash"}
+        )
+
+        result = agent.commit_prepared_analysis_reflection(self._prepared())
+
+        self.assertEqual(result["ring"]["ring_type"], "analysis_outcome")
+        self.assertEqual(len(agent.tc.sealed), 1)

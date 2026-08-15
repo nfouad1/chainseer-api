@@ -2108,6 +2108,123 @@ class TrackedTimechainLockTests(unittest.TestCase):
             self.assertEqual(duplicate.job_id, forced.job_id)
             self.assertEqual(duplicate.previous_result["timechain"]["ring"], 9)
 
+    def test_untracked_holder_reports_unknown_duration_not_process_uptime(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            holding = threading.Event()
+            release = threading.Event()
+
+            def legacy_holder():
+                service._timechain_lock.acquire()
+                try:
+                    holding.set()
+                    release.wait(2)
+                finally:
+                    service._timechain_lock.release()
+
+            thread = threading.Thread(target=legacy_holder, daemon=True)
+            thread.start()
+            self.assertTrue(holding.wait(2))
+            try:
+                with self.assertRaises(TimeoutError) as ctx:
+                    with service._tracked_timechain_lock("user_analysis"):
+                        pass
+                self.assertIn("Owner: None", str(ctx.exception))
+                self.assertIn("held=unknown", str(ctx.exception))
+            finally:
+                release.set()
+                thread.join(2)
+
+
+class WatcherOutcomePreemptionTests(unittest.TestCase):
+    def test_slow_outcome_preparation_does_not_hold_user_writer_lane(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = TrackedTimechainLockTests()._service(root, timeout=0.2)
+            preparation_started = threading.Event()
+            release_preparation = threading.Event()
+            commit_seen = threading.Event()
+            state = {
+                "subscriptions": {
+                    TOKEN: {
+                        "analyses": [{"analysis_ring": None}],
+                        "completed_outcomes": [],
+                    }
+                }
+            }
+
+            class Store:
+                def load(self):
+                    return json.loads(json.dumps(state))
+
+                def save(self, value):
+                    state.clear()
+                    state.update(json.loads(json.dumps(value)))
+
+            class Outcomes:
+                def prepare(self, *_args, **_kwargs):
+                    preparation_started.set()
+                    release_preparation.wait(2)
+                    return [{
+                        "key": "7:0",
+                        "analysis_ring": 7,
+                        "horizon_seconds": 0,
+                        "reflection": {"head_stable_during_prepare": True},
+                    }]
+
+                def commit_prepared(self, _agent, subscription, prepared):
+                    subscription["completed_outcomes"] = [prepared["key"]]
+                    commit_seen.set()
+                    return {
+                        "key": prepared["key"],
+                        "outcome_ring": 8,
+                    }
+
+            service._watcher = SimpleNamespace(
+                store=Store(),
+                outcomes=Outcomes(),
+                config=SimpleNamespace(outcome_horizons_seconds=(0,)),
+            )
+            service._agent = object()
+            service._deferred_queue.is_current = lambda _item: True
+            item = DeferredQueueItem(
+                id=1,
+                kind="watcher_outcome",
+                subject_key=f"robinhood:{TOKEN}",
+                generation=1,
+                priority=30,
+                state="preparing",
+                payload={
+                    "network": "robinhood",
+                    "token_address": TOKEN,
+                    "analysis_ring": 7,
+                    "observed_at_epoch": time.time(),
+                    "pinned_snapshot": {"provenance": {"facts": []}},
+                },
+                attempts=1,
+                created_at=time.time(),
+                updated_at=time.time(),
+            )
+            result = {}
+
+            worker = threading.Thread(
+                target=lambda: result.setdefault(
+                    "value", service._execute_deferred_outcome(item)
+                ),
+                daemon=True,
+            )
+            worker.start()
+            self.assertTrue(preparation_started.wait(2))
+            started = time.monotonic()
+            with service._tracked_timechain_lock("user_analysis"):
+                elapsed = time.monotonic() - started
+            self.assertLess(elapsed, 0.1)
+            release_preparation.set()
+            worker.join(2)
+            self.assertFalse(worker.is_alive())
+            self.assertEqual(result.get("value"), "done")
+            self.assertTrue(commit_seen.is_set())
+            self.assertIsNone(service._timechain_owner)
+
 
 if __name__ == "__main__":
     unittest.main()
