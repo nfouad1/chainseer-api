@@ -1687,6 +1687,29 @@ class RobinhoodRPC:
         result = self._call("eth_getTransactionCount", [address, self._block_tag(block)])
         return int(result, 16) if result else 0
 
+    def get_transaction(self, transaction_hash: str) -> dict:
+        return self._call("eth_getTransactionByHash", [transaction_hash]) or {}
+
+    def get_transactions(self, transaction_hashes: list[str]) -> list[dict]:
+        """Resolve transaction envelopes in one JSON-RPC batch.
+
+        Each result retains its hash and an optional per-call error so watcher
+        ingestion can remain observational when one historical transaction is
+        temporarily unavailable.
+        """
+        hashes = [str(value) for value in transaction_hashes]
+        responses = self._batch_call([
+            ("eth_getTransactionByHash", [value]) for value in hashes
+        ])
+        return [
+            {
+                "transaction_hash": transaction_hash,
+                "transaction": response.get("result") or {},
+                "error": response.get("error"),
+            }
+            for transaction_hash, response in zip(hashes, responses)
+        ]
+
     def get_logs(self, from_block: int, to_block: int,
                  address: str = None, topics: list = None) -> list:
         params = {"fromBlock": hex(from_block), "toBlock": hex(to_block)}
@@ -1698,6 +1721,28 @@ class RobinhoodRPC:
 
     def call(self, to_address: str, data: str, block=None) -> str:
         return self._call("eth_call", [{"to": to_address, "data": data}, self._block_tag(block)])
+
+    def calls(self, calls: list[tuple[str, str]], block=None) -> list[dict]:
+        """Batch independent read-only contract calls at one block tag."""
+        tag = self._block_tag(block)
+        results = []
+        for offset in range(0, len(calls), 25):
+            results.extend(self._batch_call([
+                ("eth_call", [{"to": address, "data": data}, tag])
+                for address, data in calls[offset:offset + 25]
+            ]))
+        return results
+
+    def get_codes(self, addresses: list[str], block=None) -> list[dict]:
+        """Batch bytecode reads while preserving per-address errors."""
+        tag = self._block_tag(block)
+        results = []
+        for offset in range(0, len(addresses), 25):
+            results.extend(self._batch_call([
+                ("eth_getCode", [address, tag])
+                for address in addresses[offset:offset + 25]
+            ]))
+        return results
 
     def erc20_name(self, token: str, block=None) -> str:
         return _decode_string(

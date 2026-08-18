@@ -26,7 +26,11 @@ from pathlib import Path
 from typing import Any, Callable
 
 from chainseer_governance import assess_calibration_change
-from chainseer_outcome_ledger import verify_outcome_record
+from chainseer_outcome_ledger import (
+    OUTCOME_RING_TYPES,
+    canonical_outcome_rings,
+    verify_outcome_record,
+)
 
 
 CONTROL_SCHEMA_VERSION = "1.0"
@@ -1454,16 +1458,27 @@ class CalibrationEngine:
     @staticmethod
     def summarize(rings: list[dict[str, Any]]) -> dict[str, Any]:
         rings_by_index = {ring.get("index"): ring for ring in rings}
+        # Corrections are append-only. Calibration must consume the same
+        # canonical supersession view as Memory Core rather than counting both
+        # a defective historical record and its replacement.
+        canonical_rings = canonical_outcome_rings(rings)
+        # Shared with the ledger and its verifier, so a new producer is read
+        # by every consumer the moment it is named once. A local copy here is
+        # how solana_learning_outcome came to be absent from this filter while
+        # present in the ledger's.
         outcomes = [
-            ring
-            for ring in rings
-            if ring.get("ring_type") == "analysis_outcome"
+            ring for ring in canonical_rings
+            if isinstance((ring.get("payload") or {}).get("outcome_record"), dict)
+            or ring.get("ring_type") in OUTCOME_RING_TYPES
         ]
         invalid_records = 0
         evidence_ineligible = 0
         legacy_unbound = 0
+        eligible_records = 0
+        accepted_by_ring_type: dict[str, int] = {}
+        accepted_by_network: dict[str, int] = {}
         # A later horizon supersedes an earlier label for the same analysis.
-        latest: dict[int, dict[str, Any]] = {}
+        latest: dict[int, tuple[dict[str, Any], dict[str, Any]]] = {}
         for ring in outcomes:
             payload = ring.get("payload") or {}
             record = payload.get("outcome_record")
@@ -1481,46 +1496,99 @@ class CalibrationEngine:
             if not (record.get("learning") or {}).get("eligible"):
                 evidence_ineligible += 1
                 continue
-            analysis_ring = _safe_int(payload.get("analysis_ring"), -1)
+            eligible_records += 1
+            analysis_ring = _safe_int(reference.get("ring"), -1)
             if analysis_ring < 0:
+                invalid_records += 1
                 continue
             horizon = _safe_int(
-                (payload.get("other_outcomes") or {}).get("horizon_seconds"),
+                (record.get("other_outcomes") or {}).get("horizon_seconds"),
                 0,
             )
             previous = latest.get(analysis_ring)
+            previous_record = previous[1] if previous is not None else {}
             previous_horizon = _safe_int(
-                ((previous or {}).get("payload") or {})
-                .get("other_outcomes", {})
+                (previous_record.get("other_outcomes") or {})
                 .get("horizon_seconds"),
                 -1,
             )
             if previous is None or horizon >= previous_horizon:
-                latest[analysis_ring] = ring
+                latest[analysis_ring] = (ring, record)
+            ring_type = str(ring.get("ring_type") or "unknown")
+            network = str(reference.get("network") or "unknown")
+            accepted_by_ring_type[ring_type] = (
+                accepted_by_ring_type.get(ring_type, 0) + 1
+            )
+            accepted_by_network[network] = accepted_by_network.get(network, 0) + 1
 
         tp = fp = tn = fn = 0
-        market_returns = []
-        for ring in latest.values():
-            payload = ring.get("payload") or {}
-            calibration = payload.get("calibration") or {}
-            adverse = bool(calibration.get("adverse_security_event"))
-            risk = str(calibration.get("original_risk_level") or "Unknown")
-            predicted_adverse = risk in {"High", "Critical"}
-            if adverse and predicted_adverse:
-                tp += 1
-            elif adverse:
-                fn += 1
-            elif predicted_adverse:
-                fp += 1
+        market_returns: list[float] = []
+        security_unlabelled = 0
+        security_prediction_missing = 0
+        for ring, record in latest.values():
+            calibration = record.get("calibration") or {}
+            security = record.get("security_outcomes") or {}
+            if "adverse_security_event" in calibration:
+                adverse = bool(calibration.get("adverse_security_event"))
+                security_label_present = True
+            elif security:
+                adverse = bool(
+                    security.get("rug_pull")
+                    or security.get("honeypot_observed")
+                    or security.get("exploit")
+                    or security.get("owner_privilege_used")
+                    or security.get("tax_changed")
+                    or security.get("contract_upgraded")
+                    or _safe_float(security.get("liquidity_removed_pct"), 0.0)
+                        >= 50.0
+                )
+                security_label_present = True
             else:
-                tn += 1
-            value = (payload.get("market_outcomes") or {}).get("price_return_pct")
+                adverse = False
+                security_label_present = False
+            analysis = rings_by_index.get(
+                (record.get("analysis_reference") or {}).get("ring")
+            ) or {}
+            analysis_payload = analysis.get("payload") or {}
+            risk_value = (
+                calibration.get("original_risk_level")
+                or analysis_payload.get("risk_level")
+                or (analysis_payload.get("analysis") or {}).get("risk_level")
+                or (analysis_payload.get("decision") or {}).get("risk_level")
+            )
+            if not security_label_present:
+                security_unlabelled += 1
+            elif not risk_value:
+                security_prediction_missing += 1
+            else:
+                risk = str(risk_value)
+                predicted_adverse = risk in {"High", "Critical"}
+                if adverse and predicted_adverse:
+                    tp += 1
+                elif adverse:
+                    fn += 1
+                elif predicted_adverse:
+                    fp += 1
+                else:
+                    tn += 1
+            value = (record.get("market_outcomes") or {}).get("price_return_pct")
             if value is not None:
                 market_returns.append(_safe_float(value))
         actual_positive = tp + fn
         predicted_positive = tp + fp
         total = tp + fp + tn + fn
         return {
+            # Renamed: this is the SECURITY confusion-matrix total
+            # (tp+fp+tn+fn), i.e. predictions that had an explicit security
+            # label to score against -- not the calibration population. Three
+            # separate investigations read the old name as "records available"
+            # and each concluded the pipeline was broken when it was the
+            # fail-closed guard reporting no labels exist yet.
+            #
+            # sample_size is kept as a deprecated alias because
+            # chainseer_governance gates trade permits on it; removing it here
+            # would silently open that gate.
+            "security_label_samples": total,
             "sample_size": total,
             "true_positive": tp,
             "false_positive": fp,
@@ -1538,6 +1606,13 @@ class CalibrationEngine:
                 else None
             ),
             "market_return_samples": len(market_returns),
+            "security_label_samples": total,
+            "security_unlabelled_outcomes_excluded": security_unlabelled,
+            "security_prediction_missing_excluded": security_prediction_missing,
+            "canonical_eligible_outcome_records": eligible_records,
+            "calibrated_analysis_count": len(latest),
+            "accepted_by_ring_type": dict(sorted(accepted_by_ring_type.items())),
+            "accepted_by_network": dict(sorted(accepted_by_network.items())),
             "security_and_market_labels_separated": True,
             "invalid_outcome_records_excluded": invalid_records,
             "evidence_ineligible_outcomes_excluded": evidence_ineligible,
@@ -1547,7 +1622,7 @@ class CalibrationEngine:
     def propose(self, rings: list[dict[str, Any]]) -> dict[str, Any]:
         policy = self.policy()
         metrics = self.summarize(rings)
-        sample = metrics["sample_size"]
+        sample = metrics["security_label_samples"]
         fnr = metrics["false_negative_rate"]
         if sample < policy.min_outcomes:
             proposal = {
@@ -1612,7 +1687,7 @@ class CalibrationEngine:
                 + "; ".join(violations)
             )
         metrics = proposal.get("metrics") or {}
-        if _safe_int(metrics.get("sample_size")) < current.min_outcomes:
+        if _safe_int(metrics.get("security_label_samples")) < current.min_outcomes:
             raise ValueError("calibration adoption lacks the required outcomes")
         verdict, ring = agent.poq_module.gate_and_seal(
             agent.tc,
@@ -1630,7 +1705,7 @@ class CalibrationEngine:
                 "depth": 240,
                 "covenant": 255,
             },
-            declared_evidence=max(1, _safe_int(metrics.get("sample_size"))),
+            declared_evidence=max(1, _safe_int(metrics.get("security_label_samples"))),
             extra_payload={
                 "policy": asdict(proposed),
                 "metrics": metrics,

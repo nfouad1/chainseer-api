@@ -27,6 +27,7 @@ from chainseer_governance import verify_governance_registry
 from chainseer_outcome_ledger import (
     SUPPORTED_ANALYSIS_RING_TYPES,
     analysis_reference_from_ring,
+    canonical_outcome_rings,
     verify_outcome_record,
     verify_outcome_rings,
 )
@@ -274,7 +275,7 @@ class MemoryRecallEngine:
         if not 1 <= int(limit) <= 100:
             raise MemoryCoreError("memory query limit must be between 1 and 100")
 
-        rings = self._verified_rings()
+        rings = canonical_outcome_rings(self._verified_rings())
         by_index = {ring.get("index"): ring for ring in rings}
         exclusions: list[dict[str, Any]] = []
         analyses: list[tuple[dict[str, Any], dict[str, Any]]] = []

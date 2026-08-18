@@ -7,6 +7,7 @@ from pathlib import Path
 import chainseer_controls as controls
 from chainseer_outcome_ledger import (
     analysis_evidence_binding,
+    build_outcome_correction,
     build_outcome_record,
 )
 
@@ -1072,8 +1073,90 @@ class CalibrationTests(unittest.TestCase):
             },
         }
         metrics = controls.CalibrationEngine.summarize([legacy])
-        self.assertEqual(metrics["sample_size"], 0)
+        self.assertEqual(metrics["security_label_samples"], 0)
         self.assertEqual(metrics["legacy_unbound_outcomes_excluded"], 1)
+
+    def test_calibration_reads_canonical_records_across_adapter_ring_types(self):
+        ring_types = (
+            "base_learning_outcome",
+            "pons_security_outcome",
+            "robinhood_learning_outcome",
+        )
+        rings = []
+        for index, ring_type in enumerate(ring_types):
+            analysis, outcome = self.outcome_rings(index, adverse=index == 0)
+            outcome["ring_type"] = ring_type
+            rings.extend((analysis, outcome))
+
+        metrics = controls.CalibrationEngine.summarize(rings)
+
+        self.assertEqual(metrics["security_label_samples"], 3)
+        self.assertEqual(metrics["security_label_samples"], 3)
+        self.assertEqual(metrics["market_return_samples"], 3)
+        self.assertEqual(metrics["canonical_eligible_outcome_records"], 3)
+        self.assertEqual(metrics["calibrated_analysis_count"], 3)
+        self.assertEqual(
+            metrics["accepted_by_ring_type"],
+            {ring_type: 1 for ring_type in sorted(ring_types)},
+        )
+
+    def test_market_only_outcome_is_not_a_negative_security_label(self):
+        analysis, _outcome = self.outcome_rings(30, adverse=False)
+        provenance = analysis["payload"]["provenance"]
+        record = build_outcome_record(
+            analysis,
+            {"horizon_seconds": 3600, "price_return_pct": 25},
+            observed_at="2026-01-01T01:00:00+00:00",
+            outcome_provenance={**provenance, "block_pin": 2030},
+            calibration={"original_risk_level": "Low"},
+        )
+        outcome = {
+            "index": 30,
+            "ring_type": "robinhood_learning_outcome",
+            "payload": {"outcome_record": record},
+        }
+
+        metrics = controls.CalibrationEngine.summarize([analysis, outcome])
+
+        self.assertEqual(metrics["security_label_samples"], 0)
+        self.assertEqual(metrics["security_label_samples"], 0)
+        self.assertEqual(metrics["security_unlabelled_outcomes_excluded"], 1)
+        self.assertEqual(metrics["market_return_samples"], 1)
+        self.assertEqual(metrics["mean_market_return_pct"], 25.0)
+
+    def test_calibration_uses_correction_without_counting_superseded_record(self):
+        analysis, outcome = self.outcome_rings(40, adverse=False)
+        outcome["ring_type"] = "robinhood_learning_outcome"
+        outcome["ring_hash"] = "a" * 64
+        original = outcome["payload"]["outcome_record"]
+        # Reproduce the historical post-hash eligibility mutation.
+        original["learning"] = {
+            "eligible": False,
+            "reason": "market_outcome_not_observed",
+        }
+        corrected, correction = build_outcome_correction(
+            outcome,
+            analysis,
+            learning_exclusion_reason="market_outcome_not_observed",
+        )
+        correction_ring = {
+            "index": 41,
+            "ring_type": "robinhood_learning_outcome_correction",
+            "ring_hash": "b" * 64,
+            "payload": {
+                "outcome_record": corrected,
+                "outcome_correction": correction,
+            },
+        }
+
+        metrics = controls.CalibrationEngine.summarize(
+            [analysis, outcome, correction_ring]
+        )
+
+        self.assertEqual(metrics["security_label_samples"], 0)
+        self.assertEqual(metrics["evidence_ineligible_outcomes_excluded"], 1)
+        self.assertEqual(metrics["invalid_outcome_records_excluded"], 0)
+        self.assertEqual(metrics["canonical_eligible_outcome_records"], 0)
 
     def _hand_edited_proposal(self, **overrides):
         # adopt() takes an arbitrary proposal file path, not something bound
@@ -1089,7 +1172,7 @@ class CalibrationTests(unittest.TestCase):
             "status": "proposed",
             "current_policy": asdict(current),
             "proposed_policy": proposed,
-            "metrics": {"sample_size": current.min_outcomes},
+            "metrics": {"security_label_samples": current.min_outcomes},
         }
 
     def test_adopt_rejects_loosened_false_negative_rate(self):
@@ -1186,3 +1269,26 @@ class TradePermitTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class SecurityLabelSamplesNamingTests(unittest.TestCase):
+    """The counter is a security confusion matrix, and its name now says so.
+
+    As `sample_size` it read as the calibration population, and three separate
+    investigations concluded the pipeline was broken when the value was the
+    fail-closed guard correctly reporting that no explicit security labels
+    exist yet.
+    """
+
+    def test_new_name_is_emitted(self):
+        metrics = controls.CalibrationEngine.summarize([])
+        self.assertIn("security_label_samples", metrics)
+
+    def test_deprecated_alias_still_matches(self):
+        """chainseer_governance gates trade permits on the old key."""
+        metrics = controls.CalibrationEngine.summarize([])
+        self.assertIn("sample_size", metrics)
+        self.assertEqual(
+            metrics["sample_size"], metrics["security_label_samples"],
+            "the alias must never drift from the value it aliases",
+        )

@@ -8,6 +8,7 @@ import os
 import re
 import subprocess
 import sys
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
 
@@ -56,13 +57,25 @@ CLOSED_AUDIT_TOTAL_LOSS_RATIO = 0.25
 # governing invariant is that autonomous change may preserve or tighten risk
 # controls and never relax them; loosening stays a human decision.
 CLOSED_AUDIT_SCORE_STEP = 2.0
-CLOSED_AUDIT_SCORE_CEILING = 85.0
+# FROZEN at the floor the tightener had already reached. The reason is not
+# that the loss rate is unreal -- it is real and high -- but that raising the
+# score floor does not address it: measured over observed closes the
+# score-outcome correlation is -0.21, and the 80-85 bucket returned 0.125x
+# over 5 closes with zero winners, so every tighten so far pushed admission
+# INTO the worst-performing band.
+#
+# The ceiling is deliberately equal to the current floor rather than below it.
+# The governing invariant is that autonomous change may tighten or preserve a
+# risk control and never relax one, so lowering 78 to a smaller cap would have
+# to be a human decision, not a constant edit.
+CLOSED_AUDIT_SCORE_CEILING = 78.0
 # New closed positions required before tightening again. Without this the
 # audit stepped on EVERY checkpoint -- checkpoints fire every 15 analyses, so
 # it walked 70 -> 85 in eight consecutive steps inside twenty minutes, each one
 # re-reading substantially the same closed book. A tighten must be justified by
 # evidence that did not exist at the previous tighten.
 CLOSED_AUDIT_COOLDOWN_CLOSES = 5
+AUTONOMOUS_ADMISSION_TIGHTENING_ENABLED = False
 
 
 class RobinhoodReflectionCoordinator:
@@ -82,6 +95,7 @@ class RobinhoodReflectionCoordinator:
         self.command_runner = command_runner
         self.reflections_root = self.root / "reflections"
         self.state_path = self.root / "reflection_state.json"
+        self.flow_state_path = self.root / "flow_reflection_state.json"
         self.catalog_path = self.root / "reflection_recommendations.json"
         self.audit_path = self.root / "counterfactual_audit.json"
         # Autonomous tighten-only overrides. Absent file == module
@@ -359,7 +373,35 @@ class RobinhoodReflectionCoordinator:
             ),
             "maximum_analysis_queue_age_seconds": max(queue_ages) if queue_ages else None,
             "closed_positions": self._closed_position_metrics(),
+            "shadow_admission": self._shadow_admission_metrics(),
+            "portfolio": self._portfolio_metrics(),
         }
+
+    def _portfolio_metrics(self) -> dict:
+        """Win rate, average result, and outcome by score bucket.
+
+        Reported unconditionally so the tighten's own premise stays visible
+        next to it: if a higher score does not buy a better outcome, raising
+        the floor is not a safety measure.
+        """
+        try:
+            return self.store.portfolio_metrics()
+        except Exception as error:
+            return {"error": str(error)}
+
+    def _shadow_admission_metrics(self) -> dict:
+        """Report competing admission rules without letting any of them act.
+
+        The rules were fitted on 39 pools and look near-perfect on those same
+        39, which is exactly the shape of a result that evaporates out of
+        sample. Surfacing them in the checkpoint puts each rule's record next
+        to the live gate's record on tokens neither had seen when the rule was
+        written, which is the only comparison worth anything.
+        """
+        try:
+            return self.store.shadow_admission_report()
+        except Exception as error:  # a reporting gap must not stall reflection
+            return {"error": str(error), "enforced": False}
 
     def _closed_position_metrics(self) -> dict:
         """Audit positions that were ADMITTED and then failed.
@@ -377,7 +419,7 @@ class RobinhoodReflectionCoordinator:
         out = {
             "closed": 0, "winners": 0, "total_loss": 0,
             "total_loss_ratio": 0.0, "by_exit_reason": {},
-            "worst_symbols": [],
+            "worst_symbols": [], "observation_indeterminate": 0,
         }
         try:
             with self.store.connection() as connection:
@@ -385,9 +427,14 @@ class RobinhoodReflectionCoordinator:
                     dict(row)
                     for row in connection.execute(
                         """
-                        SELECT symbol, exit_reason, cost_usd, realized_value_usd,
-                               high_multiple
-                        FROM positions WHERE status!='open'
+                        SELECT p.symbol, p.exit_reason, p.cost_usd,
+                               p.realized_value_usd, p.high_multiple,
+                               p.token_address,
+                               -- Position marks, not outcome checkpoints:
+                               -- checkpoints need a 1h+ horizon, so keying off
+                               -- them hid every fast rug from the audit.
+                               (p.verified_mark_count>0) observed_marks
+                        FROM positions p WHERE p.status!='open'
                         """
                     )
                 ]
@@ -403,6 +450,15 @@ class RobinhoodReflectionCoordinator:
             cost = float(row.get("cost_usd") or 0.0) or 1.0
             realized = float(row.get("realized_value_usd") or 0.0)
             multiple = realized / cost
+            # A position the observer never once saw a market for cannot
+            # distinguish "went to zero" from "was never watched". Counting it
+            # as a total loss lets an outage masquerade as a selection failure
+            # and drives the tightener on a blind sample -- so it is held out
+            # of BOTH sides of the ratio rather than silently scored as a loss.
+            if not int(row.get("observed_marks") or 0):
+                out["observation_indeterminate"] += 1
+                continue
+            out["closed"] += 1
             if multiple > 1.0:
                 out["winners"] += 1
             # A total loss is capital that never came back at all -- distinct
@@ -411,11 +467,15 @@ class RobinhoodReflectionCoordinator:
             if multiple <= 0.01:
                 out["total_loss"] += 1
                 worst.append(str(row.get("symbol") or "<unnamed>"))
-        out["closed"] = len(rows)
         out["by_exit_reason"] = dict(
             sorted(reasons.items(), key=lambda kv: -kv[1])
         )
-        out["total_loss_ratio"] = round(out["total_loss"] / len(rows), 4)
+        # Denominator is observed closes only. With none observed the ratio is
+        # undefined, not zero -- and 0.0 would read as a clean book.
+        out["total_loss_ratio"] = (
+            round(out["total_loss"] / out["closed"], 4) if out["closed"] else 0.0
+        )
+        out["closed_including_indeterminate"] = len(rows)
         out["worst_symbols"] = worst[:10]
         return out
 
@@ -436,6 +496,41 @@ class RobinhoodReflectionCoordinator:
                     "rejected candidate(s) passed the liquid, realizable 2x audit."
                 ),
             })
+        portfolio = metrics.get("portfolio") or {}
+        correlation = portfolio.get("score_outcome_correlation")
+        if (
+            correlation is not None and correlation <= 0.1
+            and portfolio.get("closed", 0) >= CLOSED_AUDIT_MINIMUM_POSITIONS
+        ):
+            buckets = portfolio.get("by_score_bucket") or {}
+            worst = min(
+                (item for item in buckets.items() if item[1].get("n", 0) >= 3),
+                key=lambda item: item[1].get("average_multiple", 0.0),
+                default=None,
+            )
+            findings.append({
+                "code": "RH-REFLECT-SCORE-NON-PREDICTIVE",
+                "title": "A higher legitimacy score is not buying a better outcome",
+                "recommendation": (
+                    "Do not raise the entry floor on this evidence. The floor is a "
+                    "safety control only if score predicts outcome; measure the "
+                    "safety sub-signals (holder concentration, liquidity custody) "
+                    "against outcomes before changing any threshold."
+                ),
+                "evidence": (
+                    f"Checkpoint {checkpoint}: score-outcome correlation "
+                    f"{correlation} over {portfolio.get('closed')} observed closes"
+                    + (
+                        f"; worst bucket {worst[0]} averages "
+                        f"{worst[1].get('average_multiple')}x over {worst[1].get('n')} closes"
+                        if worst else ""
+                    )
+                ),
+                "metrics": {
+                    "score_outcome_correlation": correlation,
+                    "by_score_bucket": buckets,
+                },
+            })
         closed = metrics.get("closed_positions") or {}
         # Only speak once there is enough of a book to mean something; a single
         # bad close is noise, and this recommendation carries an autonomous
@@ -447,10 +542,10 @@ class RobinhoodReflectionCoordinator:
                 "code": "RH-REFLECT-TOTAL-LOSS-RATE",
                 "title": "Admitted positions are reaching total loss",
                 "recommendation": (
-                    "Tighten admission until the total-loss rate falls. Total losses "
-                    "are the one failure class the entry gate could have refused "
-                    "outright -- an exit rule cannot recover capital from a token "
-                    "whose price reached zero."
+                    "Keep autonomous score tightening frozen. Segment failures by "
+                    "DEX version and observation validity, then test executable "
+                    "liquidity and raw safety signals prospectively; an exit rule "
+                    "cannot recover capital from a genuinely collapsed market."
                 ),
                 "evidence": (
                     f"Checkpoint {checkpoint}: {closed['total_loss']} of "
@@ -458,7 +553,7 @@ class RobinhoodReflectionCoordinator:
                     f"({closed['total_loss_ratio']:.0%}); exit reasons "
                     f"{closed['by_exit_reason']}; affected {closed['worst_symbols']}."
                 ),
-                "autonomous_action": "tighten_admission",
+                "policy_state": "autonomous_score_tightening_frozen",
                 # Carried so the executor need not re-query the store, and so
                 # the action's cooldown is judged against the same closed count
                 # that justified the finding.
@@ -595,7 +690,28 @@ class RobinhoodReflectionCoordinator:
         for required in (timechain, chronosynaptic, recall):
             if not required.is_file():
                 raise RuntimeError(f"Cypher Tempre component is missing: {required}")
-        if not (self.timechain_root / "chain" / "rings.jsonl").exists():
+        rings_path = self.timechain_root / "chain" / "rings.jsonl"
+        if rings_path.exists():
+            try:
+                self._run([
+                    sys.executable, "-X", "utf8", str(timechain), "verify",
+                    "--root", str(self.timechain_root),
+                ])
+            except subprocess.CalledProcessError as exc:
+                # Never append to a chain whose hashes no longer verify. Keep
+                # the entire damaged ledger as a forensic archive and start a
+                # clean lineage; no ring is rewritten or deleted.
+                stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+                archive = self.root / f"reflection_timechain_corrupt_{stamp}"
+                self.timechain_root.replace(archive)
+                atomic_json_write(self.root / "reflection_chain_recovery.json", {
+                    "status": "rotated_corrupt_chain",
+                    "detected_at": datetime.now(timezone.utc).isoformat(),
+                    "archive": str(archive),
+                    "verification_error": str(exc)[:1000],
+                })
+                rings_path = self.timechain_root / "chain" / "rings.jsonl"
+        if not rings_path.exists():
             self._run([
                 sys.executable, "-X", "utf8", str(timechain), "init",
                 "--name", "ChainseerRobinhoodReflection",
@@ -641,6 +757,13 @@ class RobinhoodReflectionCoordinator:
         applied: list[dict] = []
         for item in recommendations:
             if item.get("autonomous_action") != "tighten_admission":
+                continue
+            if not AUTONOMOUS_ADMISSION_TIGHTENING_ENABLED:
+                applied.append({
+                    "checkpoint": checkpoint, "code": item["code"],
+                    "action": "tighten_admission", "status": "frozen",
+                    "reason": "score is not a validated outcome predictor",
+                })
                 continue
             state = read_json(self.policy_path, {}) or {}
             current = float(
@@ -713,7 +836,7 @@ class RobinhoodReflectionCoordinator:
             AUTO_START,
             "## Robinhood reflection recommendations",
             "",
-            "Generated from sealed 15-candidate checkpoints. Completion state is preserved on refresh.",
+            "Generated from sealed 15-candidate or 15-signal checkpoints. Completion state is preserved on refresh.",
             "",
         ]
         for code in sorted(items):
@@ -808,4 +931,87 @@ class RobinhoodReflectionCoordinator:
             "next_checkpoint": checkpoint + REFLECTION_BATCH_SIZE,
             "winner": existing.get("winner"),
             "recommendations": recommendations,
+        }
+
+    def run_flow_if_due(self) -> dict:
+        """Reflect every 15 prospective qualified signals without policy drift."""
+        evidence = self.store.flow_evidence_summary()
+        observed = safe_int(evidence.get("eligible_signals"), 0)
+        state = read_json(self.flow_state_path, {}) or {}
+        last_checkpoint = safe_int(state.get("last_checkpoint"), 0)
+        checkpoint = last_checkpoint + REFLECTION_BATCH_SIZE
+        if observed < checkpoint:
+            return {
+                "status": "not_due", "eligible_signals": observed,
+                "next_checkpoint": checkpoint,
+            }
+        self.reflections_root.mkdir(parents=True, exist_ok=True)
+        metrics = {**evidence, "checkpoint": checkpoint, "reflection_kind": "flow_evidence"}
+        recommendations = []
+        gates = evidence.get("promotion_gates") or {}
+        if not gates.get("minimum_sample"):
+            recommendations.append({
+                "code": "RH-FLOW-PROSPECTIVE-SAMPLE",
+                "title": "Continue the frozen prospective Flow cohort",
+                "recommendation": "Do not tune Flow thresholds before the pre-registered evidence window is complete.",
+                "evidence": f"Checkpoint {checkpoint}: {evidence.get('completed_15m', 0)} completed 15m qualified outcomes.",
+            })
+        if not gates.get("positive_incremental_expectancy"):
+            recommendations.append({
+                "code": "RH-FLOW-CONTROL-EDGE",
+                "title": "Require a positive paired control advantage",
+                "recommendation": "Keep Flow shadow-only until the lower confidence bound of paired net expectancy is above zero.",
+                "evidence": f"Checkpoint {checkpoint}: paired 15m evidence is {evidence.get('by_horizon', {}).get('15m', {})}.",
+            })
+        if not gates.get("bounded_nonexit_rate") or not gates.get("bounded_catastrophic_rate"):
+            recommendations.append({
+                "code": "RH-FLOW-EXIT-TAIL-RISK",
+                "title": "Reduce non-exitable and catastrophic Flow outcomes",
+                "recommendation": "Investigate identity concentration, adverse direction, liquidity and quote failures before promotion.",
+                "evidence": f"Checkpoint {checkpoint}: non-exit={evidence.get('nonexit_rate_15m')}, catastrophic={evidence.get('catastrophic_rate_15m')}.",
+            })
+        perspectives = [
+            {
+                "name": "Prospective causal evidence", "kind": "explicit",
+                "summary": "Judge qualified signals only against frozen-policy, time-matched controls and realizable returns.",
+                "scores": {"coherence": 255,"relevance": 255,"novelty": 245,"consistency": 255,"depth": 255,"covenant": 255},
+            },
+            {
+                "name": "Execution and tail risk", "kind": "explicit",
+                "summary": "Treat quote failures and non-exitable states as adverse outcomes; averages cannot hide catastrophic tails.",
+                "scores": {"coherence": 252,"relevance": 254,"novelty": 248,"consistency": 255,"depth": 254,"covenant": 255},
+            },
+            {
+                "name": "Frozen-policy governance", "kind": "explicit",
+                "summary": "Reflections may create TODO findings, but cannot mutate Flow thresholds during the active cohort.",
+                "scores": {"coherence": 255,"relevance": 253,"novelty": 244,"consistency": 255,"depth": 252,"covenant": 255},
+            },
+        ]
+        winner = "Prospective causal evidence"
+        notes = {
+            "query": f"Robinhood Flow evidence reflection at {checkpoint} prospective signals",
+            "context": metrics, "perspectives": perspectives,
+            "synthesis": "Continue frozen shadow evidence collection; promotion remains gated by paired executable outcomes and tail risk.",
+        }
+        notes_path = self.reflections_root / f"flow-checkpoint-{checkpoint:06d}-notes.json"
+        result_path = self.reflections_root / f"flow-checkpoint-{checkpoint:06d}.json"
+        atomic_json_write(notes_path, notes)
+        seal = self._seal(notes_path, winner, metrics)
+        result = {
+            "schema_version": 1, "checkpoint": checkpoint,
+            "reflection_kind": "flow_evidence", "metrics": metrics,
+            "perspectives": perspectives, "winner": winner,
+            "recommendations": recommendations, "sealed": True, "seal": seal,
+        }
+        atomic_json_write(result_path, result)
+        self._sync_todo(recommendations, checkpoint)
+        atomic_json_write(self.flow_state_path, {
+            "last_checkpoint": checkpoint,
+            "next_checkpoint": checkpoint + REFLECTION_BATCH_SIZE,
+            "latest_result": str(result_path),
+        })
+        return {
+            "status": "sealed", "checkpoint": checkpoint,
+            "next_checkpoint": checkpoint + REFLECTION_BATCH_SIZE,
+            "winner": winner, "recommendations": recommendations,
         }

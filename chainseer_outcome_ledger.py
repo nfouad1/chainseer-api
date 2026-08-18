@@ -12,6 +12,7 @@ from __future__ import annotations
 import hashlib
 import json
 import re
+from copy import deepcopy
 from datetime import datetime
 from typing import Any, Iterable
 
@@ -31,6 +32,22 @@ OUTCOME_LATENESS_FLOOR_SECONDS = 15 * 60
 OUTCOME_LATENESS_FRACTION = 0.25
 EVIDENCE_MANIFEST_SCHEMA_VERSION = "1.0"
 HASH_RE = re.compile(r"^[a-f0-9]{64}$")
+
+#: Every ring type that carries an outcome_record. Producers each named their
+#: own -- base_learning_outcome, pons_security_outcome,
+#: robinhood_learning_outcome -- while consumers were written against the
+#: generic "analysis_outcome" that nothing emits. CalibrationEngine therefore
+#: reported sample_size 0 on all three chains while 2,450 verified records sat
+#: in them. Shared here so a new producer joins by adding one name in one
+#: place rather than by silently going unread.
+OUTCOME_RING_TYPES = {
+    "analysis_outcome",
+    "base_learning_outcome",
+    "pons_security_outcome",
+    "robinhood_learning_outcome",
+    "robinhood_learning_outcome_correction",
+    "solana_learning_outcome",
+}
 
 SUPPORTED_ANALYSIS_RING_TYPES = {
     "token_analysis",
@@ -68,6 +85,15 @@ INFRASTRUCTURE_OUTCOME_KEYS = {
     "quote_unavailable",
     "data_stale",
 }
+
+# These exclusions are deliberately conservative: they can only remove a
+# record from training, never promote one. Keeping the vocabulary bounded
+# prevents an arbitrary producer-supplied string from silently becoming a new
+# policy rule in the canonical ledger.
+LEARNING_EXCLUSION_REASONS = frozenset({
+    "market_outcome_not_observed",
+    "checkpoint_outside_learner_tolerance",
+})
 
 
 class OutcomeLedgerError(ValueError):
@@ -407,6 +433,7 @@ def build_outcome_record(
     outcome_provenance: dict[str, Any] | None = None,
     evidence_fact_ids: Iterable[str] = (),
     calibration: dict[str, Any] | None = None,
+    learning_exclusion_reason: str | None = None,
 ) -> dict[str, Any]:
     analysis_ref = analysis_reference_from_ring(analysis_ring)
     observed = _parse_iso(observed_at, "observed_at")
@@ -453,6 +480,23 @@ def build_outcome_record(
         learning_reason = "outcome_observed_too_late_for_its_horizon"
     else:
         learning_reason = "analysis_and_outcome_evidence_hashes_complete"
+    if learning_exclusion_reason is not None:
+        if learning_exclusion_reason not in LEARNING_EXCLUSION_REASONS:
+            raise OutcomeLedgerError("unsupported learning exclusion reason")
+        baseline_eligible = learning_eligible
+        learning_eligible = False
+        learning_reason = learning_exclusion_reason
+    else:
+        baseline_eligible = learning_eligible
+    learning = {
+        "eligible": learning_eligible,
+        "reason": learning_reason,
+    }
+    if learning_exclusion_reason is not None:
+        learning.update({
+            "baseline_eligible": baseline_eligible,
+            "exclusion_reason": learning_exclusion_reason,
+        })
     record = {
         "record_type": "chainseer_analysis_outcome",
         "schema_version": OUTCOME_LEDGER_SCHEMA_VERSION,
@@ -471,10 +515,7 @@ def build_outcome_record(
             ),
             "complete": outcome_evidence_complete,
         },
-        "learning": {
-            "eligible": learning_eligible,
-            "reason": learning_reason,
-        },
+        "learning": learning,
         "timing": timing,
         "calibration": dict(calibration or {}),
     }
@@ -547,12 +588,23 @@ def verify_outcome_record(
         timely = True
         if isinstance(timing, dict):
             timely = timing.get("within_tolerance") is not False
-        expected_eligibility = (
+        baseline_eligibility = (
             bool(reference.get("evidence_complete"))
             and bool(outcome_manifest and outcome_manifest.get("complete_fact_hashes"))
             and timely
         )
-        if bool((record.get("learning") or {}).get("eligible")) != expected_eligibility:
+        learning = record.get("learning") or {}
+        exclusion_reason = learning.get("exclusion_reason")
+        expected_eligibility = baseline_eligibility
+        if exclusion_reason is not None:
+            if exclusion_reason not in LEARNING_EXCLUSION_REASONS:
+                raise OutcomeLedgerError("unsupported learning exclusion reason")
+            if learning.get("reason") != exclusion_reason:
+                raise OutcomeLedgerError("learning exclusion reason is inconsistent")
+            if bool(learning.get("baseline_eligible")) != baseline_eligibility:
+                raise OutcomeLedgerError("baseline learning eligibility is inconsistent")
+            expected_eligibility = False
+        if bool(learning.get("eligible")) != expected_eligibility:
             raise OutcomeLedgerError("outcome learning eligibility is inconsistent")
         if analysis_ring is not None:
             expected = analysis_reference_from_ring(analysis_ring)
@@ -563,6 +615,176 @@ def verify_outcome_record(
         return True, "verified"
     except (OutcomeLedgerError, TypeError, ValueError) as exc:
         return False, str(exc)
+
+
+def build_outcome_correction(
+    original_outcome_ring: dict[str, Any],
+    analysis_ring: dict[str, Any],
+    *,
+    learning_exclusion_reason: str,
+) -> tuple[dict[str, Any], dict[str, Any]]:
+    """Build an append-only correction for the historical post-hash bug.
+
+    Only the learning block and its dependent record hash may change. The
+    correction metadata binds both versions and the immutable source ring, so
+    a verifier can select the corrected canonical view without erasing the bad
+    historical record.
+    """
+    if learning_exclusion_reason not in LEARNING_EXCLUSION_REASONS:
+        raise OutcomeLedgerError("unsupported learning exclusion reason")
+    payload = original_outcome_ring.get("payload") or {}
+    original = payload.get("outcome_record")
+    if not isinstance(original, dict):
+        raise OutcomeLedgerError("superseded ring has no outcome record")
+    original_ok, original_reason = verify_outcome_record(original, analysis_ring)
+    if original_ok or original_reason != "outcome record hash mismatch":
+        raise OutcomeLedgerError(
+            "only outcome record hash mismatches can be corrected"
+        )
+    corrected = deepcopy(original)
+    reference = corrected.get("analysis_reference") or {}
+    expected_reference = analysis_reference_from_ring(analysis_ring)
+    if canonical_hash(reference) != canonical_hash(expected_reference):
+        raise OutcomeLedgerError("correction analysis reference mismatch")
+    outcome_evidence = corrected.get("outcome_evidence") or {}
+    manifest = outcome_evidence.get("manifest")
+    timely = True
+    timing = corrected.get("timing")
+    if isinstance(timing, dict):
+        timely = timing.get("within_tolerance") is not False
+    baseline_eligible = (
+        bool(reference.get("evidence_complete"))
+        and bool(manifest and manifest.get("complete_fact_hashes"))
+        and timely
+    )
+    corrected["learning"] = {
+        "eligible": False,
+        "reason": learning_exclusion_reason,
+        "baseline_eligible": baseline_eligible,
+        "exclusion_reason": learning_exclusion_reason,
+    }
+    corrected.pop("record_hash", None)
+    corrected["record_hash"] = canonical_hash(corrected)
+    corrected_ok, corrected_reason = verify_outcome_record(corrected, analysis_ring)
+    if not corrected_ok:
+        raise OutcomeLedgerError(
+            f"corrected outcome record is invalid: {corrected_reason}"
+        )
+    correction = {
+        "schema_version": "1.0",
+        "correction_type": "outcome_learning_integrity_supersession",
+        "supersedes_ring": original_outcome_ring.get("index"),
+        "supersedes_ring_hash": original_outcome_ring.get("ring_hash"),
+        "original_record_hash": original.get("record_hash"),
+        "corrected_record_hash": corrected["record_hash"],
+        "learning_exclusion_reason": learning_exclusion_reason,
+    }
+    correction["correction_hash"] = canonical_hash(correction)
+    return corrected, correction
+
+
+def _valid_outcome_corrections(
+    ring_list: list[dict[str, Any]],
+) -> tuple[dict[int, dict[str, Any]], list[dict[str, Any]]]:
+    """Return valid one-to-one supersessions and correction errors."""
+    by_index = {ring.get("index"): ring for ring in ring_list}
+    candidates: dict[int, list[dict[str, Any]]] = {}
+    errors: list[dict[str, Any]] = []
+    for ring in ring_list:
+        payload = ring.get("payload") or {}
+        correction = payload.get("outcome_correction")
+        if not isinstance(correction, dict):
+            continue
+        target_index = correction.get("supersedes_ring")
+        candidates.setdefault(target_index, []).append(ring)
+    valid: dict[int, dict[str, Any]] = {}
+    for target_index, correction_rings in candidates.items():
+        if len(correction_rings) != 1:
+            for ring in correction_rings:
+                errors.append({
+                    "ring": ring.get("index"),
+                    "reason": "multiple outcome corrections target one ring",
+                })
+            continue
+        ring = correction_rings[0]
+        payload = ring.get("payload") or {}
+        correction = payload.get("outcome_correction") or {}
+        try:
+            if correction.get("schema_version") != "1.0":
+                raise OutcomeLedgerError("unsupported outcome correction schema")
+            if correction.get("correction_type") != (
+                "outcome_learning_integrity_supersession"
+            ):
+                raise OutcomeLedgerError("unsupported outcome correction type")
+            target = by_index.get(target_index)
+            if target is None:
+                raise OutcomeLedgerError("superseded outcome ring is missing")
+            if (target.get("payload") or {}).get("outcome_correction") is not None:
+                raise OutcomeLedgerError("correction chains are not supported")
+            if target.get("ring_hash") != correction.get("supersedes_ring_hash"):
+                raise OutcomeLedgerError("superseded outcome ring hash mismatch")
+            bare_correction = {
+                key: value for key, value in correction.items()
+                if key != "correction_hash"
+            }
+            if canonical_hash(bare_correction) != correction.get("correction_hash"):
+                raise OutcomeLedgerError("outcome correction hash mismatch")
+            original = (target.get("payload") or {}).get("outcome_record")
+            corrected = payload.get("outcome_record")
+            if not isinstance(original, dict) or not isinstance(corrected, dict):
+                raise OutcomeLedgerError("outcome correction record is missing")
+            if original.get("record_hash") != correction.get("original_record_hash"):
+                raise OutcomeLedgerError("original outcome record hash mismatch")
+            if corrected.get("record_hash") != correction.get("corrected_record_hash"):
+                raise OutcomeLedgerError("corrected outcome record hash mismatch")
+            if (corrected.get("learning") or {}).get("exclusion_reason") != (
+                correction.get("learning_exclusion_reason")
+            ):
+                raise OutcomeLedgerError("correction learning exclusion mismatch")
+            # The repair is deliberately narrow. Replacing these two dependent
+            # fields in the original must yield the exact corrected record.
+            expected = deepcopy(original)
+            expected["learning"] = deepcopy(corrected.get("learning"))
+            expected["record_hash"] = corrected.get("record_hash")
+            if canonical_hash(expected) != canonical_hash(corrected):
+                raise OutcomeLedgerError(
+                    "outcome correction changed fields outside learning integrity"
+                )
+            reference = corrected.get("analysis_reference") or {}
+            analysis = by_index.get(reference.get("ring"))
+            ok, reason = verify_outcome_record(corrected, analysis)
+            if not ok:
+                raise OutcomeLedgerError(f"corrected outcome is invalid: {reason}")
+            original_ok, original_reason = verify_outcome_record(original, analysis)
+            if original_ok or original_reason != "outcome record hash mismatch":
+                raise OutcomeLedgerError("superseded outcome is not the known hash defect")
+            valid[int(target_index)] = ring
+        except (OutcomeLedgerError, TypeError, ValueError) as exc:
+            errors.append({"ring": ring.get("index"), "reason": str(exc)})
+    return valid, errors
+
+
+def canonical_outcome_rings(
+    rings: Iterable[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """Project immutable rings into the valid canonical supersession view."""
+    ring_list = list(rings)
+    valid, _errors = _valid_outcome_corrections(ring_list)
+    correction_indices = {
+        ring.get("index") for ring in ring_list
+        if isinstance((ring.get("payload") or {}).get("outcome_correction"), dict)
+    }
+    valid_correction_indices = {
+        ring.get("index") for ring in valid.values()
+    }
+    return [
+        ring for ring in ring_list
+        if ring.get("index") not in valid
+        and (
+            ring.get("index") not in correction_indices
+            or ring.get("index") in valid_correction_indices
+        )
+    ]
 
 
 def _record_is_timely(record: dict[str, Any]) -> bool:
@@ -590,6 +812,22 @@ def verify_outcome_rings(
     rings: Iterable[dict[str, Any]],
 ) -> dict[str, Any]:
     ring_list = list(rings)
+    valid_corrections, correction_errors = _valid_outcome_corrections(ring_list)
+    correction_indices = {
+        ring.get("index") for ring in ring_list
+        if isinstance((ring.get("payload") or {}).get("outcome_correction"), dict)
+    }
+    valid_correction_indices = {
+        ring.get("index") for ring in valid_corrections.values()
+    }
+    canonical_rings = [
+        ring for ring in ring_list
+        if ring.get("index") not in valid_corrections
+        and (
+            ring.get("index") not in correction_indices
+            or ring.get("index") in valid_correction_indices
+        )
+    ]
     by_index = {ring.get("index"): ring for ring in ring_list}
     checked = 0
     eligible = 0
@@ -601,14 +839,11 @@ def verify_outcome_rings(
     # unnoticed while every integrity check kept reporting healthy.
     latest_outcome_at: str | None = None
     latest_outcome_ring: int | None = None
-    errors: list[dict[str, Any]] = []
-    for ring in ring_list:
+    errors: list[dict[str, Any]] = list(correction_errors)
+    for ring in canonical_rings:
         payload = ring.get("payload") or {}
         record = payload.get("outcome_record")
-        is_outcome_ring = ring.get("ring_type") in {
-            "analysis_outcome",
-            "base_learning_outcome",
-        }
+        is_outcome_ring = ring.get("ring_type") in OUTCOME_RING_TYPES
         if is_outcome_ring or record is not None:
             timestamp = ring.get("timestamp")
             if timestamp:
@@ -641,6 +876,7 @@ def verify_outcome_rings(
         "checked": checked,
         "learning_eligible": eligible,
         "legacy_unbound": legacy_unbound,
+        "superseded_records": len(valid_corrections),
         "stale_horizon_excluded": stale_horizon,
         "latest_outcome_at": latest_outcome_at,
         "latest_outcome_ring": latest_outcome_ring,

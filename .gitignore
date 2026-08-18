@@ -73,3 +73,16 @@ out/
 Thumbs.db
 .idea/
 .vscode/
+
+# Vendored agent skill + its append-only chain (belongs to the tool, not this repo)
+.codex/
+.hermes/
+.zcode/
+
+# Learning run artefacts: DB snapshots and rotated archives, not source
+robinhood_learning_archives/
+robinhood_learning/
+
+# Session scratch: chronosynaptic fork worksheets and review artefacts
+_fork*.json
+robinhood_review_forks.json

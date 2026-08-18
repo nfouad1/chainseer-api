@@ -3,7 +3,9 @@ import unittest
 from chainseer_outcome_ledger import (
     analysis_evidence_binding,
     analysis_reference_from_ring,
+    build_outcome_correction,
     build_outcome_record,
+    canonical_outcome_rings,
     verify_outcome_record,
     verify_outcome_rings,
 )
@@ -157,6 +159,108 @@ class OutcomeLedgerTests(unittest.TestCase):
         self.assertTrue(status["ok"])
         self.assertEqual(status["checked"], 1)
         self.assertEqual(status["learning_eligible"], 1)
+
+    def test_conservative_learning_exclusion_is_hashed_and_verifiable(self):
+        analysis = evm_analysis_ring()
+        outcome = build_outcome_record(
+            analysis,
+            {"infrastructure_indeterminate": True, "horizon_seconds": 900},
+            observed_at="2026-01-01T00:15:02+00:00",
+            outcome_provenance=provenance(456),
+            learning_exclusion_reason="market_outcome_not_observed",
+        )
+        self.assertFalse(outcome["learning"]["eligible"])
+        self.assertTrue(outcome["learning"]["baseline_eligible"])
+        self.assertEqual(
+            outcome["learning"]["exclusion_reason"],
+            "market_outcome_not_observed",
+        )
+        self.assertTrue(verify_outcome_record(outcome, analysis)[0])
+
+    def test_append_only_correction_supersedes_only_known_hash_defect(self):
+        analysis = evm_analysis_ring()
+        original = build_outcome_record(
+            analysis,
+            {"infrastructure_indeterminate": True, "horizon_seconds": 900},
+            observed_at="2026-01-01T00:15:02+00:00",
+            outcome_provenance=provenance(456),
+        )
+        # Reproduce the historical defect: mutate eligibility after hashing.
+        original["learning"] = {
+            "eligible": False,
+            "reason": "market_outcome_not_observed",
+        }
+        original_ring = {
+            "index": 9,
+            "ring_type": "analysis_outcome",
+            "ring_hash": "1" * 64,
+            "timestamp": "2026-01-01T00:15:03+00:00",
+            "payload": {"outcome_record": original},
+        }
+        corrected, correction = build_outcome_correction(
+            original_ring,
+            analysis,
+            learning_exclusion_reason="market_outcome_not_observed",
+        )
+        correction_ring = {
+            "index": 10,
+            "ring_type": "robinhood_learning_outcome_correction",
+            "ring_hash": "2" * 64,
+            "timestamp": "2026-01-01T00:16:00+00:00",
+            "payload": {
+                "outcome_record": corrected,
+                "outcome_correction": correction,
+            },
+        }
+        rings = [analysis, original_ring, correction_ring]
+        status = verify_outcome_rings(rings)
+        self.assertTrue(status["ok"], status["errors"])
+        self.assertEqual(status["checked"], 1)
+        self.assertEqual(status["learning_eligible"], 0)
+        self.assertEqual(status["superseded_records"], 1)
+        self.assertEqual(
+            [ring["index"] for ring in canonical_outcome_rings(rings)],
+            [7, 10],
+        )
+
+    def test_tampered_correction_cannot_hide_original_error(self):
+        analysis = evm_analysis_ring()
+        original = build_outcome_record(
+            analysis,
+            {"infrastructure_indeterminate": True},
+            observed_at="2026-01-02T00:00:00+00:00",
+            outcome_provenance=provenance(456),
+        )
+        original["learning"]["eligible"] = False
+        original["learning"]["reason"] = "market_outcome_not_observed"
+        original_ring = {
+            "index": 9, "ring_type": "analysis_outcome",
+            "ring_hash": "1" * 64,
+            "payload": {"outcome_record": original},
+        }
+        corrected, correction = build_outcome_correction(
+            original_ring, analysis,
+            learning_exclusion_reason="market_outcome_not_observed",
+        )
+        correction["supersedes_ring_hash"] = "f" * 64
+        correction_ring = {
+            "index": 10, "ring_type": "robinhood_learning_outcome_correction",
+            "ring_hash": "2" * 64,
+            "payload": {
+                "outcome_record": corrected,
+                "outcome_correction": correction,
+            },
+        }
+        status = verify_outcome_rings([analysis, original_ring, correction_ring])
+        self.assertFalse(status["ok"])
+        self.assertEqual(status["superseded_records"], 0)
+        self.assertGreaterEqual(len(status["errors"]), 1)
+        self.assertEqual(
+            [ring["index"] for ring in canonical_outcome_rings(
+                [analysis, original_ring, correction_ring]
+            )],
+            [7, 9],
+        )
 
 
 class LaunchAdapterRingRecognitionTests(unittest.TestCase):

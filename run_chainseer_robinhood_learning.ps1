@@ -3,8 +3,24 @@ param(
     # Robinhood produces roughly 3,000 blocks per five-minute interval.
     # 5,000 keeps discovery ahead while retaining a bounded RPC request.
     [ValidateRange(1, 10000)][int]$DiscoveryBlockLimit = 5000,
-    [ValidateRange(0, 10)][int]$AnalysisLimit = 1,
-    [ValidateRange(0, 100)][int]$OutcomeLimit = 12
+    # Analysis is the binding stage. At 2 per five-minute cycle it processed
+    # 24 candidates/hour against 55/hour of discovery, so the pending queue
+    # grew ~31/hour and stood at 188; entry starved to 0.6 admits/hour while
+    # the book drained 27 -> 17 by attrition. Cycles used 34s of a 300s budget
+    # at the old limit, so the constraint was the cap, not the clock.
+    # Raised to 8 (96/hour) to clear the backlog and outpace discovery.
+    [ValidateRange(0, 10)][int]$AnalysisLimit = 8,
+    # Timely checkpoints retain learning value and always receive this slice.
+    # At the measured discovery rate, 12 per cycle covers fresh demand without
+    # letting remote market lookups consume the complete five-minute cycle.
+    [ValidateRange(0, 100)][int]$OutcomeLimit = 12,
+    # Late checkpoints are coverage-only observations. Keep their recovery
+    # separate and small so an outage backlog cannot starve timely marks.
+    [ValidateRange(0, 30)][int]$OutcomeRecoveryLimit = 4,
+    # Market-only checks are cheap; full analysis runs only after a verified
+    # executable pool is found.
+    [ValidateRange(0, 20)][int]$MarketRecheckLimit = 4,
+    [ValidateRange(60, 290)][int]$CycleBudgetSeconds = 255
 )
 $ErrorActionPreference = "Stop"
 $workspacePath = $PSScriptRoot
@@ -39,7 +55,10 @@ try {
         "-X", "utf8", (Join-Path $workspacePath "chainseer_robinhood.py"),
         "learn-once", "--root", $learningRoot,
         "--discovery-block-limit", "$DiscoveryBlockLimit",
-        "--analysis-limit", "$AnalysisLimit", "--outcome-limit", "$OutcomeLimit"
+        "--analysis-limit", "$AnalysisLimit", "--outcome-limit", "$OutcomeLimit",
+        "--outcome-recovery-limit", "$OutcomeRecoveryLimit",
+        "--market-recheck-limit", "$MarketRecheckLimit",
+        "--cycle-budget-seconds", "$CycleBudgetSeconds"
     )
     $process = Start-Process -FilePath $pythonPath -ArgumentList $arguments -Wait `
         -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath `
