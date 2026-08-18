@@ -4041,10 +4041,15 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
             quote_block=window_end, now=self.NOW,
         )
 
-    def _classify(self, store, observation_id, coverage=1.0, gates=()):
+    QUOTE = {"verified": True, "anchor_in_raw": 1_000,
+             "token_out_raw": 10 ** 18}
+
+    def _classify(self, store, observation_id, coverage=1.0, gates=(),
+                  decision_quote=QUOTE):
         return store.classify_flow_observation(
             observation_id, decision_head=self.DECISION_HEAD,
             identity_coverage=coverage, gates=list(gates),
+            decision_quote=decision_quote,
         )
 
     def test_observation_is_committed_before_enrichment(self):
@@ -4093,15 +4098,29 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertGreater(scheduled, 0)
 
-    def test_decision_stale_can_never_enter_paper_trading(self):
+    def test_decision_stale_is_tradeable_only_with_a_verified_price(self):
+        """Policy change, deliberately recorded here.
+
+        This previously asserted that stale-at-decision could NEVER be
+        tradeable. That rule was retired because the 120-block bound it rested
+        on was unreachable on this RPC -- drift is pass duration times ~9.95
+        blocks/second, and the fastest of seven passes was 49s against the 12s
+        the bound required -- so it was not protecting anything, it was
+        refusing everything. The protection it was meant to give now comes
+        from re-taking the price: stale-at-decision is tradeable when its
+        entry price still verifies NOW, and never when it does not.
+        """
         with tempfile.TemporaryDirectory() as directory:
             store = self._store(directory)
-            verdict = self._classify(
-                store, self._seal(store, self.OBS_HEAD - 10),
-            )
+            observation_id = self._seal(store, self.OBS_HEAD - 10)
             self.assertFalse(
-                verdict["paper_eligible"],
-                "stale-at-decision must never be tradeable however clean",
+                self._classify(store, observation_id,
+                               decision_quote=None)["paper_eligible"],
+                "no re-quote must still mean no paper entry",
+            )
+            self.assertTrue(
+                self._classify(store, observation_id)["paper_eligible"],
+                "a re-verified price is what makes it actionable",
             )
 
     def test_fresh_identity_verified_reaches_the_paper_boundary(self):
@@ -4115,6 +4134,72 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
             self.assertEqual(verdict["identity_tier"], "verified")
             self.assertTrue(verdict["research_eligible"])
             self.assertTrue(verdict["paper_eligible"])
+
+    def test_without_a_decision_quote_nothing_is_tradeable(self):
+        """The safe default: no re-quote, no paper entry.
+
+        Decision freshness is now a price question, so a caller that offers no
+        price has not answered it. Silence must not read as a pass -- that is
+        the absence-as-evidence error this layer exists to prevent.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            observation_id = self._seal(
+                store, self.DECISION_HEAD - 10, head=self.DECISION_HEAD - 5,
+            )
+            verdict = self._classify(store, observation_id, decision_quote=None)
+            self.assertTrue(verdict["research_eligible"])
+            self.assertFalse(verdict["paper_eligible"])
+            self.assertFalse(verdict["decision_quote_verified"])
+
+    def test_an_unverifiable_decision_quote_blocks_paper(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            observation_id = self._seal(
+                store, self.DECISION_HEAD - 10, head=self.DECISION_HEAD - 5,
+            )
+            verdict = self._classify(
+                store, observation_id,
+                decision_quote={"verified": False, "anchor_in_raw": 1_000},
+            )
+            self.assertFalse(verdict["paper_eligible"])
+
+    def test_price_drift_is_recorded_for_a_later_threshold(self):
+        """Recorded, not gated -- the threshold comes from the cohort."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            observation_id = self._seal(
+                store, self.DECISION_HEAD - 10, head=self.DECISION_HEAD - 5,
+            )
+            verdict = self._classify(
+                store, observation_id,
+                decision_quote={"verified": True, "anchor_in_raw": 1_100,
+                                "token_out_raw": 10 ** 18},
+            )
+            self.assertIsNotNone(verdict["decision_price_drift_bps"])
+            self.assertAlmostEqual(
+                verdict["decision_price_drift_bps"], 1_000.0, places=1,
+                msg="a 10% move must read as 1,000 bps",
+            )
+            self.assertIsNone(rh.FLOW_DECISION_DRIFT_THRESHOLD_BPS)
+            self.assertTrue(
+                verdict["paper_eligible"],
+                "drift is recorded, not gated, until the cohort measures it",
+            )
+
+    def test_block_lag_no_longer_decides_eligibility(self):
+        """1,631 blocks of drift was unreachable-by-design, not dangerous."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            verdict = self._classify(
+                store, self._seal(store, self.OBS_HEAD - 10),
+            )
+            self.assertEqual(verdict["arm"], "decision_stale")
+            self.assertEqual(verdict["decision_head_lag_blocks"], 1_631)
+            self.assertTrue(
+                verdict["paper_eligible"],
+                "a verifiable price is what makes a signal actionable",
+            )
 
     def test_historical_observations_stay_excluded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5199,3 +5284,129 @@ class IncrementalNearHeadScanTests(unittest.TestCase):
                 "a narrower scan is the only lever on pass duration",
             )
             self.assertEqual(result["scan_blocks"], 487)
+
+
+class DecisionQuoteWiringTests(unittest.TestCase):
+    """The cycle re-prices only what a price could make tradeable.
+
+    classify_sealed_observations sweeps every observation for the policy
+    version each cycle -- 392 in one measured sweep. A quote is an RPC round
+    trip, so quoting the whole sweep would spend hundreds of calls re-pricing
+    observations that stay research-only whatever the price says.
+    """
+
+    HEAD = 41_000_000
+    NOW = 30_000.0
+
+    class _Market:
+        def __init__(self, fail=False):
+            self.calls = []
+            self.fail = fail
+
+        def snapshot(self, candidate, quote_block=None):
+            self.calls.append(candidate["pool_id"])
+            if self.fail:
+                raise RuntimeError("quote unavailable")
+            return {"execution_quote": {
+                "verified": True, "anchor_in_raw": 1_000,
+                "token_out_raw": 10 ** 18,
+            }}
+
+    def _engine(self, directory, fail=False):
+        store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.store = store
+        engine.root = Path(directory)
+        engine.v4_market = self._Market(fail=fail)
+        return engine, store
+
+    def _observation(self, store, pool, *, gaps, coverage):
+        store.seal_flow_observation(
+            pool_id=pool, token_address=TOKEN, observation_head=self.HEAD,
+            window_start_block=self.HEAD - 450, window_end_block=self.HEAD - 10,
+            transaction_hashes=[f"{pool}tx"], features={},
+            quote={"execution_quote": {
+                "verified": True, "anchor_in_raw": 1_000,
+                "token_out_raw": 10 ** 18}},
+            quote_block=self.HEAD - 10, now=self.NOW,
+        )
+        with store.connection() as connection:
+            connection.execute(
+                """INSERT OR REPLACE INTO flow_signals (source_version,pool_id,
+                       token_address,computed_at,window_blocks,
+                       window_start_block,window_end_block,swap_count,buy_count,
+                       sell_count,unique_sender_hints,
+                       unique_resolved_participants,identity_coverage,buy_ratio,
+                       net_anchor_flow_fraction,uncapped_shadow_score,
+                       shadow_score,shadow_qualified,confidence,features_json,
+                       qualification_gaps_json,limitations_json)
+                   VALUES ('uniswap_v4',?,?,?,1350,?,?,8,6,2,4,4,?,0.75,0.5,
+                           80.0,80.0,1,'ok','{}',?,'[]')""",
+                (pool, TOKEN, rh._utc_now(), self.HEAD - 450, self.HEAD - 10,
+                 coverage, json.dumps(gaps)),
+            )
+
+    def test_a_gated_observation_is_never_re_quoted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(directory)
+            self._observation(store, "0x" + "a1" * 32,
+                              gaps=["minimum_swaps"], coverage=1.0)
+            result = engine.classify_sealed_observations(self.HEAD)
+            self.assertEqual(engine.v4_market.calls, [])
+            self.assertEqual(result["decision_quotes_taken"], 0)
+
+    def test_unverified_identity_is_never_re_quoted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(directory)
+            self._observation(store, "0x" + "a2" * 32, gaps=[], coverage=0.0)
+            engine.classify_sealed_observations(self.HEAD)
+            self.assertEqual(
+                engine.v4_market.calls, [],
+                "an unresolved-identity window cannot be traded at any price",
+            )
+
+    def test_a_paper_candidate_is_re_quoted_and_becomes_eligible(self):
+        pool = "0x" + "a3" * 32
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(directory)
+            self._observation(store, pool, gaps=[], coverage=1.0)
+            result = engine.classify_sealed_observations(self.HEAD)
+            self.assertEqual(engine.v4_market.calls, [pool])
+            self.assertEqual(result["decision_quotes_taken"], 1)
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT paper_eligible, decision_quote_verified,"
+                    " decision_price_drift_bps"
+                    " FROM flow_observation_classifications"
+                ).fetchone()
+            self.assertTrue(row["paper_eligible"])
+            self.assertTrue(row["decision_quote_verified"])
+            self.assertEqual(row["decision_price_drift_bps"], 0.0)
+
+    def test_a_failed_re_quote_leaves_it_research_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(directory, fail=True)
+            self._observation(store, "0x" + "a4" * 32, gaps=[], coverage=1.0)
+            result = engine.classify_sealed_observations(self.HEAD)
+            self.assertEqual(result["decision_quote_failures"], 1)
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT paper_eligible FROM flow_observation_classifications"
+                ).fetchone()
+            self.assertFalse(
+                row["paper_eligible"],
+                "a failed re-quote must not read as a pass",
+            )
+
+    def test_the_per_cycle_quote_budget_is_bounded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(directory)
+            for index in range(rh.FLOW_DECISION_QUOTE_LIMIT + 5):
+                self._observation(store, f"0x{index:064x}", gaps=[], coverage=1.0)
+            result = engine.classify_sealed_observations(self.HEAD)
+            self.assertEqual(
+                result["decision_quotes_taken"], rh.FLOW_DECISION_QUOTE_LIMIT,
+            )
+            self.assertLessEqual(
+                len(engine.v4_market.calls), rh.FLOW_DECISION_QUOTE_LIMIT,
+            )

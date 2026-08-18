@@ -157,6 +157,27 @@ FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS = FLOW_WINDOW_BLOCKS
 # the observation from research as well as from trading. Decision freshness,
 # which is what gates paper entry, stays at 120.
 FLOW_MAXIMUM_OBSERVATION_HEAD_LAG_BLOCKS = FLOW_WINDOW_BLOCKS
+# Decision freshness is no longer a block count. Measured across 7 near-head
+# passes, drift is exactly pass duration times ~9.95 blocks/second, and pass
+# duration does not track workload at all -- 1,575 logs took 53s while 2,113
+# logs took 867s -- so it is RPC latency, not work, and no code change reduces
+# it. A 120-block bound needs a 12-second pass; the fastest of seven was 49s
+# and the median ~300s. The bound was unreachable rather than demanding, and
+# it held every observation at research-only.
+#
+# What it was protecting against is acting on a signal after the market moved.
+# That is a price question, so it is asked about the price: the entry quote is
+# re-taken at decision time and must still be verifiable. The drift between
+# the sealed price and the decision price is RECORDED, not gated -- there is
+# no evidence yet for the right tolerance, and inventing one would repeat the
+# error this session has been correcting. Set the threshold from the cohort.
+FLOW_DECISION_DRIFT_THRESHOLD_BPS = None   # unset until the cohort measures it
+# A decision quote costs an RPC round trip, and the classifier sweeps every
+# observation for the policy version each cycle -- 392 in one measured sweep.
+# Quoting all of them would spend hundreds of calls to re-price observations
+# that are research-only whatever the price says. So a quote is taken only
+# where it could change the verdict, and even then bounded per cycle.
+FLOW_DECISION_QUOTE_LIMIT = 20
 FLOW_NEAR_HEAD_ENRICHMENT_LIMIT = 300
 FLOW_NEAR_HEAD_ENRICHMENT_BUDGET_SECONDS = 30.0
 FLOW_MAXIMUM_PARTICIPANT_SHARE = 0.50
@@ -1343,6 +1364,8 @@ class RobinhoodLearningStore:
                     gates_json TEXT NOT NULL,
                     research_eligible INTEGER NOT NULL,
                     paper_eligible INTEGER NOT NULL,
+                    decision_quote_verified INTEGER,
+                    decision_price_drift_bps REAL,
                     FOREIGN KEY(observation_id)
                         REFERENCES flow_observations(observation_id)
                 );
@@ -1557,6 +1580,24 @@ class RobinhoodLearningStore:
                     "ALTER TABLE flow_observations ADD COLUMN cohort_id"
                     " TEXT NOT NULL DEFAULT 'pilot'"
                 )
+            classification_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(flow_observation_classifications)"
+                )
+            }
+            for name, decl in {
+                # Decision freshness stopped being a block count: the entry
+                # price is re-taken at decision time instead. Both facts are
+                # recorded so a threshold can later be set from the cohort's
+                # own drift distribution rather than guessed.
+                "decision_quote_verified": "INTEGER",
+                "decision_price_drift_bps": "REAL",
+            }.items():
+                if name not in classification_columns:
+                    connection.execute(
+                        "ALTER TABLE flow_observation_classifications"
+                        f" ADD COLUMN {name} {decl}"
+                    )
             event_columns = {
                 row[1] for row in connection.execute(
                     "PRAGMA table_info(flow_signal_events)"
@@ -2663,11 +2704,32 @@ class RobinhoodLearningStore:
             ),
         }
 
+    @staticmethod
+    def _quote_price(quote: dict | None) -> float | None:
+        """Anchor paid per token out -- the only comparable figure.
+
+        anchor_in_raw alone is the notional being quoted, which is constant by
+        construction, so comparing it would report zero drift forever.
+        """
+        payload = (quote or {}).get("execution_quote") or (quote or {})
+        anchor = safe_float(payload.get("anchor_in_raw"), 0.0)
+        tokens = safe_float(payload.get("token_out_raw"), 0.0)
+        return anchor / tokens if anchor > 0 and tokens > 0 else None
+
     def classify_flow_observation(
         self, observation_id: str, *, decision_head: int,
         identity_coverage: float | None, gates: list, now: float | None = None,
+        decision_quote: dict | None = None,
     ) -> dict:
-        """Attach a verdict WITHOUT touching the sealed observation."""
+        """Attach a verdict WITHOUT touching the sealed observation.
+
+        decision_quote is the entry price re-taken at decision time. It
+        replaces the block-count freshness bound: a signal is actionable when
+        its price can still be verified now, not when the chain happens to
+        have produced fewer than 120 blocks since the window closed. Passing
+        None keeps the observation research-only, which is the safe default
+        for every caller with no quote to offer.
+        """
         with self.connection() as connection:
             row = connection.execute(
                 "SELECT * FROM flow_observations WHERE observation_id=?",
@@ -2680,8 +2742,29 @@ class RobinhoodLearningStore:
             observation_fresh = (
                 observation_lag <= FLOW_MAXIMUM_OBSERVATION_HEAD_LAG_BLOCKS
             )
+            # Still measured and recorded -- it is the honest description of
+            # how far the chain moved -- but it no longer decides anything,
+            # because what it was measuring is RPC latency.
             decision_fresh = (
                 decision_lag <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+            )
+            execution = (decision_quote or {}).get("execution_quote") or (
+                decision_quote or {})
+            decision_quote_verified = bool(execution.get("verified"))
+            entry_price = self._quote_price(
+                json.loads(row["quote_json"] or "{}"))
+            decision_price = self._quote_price(decision_quote)
+            drift_bps = (
+                abs(decision_price - entry_price) / entry_price * 10_000
+                if entry_price and decision_price else None
+            )
+            drift_within_threshold = (
+                True if FLOW_DECISION_DRIFT_THRESHOLD_BPS is None
+                else bool(drift_bps is not None
+                          and drift_bps <= FLOW_DECISION_DRIFT_THRESHOLD_BPS)
+            )
+            decision_actionable = bool(
+                decision_quote_verified and drift_within_threshold
             )
             coverage = safe_float(identity_coverage, 0.0)
             tier = (
@@ -2695,7 +2778,7 @@ class RobinhoodLearningStore:
             )
             research = observation_fresh
             paper = bool(
-                observation_fresh and decision_fresh
+                observation_fresh and decision_actionable
                 and tier == "verified" and not list(gates or [])
             )
             verdict = {
@@ -2706,14 +2789,17 @@ class RobinhoodLearningStore:
                 "identity_tier": tier, "identity_coverage": coverage,
                 "arm": arm, "gates": list(gates or []),
                 "research_eligible": research, "paper_eligible": paper,
+                "decision_quote_verified": decision_quote_verified,
+                "decision_price_drift_bps": drift_bps,
             }
             connection.execute(
                 """
                 INSERT INTO flow_observation_classifications (
                     observation_id,classified_at,decision_head,
                     decision_head_lag_blocks,identity_tier,identity_coverage,
-                    arm,gates_json,research_eligible,paper_eligible
-                ) VALUES (?,?,?,?,?,?,?,?,?,?)
+                    arm,gates_json,research_eligible,paper_eligible,
+                    decision_quote_verified,decision_price_drift_bps
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?)
                 ON CONFLICT(observation_id) DO UPDATE SET
                     classified_at=excluded.classified_at,
                     decision_head=excluded.decision_head,
@@ -2722,12 +2808,15 @@ class RobinhoodLearningStore:
                     identity_coverage=excluded.identity_coverage,
                     arm=excluded.arm,gates_json=excluded.gates_json,
                     research_eligible=excluded.research_eligible,
-                    paper_eligible=excluded.paper_eligible
+                    paper_eligible=excluded.paper_eligible,
+                    decision_quote_verified=excluded.decision_quote_verified,
+                    decision_price_drift_bps=excluded.decision_price_drift_bps
                 """,
                 (
                     observation_id, verdict["classified_at"], int(decision_head),
                     decision_lag, tier, coverage, arm, _canonical(list(gates or [])),
                     int(research), int(paper),
+                    int(decision_quote_verified), drift_bps,
                 ),
             )
         return verdict
@@ -7281,22 +7370,47 @@ class RobinhoodLearningEngine:
         with self.store.connection() as connection:
             rows = [dict(row) for row in connection.execute(
                 """
-                SELECT o.observation_id, o.pool_id, fs.identity_coverage,
-                       fs.qualification_gaps_json
+                SELECT o.observation_id, o.pool_id, o.token_address,
+                       fs.identity_coverage, fs.qualification_gaps_json
                 FROM flow_observations o
                 LEFT JOIN flow_signals fs ON fs.pool_id=o.pool_id
                 WHERE o.policy_version=?
                 """,
                 (FLOW_EVIDENCE_POLICY_VERSION,),
             )]
+        quotes_taken = quote_failures = 0
         for row in rows:
             try:
                 gates = json.loads(row.get("qualification_gaps_json") or "[]")
             except (TypeError, ValueError):
                 gates = []
+            # Re-price ONLY a paper candidate. An observation with a failing
+            # gate or unverified identity is research-only however the price
+            # moved, so quoting it buys nothing and costs a round trip. With
+            # zero qualified windows this spends zero calls, and it starts
+            # spending exactly when there is something to spend it on.
+            decision_quote = None
+            candidate = bool(
+                not gates
+                and safe_float(row.get("identity_coverage"), 0.0)
+                    >= FLOW_MINIMUM_IDENTITY_COVERAGE
+            )
+            if candidate and quotes_taken < FLOW_DECISION_QUOTE_LIMIT:
+                try:
+                    decision_quote = self.v4_market.snapshot(
+                        {"pool_id": row["pool_id"],
+                         "token_address": row["token_address"]},
+                        quote_block=int(decision_head),
+                    )
+                    quotes_taken += 1
+                except Exception:
+                    # A failed re-quote is not a pass. classify treats None as
+                    # unactionable, which keeps the observation research-only.
+                    quote_failures += 1
             verdict = self.store.classify_flow_observation(
                 row["observation_id"], decision_head=int(decision_head),
                 identity_coverage=row.get("identity_coverage"), gates=gates,
+                decision_quote=decision_quote,
             )
             tiers[verdict["identity_tier"]] = tiers.get(verdict["identity_tier"], 0) + 1
             research += verdict["research_eligible"]
@@ -7306,6 +7420,9 @@ class RobinhoodLearningEngine:
         return {
             "classified_this_cycle": newly_classified,
             "reclassified_this_cycle": len(rows) - newly_classified,
+            "decision_quotes_taken": quotes_taken,
+            "decision_quote_failures": quote_failures,
+            "decision_quote_limit": FLOW_DECISION_QUOTE_LIMIT,
             "cumulative_classified": len(rows),
             "cumulative_identity_tiers": tiers,
             "cumulative_verified_fraction": (
