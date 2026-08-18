@@ -4041,7 +4041,9 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
             quote_block=window_end, now=self.NOW,
         )
 
-    QUOTE = {"verified": True, "anchor_in_raw": 1_000,
+    # anchor_out_raw states what a same-block exit returns: without it the
+    # quote cannot prove the position is exitable, and the gate says no.
+    QUOTE = {"verified": True, "anchor_in_raw": 1_000, "anchor_out_raw": 990,
              "token_out_raw": 10 ** 18}
 
     def _classify(self, store, observation_id, coverage=1.0, gates=(),
@@ -4174,6 +4176,7 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
             verdict = self._classify(
                 store, observation_id,
                 decision_quote={"verified": True, "anchor_in_raw": 1_100,
+                                "anchor_out_raw": 1_089,
                                 "token_out_raw": 10 ** 18},
             )
             self.assertIsNotNone(verdict["decision_price_drift_bps"])
@@ -5309,7 +5312,7 @@ class DecisionQuoteWiringTests(unittest.TestCase):
                 raise RuntimeError("quote unavailable")
             return {"execution_quote": {
                 "verified": True, "anchor_in_raw": 1_000,
-                "token_out_raw": 10 ** 18,
+                "anchor_out_raw": 990, "token_out_raw": 10 ** 18,
             }}
 
     def _engine(self, directory, fail=False):
@@ -5327,7 +5330,7 @@ class DecisionQuoteWiringTests(unittest.TestCase):
             transaction_hashes=[f"{pool}tx"], features={},
             quote={"execution_quote": {
                 "verified": True, "anchor_in_raw": 1_000,
-                "token_out_raw": 10 ** 18}},
+                "anchor_out_raw": 990, "token_out_raw": 10 ** 18}},
             quote_block=self.HEAD - 10, now=self.NOW,
         )
         with store.connection() as connection:
@@ -5480,3 +5483,100 @@ class ScoreIsNotPromotionalTests(unittest.TestCase):
             row = self._row(store, self.POOL)
             self.assertTrue(json.loads(row["qualification_gaps_json"] or "[]"))
             self.assertFalse(row["shadow_qualified"])
+
+
+class RoundTripGateTests(unittest.TestCase):
+    """An unexitable position is not a trade whatever the flow said.
+
+    Measured over 65 sealed observations, buying and selling at the SAME block
+    loses a mean 42.10%, median 22.5%, minimum 100% (pools with no liquidity).
+    Mean realised 15-minute return was -41.37%, so price movement contributed
+    +0.73%: the returns this project analysed were the fee-and-slippage
+    structure of the pools, not token behaviour.
+    """
+
+    POOL = "0x" + "7d" * 32
+    HEAD = 42_000_000
+    NOW = 40_000.0
+
+    def _quote(self, anchor_out):
+        return {"execution_quote": {
+            "verified": True, "anchor_in_raw": 100_000_000,
+            "anchor_out_raw": anchor_out, "token_out_raw": 10 ** 18,
+        }}
+
+    def _classify(self, directory, sealed_out, decision_out=None):
+        store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+        observation_id = store.seal_flow_observation(
+            pool_id=self.POOL, token_address=TOKEN, observation_head=self.HEAD,
+            window_start_block=self.HEAD - 450, window_end_block=self.HEAD - 10,
+            transaction_hashes=["0xrt"], features={},
+            quote=self._quote(sealed_out), quote_block=self.HEAD - 10,
+            now=self.NOW,
+        )
+        return store, store.classify_flow_observation(
+            observation_id, decision_head=self.HEAD, identity_coverage=1.0,
+            gates=[],
+            decision_quote=(self._quote(decision_out)
+                            if decision_out is not None else None),
+        )
+
+    def test_the_live_median_pool_is_refused(self):
+        """$77.52 back on $100 in -- the real median, -22.5%."""
+        with tempfile.TemporaryDirectory() as directory:
+            _, verdict = self._classify(directory, 77_519_219, 77_519_219)
+            self.assertAlmostEqual(verdict["round_trip_return"], -0.2248, places=3)
+            self.assertFalse(verdict["exitable"])
+            self.assertFalse(verdict["paper_eligible"])
+
+    def test_an_empty_pool_is_refused_rather_than_scored(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, verdict = self._classify(directory, 0, 0)
+            self.assertEqual(verdict["round_trip_return"], -1.0)
+            self.assertFalse(verdict["exitable"])
+
+    def test_a_deep_pool_passes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            _, verdict = self._classify(directory, 99_000_000, 99_000_000)
+            self.assertAlmostEqual(verdict["round_trip_return"], -0.01, places=4)
+            self.assertTrue(verdict["exitable"])
+            self.assertTrue(verdict["paper_eligible"])
+
+    def test_the_decision_quote_overrides_a_stale_sealed_one(self):
+        """Liquidity can drain after sealing; the current pool is what matters."""
+        with tempfile.TemporaryDirectory() as directory:
+            _, verdict = self._classify(directory, 99_000_000, 50_000_000)
+            self.assertFalse(
+                verdict["exitable"],
+                "a pool that has since drained was admitted on its old quote",
+            )
+
+    def test_the_figure_is_pinned_on_the_sealed_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store, _ = self._classify(directory, 77_519_219)
+            with store.connection() as connection:
+                stored = connection.execute(
+                    "SELECT round_trip_return FROM flow_observations"
+                ).fetchone()[0]
+            self.assertAlmostEqual(stored, -0.2248, places=3)
+
+    def test_a_quote_that_cannot_price_an_exit_is_not_a_pass(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+            observation_id = store.seal_flow_observation(
+                pool_id=self.POOL, token_address=TOKEN,
+                observation_head=self.HEAD,
+                window_start_block=self.HEAD - 450,
+                window_end_block=self.HEAD - 10,
+                transaction_hashes=["0xrt2"], features={},
+                quote={"execution_quote": {"verified": True,
+                                           "anchor_in_raw": 100_000_000}},
+                quote_block=self.HEAD - 10, now=self.NOW,
+            )
+            verdict = store.classify_flow_observation(
+                observation_id, decision_head=self.HEAD,
+                identity_coverage=1.0, gates=[],
+                decision_quote={"verified": True, "anchor_in_raw": 100_000_000},
+            )
+            self.assertIsNone(verdict["round_trip_return"])
+            self.assertFalse(verdict["exitable"])

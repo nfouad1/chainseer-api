@@ -181,6 +181,20 @@ FLOW_DECISION_DRIFT_THRESHOLD_BPS = None   # unset until the cohort measures it
 # that are research-only whatever the price says. So a quote is taken only
 # where it could change the verdict, and even then bounded per cycle.
 FLOW_DECISION_QUOTE_LIMIT = 20
+# Can the position be exited at all? The entry quote already answers it: buy
+# and sell at the SAME block, before any time passes. Measured over 65 sealed
+# observations that round trip loses a median 22.5%, a minimum of 100% (pools
+# with $0 liquidity), and a mean of 42.10% -- against a mean realised 15-minute
+# return of -41.37%. Price movement contributes +0.73%. The returns this
+# project has been analysing were almost entirely the fee-and-slippage
+# structure of the pools, not token behaviour.
+#
+# The bound below is NOT a profitability threshold and must not be read as
+# one: friction of 2% still swamps the only edge yet measured (+0.73%). It is
+# the weaker claim that a position which cannot be round-tripped within 2% is
+# not a trade at all. The figure is recorded on every observation so the bound
+# can be set from the distribution instead of argued about.
+FLOW_MAXIMUM_ROUND_TRIP_LOSS = 0.02
 FLOW_NEAR_HEAD_ENRICHMENT_LIMIT = 300
 FLOW_NEAR_HEAD_ENRICHMENT_BUDGET_SECONDS = 30.0
 FLOW_MAXIMUM_PARTICIPANT_SHARE = 0.50
@@ -1571,6 +1585,8 @@ class RobinhoodLearningStore:
                 "role": "TEXT NOT NULL DEFAULT 'matched_control'",
                 "matched_observation_id": "TEXT",
                 "qualification_gap_count": "INTEGER",
+                # Same-block buy-and-sell on the sealed quote: pure friction.
+                "round_trip_return": "REAL",
             }.items():
                 if name not in observation_columns:
                     connection.execute(
@@ -2437,8 +2453,8 @@ class RobinhoodLearningStore:
                     observed_at_epoch,window_start_block,window_end_block,
                     transaction_set_hash,transaction_count,features_json,
                     quote_json,quote_block,quote_verified,sealed_at,cohort_id,
-                    role,qualification_gap_count
-                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+                    role,qualification_gap_count,round_trip_return
+                ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
                 """,
                 (
                     observation_id, FLOW_EVIDENCE_POLICY_VERSION, pool_id,
@@ -2449,6 +2465,9 @@ class RobinhoodLearningStore:
                     int(quote_block) if quote_block else None,
                     int(verified), _utc_now(), FLOW_EVIDENCE_COHORT_ID,
                     str(role), gap_count,
+                    # Pure friction, pinned at seal: what the position would
+                    # return if bought and sold in the same block.
+                    self._round_trip_return(quote),
                 ),
             )
             if not result.rowcount:
@@ -2722,6 +2741,22 @@ class RobinhoodLearningStore:
         }
 
     @staticmethod
+    def _round_trip_return(quote: dict | None) -> float | None:
+        """What $1 in becomes if bought and sold at the same block.
+
+        This is pure friction -- fee plus price impact both ways -- with no
+        time and therefore no price movement in it. A pool with no liquidity
+        returns -1.0 here, which is the honest answer rather than a missing
+        value: the position cannot be exited.
+        """
+        payload = (quote or {}).get("execution_quote") or (quote or {})
+        anchor_in = safe_float(payload.get("anchor_in_raw"), 0.0)
+        anchor_out = safe_float(payload.get("anchor_out_raw"), -1.0)
+        if anchor_in <= 0 or anchor_out < 0:
+            return None
+        return anchor_out / anchor_in - 1.0
+
+    @staticmethod
     def _quote_price(quote: dict | None) -> float | None:
         """Anchor paid per token out -- the only comparable figure.
 
@@ -2780,8 +2815,19 @@ class RobinhoodLearningStore:
                 else bool(drift_bps is not None
                           and drift_bps <= FLOW_DECISION_DRIFT_THRESHOLD_BPS)
             )
+            # An unexitable position is not a trade whatever the flow said.
+            # Prefer the decision-time quote, which describes the pool as it
+            # is now, and fall back to the sealed one.
+            round_trip = self._round_trip_return(decision_quote)
+            if round_trip is None:
+                round_trip = self._round_trip_return(
+                    json.loads(row["quote_json"] or "{}"))
+            exitable = bool(
+                round_trip is not None
+                and round_trip >= -FLOW_MAXIMUM_ROUND_TRIP_LOSS
+            )
             decision_actionable = bool(
-                decision_quote_verified and drift_within_threshold
+                decision_quote_verified and drift_within_threshold and exitable
             )
             coverage = safe_float(identity_coverage, 0.0)
             tier = (
@@ -2808,6 +2854,8 @@ class RobinhoodLearningStore:
                 "research_eligible": research, "paper_eligible": paper,
                 "decision_quote_verified": decision_quote_verified,
                 "decision_price_drift_bps": drift_bps,
+                "round_trip_return": round_trip,
+                "exitable": exitable,
             }
             connection.execute(
                 """
@@ -3160,6 +3208,37 @@ class RobinhoodLearningStore:
                 "paper trading. A freshness_advantage near zero means the "
                 "bound is not earning its cost."
             ),
+        }
+
+    def round_trip_summary(self) -> dict:
+        """What a position costs to enter and leave, before anything moves.
+
+        The dashboard showed a -41% average with no way to see that ~42 points
+        of it is toll rather than token behaviour. Measured over the cohort,
+        the same-block round trip averages -42.10% while the realised
+        15-minute return averages -41.37%; the residual is +0.0073 at
+        sign-flip p=0.7572, which is zero. Surfacing this turns an
+        inexplicable loss into a legible one.
+        """
+        with self.connection() as connection:
+            rows = [row[0] for row in connection.execute(
+                "SELECT round_trip_return FROM flow_observations"
+                " WHERE cohort_id=? AND round_trip_return IS NOT NULL",
+                (FLOW_EVIDENCE_COHORT_ID,),
+            )]
+        if not rows:
+            return {"measured": 0, "bound": FLOW_MAXIMUM_ROUND_TRIP_LOSS}
+        rows.sort()
+        exitable = [x for x in rows if x >= -FLOW_MAXIMUM_ROUND_TRIP_LOSS]
+        return {
+            "measured": len(rows),
+            "bound": FLOW_MAXIMUM_ROUND_TRIP_LOSS,
+            "median_round_trip": rows[len(rows) // 2],
+            "worst_round_trip": rows[0],
+            "best_round_trip": rows[-1],
+            "exitable": len(exitable),
+            "exitable_fraction": len(exitable) / len(rows),
+            "unexitable": len(rows) - len(exitable),
         }
 
     def flow_evidence_summary(self) -> dict:
@@ -8509,6 +8588,8 @@ def dashboard_snapshot(
         "flow_shadow": store.flow_summary(),
         "flow_signals": store.recent_flow_signals(limit=12),
         "flow_evidence": store.flow_evidence_summary(),
+        # Friction is the largest component of every return recorded here.
+        "round_trip": store.round_trip_summary(),
         "flow_evidence_events": store.recent_flow_evidence_events(limit=16),
         "flow_origin_queue": store.pending_transaction_origin_counts(),
         "v4_custody": store.v4_custody_summary(),
