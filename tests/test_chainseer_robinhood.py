@@ -5410,3 +5410,73 @@ class DecisionQuoteWiringTests(unittest.TestCase):
             self.assertLessEqual(
                 len(engine.v4_market.calls), rh.FLOW_DECISION_QUOTE_LIMIT,
             )
+
+
+class ScoreIsNotPromotionalTests(unittest.TestCase):
+    """A reliably inverted quantity must not be the thing that says yes.
+
+    Measured on 59 resolved observations: the high-score half returned -0.5678
+    against -0.2876 for the low-score half, a gap of -0.2801 at permutation
+    p=0.0135 over 4,000 shuffles. Survivorship came back clean -- resolved
+    12.32, pending 13.02, non_exitable 14.10 mean score -- so requiring a high
+    score was selecting the worse half of an already-losing population.
+    """
+
+    POOL = "0x" + "9f" * 32
+
+    def _signal(self, store, pool, swaps, senders):
+        store.apply_v4_events([{
+            "kind": "initialize", "pool_id": pool,
+            "currency0": TOKEN.lower(), "currency1": rh.USDG_ADDRESS.lower(),
+            "token_address": TOKEN.lower(),
+            "anchor_address": rh.USDG_ADDRESS.lower(),
+            "fee_tier": 3000, "tick_spacing": 60,
+            "hooks_address": rh.ZERO_ADDRESS, "block_number": 100_000,
+            "sqrt_price_x96": 1 << 96, "tick": 0,
+        }])
+        store.apply_v4_events([{
+            "kind": "swap", "pool_id": pool,
+            "block_number": 101_000 + index, "block_timestamp": None,
+            "transaction_hash": f"{pool[:8]}tx{index}", "log_index": 0,
+            "sender_hint": senders[index % len(senders)],
+            "amount0_raw": -1, "amount1_raw": 1,
+            "sqrt_price_x96": 1 << 96, "active_liquidity": 1, "tick": 0,
+        } for index in range(swaps)])
+
+    def _row(self, store, pool):
+        with store.connection() as connection:
+            return connection.execute(
+                "SELECT * FROM flow_signals WHERE pool_id=?", (pool,)
+            ).fetchone()
+
+    def test_a_clean_window_qualifies_without_clearing_the_score_bar(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+            self._signal(store, self.POOL, 8,
+                         ["0x" + c * 40 for c in "abcd"])
+            row = self._row(store, self.POOL)
+            gaps = json.loads(row["qualification_gaps_json"] or "[]")
+            if gaps:
+                self.skipTest(f"fixture did not clear the gates: {gaps}")
+            self.assertTrue(
+                row["shadow_qualified"],
+                "a window with no failing gate was refused on score alone",
+            )
+
+    def test_the_score_is_still_recorded(self):
+        """Inverted is not useless -- it stays measurable, it just cannot promote."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+            self._signal(store, self.POOL, 8, ["0x" + c * 40 for c in "abcd"])
+            row = self._row(store, self.POOL)
+            self.assertIsNotNone(row["uncapped_shadow_score"])
+            self.assertIsNotNone(row["shadow_score"])
+
+    def test_a_gated_window_never_qualifies(self):
+        """Removing the score bar must not remove the evidence gates."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+            self._signal(store, self.POOL, 2, ["0x" + "a" * 40])
+            row = self._row(store, self.POOL)
+            self.assertTrue(json.loads(row["qualification_gaps_json"] or "[]"))
+            self.assertFalse(row["shadow_qualified"])

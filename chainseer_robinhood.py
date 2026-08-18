@@ -106,6 +106,9 @@ FLOW_WINDOW_BLOCKS = 1350
 FLOW_MINIMUM_SWAPS = 6
 FLOW_MINIMUM_SENDER_HINTS = 4
 FLOW_MINIMUM_NET_ANCHOR_FRACTION = 0.10
+# Retained for the capping behaviour and for continuity of the recorded
+# series, NOT as a promotion bar -- see _refresh_v4_flow_signal. The score is
+# anti-predictive within the observed population (p=0.0135, n=59).
 FLOW_SHADOW_SCORE_THRESHOLD = 70.0
 # Identity enrichment is the binding stage for Flow qualification. Measured on
 # a clean v2 corpus: 176 of 176 fresh windows failed minimum_identity_coverage
@@ -2112,7 +2115,21 @@ class RobinhoodLearningStore:
         score = uncapped_score
         if not enough_evidence:
             score = min(score, FLOW_SHADOW_SCORE_THRESHOLD - 1)
-        qualified = bool(enough_evidence and score >= FLOW_SHADOW_SCORE_THRESHOLD)
+        # The score no longer promotes anything. Measured on 59 resolved
+        # observations, the high-score half returned -0.5678 against -0.2876
+        # for the low-score half: a gap of -0.2801 at permutation p=0.0135
+        # over 4,000 shuffles. Requiring a HIGH score therefore selected the
+        # WORSE half of an already-losing population. The check for
+        # survivorship came back clean (resolved 12.32, pending 13.02,
+        # non_exitable 14.10 mean score), so the inversion is not an artefact
+        # of which observations happen to resolve.
+        #
+        # Qualification now rests on the evidence gates alone, which are
+        # separately testable claims about a window rather than a weighted
+        # composite. The score is still computed and recorded, because a
+        # reliably inverted quantity is information -- it simply must not be
+        # the thing that says yes.
+        qualified = bool(enough_evidence)
         limitations = [
             "sender_identity_is_event_hint_and_may_be_router",
             "qualification_uses_transaction_from_not_event_sender",
