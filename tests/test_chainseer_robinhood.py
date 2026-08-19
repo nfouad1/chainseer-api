@@ -5773,3 +5773,133 @@ class ExitableQualificationTests(unittest.TestCase):
                     "SELECT role FROM flow_observations"
                 ).fetchone()
             self.assertEqual(row["role"], "matched_control")
+
+
+class DiscoveryGapTests(unittest.TestCase):
+    """A pool born near the head is admitted on sight, not on the crawler.
+
+    Batch discovery ran 477,270 blocks behind -- about 13 hours -- with 0
+    pools known inside that gap. The near-head pass scanned those blocks every
+    cycle and discarded every swap whose pool it did not already know: 1,967
+    logs seen against 11 ingested. Two tokens the operator asked about were
+    absent from every table in the database, never rejected and never
+    analysed, because their pools were younger than the crawler's position.
+    """
+
+    NEW_POOL = "0x" + "e1" * 32
+    TOKEN_NEW = "0x" + "42" * 20
+    HEAD = 45_000_000
+
+    class _RPC:
+        def __init__(self, head, init_logs, swap_logs):
+            self.head = head
+            self.init_logs = init_logs
+            self.swap_logs = swap_logs
+            self.topics_seen = []
+
+        def get_block_number(self):
+            return self.head
+
+        def get_logs(self, from_block, to_block, address=None, topics=None):
+            flat = (topics or [[]])[0]
+            self.topics_seen.append(flat[0] if flat else None)
+            if flat and flat[0] == rh.V4_INITIALIZE_TOPIC:
+                return self.init_logs
+            return self.swap_logs
+
+        def get_transactions(self, hashes):
+            return []
+
+    def _init_log(self, pool, token, anchor_first=False):
+        anchor = rh.USDG_ADDRESS.lower()
+        c0, c1 = (anchor, token) if anchor_first else (token, anchor)
+        pad = lambda a: "0x" + "0" * 24 + a[2:]
+        return {"topics": [rh.V4_INITIALIZE_TOPIC, pool, pad(c0), pad(c1)],
+                "blockNumber": hex(self.HEAD - 300),
+                "data": "0x" + ("0" * 63 + "1") * 5, "logIndex": "0x0",
+                "transactionHash": "0x" + "1" * 64}
+
+    def _swap_log(self, pool, index):
+        return {"topics": [rh.V4_SWAP_TOPIC, pool, "0x" + "0" * 24 + "a" * 40],
+                "blockNumber": hex(self.HEAD - 200 + index),
+                "transactionHash": f"0xdead{index:060x}", "logIndex": "0x0",
+                "data": "0x" + ("0" * 63 + "1") * 5}
+
+    def _engine(self, directory, init_logs, swap_logs):
+        store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.store = store
+        engine.root = Path(directory)
+        engine.rpc = self._RPC(self.HEAD, init_logs, swap_logs)
+        return engine, store
+
+    def test_a_pool_born_this_window_is_registered_and_its_swaps_kept(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(
+                directory,
+                [self._init_log(self.NEW_POOL, self.TOKEN_NEW)],
+                [self._swap_log(self.NEW_POOL, i) for i in range(5)],
+            )
+            result = engine.near_head_flow_pass()
+            self.assertEqual(result["pools_admitted_on_sight"], 1)
+            self.assertEqual(
+                result["swaps_ingested"], 5,
+                "swaps in a newly born pool were discarded as unknown",
+            )
+            self.assertIn(self.NEW_POOL, store.known_v4_pool_ids())
+
+    def test_without_the_fix_those_swaps_would_be_dropped(self):
+        """Same swaps, no Initialize log: the pre-fix behaviour."""
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(
+                directory, [], [self._swap_log(self.NEW_POOL, i) for i in range(5)],
+            )
+            result = engine.near_head_flow_pass()
+            self.assertEqual(result["pools_admitted_on_sight"], 0)
+            self.assertEqual(result["swaps_ingested"], 0)
+
+    def test_a_pool_with_no_anchor_is_refused(self):
+        """Unpriceable pairs must not be admitted just for being new."""
+        pad = lambda a: "0x" + "0" * 24 + a[2:]
+        log = {"topics": [rh.V4_INITIALIZE_TOPIC, self.NEW_POOL,
+                          pad(self.TOKEN_NEW), pad("0x" + "77" * 20)],
+               "blockNumber": hex(self.HEAD - 300),
+               "data": "0x" + ("0" * 63 + "1") * 5, "logIndex": "0x0",
+               "transactionHash": "0x" + "1" * 64}
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(directory, [log], [])
+            self.assertEqual(
+                engine.near_head_flow_pass()["pools_admitted_on_sight"], 0)
+
+    def test_either_currency_ordering_resolves_the_token(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine, store = self._engine(
+                directory,
+                [self._init_log(self.NEW_POOL, self.TOKEN_NEW, anchor_first=True)],
+                [],
+            )
+            engine.near_head_flow_pass()
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT token_address,anchor_address FROM v4_pools"
+                    " WHERE pool_id=?", (self.NEW_POOL,)).fetchone()
+            self.assertEqual(row["token_address"], self.TOKEN_NEW)
+            self.assertEqual(row["anchor_address"], rh.USDG_ADDRESS.lower())
+
+    def test_a_failed_initialize_scan_does_not_lose_the_swap_pass(self):
+        class _Failing(self._RPC):
+            def get_logs(self, from_block, to_block, address=None, topics=None):
+                flat = (topics or [[]])[0]
+                if flat and flat[0] == rh.V4_INITIALIZE_TOPIC:
+                    raise RuntimeError("[RPC -429] rate limited")
+                return self.swap_logs
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+            engine.store = store
+            engine.root = Path(directory)
+            engine.rpc = _Failing(self.HEAD, [], [])
+            result = engine.near_head_flow_pass()
+            self.assertTrue(result["scanned"])
+            self.assertEqual(result["pools_admitted_on_sight"], 0)

@@ -7381,7 +7381,64 @@ class RobinhoodLearningEngine:
                     "from_block": from_block, "to_block": head,
                     "incremental": incremental, "reason": str(error)[:200],
                 }
+        # Register pools BORN in this window before filtering swaps by
+        # membership. Batch discovery runs 477,270 blocks behind the head --
+        # about 13 hours -- and 0 pools were known inside that gap, so a token
+        # launched today had its swaps seen and discarded on every cycle until
+        # the crawler eventually reached its Initialize block. Measured
+        # signature: 1,967 logs seen against 11 swaps ingested, because 99.5%
+        # of near-head trading happens in pools this learner had never heard
+        # of. Two tokens the operator asked about were absent from every table
+        # for exactly this reason -- never rejected, never analysed, never
+        # seen.
+        #
+        # The Initialize log carries everything v4_pools needs, so the pass
+        # can admit a pool on sight rather than waiting for a crawler that has
+        # never caught up.
         known = self.store.known_v4_pool_ids()
+        anchors = {WETH_ADDRESS.lower(), USDG_ADDRESS.lower()}
+        born = []
+        init_logs = []
+        try:
+            # No new blocks means no new pools; skip the round trip entirely.
+            if from_block <= head:
+                init_logs = self.rpc.get_logs(
+                    from_block, head, address=UNISWAP_V4_POOL_MANAGER,
+                    topics=[[V4_INITIALIZE_TOPIC]],
+                ) or []
+        except Exception:
+            # A failed Initialize scan must not lose the swap pass; the window
+            # simply stays as blind as it was before.
+            init_logs = []
+        for log in init_logs:
+            topics = log.get("topics") or []
+            if len(topics) < 4:
+                continue
+            pool_id = str(topics[1]).lower()
+            if pool_id in known:
+                continue
+            currency0 = _topic_address(topics[2]).lower()
+            currency1 = _topic_address(topics[3]).lower()
+            # Exactly one side must be an anchor, same rule the crawler uses:
+            # a pool with no anchor cannot be priced, and one with two is not
+            # a token listing.
+            if (currency0 in anchors) == (currency1 in anchors):
+                continue
+            born.append({
+                "kind": "initialize", "pool_id": pool_id,
+                "currency0": currency0, "currency1": currency1,
+                "token_address": currency1 if currency0 in anchors else currency0,
+                "anchor_address": currency0 if currency0 in anchors else currency1,
+                "fee_tier": _data_word(log.get("data"), 0) & ((1 << 24) - 1),
+                "tick_spacing": _signed_word(log.get("data"), 1, 24),
+                "hooks_address": _data_address(log.get("data"), 2).lower(),
+                "sqrt_price_x96": _data_word(log.get("data"), 3),
+                "tick": _signed_word(log.get("data"), 4, 24),
+                "block_number": int(str(log.get("blockNumber") or "0x0"), 16),
+            })
+        if born:
+            self.store.apply_v4_events(born)
+            known = self.store.known_v4_pool_ids()
         events = []
         for log in logs:
             topics = log.get("topics") or []
@@ -7425,6 +7482,8 @@ class RobinhoodLearningEngine:
             "incremental": incremental,
             "scan_blocks": max(0, head - from_block + 1),
             "logs_seen": len(logs), "swaps_ingested": len(events),
+            "initialize_logs_seen": len(init_logs),
+            "pools_admitted_on_sight": len(born),
             "pools_touched": len(touched),
             # Attributed to THIS pass's pools, never read off the whole table.
             "window_coverage": self.store.flow_window_coverage(touched),
