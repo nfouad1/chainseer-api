@@ -5580,3 +5580,72 @@ class RoundTripGateTests(unittest.TestCase):
             )
             self.assertIsNone(verdict["round_trip_return"])
             self.assertFalse(verdict["exitable"])
+
+
+class ResidualRecordedTests(unittest.TestCase):
+    """The residual is stored, not re-derived.
+
+    At n=236 friction is 96% of the realised return, so the residual -- the
+    only place an edge could live -- is what every question turns on. It was
+    reconstructed by hand three times in one night, which is three chances for
+    two analyses to disagree about the same number.
+    """
+
+    POOL = "0x" + "3c" * 32
+    HEAD = 43_000_000
+    NOW = 50_000.0
+
+    def _due(self, store, anchor_out):
+        store.seal_flow_observation(
+            pool_id=self.POOL, token_address=TOKEN, observation_head=self.HEAD,
+            window_start_block=self.HEAD - 450, window_end_block=self.HEAD - 10,
+            transaction_hashes=["0xres"], features={},
+            quote={"execution_quote": {
+                "verified": True, "anchor_in_raw": 100_000_000,
+                "anchor_out_raw": anchor_out, "token_out_raw": 10 ** 18}},
+            quote_block=self.HEAD - 10, now=self.NOW,
+        )
+        due = store.due_flow_observation_outcomes(self.NOW + 10 * 86_400,
+                                                  limit=500)
+        return [d for d in due
+                if d["horizon_label"] == rh.FLOW_PRIMARY_HORIZON_LABEL][0]
+
+    def test_friction_and_residual_are_persisted(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            due = self._due(store, 90_000_000)          # -10% friction
+            result = store.record_flow_observation_outcome(
+                due, {"verified": True, "anchor_out_raw": 1_300},
+                quote_block=self.HEAD, now=self.NOW + 10 * 86_400,
+            )
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT friction_return,residual_return,net_return"
+                    " FROM flow_observation_outcomes WHERE horizon_label=?",
+                    (rh.FLOW_PRIMARY_HORIZON_LABEL,),
+                ).fetchone()
+            self.assertAlmostEqual(row["friction_return"], -0.10, places=4)
+            self.assertAlmostEqual(
+                row["residual_return"],
+                row["net_return"] - row["friction_return"], places=6,
+                msg="the stored residual disagrees with its own components",
+            )
+
+    def test_an_unpriceable_outcome_stores_no_residual(self):
+        """Absence must not read as zero edge."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            due = dict(self._due(store, 90_000_000))
+            due["quote_verified"] = 0
+            result = store.record_flow_observation_outcome(
+                due, {"verified": True, "anchor_out_raw": 1_300},
+                quote_block=self.HEAD, now=self.NOW + 10 * 86_400,
+            )
+            self.assertEqual(result["status"], "unpriceable")
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT residual_return FROM flow_observation_outcomes"
+                    " WHERE horizon_label=?",
+                    (rh.FLOW_PRIMARY_HORIZON_LABEL,),
+                ).fetchone()
+            self.assertIsNone(row["residual_return"])

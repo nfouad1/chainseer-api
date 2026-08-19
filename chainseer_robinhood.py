@@ -1653,6 +1653,25 @@ class RobinhoodLearningStore:
                         "ALTER TABLE flow_observation_classifications"
                         f" ADD COLUMN {name} {decl}"
                     )
+            outcome_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(flow_observation_outcomes)"
+                )
+            }
+            for name, decl in {
+                # The residual -- realised minus the same-block friction the
+                # position started with -- is the only place an edge could
+                # live, and it was being re-derived by hand from the sealed
+                # quote every time the question came up. Three separate
+                # reconstructions in one night is three chances to disagree.
+                "friction_return": "REAL",
+                "residual_return": "REAL",
+            }.items():
+                if name not in outcome_columns:
+                    connection.execute(
+                        "ALTER TABLE flow_observation_outcomes"
+                        f" ADD COLUMN {name} {decl}"
+                    )
             event_columns = {
                 row[1] for row in connection.execute(
                     "PRAGMA table_info(flow_signal_events)"
@@ -2577,15 +2596,31 @@ class RobinhoodLearningStore:
             # evaluation, and distinct from unpriceable above.
             net_return = -1.0
             status = "non_exitable"
+        # The position's own friction, read from the entry quote it was sealed
+        # with: buy and sell at the same block, no time, no price movement.
+        # Measured at n=236 this is 96% of the realised return, so the part
+        # left for price to explain must be recorded separately or every
+        # analysis has to reconstruct it.
+        friction_return = self._round_trip_return(
+            json.loads(due.get("quote_json") or "{}")
+        )
+        residual_return = (
+            net_return - friction_return
+            if net_return is not None and friction_return is not None else None
+        )
         with self.connection() as connection:
             connection.execute(
                 """
                 UPDATE flow_observation_outcomes
-                SET status=?,observed_at=?,quote_block=?,net_return=?,exit_valid=?
+                SET status=?,observed_at=?,quote_block=?,net_return=?,exit_valid=?,
+                    friction_return=?,residual_return=?
                 WHERE observation_id=? AND horizon_label=? AND status='pending'
                 """,
+                # Friction is what the position cost before anything moved;
+                # the residual is what is left for price to explain.
                 (status, float(now), int(quote_block), net_return,
-                 int(exit_valid), due["observation_id"], due["horizon_label"]),
+                 int(exit_valid), friction_return, residual_return,
+                 due["observation_id"], due["horizon_label"]),
             )
         return {
             "observation_id": due["observation_id"],
