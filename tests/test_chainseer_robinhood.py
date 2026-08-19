@@ -5649,3 +5649,127 @@ class ResidualRecordedTests(unittest.TestCase):
                     (rh.FLOW_PRIMARY_HORIZON_LABEL,),
                 ).fetchone()
             self.assertIsNone(row["residual_return"])
+
+
+class ExitableQualificationTests(unittest.TestCase):
+    """An unexitable pool is not a signal, whatever its flow looked like.
+
+    The first two windows ever labelled `signal` were pools holding $2.11 and
+    $0.39, with 98.96% and 99.81% buy impact and identical returns at 1m, 5m,
+    15m and 1h of -0.9951 and -0.9995 -- pure friction. They passed because
+    the five qualification gates say nothing about whether a pool holds money,
+    and the shadow-score bar that had been excluding them as a side effect was
+    removed (their scores were 21.9 and 24.6, both under the old 70).
+    """
+
+    POOL = "0x" + "6b" * 32
+    HEAD = 44_000_000
+    NOW = 60_000.0
+
+    class _Market:
+        def __init__(self, anchor_out):
+            self.anchor_out = anchor_out
+
+        def snapshot(self, candidate, quote_block=None):
+            return {"execution_quote": {
+                "verified": True, "anchor_in_raw": 100_000_000,
+                "anchor_out_raw": self.anchor_out, "token_out_raw": 10 ** 18,
+            }}
+
+    def _seal(self, directory, anchor_out, gaps):
+        store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.store = store
+        engine.root = Path(directory)
+        engine.v4_market = self._Market(anchor_out)
+        with store.connection() as connection:
+            connection.execute(
+                """INSERT INTO flow_signals (source_version,pool_id,
+                       token_address,computed_at,window_blocks,
+                       window_start_block,window_end_block,swap_count,buy_count,
+                       sell_count,unique_sender_hints,
+                       unique_resolved_participants,identity_coverage,buy_ratio,
+                       net_anchor_flow_fraction,uncapped_shadow_score,
+                       shadow_score,shadow_qualified,confidence,features_json,
+                       qualification_gaps_json,limitations_json)
+                   VALUES ('uniswap_v4',?,?,?,1350,?,?,8,6,2,4,4,1.0,0.75,0.5,
+                           21.9,21.9,1,'ok',?,?,'[]')""",
+                (self.POOL, TOKEN, rh._utc_now(), self.HEAD - 1350,
+                 self.HEAD - 10,
+                 json.dumps({"qualification_gaps": gaps}), json.dumps(gaps)),
+            )
+        engine.seal_near_head_observations(self.HEAD, self.NOW)
+        with store.connection() as connection:
+            return connection.execute(
+                "SELECT role,qualification_gap_count,features_json,"
+                " round_trip_return FROM flow_observations"
+            ).fetchone()
+
+    def test_an_empty_pool_is_not_labelled_a_signal(self):
+        """The live case: $0.39 of liquidity, -99.95% round trip, zero gaps."""
+        with tempfile.TemporaryDirectory() as directory:
+            row = self._seal(directory, 46_992, gaps=[])
+            self.assertEqual(row["role"], "matched_control")
+            self.assertIn(
+                "exitable_round_trip",
+                json.loads(row["features_json"])["qualification_gaps"],
+            )
+            self.assertEqual(row["qualification_gap_count"], 1)
+
+    def test_a_tradeable_pool_with_no_gaps_is_still_a_signal(self):
+        with tempfile.TemporaryDirectory() as directory:
+            row = self._seal(directory, 99_000_000, gaps=[])
+            self.assertEqual(
+                row["role"], "signal",
+                "the new gate rejected a pool that can actually be exited",
+            )
+            self.assertEqual(row["qualification_gap_count"], 0)
+
+    def test_an_already_gated_window_is_unchanged(self):
+        """The gate only fires where it would flip a label."""
+        with tempfile.TemporaryDirectory() as directory:
+            row = self._seal(directory, 46_992, gaps=["minimum_swaps"])
+            self.assertEqual(row["role"], "matched_control")
+            self.assertEqual(
+                json.loads(row["features_json"])["qualification_gaps"],
+                ["minimum_swaps"],
+                "an unrelated gap list was rewritten",
+            )
+
+    def test_an_unpriceable_quote_is_not_a_signal(self):
+        """Absence must never read as a pass."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l2.sqlite3")
+            engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+            engine.store = store
+            engine.root = Path(directory)
+
+            class _NoExit:
+                def snapshot(self, candidate, quote_block=None):
+                    return {"execution_quote": {
+                        "verified": True, "anchor_in_raw": 100_000_000}}
+
+            engine.v4_market = _NoExit()
+            with store.connection() as connection:
+                connection.execute(
+                    """INSERT INTO flow_signals (source_version,pool_id,
+                           token_address,computed_at,window_blocks,
+                           window_start_block,window_end_block,swap_count,
+                           buy_count,sell_count,unique_sender_hints,
+                           unique_resolved_participants,identity_coverage,
+                           buy_ratio,net_anchor_flow_fraction,
+                           uncapped_shadow_score,shadow_score,shadow_qualified,
+                           confidence,features_json,qualification_gaps_json,
+                           limitations_json)
+                       VALUES ('uniswap_v4',?,?,?,1350,?,?,8,6,2,4,4,1.0,0.75,
+                               0.5,21.9,21.9,1,'ok','{"qualification_gaps":[]}',
+                               '[]','[]')""",
+                    (self.POOL, TOKEN, rh._utc_now(), self.HEAD - 1350,
+                     self.HEAD - 10),
+                )
+            engine.seal_near_head_observations(self.HEAD, self.NOW)
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT role FROM flow_observations"
+                ).fetchone()
+            self.assertEqual(row["role"], "matched_control")

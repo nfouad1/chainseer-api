@@ -7494,6 +7494,35 @@ class RobinhoodLearningEngine:
                 features = {}
             gaps = features.get("qualification_gaps")
             gap_count = None if gaps is None else len(gaps)
+            # An unexitable pool is not a signal, whatever its flow looked
+            # like. The five qualification gates -- swaps, participants, net
+            # flow, price direction, concentration -- say nothing about
+            # whether the pool holds any money, so the first two windows ever
+            # labelled `signal` were pools with $2.11 and $0.39 of liquidity,
+            # 98.96% and 99.81% buy impact, and identical returns at 1m, 5m,
+            # 15m and 1h of -0.9951 and -0.9995: pure friction, no price
+            # movement at all.
+            #
+            # They qualified because the shadow-score bar was removed (their
+            # scores were 21.9 and 24.6, both under the old 70). Removing it
+            # was right -- the score is anti-predictive at p=0.0000 -- but it
+            # had been excluding empty pools as a side effect, and that work
+            # needs doing explicitly rather than by accident.
+            #
+            # This matters beyond the labels: signal_versus_control() needs 8
+            # per arm, and a signal arm filled with empty pools would produce
+            # a comparison that looks like a result.
+            round_trip = self.store._round_trip_return(market)
+            exitable = bool(
+                round_trip is not None
+                and round_trip >= -FLOW_MAXIMUM_ROUND_TRIP_LOSS
+            )
+            if gap_count == 0 and not exitable:
+                gaps = list(gaps or []) + ["exitable_round_trip"]
+                gap_count = len(gaps)
+                features = dict(features)
+                features["qualification_gaps"] = gaps
+                features["round_trip_return"] = round_trip
             role = "signal" if gap_count == 0 else "matched_control"
             observation_id = self.store.seal_flow_observation(
                 role=role, gap_count=gap_count,
