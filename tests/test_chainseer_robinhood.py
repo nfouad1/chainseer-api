@@ -6120,3 +6120,97 @@ class IdentityBudgetTests(unittest.TestCase):
         store = self._Store()
         self._engine(store).resolve_flow_participants(deadline_monotonic=None)
         self.assertEqual(store.census_calls, 1)
+
+
+class NearHeadSelectorTests(unittest.TestCase):
+    """Near-head selection without the range join.
+
+    The CTE joined every swap_observations row against every flow_signals
+    window on a BETWEEN -- a cross-product no B-tree serves, measured at
+    44.7-56.9s per scope against a 60-second stage budget. Bounding it by
+    block changed nothing because the join is still evaluated. Asked the other
+    way round it is two indexed lookups: 0.19s for the same answer.
+    """
+
+    POOL = "0x" + "a9" * 32
+    HEAD = 47_000_000
+
+    def _store(self, directory):
+        store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+        store.apply_v4_events([{
+            "kind": "initialize", "pool_id": self.POOL,
+            "currency0": TOKEN.lower(), "currency1": rh.USDG_ADDRESS.lower(),
+            "token_address": TOKEN.lower(),
+            "anchor_address": rh.USDG_ADDRESS.lower(),
+            "fee_tier": 3000, "tick_spacing": 60,
+            "hooks_address": rh.ZERO_ADDRESS,
+            "block_number": self.HEAD - rh.FLOW_WINDOW_BLOCKS,
+            "sqrt_price_x96": 1 << 96, "tick": 0,
+        }])
+        return store
+
+    def _swaps(self, store, pool, first_block, count):
+        store.apply_v4_events([{
+            "kind": "swap", "pool_id": pool,
+            "block_number": first_block + index, "block_timestamp": None,
+            "transaction_hash": f"{pool[:6]}{index:04d}", "log_index": 0,
+            "sender_hint": "0x" + "b" * 40,
+            "amount0_raw": 1, "amount1_raw": -1,
+            "sqrt_price_x96": 1 << 96, "active_liquidity": 1, "tick": 0,
+        } for index in range(count)])
+
+    def test_unresolved_near_head_transactions_are_returned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._swaps(store, self.POOL, self.HEAD - 400, 5)
+            hashes = store.near_head_pending_origins(500, head_block=self.HEAD)
+            self.assertEqual(len(hashes), 5)
+
+    def test_already_resolved_transactions_are_excluded(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._swaps(store, self.POOL, self.HEAD - 400, 5)
+            store.record_transaction_origins([
+                {"transaction_hash": f"{self.POOL[:6]}0000",
+                 "transaction": {"from": "0x" + "1" * 40,
+                                 "to": "0x" + "2" * 40,
+                                 "blockNumber": hex(self.HEAD - 400)}},
+            ])
+            hashes = store.near_head_pending_origins(500, head_block=self.HEAD)
+            self.assertEqual(len(hashes), 4)
+
+    def test_windows_far_behind_the_head_are_not_returned(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._swaps(store, self.POOL, self.HEAD - 400, 3)
+            hashes = store.near_head_pending_origins(
+                500, head_block=self.HEAD + 5_000_000)
+            self.assertEqual(
+                hashes, [], "a long-stale window consumed the live budget")
+
+    def test_the_limit_is_honoured(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._swaps(store, self.POOL, self.HEAD - 400, 12)
+            self.assertEqual(
+                len(store.near_head_pending_origins(4, head_block=self.HEAD)), 4)
+
+    def test_duplicate_hashes_are_returned_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._swaps(store, self.POOL, self.HEAD - 400, 3)
+            with store.connection() as connection:
+                connection.execute(
+                    """INSERT OR IGNORE INTO swap_observations (source_version,
+                           pool_id,token_address,block_number,transaction_hash,
+                           log_index,sender_hint,sender_identity_kind,
+                           amount0_raw,amount1_raw,anchor_delta_raw,
+                           token_delta_raw,side,sqrt_price_x96,observed_at)
+                       VALUES ('uniswap_v4',?,?,?,?,1,'0xb',
+                               'event_sender_may_be_router','1','1','1','1',
+                               'buy','1',?)""",
+                    (self.POOL, TOKEN, self.HEAD - 399,
+                     f"{self.POOL[:6]}0000", rh._utc_now()),
+                )
+            hashes = store.near_head_pending_origins(500, head_block=self.HEAD)
+            self.assertEqual(len(hashes), len(set(hashes)))

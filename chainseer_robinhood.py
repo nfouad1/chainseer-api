@@ -3508,6 +3508,64 @@ class RobinhoodLearningStore:
             row["quote"] = json.loads(row.pop("quote_json") or "{}")
         return rows
 
+    def near_head_pending_origins(
+        self, limit: int, *, head_block: int,
+    ) -> list[str]:
+        """Near-head unresolved transactions, without the range join.
+
+        pending_transaction_origins builds one CTE that joins every
+        swap_observations row against every flow_signals window on
+        `block_number BETWEEN window_start AND window_end`. That is a
+        cross-product no B-tree can serve, and it cost 44.7-56.9s per scope
+        against a 60-second stage budget -- bounding it by block changed
+        nothing, because the join is still evaluated.
+
+        The join only ever existed to decide which window a swap belongs to.
+        Asked the other way round it is two indexed lookups: flow_signals is
+        small (2,176 rows) so the near-head windows come back immediately, and
+        each window's transactions are a pool_id + block range, which
+        idx_swap_observation_pool_block already serves exactly.
+
+        Windows are taken newest-first and whole. A window at 70% identity
+        coverage fails the 0.80 floor exactly as completely as one at 0%, so
+        a partial window is wasted work.
+        """
+        floor = int(head_block) - FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS
+        hashes: list[str] = []
+        seen: set[str] = set()
+        with self.connection() as connection:
+            windows = connection.execute(
+                """
+                SELECT pool_id,window_start_block,window_end_block
+                FROM flow_signals WHERE window_end_block >= ?
+                ORDER BY window_end_block DESC
+                """,
+                (floor,),
+            ).fetchall()
+            for window in windows:
+                if len(hashes) >= limit:
+                    break
+                for row in connection.execute(
+                    """
+                    SELECT so.transaction_hash
+                    FROM swap_observations so
+                    LEFT JOIN transaction_origins tx USING(transaction_hash)
+                    WHERE so.pool_id=?
+                      AND so.block_number BETWEEN ? AND ?
+                      AND so.transaction_hash<>''
+                      AND (tx.transaction_hash IS NULL OR (
+                          tx.status<>'resolved' AND tx.attempts<?
+                      ))
+                    """,
+                    (window["pool_id"], window["window_start_block"],
+                     window["window_end_block"], FLOW_ORIGIN_MAXIMUM_ATTEMPTS),
+                ):
+                    digest = row[0]
+                    if digest not in seen:
+                        seen.add(digest)
+                        hashes.append(digest)
+        return hashes[:limit]
+
     def pending_transaction_origins(
         self, limit: int = FLOW_ORIGIN_RESOLUTION_LIMIT, *, scope: str = "all",
         head_block: int | None = None,
@@ -7260,9 +7318,10 @@ class RobinhoodLearningEngine:
         historical_reserve = min(FLOW_HISTORICAL_ORIGIN_RESERVE, limit // 10)
         prospective_hashes: list[str] = []
         if head_block:
-            prospective_hashes = self.store.pending_transaction_origins(
-                limit - historical_reserve, scope="prospective",
-                head_block=head_block,
+            # Two indexed lookups instead of a range join: 0.19s against the
+            # 44.7s the prospective scope was costing, for the same answer.
+            prospective_hashes = self.store.near_head_pending_origins(
+                limit - historical_reserve, head_block=head_block,
             )
         active_hashes = [
             h for h in self.store.pending_transaction_origins(
