@@ -7271,7 +7271,16 @@ class RobinhoodLearningEngine:
         unavailable = batch["unavailable"]
         failures = batch["failures"]
         affected_pools = batch["affected_pools"]
-        pending = self.store.pending_transaction_origin_counts()
+        # Queue-depth census, not work. Measured at 85.1s against a 60-second
+        # stage budget: the batch loop honoured its deadline and then this ran
+        # regardless, so the stage came in at 268.4s. Diagnostics must not
+        # outweigh the thing they describe -- skipped past the deadline, and
+        # the skip is reported rather than silently returning zeros.
+        if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            pending = {"total": None, "active": None, "historical": None,
+                       "census_skipped_past_deadline": True}
+        else:
+            pending = self.store.pending_transaction_origin_counts()
         attempted_active = min(attempted, len(active_hashes))
         attempted_historical = max(0, attempted - attempted_active)
         return {
@@ -8422,9 +8431,17 @@ class RobinhoodLearningEngine:
                         near_head_flow.get("head_block_after") or 0
                     ) or None,
                 )
-                identity_resolution["queues"] = self.store.prospective_enrichment_counts(
-                    int(near_head_flow.get("head_block_after") or 0)
-                ) if near_head_flow.get("head_block_after") else {}
+                # 65.1s of census on top of an already-spent budget. Same
+                # rule: report the skip instead of paying for the number.
+                identity_resolution["queues"] = (
+                    self.store.prospective_enrichment_counts(
+                        int(near_head_flow.get("head_block_after") or 0)
+                    )
+                    if near_head_flow.get("head_block_after")
+                    and time.monotonic() < identity_deadline
+                    else {"census_skipped_past_deadline":
+                          bool(near_head_flow.get("head_block_after"))}
+                )
                 stage_timings["flow_identity_resolution"] = round(
                     time.monotonic() - stage_started, 3
                 )

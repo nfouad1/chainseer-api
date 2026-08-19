@@ -6053,3 +6053,70 @@ class DiscoveryCatchupTests(unittest.TestCase):
         _, coverage, passes = self._drive(observer, deadline_seconds=0.0)
         self.assertEqual(passes, 1, "the budget did not bound the loop")
         self.assertFalse(coverage["caught_up"])
+
+
+class IdentityBudgetTests(unittest.TestCase):
+    """Diagnostics must not outweigh the thing they describe.
+
+    The identity stage carried a 60-second budget and came in at 268.4s. The
+    batch loop honoured its deadline; what ran afterwards did not.
+    pending_transaction_origin_counts measured 85.1s and
+    prospective_enrichment_counts 65.1s -- 150s of queue census on top of an
+    already-spent budget, both of them reporting queue depth rather than
+    resolving anything.
+    """
+
+    class _Store:
+        def __init__(self):
+            self.census_calls = 0
+
+        def pending_transaction_origin_counts(self):
+            self.census_calls += 1
+            return {"total": 7, "active": 3, "historical": 4}
+
+        def pending_transaction_origins(self, limit, *, scope="all", head_block=None):
+            return []
+
+        def record_transaction_origins(self, records):
+            return {"resolved": 0, "unavailable": 0, "affected_pools": 0}
+
+    def _engine(self, store):
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.store = store
+        engine.rpc = type("R", (), {"get_transactions": staticmethod(lambda h: [])})()
+        return engine
+
+    def test_the_census_is_skipped_once_the_deadline_has_passed(self):
+        store = self._Store()
+        result = self._engine(store).resolve_flow_participants(
+            deadline_monotonic=time.monotonic() - 1.0,
+        )
+        self.assertEqual(
+            store.census_calls, 0,
+            "an 85-second census ran after the budget was already spent",
+        )
+        self.assertTrue(result["pending_after"] is None
+                        or result.get("pending_after") is None)
+
+    def test_the_skip_is_reported_not_silently_zeroed(self):
+        store = self._Store()
+        result = self._engine(store).resolve_flow_participants(
+            deadline_monotonic=time.monotonic() - 1.0,
+        )
+        self.assertIsNone(
+            result["pending_after"],
+            "a skipped census must not read as an empty queue",
+        )
+
+    def test_the_census_still_runs_when_time_remains(self):
+        store = self._Store()
+        result = self._engine(store).resolve_flow_participants(
+            deadline_monotonic=time.monotonic() + 60.0,
+        )
+        self.assertEqual(store.census_calls, 1)
+        self.assertEqual(result["pending_after"], 7)
+
+    def test_no_deadline_means_the_census_runs(self):
+        store = self._Store()
+        self._engine(store).resolve_flow_participants(deadline_monotonic=None)
+        self.assertEqual(store.census_calls, 1)
