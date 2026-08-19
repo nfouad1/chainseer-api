@@ -5903,3 +5903,72 @@ class DiscoveryGapTests(unittest.TestCase):
             result = engine.near_head_flow_pass()
             self.assertTrue(result["scanned"])
             self.assertEqual(result["pools_admitted_on_sight"], 0)
+
+
+class CohortBoundaryTests(unittest.TestCase):
+    """cohort-003 is closed and never mixed with what follows.
+
+    It was closed because the POPULATION changed, not the policy: batch
+    discovery ran 477,270 blocks behind the head, so every cohort-003
+    observation came from a pool at least 13 hours old when first seen.
+    Admitting pools on sight cut that to 383 blocks. Comparing arms across
+    those two regimes would call a selection difference an effect.
+    """
+
+    POOL = "0x" + "c4" * 32
+    HEAD = 46_000_000
+    NOW = 70_000.0
+
+    def _seal(self, store, pool):
+        return store.seal_flow_observation(
+            pool_id=pool, token_address=TOKEN, observation_head=self.HEAD,
+            window_start_block=self.HEAD - 450, window_end_block=self.HEAD - 10,
+            transaction_hashes=[f"{pool[:8]}tx"], features={},
+            quote={"execution_quote": {
+                "verified": True, "anchor_in_raw": 100_000_000,
+                "anchor_out_raw": 99_000_000, "token_out_raw": 10 ** 18}},
+            quote_block=self.HEAD - 10, now=self.NOW,
+        )
+
+    def test_new_observations_land_in_cohort_004(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._seal(store, self.POOL)
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT cohort_id FROM flow_observations").fetchone()
+            self.assertEqual(row["cohort_id"], "flow-evidence-v3-cohort-004")
+            self.assertEqual(rh.FLOW_EVIDENCE_COHORT_ID,
+                             "flow-evidence-v3-cohort-004")
+
+    def test_cohort_003_observations_do_not_count_toward_the_new_cohort(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            observation_id = self._seal(store, self.POOL)
+            with store.connection() as connection:
+                connection.execute(
+                    "UPDATE flow_observations SET cohort_id=?"
+                    " WHERE observation_id=?",
+                    ("flow-evidence-v3-cohort-003", observation_id),
+                )
+            self.assertEqual(
+                store.cohort_progress()["completed_primary_observations"], 0,
+                "a closed cohort's observations leaked into the new one",
+            )
+
+    def test_the_closed_cohort_stays_queryable_as_a_baseline(self):
+        """Closing is not deleting: it remains the 13-hour-old-pool baseline."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            observation_id = self._seal(store, self.POOL)
+            with store.connection() as connection:
+                connection.execute(
+                    "UPDATE flow_observations SET cohort_id=?"
+                    " WHERE observation_id=?",
+                    ("flow-evidence-v3-cohort-003", observation_id),
+                )
+            self.assertEqual(
+                store.cohort_progress(
+                    cohort_id="flow-evidence-v3-cohort-003")["cohort_id"],
+                "flow-evidence-v3-cohort-003",
+            )

@@ -220,7 +220,26 @@ FLOW_EVIDENCE_POLICY_VERSION = "flow-evidence-v3"
 # cohort-003: a 1350-block window is a different measurement from a 450-block
 # one, so its observations are not comparable with cohort-002's. The 92
 # control observations there stay as the 450-block baseline.
-FLOW_EVIDENCE_COHORT_ID = "flow-evidence-v3-cohort-003"
+# cohort-004: closed cohort-003 at 914 observations (653 resolved, 238
+# pending, 23 non-exitable, all 914 matched_control) because the POPULATION
+# changed, not the policy. Batch discovery ran 477,270 blocks behind the head
+# -- about 13 hours -- and admitted no pool inside that gap, so every
+# cohort-003 observation came from a pool at least 13 hours old when it was
+# first seen. Admitting pools on sight cut that latency to 383 blocks, roughly
+# 38 seconds, so observations sealed from here can be minutes old.
+#
+# Those are different experiments. signal_versus_control() comparing across
+# them would pair arms drawn from two selection regimes and call the
+# difference an effect. cohort-003's 653 resolved outcomes remain the
+# thirteen-hour-old-pool baseline and keep their diagnostic value; they are
+# simply not comparable with what follows.
+#
+# Expect worse friction here, not better: pools minutes old are thin by
+# construction, so the exitability gate should reject most of them. A signal
+# arm that stays near zero is that gate working, not this change failing.
+# The 700-resolved target was computed from cohort-003's return variance and
+# must be recomputed once cohort-004 can estimate its own.
+FLOW_EVIDENCE_COHORT_ID = "flow-evidence-v3-cohort-004"
 #: Reflection at 15 COMPLETED primary-horizon observations, stronger evaluation
 #: at 30+, and no tier comparison until each compared tier has its own minimum.
 #: Scheduled outcomes are not completed outcomes -- 1,985 were scheduled while
