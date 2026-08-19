@@ -197,6 +197,13 @@ FLOW_DECISION_QUOTE_LIMIT = 20
 # not a trade at all. The figure is recorded on every observation so the bound
 # can be set from the distribution instead of argued about.
 FLOW_MAXIMUM_ROUND_TRIP_LOSS = 0.02
+# Backfill catch-up. The crawler is bounded per cycle by wall clock rather
+# than by a chunk count: the constraint is RPC latency on an endpoint that
+# returns 429s, not block arithmetic. At 5,000 blocks a chunk these bounds
+# allow up to 200,000 blocks a cycle, so a 500,000-block backlog closes in a
+# few cycles instead of never.
+FLOW_DISCOVERY_CATCHUP_SECONDS = 120.0
+FLOW_DISCOVERY_MAXIMUM_PASSES = 40
 FLOW_NEAR_HEAD_ENRICHMENT_LIMIT = 300
 FLOW_NEAR_HEAD_ENRICHMENT_BUDGET_SECONDS = 30.0
 FLOW_MAXIMUM_PARTICIPANT_SHARE = 0.50
@@ -8325,9 +8332,37 @@ class RobinhoodLearningEngine:
                     time.monotonic() - stage_started, 3
                 )
                 stage_started = time.monotonic()
-                v4_discovered, v4_coverage = self.v4_observer.sync(
-                    block_limit=discovery_block_limit, lookback=lookback
+                # The crawler advanced ONE chunk per cycle -- at most 5,000
+                # blocks -- while the chain produces 3,000-9,000 in the same
+                # span, so it tied at best and lost at worst: measured drifting
+                # from 493,004 to 500,034 blocks behind in a quarter of an
+                # hour, and it had never once reported caught_up.
+                #
+                # Nothing about backfill needs to be one chunk. It runs in a
+                # loop now until it catches the head or its budget expires,
+                # which lets it burn through the backlog over a few cycles
+                # instead of receding forever. The budget is wall-clock rather
+                # than a chunk count because the constraint is RPC latency,
+                # not block arithmetic -- 429s are frequent on this endpoint.
+                v4_discovered, v4_coverage = [], {}
+                catchup_deadline = (
+                    time.monotonic() + FLOW_DISCOVERY_CATCHUP_SECONDS
                 )
+                catchup_passes = 0
+                while True:
+                    chunk, v4_coverage = self.v4_observer.sync(
+                        block_limit=discovery_block_limit, lookback=lookback
+                    )
+                    v4_discovered.extend(chunk)
+                    catchup_passes += 1
+                    if v4_coverage.get("caught_up"):
+                        break
+                    if catchup_passes >= FLOW_DISCOVERY_MAXIMUM_PASSES:
+                        break
+                    if time.monotonic() >= catchup_deadline:
+                        break
+                v4_coverage = dict(v4_coverage)
+                v4_coverage["catchup_passes"] = catchup_passes
                 stage_timings["uniswap_v4_discovery"] = round(
                     time.monotonic() - stage_started, 3
                 )

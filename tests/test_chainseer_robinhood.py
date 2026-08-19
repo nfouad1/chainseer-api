@@ -5972,3 +5972,84 @@ class CohortBoundaryTests(unittest.TestCase):
                     cohort_id="flow-evidence-v3-cohort-003")["cohort_id"],
                 "flow-evidence-v3-cohort-003",
             )
+
+
+class DiscoveryCatchupTests(unittest.TestCase):
+    """Backfill loops until it catches the head or its budget expires.
+
+    One 5,000-block chunk per cycle against a chain producing 3,000-9,000 in
+    the same span meant the crawler tied at best: measured drifting from
+    493,004 to 500,034 blocks behind in a quarter of an hour, having never
+    once reported caught_up.
+    """
+
+    class _Observer:
+        """Advances a fixed number of blocks per sync, like the real one."""
+
+        def __init__(self, behind, per_chunk=5_000, fail_after=None):
+            self.behind = behind
+            self.per_chunk = per_chunk
+            self.calls = 0
+            self.fail_after = fail_after
+
+        def sync(self, *, block_limit, lookback):
+            self.calls += 1
+            if self.fail_after and self.calls > self.fail_after:
+                raise RuntimeError("[RPC -429] rate limited")
+            self.behind = max(0, self.behind - self.per_chunk)
+            return ([{"pool": self.calls}],
+                    {"caught_up": self.behind == 0, "blocks_behind": self.behind})
+
+    def _drive(self, observer, deadline_seconds=None):
+        """Mirror of the loop in run_once, exercised without a full cycle."""
+        budget = (deadline_seconds if deadline_seconds is not None
+                  else rh.FLOW_DISCOVERY_CATCHUP_SECONDS)
+        discovered, coverage = [], {}
+        deadline = time.monotonic() + budget
+        passes = 0
+        while True:
+            chunk, coverage = observer.sync(block_limit=5_000, lookback=5_000)
+            discovered.extend(chunk)
+            passes += 1
+            if coverage.get("caught_up"):
+                break
+            if passes >= rh.FLOW_DISCOVERY_MAXIMUM_PASSES:
+                break
+            if time.monotonic() >= deadline:
+                break
+        return discovered, coverage, passes
+
+    def test_a_small_backlog_is_cleared_in_one_cycle(self):
+        observer = self._Observer(behind=20_000)
+        _, coverage, passes = self._drive(observer)
+        self.assertTrue(coverage["caught_up"])
+        self.assertEqual(passes, 4)
+
+    def test_a_large_backlog_is_bounded_but_makes_real_progress(self):
+        """500,034 behind: bounded per cycle, but no longer receding."""
+        observer = self._Observer(behind=500_034)
+        _, coverage, passes = self._drive(observer)
+        self.assertFalse(coverage["caught_up"])
+        self.assertEqual(passes, rh.FLOW_DISCOVERY_MAXIMUM_PASSES)
+        self.assertEqual(
+            coverage["blocks_behind"],
+            500_034 - rh.FLOW_DISCOVERY_MAXIMUM_PASSES * 5_000,
+            "a bounded cycle must still close 200,000 blocks",
+        )
+        self.assertLess(coverage["blocks_behind"], 500_034)
+
+    def test_the_old_single_chunk_behaviour_would_lose_ground(self):
+        """One chunk advances 5,000 while the chain adds ~6,000."""
+        observer = self._Observer(behind=500_034)
+        observer.sync(block_limit=5_000, lookback=5_000)
+        after_one_chunk = observer.behind + 6_000   # chain moved on
+        self.assertGreater(
+            after_one_chunk, 500_034,
+            "this is the regression the loop exists to fix",
+        )
+
+    def test_the_wall_clock_budget_stops_the_loop(self):
+        observer = self._Observer(behind=10_000_000)
+        _, coverage, passes = self._drive(observer, deadline_seconds=0.0)
+        self.assertEqual(passes, 1, "the budget did not bound the loop")
+        self.assertFalse(coverage["caught_up"])
