@@ -3540,6 +3540,41 @@ class RobinhoodLearningStore:
             int(head_block) - FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS
             if head_block is not None else None
         )
+        # Bound the SCAN, not just the ranking. The CTE below range-joins every
+        # swap_observations row against every flow_signals window on a BETWEEN,
+        # and nothing confined it by block: with a 600,193-row backlog the
+        # selection alone outran the whole 60-second stage budget, so the
+        # identity stage reported planned=500, selected=0, resolved=0 -- it
+        # spent 472.8 seconds deciding what to do and then did none of it.
+        #
+        # The live scopes only ever want near-head transactions, so they get a
+        # floor. `historical` and `all` deliberately keep the full range: their
+        # whole purpose is the backlog, and silently truncating it would turn a
+        # slow query into a wrong one.
+        #
+        # The floor is interpolated as an int rather than bound as a parameter
+        # because this statement's placeholders are positional and shared with
+        # two other clauses; adding one would risk binding the wrong value to
+        # the wrong slot, which SQLite accepts silently.
+        # TWICE the bound, not once. A prospective window may END up to
+        # FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS behind the head and SPANS that far
+        # again backwards, so a transaction legitimately belonging to it sits
+        # up to 2x behind. Flooring at 1x silently dropped the older half of
+        # every window -- and a half-covered window fails the 0.80 identity
+        # floor exactly as completely as an empty one, which is the whole
+        # reason the scope takes entire windows rather than recent swaps.
+        scan_floor = (
+            int(fresh_floor) - FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS
+            if fresh_floor is not None else None
+        )
+        floor_clause = (
+            f"AND so.block_number >= {scan_floor}"
+            if scan_floor is not None
+            # NOT background: that scope exists to reach the backlog, and a
+            # floor would make it return nothing at all.
+            and scope in {"prospective", "active"}
+            else ""
+        )
         with self.connection() as connection:
             return [row[0] for row in connection.execute(
                 f"""
@@ -3569,6 +3604,7 @@ class RobinhoodLearningStore:
                     LEFT JOIN flow_signals fs ON fs.pool_id=so.pool_id
                     LEFT JOIN transaction_origins tx USING(transaction_hash)
                     WHERE so.transaction_hash<>''
+                      {floor_clause}
                       AND (tx.transaction_hash IS NULL OR (
                           tx.status<>'resolved' AND tx.attempts<?
                       ))
