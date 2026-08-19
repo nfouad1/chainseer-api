@@ -8186,7 +8186,15 @@ class RobinhoodLearningEngine:
         fresh_observed = recovery_observed = 0
         fresh_selected = sum(row.get("outcome_queue") == "fresh" for row in due_outcomes)
         recovery_selected = len(due_outcomes) - fresh_selected
+        # Per-observation cost, which nothing measured. The stage reported
+        # 145.156s while its three named sub-timers -- selection 0.078s,
+        # expiration 0.375s, market batch 0.984s -- accounted for 1.4s of it.
+        # The remaining 143s was two outcomes at roughly 70s each, invisible.
+        # Same shape as the near-head telemetry and the identity census: the
+        # work being timed was not the work costing the time.
+        observation_seconds: list[float] = []
         for index, due in enumerate(due_outcomes):
+            observation_started = time.monotonic()
             if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
                 deferred = len(due_outcomes) - index
                 break
@@ -8321,6 +8329,7 @@ class RobinhoodLearningEngine:
                 except Exception:
                     producer_failures += 1
             observed+=1
+            observation_seconds.append(time.monotonic() - observation_started)
             if due.get("outcome_queue") == "recovery":
                 recovery_observed += 1
             else:
@@ -8340,6 +8349,16 @@ class RobinhoodLearningEngine:
             "recovery_limit": recovery_limit,
             "duration_seconds": round(time.monotonic() - started, 3),
             "expiration_duration_seconds": round(expiration_seconds, 3),
+            # Reported as a distribution, not a mean: one 70-second outlier
+            # and ten fast rows describe very different problems.
+            "observation_seconds_total": round(sum(observation_seconds), 3),
+            "observation_seconds_slowest": (
+                round(max(observation_seconds), 3) if observation_seconds else None
+            ),
+            "observation_seconds_median": (
+                round(sorted(observation_seconds)[len(observation_seconds) // 2], 3)
+                if observation_seconds else None
+            ),
             "selection_duration_seconds": round(selection_seconds, 3),
             "market_batch_duration_seconds": round(batch_seconds, 3),
             "market_batch_candidates": len(standard_due),

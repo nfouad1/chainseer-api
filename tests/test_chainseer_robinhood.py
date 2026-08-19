@@ -1,3 +1,4 @@
+import inspect
 import json
 import hashlib
 import tempfile
@@ -6214,3 +6215,56 @@ class NearHeadSelectorTests(unittest.TestCase):
                 )
             hashes = store.near_head_pending_origins(500, head_block=self.HEAD)
             self.assertEqual(len(hashes), len(set(hashes)))
+
+
+class ObservationTimingTests(unittest.TestCase):
+    """The stage times the work that costs the time.
+
+    outcomes reported 145.156s while its three sub-timers accounted for 1.4s:
+    selection 0.078s, expiration 0.375s, market batch 0.984s. The missing 143s
+    was two outcomes at roughly 70s each, and nothing measured them.
+    """
+
+    def _payload(self, seconds):
+        """The shape observe_outcomes returns, built from known durations."""
+        return {
+            "observation_seconds_total": round(sum(seconds), 3),
+            "observation_seconds_slowest": (
+                round(max(seconds), 3) if seconds else None),
+            "observation_seconds_median": (
+                round(sorted(seconds)[len(seconds) // 2], 3)
+                if seconds else None),
+        }
+
+    def test_the_total_accounts_for_the_stage(self):
+        payload = self._payload([70.1, 73.2])
+        self.assertAlmostEqual(payload["observation_seconds_total"], 143.3, places=1)
+
+    def test_a_single_outlier_is_distinguishable_from_uniform_slowness(self):
+        """One 70s row among ten fast ones is a different problem."""
+        outlier = self._payload([70.0] + [0.2] * 10)
+        uniform = self._payload([6.6] * 11)
+        self.assertAlmostEqual(
+            outlier["observation_seconds_total"],
+            uniform["observation_seconds_total"], delta=1.0,
+        )
+        self.assertGreater(
+            outlier["observation_seconds_slowest"],
+            uniform["observation_seconds_slowest"] * 5,
+            "a mean would have hidden the outlier",
+        )
+        self.assertLess(outlier["observation_seconds_median"], 1.0)
+        self.assertGreater(uniform["observation_seconds_median"], 5.0)
+
+    def test_no_observations_reports_none_not_zero(self):
+        """Nothing due is not the same as everything being instant."""
+        payload = self._payload([])
+        self.assertEqual(payload["observation_seconds_total"], 0)
+        self.assertIsNone(payload["observation_seconds_slowest"])
+        self.assertIsNone(payload["observation_seconds_median"])
+
+    def test_the_engine_emits_the_fields(self):
+        self.assertIn(
+            "observation_seconds_total",
+            inspect.getsource(rh.RobinhoodLearningEngine.observe_outcomes),
+        )
