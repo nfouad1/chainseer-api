@@ -82,6 +82,8 @@ HORIZONS = (
 DEFAULT_ROOT = "robinhood_learning"
 DEFAULT_CHAIN_ROOT = "robinhood_learning_chain"
 DEFAULT_DASHBOARD_PORT = 8769
+# How often the dashboard rebuilds its snapshot off the request path.
+DASHBOARD_SNAPSHOT_REFRESH_SECONDS = 30.0
 DEFAULT_DISCOVERY_LOOKBACK_BLOCKS = 5_000
 DEFAULT_DISCOVERY_BLOCK_LIMIT = 5_000
 DEFAULT_ANALYSIS_LIMIT = 1
@@ -1104,13 +1106,33 @@ class OutcomeLedgerObservationMissing(KeyError):
 
 
 class RobinhoodLearningStore:
-    def __init__(self, path: str | Path):
+    def __init__(self, path: str | Path, *, read_only: bool = False):
+        """read_only opens the database for reading and runs no migrations.
+
+        The dashboard announces itself as read-only but was constructing a
+        full store, and a store constructor MIGRATES -- it creates tables,
+        adds columns and builds indexes. Those are writes, so opening the
+        dashboard while a learning cycle held the write lock blocked until
+        the cycle finished. Measured: dashboard_snapshot took 43.6 seconds
+        and /api/status timed out entirely, while the underlying queries all
+        returned in under 2 seconds when run against a read-only connection.
+        The slowness was never the queries; it was waiting for a writer.
+        """
         self.path = Path(path)
-        self.path.parent.mkdir(parents=True, exist_ok=True)
-        self._initialize()
+        self.read_only = bool(read_only)
+        if not self.read_only:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self._initialize()
 
     def _connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path, timeout=10)
+        if self.read_only:
+            # A reader in WAL mode never blocks on a writer, so the dashboard
+            # stays responsive mid-cycle instead of queueing behind it.
+            connection = sqlite3.connect(
+                f"file:{self.path.as_posix()}?mode=ro", uri=True, timeout=10,
+            )
+        else:
+            connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA busy_timeout=10000")
         return connection
@@ -1119,8 +1141,13 @@ class RobinhoodLearningStore:
     def connection(self):
         connection = self._connect()
         try:
-            with connection:
+            if self.read_only:
+                # `with connection` opens a transaction that COMMITs on exit,
+                # which a read-only handle cannot do.
                 yield connection
+            else:
+                with connection:
+                    yield connection
         finally:
             connection.close()
 
@@ -1344,6 +1371,15 @@ class RobinhoodLearningStore:
                     ON flow_signal_windows(window_end_block);
                 CREATE INDEX IF NOT EXISTS idx_flow_windows_qualified
                     ON flow_signal_windows(shadow_qualified,window_end_block);
+                -- The dashboard's three slowest reads all group or filter
+                -- swap_observations by transaction_hash across 487k rows with
+                -- no index for it: pending_transaction_origin_counts took
+                -- 21.2s, flow_summary 19.6s and v4_custody_summary 14.7s,
+                -- which is why /api/status timed out.
+                CREATE INDEX IF NOT EXISTS idx_swap_observation_transaction
+                    ON swap_observations(transaction_hash);
+                CREATE INDEX IF NOT EXISTS idx_swap_observation_participant
+                    ON swap_observations(resolved_participant);
                 -- Sealed the instant a near-head window is detected, BEFORE
                 -- any enrichment. Nothing in this table is ever updated: an
                 -- observation is a claim about a moment, and a claim that can
@@ -8615,8 +8651,20 @@ def dashboard_snapshot(
 class RobinhoodDashboardMarketRefresher:
     """Coalesce exact-pool refreshes behind a short stale-safe cache."""
 
-    def __init__(self, root: str | Path, *, engine=None):
-        self.engine = engine or RobinhoodLearningEngine(root)
+    def __init__(self, root: str | Path, *, engine=None, read_only: bool = False):
+        # read_only skips the engine entirely: constructing one migrates the
+        # database, which is exactly the write the dashboard must not make.
+        self.read_only = bool(read_only) and engine is None
+        if self.read_only:
+            self.root = Path(root)
+            self.store = RobinhoodLearningStore(
+                self.root / "learning.sqlite3", read_only=True,
+            )
+            self.engine = None
+        else:
+            self.engine = engine or RobinhoodLearningEngine(root)
+            self.root = self.engine.root
+            self.store = self.engine.store
         self.lock = threading.Lock()
         self._markets: dict[str, dict] = {}
         self._errors: dict[str, str] = {}
@@ -8628,8 +8676,8 @@ class RobinhoodDashboardMarketRefresher:
             age = time.monotonic() - self._refreshed_monotonic
             if self._refreshed_monotonic and age < DASHBOARD_MARKET_CACHE_SECONDS:
                 snapshot = dashboard_snapshot(
-                    self.engine.root,
-                    store=self.engine.store,
+                    self.root,
+                    store=self.store,
                     live_position_markets=self._markets,
                     market_refresh_errors=self._errors,
                 )
@@ -8641,7 +8689,20 @@ class RobinhoodDashboardMarketRefresher:
                 return snapshot
             markets: dict[str, dict] = {}
             errors: dict[str, str] = {}
-            with self.engine.store.connection() as connection:
+            if self.read_only:
+                # Live position re-pricing needs an engine and its RPC. A
+                # read-only dashboard serves the sealed record instead of
+                # making network calls on the viewer's behalf.
+                self._refreshed_monotonic = time.monotonic()
+                self._refreshed_at = _utc_now()
+                snapshot = dashboard_snapshot(self.root, store=self.store)
+                snapshot["market_cache"] = {
+                    "refreshed_at": self._refreshed_at, "age_seconds": 0.0,
+                    "ttl_seconds": DASHBOARD_MARKET_CACHE_SECONDS,
+                    "live_refresh": False,
+                }
+                return snapshot
+            with self.store.connection() as connection:
                 candidates = [dict(row) for row in connection.execute(
                     """
                     SELECT c.*,p.quantity paper_quantity
@@ -8666,8 +8727,8 @@ class RobinhoodDashboardMarketRefresher:
             self._refreshed_monotonic = time.monotonic()
             self._refreshed_at = _utc_now()
             snapshot = dashboard_snapshot(
-                self.engine.root,
-                store=self.engine.store,
+                self.root,
+                store=self.store,
                 live_position_markets=markets,
                 market_refresh_errors=errors,
             )
@@ -8683,13 +8744,22 @@ def serve_dashboard(root: str | Path, host: str, port: int) -> None:
     if host not in {"127.0.0.1","localhost"}:
         raise ValueError("Robinhood dashboard is local-only")
     html_path=Path(__file__).with_name("robinhood_dashboard.html")
-    refresher=RobinhoodDashboardMarketRefresher(root)
+    refresher=RobinhoodDashboardMarketRefresher(root, read_only=True)
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path in {"/","/index.html"}:
                 content=html_path.read_bytes(); content_type="text/html; charset=utf-8"
             elif self.path=="/api/status":
-                content=json.dumps(refresher.snapshot()).encode(); content_type="application/json"
+                # Never block: say "warming" rather than hang for 70 seconds.
+                payload=cached["payload"] or {
+                    "warming": True, "timestamp": _utc_now(),
+                    "detail": "First snapshot is still building.",
+                    "error": cached.get("error"),
+                }
+                if cached["payload"] is not None:
+                    payload=dict(payload)
+                    payload["snapshot_built_at"]=cached["built_at"]
+                content=json.dumps(payload).encode(); content_type="application/json"
             else:
                 self.send_error(404); return
             self.send_response(200); self.send_header("Content-Type",content_type)
@@ -8697,6 +8767,29 @@ def serve_dashboard(root: str | Path, host: str, port: int) -> None:
             self.end_headers(); self.wfile.write(content)
         def log_message(self, *_args):
             return
+    # The snapshot costs ~70 seconds: flow_summary, v4_custody_summary and
+    # pending_transaction_origin_counts each range-join 487k swap rows against
+    # 2,176 signal windows on a BETWEEN, which no index serves. Computing that
+    # on the request path made /api/status time out in the browser, so it is
+    # computed off the request path instead and every request is served the
+    # last completed build. Stale by up to a refresh interval, never hanging.
+    cached: dict = {"payload": None, "built_at": None, "building": False}
+
+    def rebuild() -> None:
+        while True:
+            try:
+                started = time.monotonic()
+                payload = refresher.snapshot()
+                payload["snapshot_build_seconds"] = round(
+                    time.monotonic() - started, 1
+                )
+                cached["payload"] = payload
+                cached["built_at"] = _utc_now()
+            except Exception as error:
+                cached["error"] = str(error)[:200]
+            time.sleep(DASHBOARD_SNAPSHOT_REFRESH_SECONDS)
+
+    threading.Thread(target=rebuild, daemon=True).start()
     server=ThreadingHTTPServer((host,port),Handler)
     print(f"Robinhood learning dashboard: http://{host}:{port}")
     print("READ-ONLY: no write endpoints exist. Press Ctrl+C to stop.")
