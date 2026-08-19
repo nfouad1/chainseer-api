@@ -3300,6 +3300,36 @@ class RobinhoodLearningStore:
             ),
         }
 
+    def pool_discovery_latency(self) -> dict:
+        """Two different numbers that were being reported as one.
+
+        The dashboard showed the batch crawler's cursor -- 493,004 blocks
+        behind -- which read as "blind for 493,004 blocks". Since pools are
+        admitted on sight from the near-head window, the newest pool is
+        typically within a handful of blocks of the head. But the crawler gap
+        is not harmless either: a pool BORN inside it that starts trading
+        today is still invisible, because on-sight admission only sees
+        Initialize logs in the near-head window. So both are reported, named
+        for what they actually are.
+        """
+        with self.connection() as connection:
+            head = connection.execute(
+                "SELECT MAX(block_number) FROM swap_observations"
+            ).fetchone()[0] or 0
+            newest = connection.execute(
+                "SELECT MAX(initialized_block) FROM v4_pools"
+            ).fetchone()[0] or 0
+            recent = connection.execute(
+                "SELECT COUNT(*) FROM v4_pools WHERE initialized_block > ?",
+                (head - FLOW_WINDOW_BLOCKS,),
+            ).fetchone()[0]
+        return {
+            "head_block": head,
+            "newest_pool_block": newest,
+            "new_pool_latency_blocks": max(0, head - newest) if newest else None,
+            "pools_born_in_last_window": recent,
+        }
+
     def round_trip_summary(self) -> dict:
         """What a position costs to enter and leave, before anything moves.
 
@@ -8768,6 +8798,8 @@ def dashboard_snapshot(
         "flow_evidence": store.flow_evidence_summary(),
         # Friction is the largest component of every return recorded here.
         "round_trip": store.round_trip_summary(),
+        # Distinct from discovery_coverage, which is the BACKFILL cursor.
+        "pool_discovery": store.pool_discovery_latency(),
         "flow_evidence_events": store.recent_flow_evidence_events(limit=16),
         "flow_origin_queue": store.pending_transaction_origin_counts(),
         "v4_custody": store.v4_custody_summary(),
