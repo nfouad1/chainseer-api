@@ -3262,7 +3262,10 @@ class NearHeadFlowPassTests(unittest.TestCase):
 
         def get_logs(self, start, end, address=None, topics=None):
             self.ranges.append((start, end))
-            return self.logs
+            # Fetches are chunked; a fixture ignoring the range would return
+            # the same logs once per chunk and triple its own counts.
+            return [l for l in self.logs
+                    if start <= int(str(l.get("blockNumber")), 16) <= end]
 
     def _engine(self, directory, rpc):
         return rh.RobinhoodLearningEngine(
@@ -3275,9 +3278,16 @@ class NearHeadFlowPassTests(unittest.TestCase):
             result = self._engine(directory, rpc).near_head_flow_pass()
             self.assertTrue(result["supported"])
             self.assertTrue(result["scanned"])
-            start, end = rpc.ranges[0]
+            # Fetches are chunked, so the pass is the UNION of its requests.
+            swap = [r for r in rpc.ranges]
+            start = min(r[0] for r in swap); end = max(r[1] for r in swap)
             self.assertEqual(end - start + 1, rh.FLOW_NEAR_HEAD_SCAN_BLOCKS)
             self.assertEqual(end, 1_000_000)
+            # And the chunks must abut: no block inside the span unrequested.
+            covered = sorted(set(swap))
+            for (a1, b1), (a2, _) in zip(covered, covered[1:]):
+                self.assertLessEqual(
+                    a2, b1 + 1, "chunked fetches left an unscanned block")
 
     def test_lag_is_re_read_not_assumed(self):
         """Reusing the starting head would make freshness self-certifying."""
@@ -4847,7 +4857,8 @@ class NearHeadEnrichmentOrderingTests(unittest.TestCase):
             return self.head
 
         def get_logs(self, from_block, to_block, address=None, topics=None):
-            return self.swaps
+            return [l for l in self.swaps
+                    if from_block <= int(str(l.get("blockNumber")), 16) <= to_block]
 
         def get_transactions(self, hashes):
             self.transaction_calls.append(list(hashes))
@@ -5211,6 +5222,13 @@ class IncrementalNearHeadScanTests(unittest.TestCase):
                 raise RuntimeError("[RPC -429] RPC HTTP response failed (429)")
             return []
 
+        @staticmethod
+        def _in_range(logs, from_block, to_block):
+            """Fetches are chunked, so a fixture returning every log on every
+            call would duplicate them."""
+            return [l for l in logs
+                    if from_block <= int(str(l.get("blockNumber")), 16) <= to_block]
+
         def get_transactions(self, hashes):
             return []
 
@@ -5272,7 +5290,11 @@ class IncrementalNearHeadScanTests(unittest.TestCase):
             engine = self._engine(directory)
             first = engine.near_head_flow_pass()
             engine.rpc.head = self.HEAD + 9_000      # a realistic long stride
+            before = len(engine.rpc.ranges)
             second = engine.near_head_flow_pass()
+            # Fetches are chunked, so the abutting request is the FIRST chunk
+            # of this pass, not the last one recorded.
+            this_pass = engine.rpc.ranges[before:]
             self.assertFalse(second["scan_capped"])
             self.assertEqual(second["blocks_skipped_by_cap"], 0)
             self.assertEqual(
@@ -5280,7 +5302,7 @@ class IncrementalNearHeadScanTests(unittest.TestCase):
                 "the pass must cover the whole stride, not a fixed window",
             )
             self.assertEqual(
-                engine.rpc.ranges[-1][0], first["to_block"] + 1,
+                min(r[0] for r in this_pass), first["to_block"] + 1,
                 "consecutive passes must abut with no unscanned block",
             )
 
@@ -5836,9 +5858,11 @@ class DiscoveryGapTests(unittest.TestCase):
         def get_logs(self, from_block, to_block, address=None, topics=None):
             flat = (topics or [[]])[0]
             self.topics_seen.append(flat[0] if flat else None)
-            if flat and flat[0] == rh.V4_INITIALIZE_TOPIC:
-                return self.init_logs
-            return self.swap_logs
+            pool = (self.init_logs if flat and flat[0] == rh.V4_INITIALIZE_TOPIC
+                    else self.swap_logs)
+            # Chunked fetches: return only what falls in the requested range.
+            return [l for l in pool
+                    if from_block <= int(str(l.get("blockNumber")), 16) <= to_block]
 
         def get_transactions(self, hashes):
             return []

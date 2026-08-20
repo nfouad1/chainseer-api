@@ -223,6 +223,17 @@ FLOW_DISCOVERY_MAXIMUM_PASSES = 40
 # room and overlaps rather than gapping, since re-reading a block is harmless
 # and missing one is not.
 FLOW_NEAR_HEAD_SCAN_BLOCKS = 12_000
+# One get_logs call cannot span the whole range. The endpoint rejects a query
+# whose RESULT SET is too large -- "[RPC -32000] logs matched by query exceeds
+# limit" -- and a 12,000-block span returns roughly 23,000 swap logs against a
+# 5,000-block span's measured 9,533. Widening the scan without chunking took
+# coverage from 15.1% to ZERO for an hour: every pass failed and ingested
+# nothing. The benchmark that justified the widening measured 5,000 blocks and
+# I extrapolated the span without checking the log ceiling.
+#
+# So the range is fetched in chunks that stay under the limit and concatenated.
+# The cursor still drives the total span; this only bounds each request.
+FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS = 4_000
 FLOW_NEAR_HEAD_ENRICHMENT_LIMIT = 300
 FLOW_NEAR_HEAD_ENRICHMENT_BUDGET_SECONDS = 30.0
 FLOW_MAXIMUM_PARTICIPANT_SHARE = 0.50
@@ -7572,10 +7583,15 @@ class RobinhoodLearningEngine:
             logs = []
         else:
             try:
-                logs = self.rpc.get_logs(
-                    from_block, head, address=UNISWAP_V4_POOL_MANAGER,
-                    topics=[[V4_SWAP_TOPIC]],
-                ) or []
+                logs = []
+                span = from_block
+                while span <= head:
+                    upper = min(head, span + FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS - 1)
+                    logs.extend(self.rpc.get_logs(
+                        span, upper, address=UNISWAP_V4_POOL_MANAGER,
+                        topics=[[V4_SWAP_TOPIC]],
+                    ) or [])
+                    span = upper + 1
             except Exception as error:
                 # The cursor is NOT advanced on failure, so the blocks this
                 # scan missed are picked up by the next one.
@@ -7604,11 +7620,14 @@ class RobinhoodLearningEngine:
         init_logs = []
         try:
             # No new blocks means no new pools; skip the round trip entirely.
-            if from_block <= head:
-                init_logs = self.rpc.get_logs(
-                    from_block, head, address=UNISWAP_V4_POOL_MANAGER,
+            span = from_block
+            while span <= head:
+                upper = min(head, span + FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS - 1)
+                init_logs.extend(self.rpc.get_logs(
+                    span, upper, address=UNISWAP_V4_POOL_MANAGER,
                     topics=[[V4_INITIALIZE_TOPIC]],
-                ) or []
+                ) or [])
+                span = upper + 1
         except Exception:
             # A failed Initialize scan must not lose the swap pass; the window
             # simply stays as blind as it was before.
