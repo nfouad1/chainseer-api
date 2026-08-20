@@ -3276,7 +3276,7 @@ class NearHeadFlowPassTests(unittest.TestCase):
             self.assertTrue(result["supported"])
             self.assertTrue(result["scanned"])
             start, end = rpc.ranges[0]
-            self.assertEqual(end - start + 1, rh.FLOW_WINDOW_BLOCKS)
+            self.assertEqual(end - start + 1, rh.FLOW_NEAR_HEAD_SCAN_BLOCKS)
             self.assertEqual(end, 1_000_000)
 
     def test_lag_is_re_read_not_assumed(self):
@@ -5227,7 +5227,7 @@ class IncrementalNearHeadScanTests(unittest.TestCase):
             engine = self._engine(directory)
             result = engine.near_head_flow_pass()
             self.assertFalse(result["incremental"])
-            self.assertEqual(result["scan_blocks"], rh.FLOW_WINDOW_BLOCKS)
+            self.assertEqual(result["scan_blocks"], rh.FLOW_NEAR_HEAD_SCAN_BLOCKS)
 
     def test_the_second_pass_scans_only_new_blocks(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -5249,7 +5249,7 @@ class IncrementalNearHeadScanTests(unittest.TestCase):
             engine.near_head_flow_pass()
             engine.rpc.head = self.HEAD + 50_000
             result = engine.near_head_flow_pass()
-            self.assertEqual(result["scan_blocks"], rh.FLOW_WINDOW_BLOCKS)
+            self.assertEqual(result["scan_blocks"], rh.FLOW_NEAR_HEAD_SCAN_BLOCKS)
             self.assertFalse(result["incremental"])
 
     def test_a_failed_scan_does_not_advance_the_cursor(self):
@@ -5284,7 +5284,7 @@ class IncrementalNearHeadScanTests(unittest.TestCase):
             engine.rpc.head = self.HEAD + 487       # the measured live stride
             result = engine.near_head_flow_pass()
             self.assertLess(
-                result["scan_blocks"], rh.FLOW_WINDOW_BLOCKS,
+                result["scan_blocks"], rh.FLOW_NEAR_HEAD_SCAN_BLOCKS,
                 "a narrower scan is the only lever on pass duration",
             )
             self.assertEqual(result["scan_blocks"], 487)

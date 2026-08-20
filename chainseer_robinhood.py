@@ -204,6 +204,25 @@ FLOW_MAXIMUM_ROUND_TRIP_LOSS = 0.02
 # few cycles instead of never.
 FLOW_DISCOVERY_CATCHUP_SECONDS = 120.0
 FLOW_DISCOVERY_MAXIMUM_PASSES = 40
+# How far back each near-head pass FETCHES. Distinct from FLOW_WINDOW_BLOCKS,
+# which is how wide an analytic window is -- conflating them would change the
+# measurement and invalidate cohort-004, exactly as a 450-to-1350 change
+# retired cohort-002.
+#
+# Measured across 195 sealed passes spanning 1,714,814 blocks: each pass
+# scanned exactly 1,350 blocks while the median gap to the next pass was 6,960
+# and the maximum 22,515. Total coverage 15.1% -- five blocks in six were read
+# by nothing, and the backfill crawler meant to cover them is over a million
+# blocks behind. A pool registered on sight then trading outside a scanned
+# stretch is never observed, which is what happened to every pool of the token
+# the operator asked about: discovered, zero swaps ingested, no window, no
+# observation.
+#
+# Sized to the observed stride rather than a round number: median 6,960, and
+# gaps ran 9,000-13,000 once cycles lengthened. 12,000 covers the median with
+# room and overlaps rather than gapping, since re-reading a block is harmless
+# and missing one is not.
+FLOW_NEAR_HEAD_SCAN_BLOCKS = 12_000
 FLOW_NEAR_HEAD_ENRICHMENT_LIMIT = 300
 FLOW_NEAR_HEAD_ENRICHMENT_BUDGET_SECONDS = 30.0
 FLOW_MAXIMUM_PARTICIPANT_SHARE = 0.50
@@ -7514,7 +7533,8 @@ class RobinhoodLearningEngine:
         # 487 blocks of drift against a 120-block decision bound. The cursor
         # floor is still the full window, so an interrupted or long-delayed
         # cycle re-scans normally rather than leaving a hole.
-        window_floor = max(0, head - FLOW_WINDOW_BLOCKS + 1)
+        # The SCAN floor, not the analytic window floor.
+        window_floor = max(0, head - FLOW_NEAR_HEAD_SCAN_BLOCKS + 1)
         cursor_path = self.root / "near_head_cursor.json"
         cursor = read_json(cursor_path, {}) or {}
         last_scanned = safe_int(cursor.get("last_scanned_block"), 0)
