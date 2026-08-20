@@ -5242,15 +5242,47 @@ class IncrementalNearHeadScanTests(unittest.TestCase):
             )
             self.assertEqual(engine.rpc.ranges[-1][0], self.HEAD + 1)
 
-    def test_a_long_gap_falls_back_to_the_full_window(self):
-        """An interrupted cycle must not leave a hole in the record."""
+    def test_a_gap_beyond_the_cap_is_recorded_not_hidden(self):
+        """A cap DOES leave a hole; the record has to say so.
+
+        The old behaviour fell back to a fixed lookback whenever the gap
+        exceeded it, and the test asserting that claimed an interrupted cycle
+        "must not leave a hole" -- which was never true, the fallback was the
+        hole. At a 1,350-block width it fired on 194 of 195 observed gaps and
+        coverage was 15.1% of the chain.
+        """
         with tempfile.TemporaryDirectory() as directory:
             engine = self._engine(directory)
             engine.near_head_flow_pass()
             engine.rpc.head = self.HEAD + 50_000
             result = engine.near_head_flow_pass()
             self.assertEqual(result["scan_blocks"], rh.FLOW_NEAR_HEAD_SCAN_BLOCKS)
-            self.assertFalse(result["incremental"])
+            self.assertTrue(
+                result["scan_capped"],
+                "a gap larger than one pass must be flagged as capped",
+            )
+            self.assertGreater(
+                result["blocks_skipped_by_cap"], 0,
+                "blocks given up to the cap must be counted, not dropped",
+            )
+
+    def test_a_gap_within_the_cap_tiles_exactly_with_no_hole(self):
+        """The cursor drives the range, so consecutive passes abut."""
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._engine(directory)
+            first = engine.near_head_flow_pass()
+            engine.rpc.head = self.HEAD + 9_000      # a realistic long stride
+            second = engine.near_head_flow_pass()
+            self.assertFalse(second["scan_capped"])
+            self.assertEqual(second["blocks_skipped_by_cap"], 0)
+            self.assertEqual(
+                second["scan_blocks"], 9_000,
+                "the pass must cover the whole stride, not a fixed window",
+            )
+            self.assertEqual(
+                engine.rpc.ranges[-1][0], first["to_block"] + 1,
+                "consecutive passes must abut with no unscanned block",
+            )
 
     def test_a_failed_scan_does_not_advance_the_cursor(self):
         with tempfile.TemporaryDirectory() as directory:

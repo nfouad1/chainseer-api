@@ -7533,16 +7533,39 @@ class RobinhoodLearningEngine:
         # 487 blocks of drift against a 120-block decision bound. The cursor
         # floor is still the full window, so an interrupted or long-delayed
         # cycle re-scans normally rather than leaving a hole.
-        # The SCAN floor, not the analytic window floor.
-        window_floor = max(0, head - FLOW_NEAR_HEAD_SCAN_BLOCKS + 1)
+        # The CURSOR drives the range; the width is only a cap.
+        #
+        # Previously the cursor was used only when the gap since the last scan
+        # happened to fit inside a fixed lookback, and otherwise the pass fell
+        # back to that lookback and left a hole. At a 1,350-block width the
+        # fallback fired on 194 of 195 observed gaps -- the incremental path
+        # was effectively dead code and coverage was 15.1% of the chain. At
+        # 12,000 the fallback would still fire on 10.3% of gaps overall and on
+        # 5 of the last 17, because cycles have been lengthening: median gap
+        # 6,960, p90 12,691, max 22,515.
+        #
+        # A fallback that fires is a hole in the record, and no width removes
+        # it -- it only makes it rarer. So the cursor now drives the range
+        # unconditionally: scan from the block after the last one scanned,
+        # whatever that span turns out to be. Coverage becomes complete by
+        # construction rather than complete-until-a-cycle-runs-long.
+        #
+        # FLOW_NEAR_HEAD_SCAN_BLOCKS survives as a CAP, not a window: it bounds
+        # a single fetch when the cursor is absent (first run) or absurdly
+        # stale (a long outage), so one pass cannot try to read a million
+        # blocks. Being capped is recorded, because a capped pass DOES leave a
+        # hole and the next reader must be able to see that it did.
         cursor_path = self.root / "near_head_cursor.json"
         cursor = read_json(cursor_path, {}) or {}
         last_scanned = safe_int(cursor.get("last_scanned_block"), 0)
-        from_block = window_floor
-        incremental = False
-        if last_scanned and last_scanned + 1 > window_floor:
-            from_block = last_scanned + 1
-            incremental = True
+        window_floor = max(0, head - FLOW_NEAR_HEAD_SCAN_BLOCKS + 1)
+        incremental = bool(last_scanned)
+        from_block = last_scanned + 1 if last_scanned else window_floor
+        scan_capped = bool(from_block < window_floor)
+        if scan_capped:
+            # The gap exceeds one pass. Take the newest cap-width span and
+            # record the blocks given up rather than silently dropping them.
+            from_block = window_floor
         if from_block > head:
             # No new blocks. The windows already in the database stand; there
             # is nothing to ingest and nothing to enrich.
@@ -7660,6 +7683,10 @@ class RobinhoodLearningEngine:
             "supported": True, "scanned": True,
             "from_block": from_block, "to_block": head,
             "incremental": incremental,
+            "scan_capped": scan_capped,
+            "blocks_skipped_by_cap": (
+                max(0, window_floor - (last_scanned + 1)) if scan_capped else 0
+            ),
             "scan_blocks": max(0, head - from_block + 1),
             "logs_seen": len(logs), "swaps_ingested": len(events),
             "initialize_logs_seen": len(init_logs),
