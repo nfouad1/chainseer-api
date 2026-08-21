@@ -1780,6 +1780,29 @@ class RobinhoodLearningStore:
                         "ALTER TABLE flow_observation_classifications"
                         f" ADD COLUMN {name} {decl}"
                     )
+            connection.executescript(
+                """
+                -- Blocks the LIVE lane deliberately skipped so it could stay
+                -- near the head. Today the cap drops them: scan_capped fires,
+                -- blocks_skipped_by_cap is recorded, and the range is gone.
+                -- Recording a number is not a queue -- nothing can consume it,
+                -- so the live lane's only options are to fall behind or to
+                -- lose history. Enqueueing makes re-anchoring safe: the live
+                -- lane jumps to the head and the range survives for a slower
+                -- lane to drain.
+                CREATE TABLE IF NOT EXISTS flow_backfill_queue (
+                    from_block INTEGER NOT NULL,
+                    to_block INTEGER NOT NULL,
+                    enqueued_at REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    completed_at REAL,
+                    PRIMARY KEY (from_block, to_block)
+                );
+                CREATE INDEX IF NOT EXISTS idx_backfill_pending
+                    ON flow_backfill_queue(completed_at, enqueued_at);
+                """
+            )
             run_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(runs)")
             }
@@ -3896,6 +3919,51 @@ class RobinhoodLearningStore:
                 (FLOW_ORIGIN_MAXIMUM_ATTEMPTS,),
             ).fetchone()
         return {key: int(row[key] or 0) for key in ("total", "active", "historical")}
+
+    def enqueue_backfill(self, from_block: int, to_block: int, reason: str) -> bool:
+        """Record a range the live lane skipped, so it is deferred not lost."""
+        if to_block < from_block:
+            return False
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """INSERT OR IGNORE INTO flow_backfill_queue
+                       (from_block,to_block,enqueued_at,reason)
+                   VALUES (?,?,?,?)""",
+                (int(from_block), int(to_block), time.time(), str(reason)),
+            )
+        return bool(cursor.rowcount)
+
+    def pending_backfill(self, limit: int = 10) -> list[dict]:
+        """Oldest first: the deepest hole is the one most likely to be lost."""
+        with self.connection() as connection:
+            return [dict(row) for row in connection.execute(
+                """SELECT * FROM flow_backfill_queue WHERE completed_at IS NULL
+                   ORDER BY enqueued_at LIMIT ?""", (int(limit),))]
+
+    def complete_backfill(self, from_block: int, to_block: int) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                """UPDATE flow_backfill_queue SET completed_at=?
+                   WHERE from_block=? AND to_block=?""",
+                (time.time(), int(from_block), int(to_block)),
+            )
+
+    def backfill_backlog(self) -> dict:
+        """Backlog AGE, not just depth: a queue that never drains is a leak."""
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) ranges,
+                          COALESCE(SUM(to_block-from_block+1),0) blocks,
+                          MIN(enqueued_at) oldest
+                   FROM flow_backfill_queue WHERE completed_at IS NULL"""
+            ).fetchone()
+        oldest = row["oldest"]
+        return {
+            "pending_ranges": int(row["ranges"] or 0),
+            "pending_blocks": int(row["blocks"] or 0),
+            "oldest_age_seconds": (
+                round(time.time() - oldest, 1) if oldest else None),
+        }
 
     def begin_run(self, run_id: str, deadline_seconds: float) -> int:
         """Claim a run row stamped with who owns it and when it last breathed."""
@@ -7762,8 +7830,13 @@ class RobinhoodLearningEngine:
         from_block = last_scanned + 1 if last_scanned else window_floor
         scan_capped = bool(from_block < window_floor)
         if scan_capped:
-            # The gap exceeds one pass. Take the newest cap-width span and
-            # record the blocks given up rather than silently dropping them.
+            # RE-ANCHOR. The live lane must observe the PRESENT, so it jumps to
+            # the newest cap-width span rather than grinding through history
+            # first. The skipped range is enqueued, not dropped: recording a
+            # count told the operator blocks were lost but gave nothing the
+            # power to recover them.
+            self.store.enqueue_backfill(
+                last_scanned + 1, window_floor - 1, "live_lane_reanchor")
             from_block = window_floor
         if from_block > head:
             # No new blocks. The windows already in the database stand; there
@@ -7887,6 +7960,7 @@ class RobinhoodLearningEngine:
             "from_block": from_block, "to_block": head,
             "incremental": incremental,
             "scan_capped": scan_capped,
+            "backfill_backlog": self.store.backfill_backlog(),
             "blocks_skipped_by_cap": (
                 max(0, window_floor - (last_scanned + 1)) if scan_capped else 0
             ),

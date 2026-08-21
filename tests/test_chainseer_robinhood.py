@@ -6580,3 +6580,91 @@ class CycleLifecycleTests(unittest.TestCase):
         self.assertIn('$terminal = $status -ne "running"', source)
         self.assertIn("if ($terminal)", source)
 
+
+
+class BackfillQueueTests(unittest.TestCase):
+    """Skipped ranges are deferred, not lost — the seam a lane split needs.
+
+    The live lane must observe the PRESENT: decision lag was 5,234 blocks
+    against a 120-block target while near-head processing took 268.6s, flow
+    evidence 672.6s and identity 429.5s in one serial cycle. Re-anchoring to
+    the head is only safe if the skipped range survives, and until now the cap
+    merely recorded blocks_skipped_by_cap — a number nothing could consume.
+    """
+
+    HEAD = 50_000_000
+
+    def _store(self, directory):
+        return rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+
+    def test_a_skipped_range_is_recoverable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self.assertTrue(store.enqueue_backfill(100, 5_000, "reanchor"))
+            pending = store.pending_backfill()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["from_block"], 100)
+            self.assertEqual(pending[0]["to_block"], 5_000)
+
+    def test_the_backlog_reports_age_not_only_depth(self):
+        """A queue that never drains is a leak, and depth alone hides that."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            store.enqueue_backfill(1, 1_000, "reanchor")
+            backlog = store.backfill_backlog()
+            self.assertEqual(backlog["pending_ranges"], 1)
+            self.assertEqual(backlog["pending_blocks"], 1_000)
+            self.assertIsNotNone(backlog["oldest_age_seconds"])
+
+    def test_draining_clears_the_backlog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            store.enqueue_backfill(1, 1_000, "reanchor")
+            store.complete_backfill(1, 1_000)
+            self.assertEqual(store.pending_backfill(), [])
+            self.assertEqual(store.backfill_backlog()["pending_ranges"], 0)
+
+    def test_the_same_range_is_not_queued_twice(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self.assertTrue(store.enqueue_backfill(1, 1_000, "reanchor"))
+            self.assertFalse(store.enqueue_backfill(1, 1_000, "reanchor"))
+            self.assertEqual(len(store.pending_backfill()), 1)
+
+    def test_oldest_ranges_drain_first(self):
+        """The deepest hole is the one most likely to be lost for good."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            store.enqueue_backfill(1, 100, "old")
+            time.sleep(0.01)
+            store.enqueue_backfill(200, 300, "new")
+            self.assertEqual(store.pending_backfill()[0]["from_block"], 1)
+
+    def test_an_inverted_range_is_refused(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self.assertFalse(store.enqueue_backfill(500, 100, "bogus"))
+            self.assertEqual(store.pending_backfill(), [])
+
+    def test_the_live_lane_enqueues_what_it_reanchors_past(self):
+        """The whole contract: jump to the head, keep the history."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+            engine.store = store
+            engine.root = Path(directory)
+            engine.rpc = IncrementalNearHeadScanTests._RPC(self.HEAD)
+            engine.near_head_flow_pass()                      # writes cursor
+            engine.rpc.head = self.HEAD + 500_000             # long outage
+            result = engine.near_head_flow_pass()
+            self.assertTrue(result["scan_capped"])
+            backlog = store.backfill_backlog()
+            self.assertGreater(
+                backlog["pending_blocks"], 0,
+                "re-anchoring discarded history instead of deferring it",
+            )
+            self.assertEqual(
+                result["backfill_backlog"]["pending_ranges"],
+                backlog["pending_ranges"],
+                "the pass must report the backlog it just created",
+            )
