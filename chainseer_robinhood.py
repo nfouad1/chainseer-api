@@ -222,7 +222,13 @@ FLOW_DISCOVERY_MAXIMUM_PASSES = 40
 # gaps ran 9,000-13,000 once cycles lengthened. 12,000 covers the median with
 # room and overlaps rather than gapping, since re-reading a block is harmless
 # and missing one is not.
-FLOW_NEAR_HEAD_SCAN_BLOCKS = 12_000
+# Raised from 12,000 after the cap fired on EVERY pass: consecutive passes
+# left gaps of 618, 981, 1,020, 1,040 and 10,605 blocks, so the stride exceeds
+# 12,000 and the cap was silently truncating the oldest end of each range.
+# Observed gaps across 195 passes: median 6,960, p90 12,691, max 22,515 --
+# 12,000 leaves 10.3% uncovered, 20,000 leaves 1.0%, 25,000 leaves none.
+# Chunked fetch keeps the cost flat: 25,000 blocks measured in a few seconds.
+FLOW_NEAR_HEAD_SCAN_BLOCKS = 25_000
 # One get_logs call cannot span the whole range. The endpoint rejects a query
 # whose RESULT SET is too large -- "[RPC -32000] logs matched by query exceeds
 # limit" -- and a 12,000-block span returns roughly 23,000 swap logs against a

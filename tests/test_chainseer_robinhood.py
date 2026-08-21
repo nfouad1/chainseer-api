@@ -6324,3 +6324,38 @@ class ObservationTimingTests(unittest.TestCase):
             "observation_seconds_total",
             inspect.getsource(rh.RobinhoodLearningEngine.observe_outcomes),
         )
+
+
+class ScanCapSufficiencyTests(unittest.TestCase):
+    """The cap must exceed the stride, or every pass silently truncates.
+
+    At 12,000 the cap fired on EVERY live pass and consecutive passes left
+    gaps of 618, 981, 1,020, 1,040 and 10,605 blocks -- coverage improved
+    hugely from 15.1% but was still not complete, and the design argument said
+    it was. Observed gaps across 195 passes: median 6,960, p90 12,691, max
+    22,515.
+    """
+
+    def test_the_cap_covers_every_gap_ever_observed(self):
+        self.assertGreaterEqual(
+            rh.FLOW_NEAR_HEAD_SCAN_BLOCKS, 22_515,
+            "the cap must exceed the largest observed inter-pass gap",
+        )
+
+    def test_the_cap_exceeds_the_p90_stride_with_margin(self):
+        self.assertGreater(rh.FLOW_NEAR_HEAD_SCAN_BLOCKS, 12_691 * 1.5)
+
+    def test_the_fetch_chunk_stays_under_the_rpc_result_ceiling(self):
+        """A 12,000-block single request returned '-32000 exceeds limit'."""
+        self.assertLessEqual(rh.FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS, 5_000)
+        self.assertLess(
+            rh.FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS,
+            rh.FLOW_NEAR_HEAD_SCAN_BLOCKS,
+            "the chunk must be a fraction of the cap, not equal to it",
+        )
+
+    def test_the_cap_is_not_the_analytic_window(self):
+        """Conflating them would change the measurement and void the cohort."""
+        self.assertNotEqual(
+            rh.FLOW_NEAR_HEAD_SCAN_BLOCKS, rh.FLOW_WINDOW_BLOCKS)
+        self.assertEqual(rh.FLOW_WINDOW_BLOCKS, 1350)
