@@ -36,11 +36,16 @@ $logPath = Join-Path $logRoot ("learn-once-{0}.log" -f (Get-Date -Format "yyyy-M
 $stdoutPath = Join-Path $logRoot ("learn-once-{0}.stdout.tmp" -f $PID)
 $stderrPath = Join-Path $logRoot ("learn-once-{0}.stderr.tmp" -f $PID)
 function Write-Status([string]$status, [int]$exitCode, [string]$errorText) {
+    # A running cycle has not completed and has no exit code. Stamping both
+    # made "running" indistinguishable from "finished successfully" to any
+    # reader, which is how a 1,714-second cycle could look complete.
+    $terminal = $status -ne "running"
     $value = @{
         status=$status; started_at=$started.ToUniversalTime().ToString("o")
-        completed_at=(Get-Date).ToUniversalTime().ToString("o")
+        completed_at=$(if ($terminal) { (Get-Date).ToUniversalTime().ToString("o") } else { $null })
         duration_seconds=[Math]::Round(((Get-Date)-$started).TotalSeconds,3)
-        exit_code=$exitCode; last_error=$errorText; log_path=$logPath
+        exit_code=$(if ($terminal) { $exitCode } else { $null })
+        last_error=$errorText; log_path=$logPath
         paper_only=$true; live_execution_enabled=$false
     }
     $temporary = "$statusPath.tmp"
@@ -93,12 +98,22 @@ public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProc);
     [Runtime.InteropServices.Marshal]::WriteInt32($info, 16, 0x2000)
     [void][Win32.ChainseerJob]::SetInformationJobObject($job, 9, $info, $infoSize)
 
-    $process = Start-Process -FilePath $pythonPath -ArgumentList $arguments -Wait `
+    # NOT -Wait. Start-Process -Wait returns only after the child has already
+    # exited, so assigning it to the job afterwards was dead code and the
+    # process tree was never owned. Start detached-but-tracked, assign to the
+    # job immediately, THEN wait.
+    $process = Start-Process -FilePath $pythonPath -ArgumentList $arguments `
         -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath `
         -RedirectStandardError $stderrPath
-    if ($process -and -not $process.HasExited) {
-        [void][Win32.ChainseerJob]::AssignProcessToJobObject($job, $process.Handle)
+    if (-not $process) { throw "learner process failed to start" }
+    $assigned = [Win32.ChainseerJob]::AssignProcessToJobObject($job, $process.Handle)
+    if (-not $assigned) {
+        # Refusing to proceed unowned is deliberate: an unowned child is the
+        # orphan this whole change exists to prevent.
+        try { $process.Kill() } catch { }
+        throw "could not assign learner to job object; refusing to run unowned"
     }
+    $process.WaitForExit()
     $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { "" }
     $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { "" }
     if ($stdout) { Add-Content -LiteralPath $logPath -Value $stdout }

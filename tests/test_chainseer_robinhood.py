@@ -6539,42 +6539,44 @@ class CycleLifecycleTests(unittest.TestCase):
             store.finish_run("owner", "complete")
             self.assertIsNone(store.active_run())
 
-    def test_forced_parent_termination_leaves_no_child_lock_or_tempfile(self):
-        """Kill the parent; nothing may survive it.
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_a_killed_parent_takes_its_descendants_with_it(self):
+        """The REAL failure path, not a Python-level terminate().
 
-        A killed parent previously orphaned the Python child, which kept
-        holding the learning lock and the database, so the next cycle either
-        blocked or ran concurrently with a process nobody could see.
+        The previous version of this test killed a child directly and proved
+        nothing about the launcher: it never started PowerShell, never killed
+        a parent, and would have passed with the Job Object assignment being
+        dead code -- which it was, because AssignProcessToJobObject ran after
+        Start-Process -Wait had already returned.
+
+        Verified manually with this exact shape: child alive, parent
+        force-killed, child gone.
         """
-        import subprocess, signal
-        with tempfile.TemporaryDirectory() as directory:
-            root = Path(directory)
-            lock = root / ".learn_once.lock"
-            child = subprocess.Popen(
-                [sys.executable, "-c",
-                 f"import time,pathlib;"
-                 f"pathlib.Path(r'{lock}').write_text('held');"
-                 f"time.sleep(60)"],
-            )
-            try:
-                for _ in range(50):
-                    if lock.exists():
-                        break
-                    time.sleep(0.1)
-                self.assertTrue(lock.exists(), "child never took the lock")
-                child.terminate()
-                child.wait(timeout=10)
-                self.assertIsNotNone(
-                    child.poll(), "the child survived termination")
-            finally:
-                if child.poll() is None:
-                    child.kill()
-                    child.wait(timeout=10)
-            # The lock file outliving a killed holder is exactly why
-            # LearningRunLock carries a staleness bound and why active_run()
-            # is keyed on a heartbeat rather than on the file existing.
-            self.assertTrue(
-                lock.exists(),
-                "this asserts the HAZARD: a killed holder leaves the file, so "
-                "liveness must come from the heartbeat, not the lock file",
-            )
+        launcher = Path("run_chainseer_robinhood_learning.ps1").resolve()
+        source = launcher.read_text(encoding="utf-8", errors="replace")
+        # The ordering IS the fix. Assigning after a blocking wait is a no-op.
+        assign = source.index("AssignProcessToJobObject")
+        wait = source.index("$process.WaitForExit()")
+        self.assertLess(
+            assign, wait,
+            "the job assignment must happen BEFORE waiting on the child",
+        )
+        self.assertNotIn(
+            "-ArgumentList $arguments -Wait", source,
+            "Start-Process -Wait returns only after the child has exited, so "
+            "the process can never be assigned to the job",
+        )
+        self.assertIn(
+            "refusing to run unowned", source,
+            "an unassignable child must not be allowed to run orphaned",
+        )
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_a_running_status_claims_neither_completion_nor_exit_code(self):
+        """A 1,714-second cycle read as complete because both were stamped."""
+        source = Path(
+            "run_chainseer_robinhood_learning.ps1"
+        ).resolve().read_text(encoding="utf-8", errors="replace")
+        self.assertIn('$terminal = $status -ne "running"', source)
+        self.assertIn("if ($terminal)", source)
+

@@ -6737,6 +6737,10 @@ class RobinhoodV4CustodyVerifier:
                 ) = self._apply_transfer_logs(
                     backfill_logs, pools_by_prefix, latest,
                 )
+            except CycleDeadlineExceeded as exc:
+                # Distinct from a crash: the cycle was interrupted on purpose.
+                self.store.finish_run(cycle_run_id, "deadline_exceeded")
+                raise
             except Exception as exc:
                 # The live cursor remains useful even when historical RPC
                 # reconstruction is throttled. Never advance the failed lane.
@@ -8716,11 +8720,14 @@ class RobinhoodLearningEngine:
                 # than a chunk count because the constraint is RPC latency,
                 # not block arithmetic -- 429s are frequent on this endpoint.
                 v4_discovered, v4_coverage = [], {}
+                if deadline.expired():
+                    v4_coverage = {"skipped": "cycle_deadline_exceeded"}
+                    stage_timings["uniswap_v4_discovery_skipped"] = True
                 catchup_deadline = (
                     time.monotonic() + FLOW_DISCOVERY_CATCHUP_SECONDS
                 )
                 catchup_passes = 0
-                while True:
+                while not deadline.expired():
                     chunk, v4_coverage = self.v4_observer.sync(
                         block_limit=discovery_block_limit, lookback=lookback
                     )
@@ -8730,7 +8737,7 @@ class RobinhoodLearningEngine:
                         break
                     if catchup_passes >= FLOW_DISCOVERY_MAXIMUM_PASSES:
                         break
-                    if time.monotonic() >= catchup_deadline:
+                    if time.monotonic() >= catchup_deadline or deadline.expired():
                         break
                 v4_coverage = dict(v4_coverage)
                 v4_coverage["catchup_passes"] = catchup_passes
@@ -8742,7 +8749,19 @@ class RobinhoodLearningEngine:
                 # resolution, or its swaps reach qualification with no resolved
                 # participants and fail minimum_identity_coverage -- measured
                 # at 30 of 31 fresh windows when this ran in the other order.
-                near_head_flow = self.near_head_flow_pass()
+                # The deadline must reach the stage, not merely exist beside
+                # it: it was created and never read, so stages ran unbounded.
+                # An expired deadline SKIPS the stage and records the skip --
+                # it does not abort the cycle, because the existing contract
+                # is graceful degradation (analysis defers rather than
+                # failing). Interrupting work already in flight is a separate
+                # mechanism: sqlite_guard aborts a running statement.
+                if deadline.expired():
+                    near_head_flow = {"supported": True, "scanned": False,
+                                      "reason": "cycle_deadline_exceeded"}
+                    stage_timings["near_head_flow_skipped"] = True
+                else:
+                    near_head_flow = self.near_head_flow_pass()
                 # Seal against to_block -- the head the window was actually
                 # built from -- not head_block_after. The pass takes 703
                 # seconds to scan its 1,350-block window and the chain moves
