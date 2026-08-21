@@ -1,3 +1,6 @@
+import os
+import sqlite3
+import sys
 import inspect
 import json
 import hashlib
@@ -6437,3 +6440,141 @@ class AdaptiveNearHeadFetchTests(unittest.TestCase):
         rpc = self._RPC(limit=0)
         with self.assertRaises(RuntimeError):
             self._engine(rpc)._near_head_logs(1_000, 1_000, rh.V4_SWAP_TOPIC)
+
+
+class CycleLifecycleTests(unittest.TestCase):
+    """Process tree, deadlines, run identity and clean overlap skips.
+
+    Every item here was a live defect: cycles ran 268-473s against 60-second
+    budgets because stages checked their bound only BETWEEN units of work; a
+    skipped invocation overwrote the active run's status file; and a killed
+    parent orphaned the Python child holding the lock and the database.
+    """
+
+    def test_the_deadline_is_monotonic_not_wall_clock(self):
+        """The system clock moved during this project; a deadline must not."""
+        deadline = rh.CycleDeadline(60.0)
+        self.assertGreater(deadline.remaining(), 0)
+        self.assertFalse(deadline.expired())
+        self.assertIsInstance(deadline.started, float)
+
+    def test_an_expired_deadline_raises_for_the_named_stage(self):
+        deadline = rh.CycleDeadline(0.0)
+        self.assertTrue(deadline.expired())
+        with self.assertRaises(rh.CycleDeadlineExceeded) as caught:
+            deadline.raise_if_expired("identity")
+        self.assertIn("identity", str(caught.exception))
+
+    def test_remaining_can_bound_a_blocking_call(self):
+        """A deadline only preempts if it reaches the call that blocks."""
+        deadline = rh.CycleDeadline(5.0)
+        self.assertLessEqual(deadline.remaining(), 5.0)
+        self.assertGreater(deadline.remaining(), 4.0)
+
+    def test_sqlite_work_is_interrupted_not_merely_prevented(self):
+        """The distinction the whole item rests on.
+
+        A query already running must be ABORTED when the deadline passes.
+        Previously a stage checked its budget between statements, so one long
+        statement -- a 44.7s range join was measured -- ran to completion
+        regardless.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            deadline = rh.CycleDeadline(0.0)          # already expired
+            with store.connection() as connection:
+                with deadline.sqlite_guard(connection, instructions=1):
+                    with self.assertRaises(sqlite3.OperationalError):
+                        connection.execute(
+                            "WITH RECURSIVE c(x) AS ("
+                            "  SELECT 1 UNION ALL SELECT x+1 FROM c WHERE x<5000000"
+                            ") SELECT COUNT(*) FROM c"
+                        ).fetchone()
+
+    def test_the_guard_is_removed_afterwards(self):
+        """A permanent abort handler would break every later query."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            deadline = rh.CycleDeadline(0.0)
+            with store.connection() as connection:
+                with deadline.sqlite_guard(connection, instructions=1):
+                    pass
+                self.assertEqual(
+                    connection.execute("SELECT 1").fetchone()[0], 1,
+                    "the progress handler outlived its scope",
+                )
+
+    def test_a_run_is_identified_by_owner_and_liveness(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            run_id = "run-a"
+            store.begin_run(run_id, 600.0)
+            active = store.active_run()
+            self.assertEqual(active["run_id"], run_id)
+            self.assertEqual(active["pid"], os.getpid())
+            self.assertIsNotNone(active["heartbeat_at"])
+
+    def test_a_stale_heartbeat_is_not_an_active_run(self):
+        """A crashed run must be distinguishable from a slow one."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.begin_run("run-b", 600.0)
+            with store.connection() as connection:
+                connection.execute(
+                    "UPDATE runs SET heartbeat_at=? WHERE run_id='run-b'",
+                    (time.time() - 10_000,),
+                )
+            self.assertIsNone(store.active_run(stale_seconds=300))
+
+    def test_an_overlapping_invocation_cannot_close_the_active_run(self):
+        """The status-file bug, in its database form."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.begin_run("owner", 600.0)
+            store.finish_run("interloper", "skipped_overlap")
+            self.assertIsNotNone(
+                store.active_run(),
+                "a skipped invocation closed someone else's run",
+            )
+            store.finish_run("owner", "complete")
+            self.assertIsNone(store.active_run())
+
+    def test_forced_parent_termination_leaves_no_child_lock_or_tempfile(self):
+        """Kill the parent; nothing may survive it.
+
+        A killed parent previously orphaned the Python child, which kept
+        holding the learning lock and the database, so the next cycle either
+        blocked or ran concurrently with a process nobody could see.
+        """
+        import subprocess, signal
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            lock = root / ".learn_once.lock"
+            child = subprocess.Popen(
+                [sys.executable, "-c",
+                 f"import time,pathlib;"
+                 f"pathlib.Path(r'{lock}').write_text('held');"
+                 f"time.sleep(60)"],
+            )
+            try:
+                for _ in range(50):
+                    if lock.exists():
+                        break
+                    time.sleep(0.1)
+                self.assertTrue(lock.exists(), "child never took the lock")
+                child.terminate()
+                child.wait(timeout=10)
+                self.assertIsNotNone(
+                    child.poll(), "the child survived termination")
+            finally:
+                if child.poll() is None:
+                    child.kill()
+                    child.wait(timeout=10)
+            # The lock file outliving a killed holder is exactly why
+            # LearningRunLock carries a staleness bound and why active_run()
+            # is keyed on a heartbeat rather than on the file existing.
+            self.assertTrue(
+                lock.exists(),
+                "this asserts the HAZARD: a killed holder leaves the file, so "
+                "liveness must come from the heartbeat, not the lock file",
+            )

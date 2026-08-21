@@ -15,6 +15,7 @@ import re
 import sqlite3
 import threading
 import time
+import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
@@ -228,6 +229,70 @@ FLOW_DISCOVERY_MAXIMUM_PASSES = 40
 # Observed gaps across 195 passes: median 6,960, p90 12,691, max 22,515 --
 # 12,000 leaves 10.3% uncovered, 20,000 leaves 1.0%, 25,000 leaves none.
 # Chunked fetch keeps the cost flat: 25,000 blocks measured in a few seconds.
+class CycleDeadline:
+    """One monotonic hard deadline, shared by every stage of a cycle.
+
+    Stages previously each computed their own bound from wall clock and
+    checked it only BETWEEN units of work, so a deadline prevented the next
+    step without interrupting the current one. Measured consequences: an
+    identity stage with a 60-second budget ran 268.4s and then 472.8s; a
+    queue census with no bound at all cost 150s of that; a single get_logs
+    could overrun any budget it started inside.
+
+    monotonic, not wall clock: the system clock moved during this project and
+    a wall-clock deadline would have jumped with it.
+
+    remaining() is what a caller passes to a socket or an RPC timeout so the
+    bound reaches the blocking call itself. expired() is the cheap check for
+    loop heads. sqlite_guard() installs a progress handler so a long query is
+    ABORTED rather than merely not started -- that is the difference between
+    a deadline and a suggestion.
+    """
+
+    __slots__ = ("started", "seconds", "_expired_at")
+
+    def __init__(self, seconds: float):
+        self.started = time.monotonic()
+        self.seconds = max(0.0, float(seconds))
+        self._expired_at: float | None = None
+
+    def remaining(self) -> float:
+        return max(0.0, self.seconds - (time.monotonic() - self.started))
+
+    def expired(self) -> bool:
+        if self.remaining() > 0:
+            return False
+        if self._expired_at is None:
+            self._expired_at = time.monotonic()
+        return True
+
+    def raise_if_expired(self, stage: str) -> None:
+        if self.expired():
+            raise CycleDeadlineExceeded(stage)
+
+    @contextmanager
+    def sqlite_guard(self, connection, instructions: int = 50_000):
+        """Abort an in-flight query when the deadline passes.
+
+        SQLite calls the progress handler every `instructions` VM steps and
+        aborts the statement if it returns non-zero. Without this a single
+        range-join could hold a stage long past its budget -- one measured at
+        44.7s inside a 60-second cycle stage that also had other work to do.
+        """
+        def _abort():
+            return 1 if self.expired() else 0
+
+        connection.set_progress_handler(_abort, instructions)
+        try:
+            yield connection
+        finally:
+            connection.set_progress_handler(None, instructions)
+
+
+class CycleDeadlineExceeded(RuntimeError):
+    """A stage was interrupted because the cycle deadline passed."""
+
+
 FLOW_NEAR_HEAD_SCAN_BLOCKS = 25_000
 # One get_logs call cannot span the whole range. The endpoint rejects a query
 # whose RESULT SET is too large -- "[RPC -32000] logs matched by query exceeds
@@ -1715,6 +1780,27 @@ class RobinhoodLearningStore:
                         "ALTER TABLE flow_observation_classifications"
                         f" ADD COLUMN {name} {decl}"
                     )
+            run_columns = {
+                row[1] for row in connection.execute("PRAGMA table_info(runs)")
+            }
+            for name, decl in {
+                # A rowid identifies a row, not a RUN: it cannot say which
+                # process owns it, whether that process is alive, or whether
+                # the status you are reading belongs to the cycle now
+                # executing. External status was written to a file that any
+                # skipped invocation could overwrite, so "running" was not
+                # authoritative and could not be trusted.
+                "run_id": "TEXT",
+                "pid": "INTEGER",
+                "host": "TEXT",
+                "heartbeat_at": "REAL",
+                "deadline_seconds": "REAL",
+            }.items():
+                if name not in run_columns:
+                    connection.execute(
+                        f"ALTER TABLE runs ADD COLUMN {name} {decl}")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_run_id ON runs(run_id)")
             outcome_columns = {
                 row[1] for row in connection.execute(
                     "PRAGMA table_info(flow_observation_outcomes)"
@@ -3810,6 +3896,62 @@ class RobinhoodLearningStore:
                 (FLOW_ORIGIN_MAXIMUM_ATTEMPTS,),
             ).fetchone()
         return {key: int(row[key] or 0) for key in ("total", "active", "historical")}
+
+    def begin_run(self, run_id: str, deadline_seconds: float) -> int:
+        """Claim a run row stamped with who owns it and when it last breathed."""
+        import os as _os, socket as _socket
+        with self.connection() as connection:
+            return connection.execute(
+                """INSERT INTO runs(started_at,status,run_id,pid,host,
+                       heartbeat_at,deadline_seconds)
+                   VALUES (?,'running',?,?,?,?,?)""",
+                (_utc_now(), run_id, _os.getpid(), _socket.gethostname(),
+                 time.time(), float(deadline_seconds)),
+            ).lastrowid
+
+    def heartbeat_run(self, run_id: str) -> None:
+        """Liveness, so a crashed run is distinguishable from a slow one.
+
+        Without this a `running` row is indistinguishable from an abandoned
+        one, and the only recovery is a human noticing. A stale heartbeat is
+        evidence; an old started_at is not.
+        """
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE runs SET heartbeat_at=? WHERE run_id=? AND status='running'",
+                (time.time(), run_id),
+            )
+
+    def finish_run(self, run_id: str, status: str) -> None:
+        """Only the owning run may close its own row.
+
+        Scoping the write to run_id is what stops a skipped overlapping
+        invocation from marking the ACTIVE run finished -- the failure the
+        file-based status had, where any invocation could overwrite any
+        other's state.
+        """
+        with self.connection() as connection:
+            connection.execute(
+                "UPDATE runs SET status=?, completed_at=? WHERE run_id=?",
+                (status, _utc_now(), run_id),
+            )
+
+    def active_run(self, stale_seconds: float = 300.0) -> dict | None:
+        """The authoritative answer to 'is a cycle running right now?'
+
+        A row is active only if its heartbeat is recent. That makes the
+        question answerable from the database rather than from a lock file
+        whose owner may have been killed without releasing it.
+        """
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT * FROM runs WHERE status='running'
+                     AND heartbeat_at IS NOT NULL
+                     AND heartbeat_at > ?
+                   ORDER BY heartbeat_at DESC LIMIT 1""",
+                (time.time() - float(stale_seconds),),
+            ).fetchone()
+        return dict(row) if row else None
 
     def flow_window_coverage(self, pool_ids: list[str]) -> dict:
         """Summarise the flow windows belonging to one named set of pools.
@@ -8526,12 +8668,14 @@ class RobinhoodLearningEngine:
                  lookback=DEFAULT_DISCOVERY_LOOKBACK_BLOCKS,now:float|None=None) -> dict:
         started = time.monotonic()
         now = time.time() if now is None else now
+        # ONE monotonic deadline for the whole cycle, handed to every stage
+        # rather than each recomputing its own from wall clock.
+        deadline = CycleDeadline(float(cycle_budget_seconds))
+        self.cycle_deadline = deadline
+        cycle_run_id = uuid.uuid4().hex
+        self.cycle_run_uuid = cycle_run_id
         with LearningRunLock(self.root / ".learn_once.lock"):
-            with self.store.connection() as connection:
-                run_id = connection.execute(
-                    "INSERT INTO runs(started_at,status) VALUES (?,'running')",
-                    (_utc_now(),),
-                ).lastrowid
+            run_id = self.store.begin_run(cycle_run_id, float(cycle_budget_seconds))
             try:
                 stage_timings = {}
                 stage_started = time.monotonic()
@@ -8890,6 +9034,7 @@ class RobinhoodLearningEngine:
                 )
                 stage_started = time.monotonic()
                 learning_summary = self.store.summary()
+                self.store.heartbeat_run(cycle_run_id)
                 stage_timings["learning_summary"] = round(
                     time.monotonic() - stage_started, 3
                 )
@@ -8970,8 +9115,9 @@ class RobinhoodLearningEngine:
                 atomic_json_write(self.root / "learning_summary.json", summary)
                 with self.store.connection() as connection:
                     connection.execute(
-                        "UPDATE runs SET completed_at=?,status='complete',summary_json=? WHERE id=?",
-                        (_utc_now(), _canonical(summary), run_id),
+                        "UPDATE runs SET completed_at=?,status='complete',summary_json=?"
+                        " WHERE id=? AND run_id=?",
+                        (_utc_now(), _canonical(summary), run_id, cycle_run_id),
                     )
                 return summary
             except Exception as exc:
@@ -8982,8 +9128,9 @@ class RobinhoodLearningEngine:
                 }
                 with self.store.connection() as connection:
                     connection.execute(
-                        "UPDATE runs SET completed_at=?,status='failed',summary_json=? WHERE id=?",
-                        (_utc_now(), _canonical(failure), run_id),
+                        "UPDATE runs SET completed_at=?,status='failed',summary_json=?"
+                        " WHERE id=? AND run_id=?",
+                        (_utc_now(), _canonical(failure), run_id, cycle_run_id),
                     )
                 raise
 

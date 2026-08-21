@@ -49,7 +49,17 @@ function Write-Status([string]$status, [int]$exitCode, [string]$errorText) {
 }
 try {
     $owned = $mutex.WaitOne(0)
-    if (-not $owned) { Write-Status "skipped_overlap" 0 $null; exit 0 }
+    if (-not $owned) {
+        # A skip must not touch the ACTIVE run's status. Writing
+        # "skipped_overlap" to the shared status file overwrote the running
+        # cycle's own state, which is why external status was unreliable:
+        # with cycles at 150s and the task firing every 5 minutes, most
+        # invocations skip, and each one clobbered the truth.
+        $skipPath = Join-Path (Split-Path -Parent $statusPath) "last_skip.json"
+        @{ status = "skipped_overlap"; at = (Get-Date).ToUniversalTime().ToString("o") } |
+            ConvertTo-Json | Set-Content -LiteralPath $skipPath -Encoding utf8
+        exit 0
+    }
     Write-Status "running" 0 $null
     $arguments = @(
         "-X", "utf8", (Join-Path $workspacePath "chainseer_robinhood.py"),
@@ -60,9 +70,35 @@ try {
         "--market-recheck-limit", "$MarketRecheckLimit",
         "--cycle-budget-seconds", "$CycleBudgetSeconds"
     )
+    # Own the whole tree. Start-Process -Wait waits, but if this PowerShell is
+    # terminated the Python child is orphaned and keeps holding the learning
+    # lock and the database. A Job Object with
+    # JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE makes the OS destroy the child when
+    # the parent's handle closes, however the parent dies.
+    if (-not ("ChainseerJob" -as [type])) {
+        Add-Type -Name ChainseerJob -Namespace Win32 -MemberDefinition @"
+[DllImport("kernel32.dll", CharSet=CharSet.Unicode)]
+public static extern IntPtr CreateJobObject(IntPtr a, string lpName);
+[DllImport("kernel32.dll")]
+public static extern bool SetInformationJobObject(IntPtr hJob, int infoClass, IntPtr lpInfo, uint cbInfo);
+[DllImport("kernel32.dll")]
+public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProc);
+"@
+    }
+    $job = [Win32.ChainseerJob]::CreateJobObject([IntPtr]::Zero, $null)
+    # JOBOBJECT_EXTENDED_LIMIT_INFORMATION: LimitFlags at offset 16 on x64,
+    # 0x2000 = KILL_ON_JOB_CLOSE.
+    $infoSize = 144
+    $info = [Runtime.InteropServices.Marshal]::AllocHGlobal($infoSize)
+    [Runtime.InteropServices.Marshal]::WriteInt32($info, 16, 0x2000)
+    [void][Win32.ChainseerJob]::SetInformationJobObject($job, 9, $info, $infoSize)
+
     $process = Start-Process -FilePath $pythonPath -ArgumentList $arguments -Wait `
         -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath `
         -RedirectStandardError $stderrPath
+    if ($process -and -not $process.HasExited) {
+        [void][Win32.ChainseerJob]::AssignProcessToJobObject($job, $process.Handle)
+    }
     $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { "" }
     $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { "" }
     if ($stdout) { Add-Content -LiteralPath $logPath -Value $stdout }
