@@ -6359,3 +6359,81 @@ class ScanCapSufficiencyTests(unittest.TestCase):
         self.assertNotEqual(
             rh.FLOW_NEAR_HEAD_SCAN_BLOCKS, rh.FLOW_WINDOW_BLOCKS)
         self.assertEqual(rh.FLOW_WINDOW_BLOCKS, 1350)
+
+
+class AdaptiveNearHeadFetchTests(unittest.TestCase):
+    """A result-set refusal splits the range instead of killing the pass.
+
+    The limit is on ROWS returned, not blocks queried, so no fixed chunk width
+    is safe. A single 12,000-block request took coverage to ZERO for an hour;
+    after chunking to 4,000 the same refusal still killed two passes on a busy
+    stretch. Because the cursor does not advance on failure, the head ran away
+    and one outage cost a 54,503-block hole.
+    """
+
+    class _RPC:
+        """Refuses any span wider than `limit`, as the endpoint does."""
+
+        def __init__(self, limit, logs=None):
+            self.limit = limit
+            self.calls = []
+            self.logs = logs or []
+
+        def get_logs(self, start, end, address=None, topics=None):
+            self.calls.append((start, end))
+            if end - start + 1 > self.limit:
+                raise RuntimeError(
+                    "[RPC -32000] logs matched by query exceeds limit of 10000")
+            return [l for l in self.logs
+                    if start <= int(str(l.get("blockNumber")), 16) <= end]
+
+    def _engine(self, rpc):
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.rpc = rpc
+        return engine
+
+    def test_an_oversized_range_is_split_until_it_succeeds(self):
+        rpc = self._RPC(limit=250)
+        logs = self._engine(rpc)._near_head_logs(1_000, 1_999, rh.V4_SWAP_TOPIC)
+        self.assertEqual(logs, [])
+        # Intermediate halves are refused too until they fit; what matters is
+        # that the range keeps splitting and ends in accepted sub-ranges.
+        accepted = [c for c in rpc.calls if c[1] - c[0] + 1 <= 250]
+        self.assertGreater(len(rpc.calls), 1, "the range was not split")
+        self.assertTrue(accepted, "splitting never reached an accepted width")
+        self.assertNotIn(
+            (1_000, 1_999), accepted,
+            "the oversized range must never be counted as accepted",
+        )
+
+    def test_every_block_in_the_range_is_still_covered(self):
+        rpc = self._RPC(limit=250)
+        self._engine(rpc)._near_head_logs(1_000, 1_999, rh.V4_SWAP_TOPIC)
+        ok = [c for c in rpc.calls if c[1] - c[0] + 1 <= 250]
+        covered = set()
+        for s, e in ok:
+            covered.update(range(s, e + 1))
+        self.assertEqual(
+            covered, set(range(1_000, 2_000)),
+            "splitting dropped blocks -- the hole it exists to prevent",
+        )
+
+    def test_logs_are_returned_once_not_per_attempt(self):
+        entries = [{"blockNumber": hex(b)} for b in (1_100, 1_500, 1_900)]
+        rpc = self._RPC(limit=250, logs=entries)
+        logs = self._engine(rpc)._near_head_logs(1_000, 1_999, rh.V4_SWAP_TOPIC)
+        self.assertEqual(len(logs), 3)
+
+    def test_a_non_limit_error_still_surfaces(self):
+        """A rate limit is not an oversized query; it must not be split."""
+        class _RateLimited:
+            def get_logs(self, start, end, address=None, topics=None):
+                raise RuntimeError("[RPC -429] RPC HTTP response failed (429)")
+        with self.assertRaises(RuntimeError):
+            self._engine(_RateLimited())._near_head_logs(
+                1_000, 1_999, rh.V4_SWAP_TOPIC)
+
+    def test_an_unsplittable_range_re_raises_rather_than_looping(self):
+        rpc = self._RPC(limit=0)
+        with self.assertRaises(RuntimeError):
+            self._engine(rpc)._near_head_logs(1_000, 1_000, rh.V4_SWAP_TOPIC)

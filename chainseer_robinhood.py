@@ -7477,6 +7477,42 @@ class RobinhoodLearningEngine:
             "observed_batch_seconds": round(batch_seconds, 3),
         }
 
+    def _near_head_logs(self, start: int, end: int, topic: str) -> list[dict]:
+        """Fetch a block range, halving on a provider result-set refusal.
+
+        The limit is on ROWS RETURNED, not blocks queried, so no fixed chunk
+        width is safe: a single 12,000-block request took coverage to zero for
+        an hour, and after chunking to 4,000 the same
+        "[RPC -32000] logs matched by query exceeds limit" still killed two
+        passes on a busy stretch. Each failure abandoned the whole pass, and
+        because the cursor does not advance on failure the head ran away --
+        one outage cost a 54,503-block hole that the next pass had to skip.
+
+        Splitting on refusal makes the chunk width self-correcting instead of
+        a standing guess. This mirrors _adaptive_logs on the V4 observer,
+        which has had it all along; the near-head path simply never used it.
+        A range that cannot be split further re-raises, so a genuine outage
+        still surfaces rather than looping.
+        """
+        pending = [(start, end)]
+        logs: list[dict] = []
+        while pending:
+            lower, upper = pending.pop()
+            try:
+                logs.extend(self.rpc.get_logs(
+                    lower, upper, address=UNISWAP_V4_POOL_MANAGER,
+                    topics=[[topic]],
+                ) or [])
+            except Exception as error:
+                oversized = "exceeds limit" in str(error).lower()
+                if not oversized or lower >= upper:
+                    raise
+                midpoint = (lower + upper) // 2
+                # LIFO keeps the requests chronological.
+                pending.append((midpoint + 1, upper))
+                pending.append((lower, midpoint))
+        return logs
+
     def enrich_near_head_window(self, events: list[dict]) -> dict:
         """Resolve origins for the window ABOUT TO BE SEALED.
 
@@ -7593,10 +7629,8 @@ class RobinhoodLearningEngine:
                 span = from_block
                 while span <= head:
                     upper = min(head, span + FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS - 1)
-                    logs.extend(self.rpc.get_logs(
-                        span, upper, address=UNISWAP_V4_POOL_MANAGER,
-                        topics=[[V4_SWAP_TOPIC]],
-                    ) or [])
+                    logs.extend(
+                        self._near_head_logs(span, upper, V4_SWAP_TOPIC))
                     span = upper + 1
             except Exception as error:
                 # The cursor is NOT advanced on failure, so the blocks this
@@ -7629,10 +7663,8 @@ class RobinhoodLearningEngine:
             span = from_block
             while span <= head:
                 upper = min(head, span + FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS - 1)
-                init_logs.extend(self.rpc.get_logs(
-                    span, upper, address=UNISWAP_V4_POOL_MANAGER,
-                    topics=[[V4_INITIALIZE_TOPIC]],
-                ) or [])
+                init_logs.extend(
+                    self._near_head_logs(span, upper, V4_INITIALIZE_TOPIC))
                 span = upper + 1
         except Exception:
             # A failed Initialize scan must not lose the swap pass; the window
