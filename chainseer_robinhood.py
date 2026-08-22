@@ -4445,7 +4445,9 @@ class RobinhoodLearningStore:
         }
         with self.connection() as connection:
             row = connection.execute(
-                """SELECT run_id, current_stage, stage_started_at
+                """SELECT run_id, current_stage, stage_started_at,
+                          deadline_remaining_at_stage_start,
+                          completed_stage_seconds_json
                    FROM lane_state
                    WHERE lane=? AND pid=? AND status='running'""",
                 (str(lane), int(pid)),
@@ -4454,6 +4456,13 @@ class RobinhoodLearningStore:
                 # The stage the process was INSIDE, read from the database
                 # rather than from a dead process's memory.
                 failure["failure_stage"] = row["current_stage"]
+                failure["deadline_remaining_at_stage_start"] = row[
+                    "deadline_remaining_at_stage_start"]
+                try:
+                    failure["completed_stage_seconds"] = json.loads(
+                        row["completed_stage_seconds_json"] or "{}")
+                except (TypeError, ValueError):
+                    failure["completed_stage_seconds"] = {}
                 started = row["stage_started_at"]
                 failure["stage_elapsed_seconds"] = (
                     round(now - started, 3) if started else None)
@@ -9776,7 +9785,9 @@ class RobinhoodLearningEngine:
             # that must stay near the chain head.
             positions = {"delegated_to": "marks_lane"}
             stage = time.monotonic()
-            self.store.mark_lane_stage("live", "ingestion")
+            self.store.mark_lane_stage(
+                    "live", "ingestion", run_id=self.cycle_run_uuid,
+                    remaining=deadline.remaining(), completed=dict(timings))
             with self._rpc_deadline(deadline):
                 near_head = self.near_head_flow_pass(
                     deadline=deadline, cursor_name="live_lane_cursor.json",
@@ -9786,7 +9797,9 @@ class RobinhoodLearningEngine:
                 )
             timings["head_ingestion_and_identity"] = round(
                 time.monotonic() - stage, 3)
-            self.store.mark_lane_stage("live", "sealing")
+            self.store.mark_lane_stage(
+                    "live", "sealing", run_id=self.cycle_run_uuid,
+                    remaining=deadline.remaining(), completed=dict(timings))
             if not near_head.get("scanned"):
                 return {
                     "position_evaluations": positions,
@@ -9807,9 +9820,13 @@ class RobinhoodLearningEngine:
                     pool_ids=touched, deadline=deadline,
                     limit=LIVE_LANE_OBSERVATION_LIMIT,
                 )
-                self.store.mark_lane_stage("live", "decision_head")
+                self.store.mark_lane_stage(
+                    "live", "decision_head", run_id=self.cycle_run_uuid,
+                    remaining=deadline.remaining(), completed=dict(timings))
                 decision_head = int(self.rpc.get_block_number())
-                self.store.mark_lane_stage("live", "classification")
+                self.store.mark_lane_stage(
+                    "live", "classification", run_id=self.cycle_run_uuid,
+                    remaining=deadline.remaining(), completed=dict(timings))
                 classification = self.classify_sealed_observations(
                     decision_head,
                     observation_ids=list(observation.get("observation_ids") or []),

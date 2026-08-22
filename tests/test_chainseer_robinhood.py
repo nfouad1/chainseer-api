@@ -7202,3 +7202,83 @@ class DashboardKeyContractTests(unittest.TestCase):
         source = inspect.getsource(rh.RobinhoodLearningStore.mark_lane_stage)
         self.assertIn("deadline_remaining_at_stage_start", source)
         self.assertIn("completed_stage_seconds", source)
+
+
+class StageHeadroomIntegrationTests(unittest.TestCase):
+    """A real transition must write NUMBERS, not just field names.
+
+    The columns, the parameters and the payload keys all existed while every
+    call site passed none of them -- so every recent failure payload had
+    deadline_remaining_at_stage_start and completed_stage_seconds missing.
+    Asserting that a name appears in source would have passed throughout.
+    """
+
+    def _store(self, directory):
+        return rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+
+    def _running(self, store, budget=25.0):
+        with store.connection() as connection:
+            connection.execute(
+                """INSERT OR REPLACE INTO lane_state
+                       (lane,run_id,pid,status,started_at,heartbeat_at,
+                        deadline_seconds)
+                   VALUES ('live','rid',?,'running',?,?,?)""",
+                (os.getpid(), time.time(), time.time(), budget),
+            )
+            connection.execute(
+                """INSERT OR REPLACE INTO runs(started_at,status,run_id,lane,
+                       pid,deadline_seconds,summary_json)
+                   VALUES (?,'running','rid','live',?,?,'{}')""",
+                (_utc_now_iso(), os.getpid(), budget),
+            )
+
+    def test_a_real_transition_persists_numeric_headroom(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._running(store)
+            store.mark_lane_stage(
+                "live", "classification", run_id="rid",
+                remaining=3.25, completed={"ingestion": 12.5, "sealing": 8.0},
+            )
+            store.terminate_lane("live", os.getpid(), "hard_kill")
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT summary_json FROM runs WHERE run_id='rid'"
+                ).fetchone()
+            payload = json.loads(row["summary_json"])
+            self.assertEqual(payload["failure_stage"], "classification")
+            self.assertAlmostEqual(
+                payload["deadline_remaining_at_stage_start"], 3.25, places=2)
+            self.assertEqual(
+                payload["completed_stage_seconds"],
+                {"ingestion": 12.5, "sealing": 8.0},
+                "the stages that consumed the budget must be named",
+            )
+
+    def test_headroom_distinguishes_a_slow_stage_from_an_empty_budget(self):
+        """0.48-4.07s inside classification is an empty budget, not slowness."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._running(store)
+            store.mark_lane_stage(
+                "live", "classification", run_id="rid",
+                remaining=0.9, completed={"ingestion": 3.1, "sealing": 20.56},
+            )
+            store.terminate_lane("live", os.getpid(), "deadline")
+            payload = json.loads(
+                store.lane_performance(limit=5).get("live", {}).get(
+                    "last_failure_json", "{}")
+                if False else json.dumps(
+                    store.lane_failure_stage("live", "rid")))
+            self.assertLess(payload["deadline_remaining_at_stage_start"], 1.0)
+            self.assertGreater(
+                payload["completed_stage_seconds"]["sealing"], 20.0,
+                "sealing consumed the budget classification needed",
+            )
+
+    def test_every_live_call_site_supplies_the_new_arguments(self):
+        source = inspect.getsource(rh.RobinhoodLearningEngine.run_live_lane)
+        self.assertEqual(source.count("mark_lane_stage"), 4)
+        self.assertEqual(source.count("run_id=self.cycle_run_uuid"), 4)
+        self.assertEqual(source.count("remaining=deadline.remaining()"), 4)
+        self.assertEqual(source.count("completed=dict(timings)"), 4)
