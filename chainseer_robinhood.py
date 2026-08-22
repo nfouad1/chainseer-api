@@ -1914,13 +1914,22 @@ class RobinhoodLearningStore:
                 -- ranges above, where recording a skipped count was mistaken
                 -- for queueing the range.
                 --
-                -- Keyed by the window identity that flow_observations keys
-                -- on, so an entry cannot outlive the observation it names.
+                -- The row carries the WINDOW, not a pointer to it.
+                -- flow_signals is keyed by pool_id alone -- one row per pool,
+                -- replaced on every recompute -- so a queued
+                -- (pool_id, window_end_block) stopped resolving as soon as
+                -- that pool traded again. Measured: 432 entries pending, the
+                -- oldest 113 minutes old, and zero drained, because not one
+                -- of them still matched a flow_signals row. A queue whose
+                -- entries cannot be acted on is the leak it was built to
+                -- prevent, so features_json is snapshotted at defer time and
+                -- the entry is self-sufficient.
                 CREATE TABLE IF NOT EXISTS flow_seal_queue (
                     pool_id TEXT NOT NULL,
                     window_end_block INTEGER NOT NULL,
                     token_address TEXT,
                     window_start_block INTEGER,
+                    features_json TEXT,
                     enqueued_at REAL NOT NULL,
                     reason TEXT NOT NULL,
                     attempts INTEGER NOT NULL DEFAULT 0,
@@ -1983,6 +1992,22 @@ class RobinhoodLearningStore:
                     connection.execute(
                         "ALTER TABLE flow_backfill_queue"
                         f" ADD COLUMN {name} {decl}")
+            seal_queue_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(flow_seal_queue)")
+            }
+            if seal_queue_columns and "features_json" not in seal_queue_columns:
+                connection.execute(
+                    "ALTER TABLE flow_seal_queue ADD COLUMN features_json TEXT")
+                # Entries queued before the snapshot existed cannot be sealed:
+                # the features that defined those windows were overwritten by
+                # the next recompute of the same pool. Retiring them says so,
+                # instead of leaving a backlog that can only ever grow.
+                connection.execute(
+                    """UPDATE flow_seal_queue
+                       SET completed_at=?, reason='superseded_before_snapshot'
+                       WHERE completed_at IS NULL AND features_json IS NULL""",
+                    (time.time(),))
             run_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(runs)")
             }
@@ -4225,6 +4250,7 @@ class RobinhoodLearningStore:
             rows.append((
                 str(pool_id), int(end_block), window.get("token_address"),
                 safe_int(window.get("window_start_block"), 0),
+                window.get("features_json") or "{}",
                 time.time(), str(reason),
             ))
         if not rows:
@@ -4237,12 +4263,16 @@ class RobinhoodLearningStore:
             connection.executemany(
                 """INSERT OR IGNORE INTO flow_seal_queue
                        (pool_id,window_end_block,token_address,
-                        window_start_block,enqueued_at,reason)
-                   VALUES (?,?,?,?,?,?)""", rows)
+                        window_start_block,features_json,enqueued_at,reason)
+                   VALUES (?,?,?,?,?,?,?)""", rows)
         return len(rows)
 
     def pending_seal_windows(self, limit: int = 25) -> list[dict]:
-        """Queued windows, oldest first, that are still genuinely unsealed.
+        """Queued windows, oldest first, ready to seal without a lookup.
+
+        Each row is shaped like the flow_signals row it came from, because
+        flow_signals cannot supply it a second time: that table is keyed by
+        pool_id alone and is overwritten whenever the pool trades again.
 
         The join against flow_observations is what keeps the queue honest: a
         window sealed by any other path (a wider batch pass, a later cycle
@@ -9227,26 +9257,11 @@ class RobinhoodLearningEngine:
         # Queued first: these are windows an earlier cycle admitted and could
         # not reach. They are older than anything fresh by construction, and
         # they are the ones that age below `floor` and vanish if not drained.
-        queued = self.store.pending_seal_windows(SEAL_QUEUE_DRAIN_LIMIT)
-        queued_rows: list[dict] = []
-        if queued:
-            wanted = {
-                (str(entry["pool_id"]), int(entry["window_end_block"])): rank
-                for rank, entry in enumerate(queued)
-            }
-            with self.store.connection() as connection:
-                candidates = [dict(row) for row in connection.execute(
-                    "SELECT * FROM flow_signals WHERE pool_id IN ("
-                    + ",".join("?" * len(queued)) + ")",
-                    [entry["pool_id"] for entry in queued],
-                )]
-            queued_rows = sorted(
-                (row for row in candidates
-                 if (str(row["pool_id"]), int(row["window_end_block"]))
-                 in wanted),
-                key=lambda row: wanted[
-                    (str(row["pool_id"]), int(row["window_end_block"]))],
-            )
+        # Used as-is. Re-reading flow_signals here is what made the queue
+        # undrainable: that table keys on pool_id alone and is replaced on
+        # every recompute, so the window a queued row named no longer existed.
+        queued_rows = [dict(entry) for entry in
+                       self.store.pending_seal_windows(SEAL_QUEUE_DRAIN_LIMIT)]
         with self.store.connection() as connection:
             if pool_ids is None:
                 windows = [dict(row) for row in connection.execute(

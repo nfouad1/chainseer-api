@@ -7972,3 +7972,126 @@ class SealedWindowLookupIndexTests(unittest.TestCase):
                 )
         self.assertIn("idx_flow_obs_window", plan)
         self.assertNotIn("SCAN o", plan)
+
+
+class SealQueueSurvivesRecomputeTests(SealStageBudgetTests):
+    """A queued window must survive its pool trading again.
+
+    flow_signals is keyed by pool_id alone -- one row per pool, replaced on
+    every recompute -- so a queue holding (pool_id, window_end_block) stopped
+    resolving the moment that pool traded. Measured on the live database: 432
+    entries pending, oldest 113 minutes, and zero ever drained, because not
+    one still matched a flow_signals row. The first version of these tests
+    passed because nothing recomputed the signal between the two cycles.
+    """
+
+    def _recompute(self, store, pool_id, new_end):
+        """What the near-head pass does: replace the pool's single row."""
+        with store.connection() as connection:
+            connection.execute(
+                "UPDATE flow_signals SET window_end_block=?,"
+                " window_start_block=?, computed_at=? WHERE pool_id=?",
+                (new_end, new_end - 1350, rh._utc_now(), pool_id))
+
+    def test_a_deferred_window_seals_after_its_pool_traded_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 2)
+            store.set_scheduler_state(
+                "seal_window_cost", {"per_window_seconds": 2.0})
+            engine = self._engine(directory, store)
+            first = engine.seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(7.0),
+                limit=2, reserve_seconds=5.0)
+            self.assertEqual(first["windows_queued"], 1)
+
+            with store.connection() as connection:
+                deferred = connection.execute(
+                    "SELECT pool_id, window_end_block FROM flow_seal_queue"
+                    " WHERE completed_at IS NULL").fetchone()
+            # Every pool in the queue trades again and is recomputed.
+            self._recompute(store, deferred["pool_id"], self.HEAD + 50_000)
+
+            second = engine.seal_near_head_observations(
+                self.HEAD, self.NOW + 30, deadline=rh.CycleDeadline(25.0),
+                limit=2, reserve_seconds=5.0)
+            self.assertEqual(
+                second["admission"]["queue_drained"], 1,
+                "a recomputed pool must not strand its deferred window",
+            )
+            # The specific entry, not the depth: the second cycle admits two
+            # windows out of three and legitimately defers the third, so a
+            # non-empty queue here is the queue working.
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT completed_at FROM flow_seal_queue"
+                    " WHERE pool_id=? AND window_end_block=?",
+                    (deferred["pool_id"], deferred["window_end_block"]),
+                ).fetchone()
+            self.assertIsNotNone(
+                row["completed_at"],
+                "432 entries once sat pending, oldest 113 minutes, because"
+                " none of them could resolve to a flow_signals row",
+            )
+            with store.connection() as connection:
+                sealed_here = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observations"
+                    " WHERE pool_id=? AND window_end_block=?",
+                    (deferred["pool_id"], deferred["window_end_block"]),
+                ).fetchone()[0]
+            self.assertEqual(sealed_here, 1, "the deferred window was sealed")
+
+    def test_the_queue_carries_the_features_not_a_pointer(self):
+        """The gaps decide role; losing them mislabels every control."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.enqueue_seal([{
+                "pool_id": "0x" + "0a" * 32,
+                "window_end_block": self.HEAD,
+                "window_start_block": self.HEAD - 1350,
+                "token_address": TOKEN,
+                "features_json": json.dumps(
+                    {"qualification_gaps": ["minimum_swaps"]}),
+            }], "test")
+            row = store.pending_seal_windows(4)[0]
+            self.assertEqual(
+                json.loads(row["features_json"])["qualification_gaps"],
+                ["minimum_swaps"],
+            )
+            for key in ("pool_id", "token_address", "window_start_block",
+                        "window_end_block"):
+                self.assertIsNotNone(row[key], key + " is needed to seal")
+
+    def test_entries_predating_the_snapshot_are_retired(self):
+        """They cannot be sealed: their features were already overwritten.
+
+        Leaving them pending would report a backlog that can only grow, which
+        is the same dishonesty as counting skipped blocks and calling it a
+        queue.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "l.sqlite3"
+            store = rh.RobinhoodLearningStore(path)
+            with store.connection() as connection:
+                connection.execute(
+                    "INSERT INTO flow_seal_queue(pool_id,window_end_block,"
+                    " token_address,window_start_block,enqueued_at,reason)"
+                    " VALUES (?,?,?,?,?,?)",
+                    ("0x" + "0b" * 32, self.HEAD, TOKEN, self.HEAD - 1350,
+                     time.time(), "live_lane_headroom"))
+                connection.execute(
+                    "UPDATE flow_seal_queue SET features_json=NULL")
+                connection.execute(
+                    "ALTER TABLE flow_seal_queue RENAME COLUMN features_json"
+                    " TO features_json_old")
+            self.assertEqual(store.seal_queue_backlog()["pending_windows"], 1)
+
+            reopened = rh.RobinhoodLearningStore(path)
+            with reopened.connection() as connection:
+                row = connection.execute(
+                    "SELECT completed_at, reason FROM flow_seal_queue"
+                ).fetchone()
+            self.assertIsNotNone(row["completed_at"])
+            self.assertEqual(row["reason"], "superseded_before_snapshot")
+            self.assertEqual(
+                reopened.seal_queue_backlog()["pending_windows"], 0)
