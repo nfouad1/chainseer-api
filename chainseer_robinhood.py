@@ -8,15 +8,20 @@ from expensive analysis so new-pair intake remains bounded and observable.
 from __future__ import annotations
 
 import argparse
+import ctypes
+from ctypes import wintypes
 import hashlib
 import json
+import os
 import random
 import re
 import sqlite3
+import subprocess
+import sys
 import threading
 import time
 import uuid
-from contextlib import contextmanager
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -35,7 +40,7 @@ from chainseer import (
     _load_timechain_module,
     ensure_utf8_runtime,
 )
-from chainseer_base import LearningRunLock
+from chainseer_base import LearningRunLock, _process_is_running
 from chainseer_core import atomic_json_write, read_json, safe_float, safe_int
 from chainseer_outcome_ledger import (
     analysis_evidence_binding,
@@ -85,6 +90,7 @@ DEFAULT_CHAIN_ROOT = "robinhood_learning_chain"
 DEFAULT_DASHBOARD_PORT = 8769
 # How often the dashboard rebuilds its snapshot off the request path.
 DASHBOARD_SNAPSHOT_REFRESH_SECONDS = 30.0
+DASHBOARD_INTEGRITY_MAX_AGE_SECONDS = 24 * 60 * 60
 DEFAULT_DISCOVERY_LOOKBACK_BLOCKS = 5_000
 DEFAULT_DISCOVERY_BLOCK_LIMIT = 5_000
 DEFAULT_ANALYSIS_LIMIT = 1
@@ -92,6 +98,20 @@ DEFAULT_OUTCOME_LIMIT = 12
 DEFAULT_OUTCOME_RECOVERY_LIMIT = 4
 DEFAULT_MARKET_RECHECK_LIMIT = 4
 DEFAULT_CYCLE_BUDGET_SECONDS = 255.0
+LIVE_LANE_BUDGET_SECONDS = 25.0
+ANALYSIS_LANE_BUDGET_SECONDS = 120.0
+BACKFILL_LANE_BUDGET_SECONDS = 120.0
+BACKFILL_LANE_IDENTITY_LIMIT = 25
+BACKFILL_V4_ACTIVATION_LIMIT = 25
+LIVE_LANE_SCAN_BLOCKS = 750
+LIVE_LANE_ENRICHMENT_LIMIT = 60
+LIVE_LANE_ENRICHMENT_BUDGET_SECONDS = 6.0
+LIVE_LANE_OBSERVATION_LIMIT = 8
+LIVE_LANE_CADENCE_SECONDS = 30.0
+ANALYSIS_LANE_CADENCE_SECONDS = 60.0
+BACKFILL_LANE_CADENCE_SECONDS = 300.0
+LANE_HEARTBEAT_SECONDS = 5.0
+LANE_TERMINATION_GRACE_SECONDS = 3.0
 ANALYSIS_START_RESERVE_SECONDS = 45.0
 OUTCOME_STAGE_BUDGET_SECONDS = 60.0
 MISSED_EXPIRATION_LIMIT = 250
@@ -1801,8 +1821,35 @@ class RobinhoodLearningStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_backfill_pending
                     ON flow_backfill_queue(completed_at, enqueued_at);
+                CREATE TABLE IF NOT EXISTS lane_state (
+                    lane TEXT PRIMARY KEY,
+                    run_id TEXT,
+                    pid INTEGER,
+                    status TEXT NOT NULL,
+                    started_at REAL,
+                    heartbeat_at REAL,
+                    completed_at REAL,
+                    deadline_seconds REAL,
+                    cursor_json TEXT NOT NULL DEFAULT '{}',
+                    backlog_json TEXT NOT NULL DEFAULT '{}',
+                    summary_json TEXT NOT NULL DEFAULT '{}',
+                    last_error TEXT
+                );
                 """
             )
+            backfill_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(flow_backfill_queue)")
+            }
+            for name, decl in {
+                "next_block": "INTEGER",
+                "last_attempt_at": "REAL",
+                "last_error": "TEXT",
+            }.items():
+                if name not in backfill_columns:
+                    connection.execute(
+                        "ALTER TABLE flow_backfill_queue"
+                        f" ADD COLUMN {name} {decl}")
             run_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(runs)")
             }
@@ -1818,12 +1865,16 @@ class RobinhoodLearningStore:
                 "host": "TEXT",
                 "heartbeat_at": "REAL",
                 "deadline_seconds": "REAL",
+                "lane": "TEXT NOT NULL DEFAULT 'legacy'",
             }.items():
                 if name not in run_columns:
                     connection.execute(
                         f"ALTER TABLE runs ADD COLUMN {name} {decl}")
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_runs_run_id ON runs(run_id)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_lane_status"
+                " ON runs(lane,status,heartbeat_at)")
             outcome_columns = {
                 row[1] for row in connection.execute(
                     "PRAGMA table_info(flow_observation_outcomes)"
@@ -3482,6 +3533,64 @@ class RobinhoodLearningStore:
             "pools_born_in_last_window": recent,
         }
 
+    def lane_health(self, sample: int = 200) -> dict:
+        """Per-lane duration AND completion rate, always together.
+
+        p95 alone is gameable and was in fact misread: runs are killed at the
+        deadline, so their durations cluster just under it and never form a
+        tail. A live lane reporting p95 27.0s looked inside a 30s bar while
+        only 850 of 1,564 runs -- 54.3% -- actually completed. The censored
+        distribution IS the signature of truncation, and reading it as
+        "no outliers" inverts the finding.
+
+        Readiness therefore needs both: p95 under budget AND >=99% complete.
+        Reporting them apart lets a lane that kills everything at the cutoff
+        score perfectly while doing no work.
+        """
+        import json as _json
+        out: dict[str, dict] = {}
+        with self.connection() as connection:
+            lanes = [r[0] for r in connection.execute(
+                "SELECT DISTINCT lane FROM runs WHERE lane IS NOT NULL")]
+            for lane in lanes:
+                rows = connection.execute(
+                    """SELECT status, summary_json FROM runs
+                       WHERE lane=? ORDER BY id DESC LIMIT ?""",
+                    (lane, int(sample)),
+                ).fetchall()
+                if not rows:
+                    continue
+                terminal = [r for r in rows if r["status"] != "running"]
+                complete = [r for r in terminal if r["status"] == "complete"]
+                durations = []
+                for row in complete:
+                    try:
+                        value = (_json.loads(row["summary_json"] or "{}")
+                                 .get("duration_seconds"))
+                    except (TypeError, ValueError):
+                        value = None
+                    if isinstance(value, (int, float)):
+                        durations.append(float(value))
+                durations.sort()
+                rate = len(complete) / len(terminal) if terminal else None
+                out[lane] = {
+                    "sampled": len(rows),
+                    "completed": len(complete),
+                    "completion_rate": round(rate, 4) if rate is not None else None,
+                    # Stated explicitly: these describe SURVIVORS only.
+                    "duration_median_seconds": (
+                        durations[len(durations) // 2] if durations else None),
+                    "duration_p95_seconds": (
+                        durations[max(0, int(0.95 * len(durations)) - 1)]
+                        if durations else None),
+                    "durations_are_survivors_only": True,
+                    "ready": bool(
+                        rate is not None and rate >= 0.99 and durations
+                        and durations[max(0, int(0.95 * len(durations)) - 1)] < 30.0
+                    ),
+                }
+        return out
+
     def round_trip_summary(self) -> dict:
         """What a position costs to enter and leave, before anything moves.
 
@@ -3948,12 +4057,25 @@ class RobinhoodLearningStore:
                 (time.time(), int(from_block), int(to_block)),
             )
 
+    def advance_backfill(
+        self, from_block: int, to_block: int, next_block: int,
+        *, error: str | None = None,
+    ) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                """UPDATE flow_backfill_queue
+                   SET next_block=?,attempts=attempts+1,last_attempt_at=?,last_error=?
+                   WHERE from_block=? AND to_block=? AND completed_at IS NULL""",
+                (int(next_block), time.time(), error,
+                 int(from_block), int(to_block)),
+            )
+
     def backfill_backlog(self) -> dict:
         """Backlog AGE, not just depth: a queue that never drains is a leak."""
         with self.connection() as connection:
             row = connection.execute(
                 """SELECT COUNT(*) ranges,
-                          COALESCE(SUM(to_block-from_block+1),0) blocks,
+                          COALESCE(SUM(to_block-COALESCE(next_block,from_block)+1),0) blocks,
                           MIN(enqueued_at) oldest
                    FROM flow_backfill_queue WHERE completed_at IS NULL"""
             ).fetchone()
@@ -3965,17 +4087,35 @@ class RobinhoodLearningStore:
                 round(time.time() - oldest, 1) if oldest else None),
         }
 
-    def begin_run(self, run_id: str, deadline_seconds: float) -> int:
+    def begin_run(
+        self, run_id: str, deadline_seconds: float, lane: str = "legacy",
+    ) -> int:
         """Claim a run row stamped with who owns it and when it last breathed."""
         import os as _os, socket as _socket
+        now = time.time()
         with self.connection() as connection:
-            return connection.execute(
+            row_id = connection.execute(
                 """INSERT INTO runs(started_at,status,run_id,pid,host,
-                       heartbeat_at,deadline_seconds)
-                   VALUES (?,'running',?,?,?,?,?)""",
+                       heartbeat_at,deadline_seconds,lane)
+                   VALUES (?,'running',?,?,?,?,?,?)""",
                 (_utc_now(), run_id, _os.getpid(), _socket.gethostname(),
-                 time.time(), float(deadline_seconds)),
+                 now, float(deadline_seconds), str(lane)),
             ).lastrowid
+            if lane != "legacy":
+                connection.execute(
+                    """INSERT INTO lane_state
+                       (lane,run_id,pid,status,started_at,heartbeat_at,
+                        completed_at,deadline_seconds,last_error)
+                       VALUES (?,?,?,'running',?,?,NULL,?,NULL)
+                       ON CONFLICT(lane) DO UPDATE SET
+                       run_id=excluded.run_id,pid=excluded.pid,
+                       status='running',started_at=excluded.started_at,
+                       heartbeat_at=excluded.heartbeat_at,completed_at=NULL,
+                       deadline_seconds=excluded.deadline_seconds,last_error=NULL""",
+                    (str(lane), run_id, _os.getpid(), now, now,
+                     float(deadline_seconds)),
+                )
+        return row_id
 
     def heartbeat_run(self, run_id: str) -> None:
         """Liveness, so a crashed run is distinguishable from a slow one.
@@ -3985,12 +4125,20 @@ class RobinhoodLearningStore:
         evidence; an old started_at is not.
         """
         with self.connection() as connection:
+            now = time.time()
             connection.execute(
                 "UPDATE runs SET heartbeat_at=? WHERE run_id=? AND status='running'",
-                (time.time(), run_id),
+                (now, run_id),
             )
+            connection.execute(
+                """UPDATE lane_state SET heartbeat_at=?
+                   WHERE run_id=? AND status='running'""", (now, run_id))
 
-    def finish_run(self, run_id: str, status: str) -> None:
+    def finish_run(
+        self, run_id: str, status: str, *, summary: dict | None = None,
+        error: str | None = None, cursor: dict | None = None,
+        backlog: dict | None = None,
+    ) -> None:
         """Only the owning run may close its own row.
 
         Scoping the write to run_id is what stops a skipped overlapping
@@ -3999,12 +4147,27 @@ class RobinhoodLearningStore:
         other's state.
         """
         with self.connection() as connection:
+            now = time.time()
             connection.execute(
-                "UPDATE runs SET status=?, completed_at=? WHERE run_id=?",
-                (status, _utc_now(), run_id),
+                """UPDATE runs SET status=?, completed_at=?, summary_json=?
+                   WHERE run_id=?""",
+                (status, _utc_now(), _canonical(summary or {}), run_id),
+            )
+            connection.execute(
+                """UPDATE lane_state SET status=?,heartbeat_at=?,completed_at=?,
+                       summary_json=?,last_error=?,
+                       cursor_json=COALESCE(?,cursor_json),
+                       backlog_json=COALESCE(?,backlog_json)
+                   WHERE run_id=?""",
+                (status, now, now, _canonical(summary or {}), error,
+                 _canonical(cursor) if cursor is not None else None,
+                 _canonical(backlog) if backlog is not None else None,
+                 run_id),
             )
 
-    def active_run(self, stale_seconds: float = 300.0) -> dict | None:
+    def active_run(
+        self, stale_seconds: float = 300.0, lane: str | None = None,
+    ) -> dict | None:
         """The authoritative answer to 'is a cycle running right now?'
 
         A row is active only if its heartbeat is recent. That makes the
@@ -4012,14 +4175,447 @@ class RobinhoodLearningStore:
         whose owner may have been killed without releasing it.
         """
         with self.connection() as connection:
+            lane_clause = " AND lane=?" if lane else ""
+            parameters: list = [time.time() - float(stale_seconds)]
+            if lane:
+                parameters.append(str(lane))
             row = connection.execute(
                 """SELECT * FROM runs WHERE status='running'
                      AND heartbeat_at IS NOT NULL
-                     AND heartbeat_at > ?
+                     AND heartbeat_at > ?""" + lane_clause + """
                    ORDER BY heartbeat_at DESC LIMIT 1""",
-                (time.time() - float(stale_seconds),),
+                parameters,
             ).fetchone()
         return dict(row) if row else None
+
+    def recover_abandoned_runs(
+        self, process_is_running=_process_is_running,
+    ) -> list[dict]:
+        """Close historical ``running`` rows that cannot still own work.
+
+        ``lane_state`` is intentionally one row per lane.  That makes current
+        status authoritative, but it also means a killed worker can be
+        superseded before its historical ``runs`` row is closed.  Reconciling
+        only ``lane_state`` therefore left an ever-growing set of audit rows
+        claiming to run forever.  Recovery examines every running row and is
+        deliberately conservative: a row is closed only when its owner is
+        dead, its heartbeat has exceeded its own deadline plus grace, it has
+        been superseded by the lane's authoritative run, or it predates the
+        run-id/heartbeat schema and consequently cannot be authoritative.
+        """
+        import socket as _socket
+
+        now = time.time()
+        local_host = _socket.gethostname()
+        recovered: list[dict] = []
+        states = self.lane_states()
+        with self.connection() as connection:
+            rows = [dict(row) for row in connection.execute(
+                "SELECT * FROM runs WHERE status='running' ORDER BY id"
+            )]
+            for row in rows:
+                lane = str(row.get("lane") or "legacy")
+                run_id = row.get("run_id")
+                pid = safe_int(row.get("pid"), 0)
+                heartbeat = safe_float(row.get("heartbeat_at"), 0.0)
+                deadline = max(0.0, safe_float(
+                    row.get("deadline_seconds"), 0.0))
+                state = states.get(lane) or {}
+                superseded = bool(
+                    lane != "legacy" and state.get("run_id") != run_id)
+                pre_authoritative = not run_id or not heartbeat
+                heartbeat_age = now - heartbeat if heartbeat else None
+                stale = bool(
+                    heartbeat_age is not None
+                    and heartbeat_age > max(
+                        30.0, deadline + 2 * LANE_HEARTBEAT_SECONDS,
+                    )
+                )
+                local_owner = not row.get("host") or row.get("host") == local_host
+                owner_dead = bool(
+                    pid > 0 and local_owner
+                    and process_is_running(pid) is False
+                )
+                if not (superseded or pre_authoritative or stale or owner_dead):
+                    continue
+                if pre_authoritative:
+                    reason = "pre_authoritative_run_recovered"
+                elif superseded:
+                    reason = "superseded_run_recovered"
+                elif owner_dead:
+                    reason = "dead_owner_run_recovered"
+                else:
+                    reason = "stale_heartbeat_run_recovered"
+                payload = {
+                    "schema_version": 1,
+                    "status": "abandoned_recovered",
+                    "reason": reason,
+                    "lane": lane,
+                    "run_id": run_id,
+                    "pid": pid or None,
+                    "recovered_at": _utc_now(),
+                    "previous_heartbeat_age_seconds": (
+                        round(heartbeat_age, 3)
+                        if heartbeat_age is not None else None
+                    ),
+                }
+                changed = connection.execute(
+                    """UPDATE runs SET status='abandoned_recovered',
+                              completed_at=?,summary_json=?
+                       WHERE id=? AND status='running'""",
+                    (_utc_now(), _canonical(payload), int(row["id"])),
+                ).rowcount
+                if not changed:
+                    continue
+                if state.get("run_id") == run_id:
+                    connection.execute(
+                        """UPDATE lane_state
+                           SET status='abandoned_recovered',heartbeat_at=?,
+                               completed_at=?,summary_json=?,last_error=?
+                           WHERE lane=? AND run_id=? AND status='running'""",
+                        (now, now, _canonical(payload), reason, lane, run_id),
+                    )
+                recovered.append(payload)
+        return recovered
+
+    def running_run_audit(self) -> dict:
+        """Report active and abandoned-looking run rows without mutating."""
+        import socket as _socket
+
+        now = time.time()
+        local_host = _socket.gethostname()
+        states = self.lane_states()
+        with self.connection() as connection:
+            rows = [dict(row) for row in connection.execute(
+                "SELECT * FROM runs WHERE status='running' ORDER BY id"
+            )]
+        active: list[dict] = []
+        stale: list[dict] = []
+        by_lane: dict[str, int] = {}
+        for row in rows:
+            lane = str(row.get("lane") or "legacy")
+            run_id = row.get("run_id")
+            pid = safe_int(row.get("pid"), 0)
+            heartbeat = safe_float(row.get("heartbeat_at"), 0.0)
+            age = now - heartbeat if heartbeat else None
+            current = bool(
+                lane != "legacy"
+                and (states.get(lane) or {}).get("run_id") == run_id
+            )
+            local_owner = not row.get("host") or row.get("host") == local_host
+            owner_alive = (
+                _process_is_running(pid) if pid > 0 and local_owner else None)
+            fresh = bool(
+                run_id and heartbeat and age <= max(
+                    30.0,
+                    max(0.0, safe_float(row.get("deadline_seconds"), 0.0))
+                    + 2 * LANE_HEARTBEAT_SECONDS,
+                )
+            )
+            item = {
+                "id": int(row["id"]), "lane": lane, "run_id": run_id,
+                "pid": pid or None,
+                "heartbeat_age_seconds": round(age, 3) if age is not None else None,
+                "authoritative_lane_run": current,
+                "owner_alive": owner_alive,
+            }
+            if fresh and current and owner_alive is not False:
+                active.append(item)
+                by_lane[lane] = by_lane.get(lane, 0) + 1
+            else:
+                stale.append(item)
+        return {
+            "running_rows": len(rows), "active": len(active),
+            "stale": len(stale), "active_by_lane": by_lane,
+            "overlap_lanes": sorted(
+                lane for lane, count in by_lane.items() if count > 1),
+            "stale_rows": stale,
+        }
+
+    def lane_states(self) -> dict[str, dict]:
+        with self.connection() as connection:
+            rows = [dict(row) for row in connection.execute(
+                "SELECT * FROM lane_state ORDER BY lane")]
+        for row in rows:
+            for key in ("cursor_json", "backlog_json", "summary_json"):
+                try:
+                    row[key.removesuffix("_json")] = json.loads(row.pop(key) or "{}")
+                except (TypeError, ValueError):
+                    row[key.removesuffix("_json")] = {}
+        return {row["lane"]: row for row in rows}
+
+    def terminate_lane(self, lane: str, pid: int, reason: str) -> None:
+        """Close only the run owned by the process the supervisor terminated."""
+        now = time.time()
+        failure = {
+            "lane": str(lane), "status": "deadline_exceeded",
+            "pid": int(pid), "error": str(reason), "timestamp": _utc_now(),
+        }
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT run_id FROM lane_state
+                   WHERE lane=? AND pid=? AND status='running'""",
+                (str(lane), int(pid)),
+            ).fetchone()
+            if not row:
+                return
+            connection.execute(
+                """UPDATE runs SET status='deadline_exceeded',completed_at=?,
+                       summary_json=? WHERE run_id=? AND status='running'""",
+                (_utc_now(), _canonical(failure), row["run_id"]),
+            )
+            connection.execute(
+                """UPDATE lane_state SET status='deadline_exceeded',
+                       heartbeat_at=?,completed_at=?,summary_json=?,last_error=?
+                   WHERE lane=? AND pid=? AND status='running'""",
+                (now, now, _canonical(failure), str(reason),
+                 str(lane), int(pid)),
+            )
+
+    def lane_performance(self, limit: int = 100) -> dict[str, dict]:
+        """Measured lane latency/reliability, including terminated attempts.
+
+        A supervisor-terminated worker may never get to write duration_seconds.
+        Excluding those rows made the displayed p95 success-biased precisely
+        when the lane was least reliable. Terminal wall-clock timestamps are a
+        conservative duration for those censored attempts; successful latency
+        remains available separately for diagnosis.
+        """
+        result: dict[str, dict] = {}
+        with self.connection() as connection:
+            for lane in ("live", "analysis", "backfill"):
+                rows = connection.execute(
+                    """SELECT status,summary_json,started_at,completed_at
+                       FROM runs WHERE lane=?
+                       ORDER BY id DESC LIMIT ?""", (lane, int(limit)),
+                ).fetchall()
+                durations: list[float] = []
+                successful_durations: list[float] = []
+                timestamp_derived = 0
+                statuses: dict[str, int] = {}
+                for row in rows:
+                    statuses[row["status"]] = statuses.get(row["status"], 0) + 1
+                    try:
+                        duration = safe_float(
+                            json.loads(row["summary_json"] or "{}").get(
+                                "duration_seconds"), -1.0)
+                    except (TypeError, ValueError):
+                        duration = -1.0
+                    if duration < 0 and row["status"] != "running":
+                        started_at = _timestamp(row["started_at"])
+                        completed_at = _timestamp(row["completed_at"])
+                        if started_at is not None and completed_at is not None:
+                            duration = max(0.0, completed_at - started_at)
+                            timestamp_derived += 1
+                    if duration >= 0:
+                        durations.append(duration)
+                        if row["status"] == "complete":
+                            successful_durations.append(duration)
+
+                def percentile_95(values: list[float]) -> float | None:
+                    ordered = sorted(values)
+                    if not ordered:
+                        return None
+                    index = max(0, min(
+                        len(ordered) - 1,
+                        int((len(ordered) * 0.95) + 0.999999) - 1,
+                    ))
+                    return round(ordered[index], 3)
+
+                p95 = percentile_95(durations)
+                success_p95 = percentile_95(successful_durations)
+                terminal = sum(
+                    count for status, count in statuses.items()
+                    if status != "running"
+                )
+                completed = statuses.get("complete", 0)
+                result[lane] = {
+                    "sample_size": len(rows),
+                    "terminal_sample_size": terminal,
+                    "durations_measured": len(durations),
+                    "timestamp_derived_durations": timestamp_derived,
+                    "p95_seconds": p95,
+                    "p95_scope": "all_terminal_attempts",
+                    "success_p95_seconds": success_p95,
+                    "completion_rate": (
+                        round(completed / terminal, 4) if terminal else None
+                    ),
+                    "statuses": statuses,
+                    "target_seconds": 30.0 if lane == "live" else None,
+                    "target_met": (
+                        p95 < 30.0 if lane == "live" and p95 is not None else None),
+                }
+        return result
+
+    def stabilization_summary(
+        self, *, integrity: dict | None = None, sample_target: int = 100,
+    ) -> dict:
+        """Fail-closed operational readiness, separate from strategy promotion."""
+        target = max(1, int(sample_target))
+        performance = self.lane_performance(limit=target)
+        ownership = self.running_run_audit()
+        with self.connection() as connection:
+            live_rows = [dict(row) for row in connection.execute(
+                """SELECT status,summary_json FROM runs
+                   WHERE lane='live' AND status='complete'
+                   ORDER BY id DESC LIMIT ?""", (target,)
+            )]
+            recent_live_statuses = [dict(row) for row in connection.execute(
+                """SELECT status FROM runs WHERE lane='live'
+                   ORDER BY id DESC LIMIT ?""", (target,)
+            )]
+            identity_violations = int(connection.execute(
+                """SELECT COUNT(*) FROM flow_observation_classifications
+                   WHERE paper_eligible=1 AND identity_tier!='verified'"""
+            ).fetchone()[0])
+
+            def backlog_series(lane: str, key: str) -> list[int]:
+                rows = connection.execute(
+                    """SELECT summary_json FROM runs
+                       WHERE lane=? AND status='complete'
+                       ORDER BY id DESC LIMIT 10""", (lane,)
+                ).fetchall()
+                values: list[int] = []
+                for item in reversed(rows):
+                    try:
+                        value = (json.loads(item["summary_json"] or "{}").get(
+                            "backlog") or {}).get(key)
+                        if value is not None:
+                            values.append(max(0, int(value)))
+                    except (TypeError, ValueError, json.JSONDecodeError):
+                        continue
+                return values
+
+            backfill_values = backlog_series("backfill", "pending_blocks")
+            analysis_values = backlog_series("analysis", "pending_analysis")
+
+        lags: list[float] = []
+        marks_complete = 0
+        for row in live_rows:
+            try:
+                summary = json.loads(row.get("summary_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                summary = {}
+            lag = (summary.get("observation_seal") or {}).get(
+                "decision_head_lag_blocks")
+            if lag is not None:
+                lags.append(safe_float(lag, float("inf")))
+            marks = summary.get("position_evaluations") or {}
+            if (
+                safe_int(marks.get("checked"), 0)
+                == safe_int(marks.get("marked"), 0)
+                and safe_int(marks.get("failures"), 0) == 0
+                and safe_int(marks.get("unverified"), 0) == 0
+            ):
+                marks_complete += 1
+
+        def trend(values: list[int]) -> dict:
+            current = values[-1] if values else None
+            oldest = values[0] if values else None
+            enough = len(values) >= 3
+            decreasing = bool(
+                enough and current is not None and oldest is not None
+                and (current == 0 or current < oldest)
+            )
+            return {
+                "samples": len(values), "oldest": oldest, "current": current,
+                "decreasing": decreasing,
+            }
+
+        completed = len(live_rows)
+        lag_rate = (
+            sum(value <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                for value in lags) / len(lags)
+            if lags else None
+        )
+        mark_rate = marks_complete / completed if completed else None
+        live_perf = performance.get("live") or {}
+        reliability_pass = bool(
+            len(recent_live_statuses) >= target
+            and all(row["status"] == "complete" for row in recent_live_statuses)
+        )
+        backfill_trend = trend(backfill_values)
+        analysis_trend = trend(analysis_values)
+        integrity = dict(integrity or {})
+        integrity_pass = bool(integrity.get("ok"))
+        criteria = {
+            "live_cycle_sample": {
+                "pass": completed >= target, "value": completed,
+                "target": target, "label": "Completed live cycles",
+            },
+            "live_p95": {
+                "pass": bool(live_perf.get("target_met")),
+                "value": live_perf.get("p95_seconds"), "target": "<30s",
+                "label": "Live-lane p95",
+            },
+            "decision_lag": {
+                "pass": bool(lag_rate is not None and lag_rate >= 0.99),
+                "value": lag_rate, "samples": len(lags), "target": ">=99% <=120 blocks",
+                "label": "Decision-lag SLO",
+            },
+            "position_marks": {
+                "pass": bool(mark_rate is not None and mark_rate >= 1.0),
+                "value": mark_rate, "samples": completed, "target": "100%",
+                "label": "Complete position marks",
+            },
+            "run_ownership": {
+                "pass": ownership["stale"] == 0 and not ownership["overlap_lanes"],
+                "value": ownership["stale"], "target": "0 stale / 0 overlaps",
+                "label": "Run ownership",
+            },
+            "live_reliability": {
+                "pass": reliability_pass,
+                "value": (sum(row["status"] == "complete"
+                              for row in recent_live_statuses)),
+                "samples": len(recent_live_statuses), "target": f"{target}/{target}",
+                "label": "Live-cycle reliability",
+            },
+            "backfill_convergence": {
+                "pass": backfill_trend["decreasing"], "value": backfill_trend,
+                "target": "decreasing", "label": "Backfill backlog",
+            },
+            "analysis_convergence": {
+                "pass": analysis_trend["decreasing"], "value": analysis_trend,
+                "target": "decreasing", "label": "Analysis backlog",
+            },
+            "identity_fail_closed": {
+                "pass": identity_violations == 0, "value": identity_violations,
+                "target": 0, "label": "Identity-incomplete admissions",
+            },
+            "integrity": {
+                "pass": integrity_pass, "value": integrity,
+                "target": "all verified", "label": "Ledger / DB / Timechain",
+            },
+        }
+        all_pass = all(item["pass"] for item in criteria.values())
+        critical_fail = any(not criteria[key]["pass"] for key in (
+            "run_ownership", "identity_fail_closed", "integrity",
+        ))
+        operational_fail = any(not criteria[key]["pass"] for key in (
+            "live_p95", "position_marks", "live_reliability",
+        ))
+        if all_pass:
+            status = "STABILIZED"
+        elif critical_fail:
+            status = "DEGRADED"
+        elif completed < target:
+            status = "COLLECTING_DATA"
+        elif operational_fail:
+            status = "DEGRADED"
+        else:
+            status = "STABILIZING"
+        return {
+            "schema_version": 1, "status": status,
+            "stabilized": all_pass, "sample_target": target,
+            "completed_live_cycles": completed,
+            "criteria_passed": sum(item["pass"] for item in criteria.values()),
+            "criteria_total": len(criteria), "criteria": criteria,
+            "run_ownership": ownership,
+            "note": (
+                "Operational stabilization is independent of paper-strategy "
+                "promotion readiness. No result enables live execution."
+            ),
+        }
 
     def flow_window_coverage(self, pool_ids: list[str]) -> dict:
         """Summarise the flow windows belonging to one named set of pools.
@@ -6230,7 +6826,10 @@ class RobinhoodV4Observer:
             successful_windows += 1
         return logs, successful_windows
 
-    def sync(self, *, block_limit: int, lookback: int) -> tuple[list[dict], dict]:
+    def sync(
+        self, *, block_limit: int, lookback: int,
+        activation_limit: int | None = None,
+    ) -> tuple[list[dict], dict]:
         latest = _remote_call("Robinhood latest block", self.rpc.get_block_number)
         state = self._state()
         start = safe_int(state.get("next_block"), max(0, latest - lookback))
@@ -6300,6 +6899,9 @@ class RobinhoodV4Observer:
                 counts["swap"] += 1
         self.store.apply_v4_events(events)
         activations = self.store.pending_v4_activations()
+        activations_available = len(activations)
+        if activation_limit is not None:
+            activations = activations[:max(0, int(activation_limit))]
         candidates = []
         activation_block_times: dict[int, int] = {}
         for pool in activations:
@@ -6333,6 +6935,9 @@ class RobinhoodV4Observer:
             "rpc_windows": rpc_windows,
             "initialize_events": counts["initialize"], "liquidity_events": counts["modify"],
             "swap_events": counts["swap"], "activated_pools": len(candidates),
+            "activations_available": activations_available,
+            "activations_deferred": max(
+                0, activations_available - len(activations)),
             "caught_up": end >= latest, "blocks_behind": max(0, latest-end),
             "scope": "uniswap_v4_weth_or_usdg_first_swap_activation", "measured_at": _utc_now(),
         }
@@ -7514,6 +8119,40 @@ class RobinhoodLearningEngine:
                 chain_root, skill_root=skill_root or default_skill_root(),
             )
 
+    @contextmanager
+    def _rpc_deadline(self, deadline: CycleDeadline):
+        """Push the monotonic budget into this lane's blocking RPC socket."""
+        if not hasattr(self.rpc, "timeout"):
+            yield
+            return
+        original = self.rpc.timeout
+        remaining = max(0.5, deadline.remaining())
+        # _remote_call may retry a failed request. Giving every attempt the
+        # whole remaining budget made one stage consume 3x its deadline.
+        per_attempt = remaining / max(1, REMOTE_RETRY_ATTEMPTS + 1)
+        self.rpc.timeout = max(
+            0.5, min(float(original), max(0.5, per_attempt)))
+        try:
+            yield
+        finally:
+            self.rpc.timeout = original
+
+    @contextmanager
+    def _market_deadline(self, deadline: CycleDeadline):
+        """Push the lane deadline into blocking market-provider requests."""
+        if not hasattr(self.market, "timeout"):
+            yield
+            return
+        original = self.market.timeout
+        remaining = max(0.5, deadline.remaining())
+        per_attempt = remaining / max(1, REMOTE_RETRY_ATTEMPTS + 1)
+        self.market.timeout = max(
+            0.5, min(float(original), max(0.5, per_attempt)))
+        try:
+            yield
+        finally:
+            self.market.timeout = original
+
     def _analyzer(self):
         if self.analyzer is None:
             self.analyzer=Chainseer(
@@ -7671,6 +8310,7 @@ class RobinhoodLearningEngine:
                 records = _remote_call(
                     f"Robinhood transaction origins {offset + 1}-{offset + len(chunk)}",
                     lambda chunk=chunk: self.rpc.get_transactions(chunk),
+                    attempts=1,
                 )
             except Exception:
                 failures += len(chunk)
@@ -7691,7 +8331,10 @@ class RobinhoodLearningEngine:
             "observed_batch_seconds": round(batch_seconds, 3),
         }
 
-    def _near_head_logs(self, start: int, end: int, topic: str) -> list[dict]:
+    def _near_head_logs(
+        self, start: int, end: int, topic: str,
+        *, deadline: CycleDeadline | None = None,
+    ) -> list[dict]:
         """Fetch a block range, halving on a provider result-set refusal.
 
         The limit is on ROWS RETURNED, not blocks queried, so no fixed chunk
@@ -7711,12 +8354,16 @@ class RobinhoodLearningEngine:
         pending = [(start, end)]
         logs: list[dict] = []
         while pending:
+            if deadline is not None:
+                deadline.raise_if_expired("near_head_rpc")
             lower, upper = pending.pop()
             try:
                 logs.extend(self.rpc.get_logs(
                     lower, upper, address=UNISWAP_V4_POOL_MANAGER,
                     topics=[[topic]],
                 ) or [])
+            except CycleDeadlineExceeded:
+                raise
             except Exception as error:
                 oversized = "exceeds limit" in str(error).lower()
                 if not oversized or lower >= upper:
@@ -7727,7 +8374,12 @@ class RobinhoodLearningEngine:
                 pending.append((lower, midpoint))
         return logs
 
-    def enrich_near_head_window(self, events: list[dict]) -> dict:
+    def enrich_near_head_window(
+        self, events: list[dict], *,
+        limit: int = FLOW_NEAR_HEAD_ENRICHMENT_LIMIT,
+        budget_seconds: float = FLOW_NEAR_HEAD_ENRICHMENT_BUDGET_SECONDS,
+        deadline: CycleDeadline | None = None,
+    ) -> dict:
         """Resolve origins for the window ABOUT TO BE SEALED.
 
         Running this after the seal was measurably useless: the window moves
@@ -7749,10 +8401,13 @@ class RobinhoodLearningEngine:
         # Truncation is recorded rather than hidden: a partly-enriched window
         # fails the coverage floor exactly as completely as an empty one, and
         # the seal must be able to say which it was.
-        truncated = max(0, len(candidates) - FLOW_NEAR_HEAD_ENRICHMENT_LIMIT)
-        selected = candidates[:FLOW_NEAR_HEAD_ENRICHMENT_LIMIT]
-        deadline = time.monotonic() + FLOW_NEAR_HEAD_ENRICHMENT_BUDGET_SECONDS
-        batch = self._resolve_origin_batches(selected, deadline)
+        limit = max(0, int(limit))
+        truncated = max(0, len(candidates) - limit)
+        selected = candidates[:limit]
+        local_deadline = time.monotonic() + max(0.0, float(budget_seconds))
+        if deadline is not None:
+            local_deadline = min(local_deadline, time.monotonic() + deadline.remaining())
+        batch = self._resolve_origin_batches(selected, local_deadline)
         return {
             "supported": True,
             "candidates": len(candidates),
@@ -7769,7 +8424,13 @@ class RobinhoodLearningEngine:
             ),
         }
 
-    def near_head_flow_pass(self) -> dict:
+    def near_head_flow_pass(
+        self, *, deadline: CycleDeadline | None = None,
+        cursor_name: str = "near_head_cursor.json",
+        max_scan_blocks: int = FLOW_NEAR_HEAD_SCAN_BLOCKS,
+        enrichment_limit: int = FLOW_NEAR_HEAD_ENRICHMENT_LIMIT,
+        enrichment_budget_seconds: float = FLOW_NEAR_HEAD_ENRICHMENT_BUDGET_SECONDS,
+    ) -> dict:
         """Ingest the newest FLOW_WINDOW_BLOCKS so a signal can be fresh.
 
         The batch cycle scans a wide range and finishes thousands of blocks
@@ -7822,10 +8483,11 @@ class RobinhoodLearningEngine:
         # stale (a long outage), so one pass cannot try to read a million
         # blocks. Being capped is recorded, because a capped pass DOES leave a
         # hole and the next reader must be able to see that it did.
-        cursor_path = self.root / "near_head_cursor.json"
+        cursor_path = self.root / cursor_name
         cursor = read_json(cursor_path, {}) or {}
         last_scanned = safe_int(cursor.get("last_scanned_block"), 0)
-        window_floor = max(0, head - FLOW_NEAR_HEAD_SCAN_BLOCKS + 1)
+        max_scan_blocks = max(1, int(max_scan_blocks))
+        window_floor = max(0, head - max_scan_blocks + 1)
         incremental = bool(last_scanned)
         from_block = last_scanned + 1 if last_scanned else window_floor
         scan_capped = bool(from_block < window_floor)
@@ -7847,9 +8509,12 @@ class RobinhoodLearningEngine:
                 logs = []
                 span = from_block
                 while span <= head:
+                    if deadline is not None:
+                        deadline.raise_if_expired("near_head_swaps")
                     upper = min(head, span + FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS - 1)
                     logs.extend(
-                        self._near_head_logs(span, upper, V4_SWAP_TOPIC))
+                        self._near_head_logs(
+                            span, upper, V4_SWAP_TOPIC, deadline=deadline))
                     span = upper + 1
             except Exception as error:
                 # The cursor is NOT advanced on failure, so the blocks this
@@ -7881,10 +8546,15 @@ class RobinhoodLearningEngine:
             # No new blocks means no new pools; skip the round trip entirely.
             span = from_block
             while span <= head:
+                if deadline is not None:
+                    deadline.raise_if_expired("near_head_initializes")
                 upper = min(head, span + FLOW_NEAR_HEAD_FETCH_CHUNK_BLOCKS - 1)
                 init_logs.extend(
-                    self._near_head_logs(span, upper, V4_INITIALIZE_TOPIC))
+                    self._near_head_logs(
+                        span, upper, V4_INITIALIZE_TOPIC, deadline=deadline))
                 span = upper + 1
+        except CycleDeadlineExceeded:
+            raise
         except Exception:
             # A failed Initialize scan must not lose the swap pass; the window
             # simply stays as blind as it was before.
@@ -7948,7 +8618,12 @@ class RobinhoodLearningEngine:
         # record_transaction_origins recomputes it again with the real ones, so
         # the seal that follows carries the identity evidence that actually
         # existed at observation time.
-        enrichment = self.enrich_near_head_window(events)
+        enrichment = self.enrich_near_head_window(
+            events, limit=enrichment_limit,
+            budget_seconds=enrichment_budget_seconds, deadline=deadline,
+        )
+        if deadline is not None:
+            deadline.raise_if_expired("near_head_commit")
         atomic_json_write(cursor_path, {"last_scanned_block": int(head)})
         try:
             head_after = int(self.rpc.get_block_number())
@@ -7969,6 +8644,7 @@ class RobinhoodLearningEngine:
             "initialize_logs_seen": len(init_logs),
             "pools_admitted_on_sight": len(born),
             "pools_touched": len(touched),
+            "touched_pool_ids": touched,
             # Attributed to THIS pass's pools, never read off the whole table.
             "window_coverage": self.store.flow_window_coverage(touched),
             "enrichment": enrichment,
@@ -7981,7 +8657,12 @@ class RobinhoodLearningEngine:
             "scope": "near_head_flow_window_v1",
         }
 
-    def seal_near_head_observations(self, head_block: int, now: float) -> dict:
+    def seal_near_head_observations(
+        self, head_block: int, now: float, *,
+        pool_ids: list[str] | None = None,
+        deadline: CycleDeadline | None = None,
+        limit: int | None = None,
+    ) -> dict:
         """Seal every near-head window, pinned to the OBSERVATION head.
 
         head_block must be the head the window was built from, never a head
@@ -8007,10 +8688,42 @@ class RobinhoodLearningEngine:
         sealed: list[str] = []
         failures = 0
         with self.store.connection() as connection:
-            windows = [dict(row) for row in connection.execute(
-                "SELECT * FROM flow_signals WHERE window_end_block >= ?", (floor,),
-            )]
+            if pool_ids is None:
+                windows = [dict(row) for row in connection.execute(
+                    "SELECT * FROM flow_signals WHERE window_end_block >= ?",
+                    (floor,),
+                )]
+            elif pool_ids:
+                placeholders = ",".join("?" * len(pool_ids))
+                windows = [dict(row) for row in connection.execute(
+                    """SELECT fs.* FROM flow_signals fs
+                       WHERE fs.window_end_block >= ? AND (
+                         fs.pool_id IN (""" + placeholders + """) OR NOT EXISTS (
+                           SELECT 1 FROM flow_observations o
+                           WHERE o.pool_id=fs.pool_id
+                             AND o.window_end_block=fs.window_end_block
+                             AND o.policy_version=?
+                         )
+                       ) ORDER BY fs.window_end_block DESC LIMIT 100""",
+                    [floor, *pool_ids, FLOW_EVIDENCE_POLICY_VERSION],
+                )]
+            else:
+                windows = [dict(row) for row in connection.execute(
+                    """SELECT fs.* FROM flow_signals fs
+                       WHERE fs.window_end_block >= ? AND NOT EXISTS (
+                         SELECT 1 FROM flow_observations o
+                         WHERE o.pool_id=fs.pool_id
+                           AND o.window_end_block=fs.window_end_block
+                           AND o.policy_version=?
+                       ) ORDER BY fs.window_end_block DESC LIMIT 100""",
+                    (floor, FLOW_EVIDENCE_POLICY_VERSION),
+                )]
+        windows_available = len(windows)
+        if limit is not None:
+            windows = windows[:max(0, int(limit))]
         for window in windows:
+            if deadline is not None and deadline.expired():
+                break
             with self.store.connection() as connection:
                 hashes = [
                     row[0] for row in connection.execute(
@@ -8086,20 +8799,27 @@ class RobinhoodLearningEngine:
             ).fetchone()[0]
         return {
             "windows_considered": len(windows),
+            "windows_available": windows_available,
+            "windows_deferred": max(0, windows_available - len(sealed)),
             "sealed_this_cycle": len(sealed),
+            "observation_ids": sealed,
             "cumulative_observations": cumulative,
             "quote_failures": failures, "observation_head": int(head_block),
         }
 
-    def classify_sealed_observations(self, decision_head: int) -> dict:
+    def classify_sealed_observations(
+        self, decision_head: int, *, observation_ids: list[str] | None = None,
+        deadline: CycleDeadline | None = None,
+    ) -> dict:
         """Classify sealed observations after enrichment. Never mutates them."""
         # Cumulative totals read as a rate unless the delta is stated beside
         # them: a backlog sweep classifying 392 observations while the cycle
         # sealed 6 was misread as 47 verified per cycle when the true figure
         # was 12% of a cumulative 392. Every count below is labelled.
-        tiers: dict[str, int] = {}
+        scoped_tiers: dict[str, int] = {}
         research = paper = 0
         newly_classified = 0
+        processed = 0
         with self.store.connection() as connection:
             already = {
                 row[0] for row in connection.execute(
@@ -8107,18 +8827,26 @@ class RobinhoodLearningEngine:
                 )
             }
         with self.store.connection() as connection:
-            rows = [dict(row) for row in connection.execute(
-                """
+            query = """
                 SELECT o.observation_id, o.pool_id, o.token_address,
                        fs.identity_coverage, fs.qualification_gaps_json
                 FROM flow_observations o
                 LEFT JOIN flow_signals fs ON fs.pool_id=o.pool_id
                 WHERE o.policy_version=?
-                """,
-                (FLOW_EVIDENCE_POLICY_VERSION,),
-            )]
+                """
+            parameters: list = [FLOW_EVIDENCE_POLICY_VERSION]
+            if observation_ids is not None:
+                if observation_ids:
+                    query += " AND o.observation_id IN (" + ",".join(
+                        "?" * len(observation_ids)) + ")"
+                    parameters.extend(observation_ids)
+                else:
+                    query += " AND 1=0"
+            rows = [dict(row) for row in connection.execute(query, parameters)]
         quotes_taken = quote_failures = 0
         for row in rows:
+            if deadline is not None and deadline.expired():
+                break
             try:
                 gates = json.loads(row.get("qualification_gaps_json") or "[]")
             except (TypeError, ValueError):
@@ -8151,24 +8879,46 @@ class RobinhoodLearningEngine:
                 identity_coverage=row.get("identity_coverage"), gates=gates,
                 decision_quote=decision_quote,
             )
-            tiers[verdict["identity_tier"]] = tiers.get(verdict["identity_tier"], 0) + 1
+            scoped_tiers[verdict["identity_tier"]] = (
+                scoped_tiers.get(verdict["identity_tier"], 0) + 1)
             research += verdict["research_eligible"]
             paper += verdict["paper_eligible"]
             newly_classified += row["observation_id"] not in already
+            processed += 1
+        with self.store.connection() as connection:
+            cumulative_rows = connection.execute(
+                """SELECT c.identity_tier,COUNT(*) count,
+                          COALESCE(SUM(c.research_eligible),0) research,
+                          COALESCE(SUM(c.paper_eligible),0) paper
+                   FROM flow_observation_classifications c
+                   JOIN flow_observations o USING(observation_id)
+                   WHERE o.policy_version=? GROUP BY c.identity_tier""",
+                (FLOW_EVIDENCE_POLICY_VERSION,),
+            ).fetchall()
+        tiers = {row["identity_tier"]: int(row["count"]) for row in cumulative_rows}
+        cumulative_research = sum(int(row["research"]) for row in cumulative_rows)
+        cumulative_paper = sum(int(row["paper"]) for row in cumulative_rows)
+        cumulative_total = sum(tiers.values())
         verified = tiers.get("verified", 0)
         return {
             "classified_this_cycle": newly_classified,
-            "reclassified_this_cycle": len(rows) - newly_classified,
+            "reclassified_this_cycle": processed - newly_classified,
+            "scoped_rows_selected": len(rows),
+            "scoped_rows_processed": processed,
+            "scoped_rows_deferred": len(rows) - processed,
+            "scoped_identity_tiers": scoped_tiers,
+            "scoped_research_eligible": research,
+            "scoped_paper_eligible": paper,
             "decision_quotes_taken": quotes_taken,
             "decision_quote_failures": quote_failures,
             "decision_quote_limit": FLOW_DECISION_QUOTE_LIMIT,
-            "cumulative_classified": len(rows),
+            "cumulative_classified": cumulative_total,
             "cumulative_identity_tiers": tiers,
             "cumulative_verified_fraction": (
-                round(verified / len(rows), 4) if rows else None
+                round(verified / cumulative_total, 4) if cumulative_total else None
             ),
-            "cumulative_research_eligible": research,
-            "cumulative_paper_eligible": paper,
+            "cumulative_research_eligible": cumulative_research,
+            "cumulative_paper_eligible": cumulative_paper,
             "decision_head": int(decision_head),
             "note": (
                 "counts prefixed cumulative_ are totals over the whole cohort, "
@@ -8695,8 +9445,10 @@ class RobinhoodLearningEngine:
             "producer_observation_block": observation_block,
         }
 
-    def evaluate_open_positions(self, now: float) -> dict:
-        """Evaluate every open paper position independently of outcome horizons."""
+    def evaluate_open_positions(
+        self, now: float, *, deadline: CycleDeadline | None = None,
+    ) -> dict:
+        """Evaluate every open paper position, batching shared market reads."""
         with self.store.connection() as connection:
             candidates = [dict(row) for row in connection.execute(
                 """
@@ -8705,17 +9457,64 @@ class RobinhoodLearningEngine:
                 WHERE p.status='open' ORDER BY p.opened_at
                 """
             )]
-        checked = marked = unverified = closed = partial_exits = failures = 0
-        for candidate in candidates:
-            checked += 1
+        checked = len(candidates)
+        marked = unverified = closed = partial_exits = failures = 0
+        standard = [
+            candidate for candidate in candidates
+            if candidate.get("source_version") != SOURCE_V4
+        ]
+        v4 = [
+            candidate for candidate in candidates
+            if candidate.get("source_version") == SOURCE_V4
+        ]
+        resolved: dict[str, dict] = {}
+        market_batch_requests = 0
+        market_batch_failed = False
+        if standard:
             try:
-                market = (
-                    self.v4_market.snapshot(candidate)
-                    if candidate.get("source_version") == SOURCE_V4
-                    else self.market.snapshot(
-                        candidate["token_address"], candidate["pair_address"]
+                if deadline is not None:
+                    deadline.raise_if_expired("position_market_batch")
+                tokens = [candidate["token_address"] for candidate in standard]
+                if hasattr(self.market, "snapshots_many"):
+                    context = (
+                        self._market_deadline(deadline)
+                        if deadline is not None else nullcontext()
                     )
-                )
+                    with context:
+                        grouped = self.market.snapshots_many(tokens)
+                    market_batch_requests = (len(set(
+                        token.lower() for token in tokens
+                    )) + 29) // 30
+                    for candidate in standard:
+                        token = candidate["token_address"].lower()
+                        resolved[token] = self.market.select_snapshot(
+                            grouped.get(token, []), candidate.get("pair_address")
+                        )
+                else:
+                    # Compatibility for injected test/offline clients. The
+                    # production client always takes the batched path.
+                    for candidate in standard:
+                        resolved[candidate["token_address"].lower()] = (
+                            self.market.snapshot(
+                                candidate["token_address"],
+                                candidate.get("pair_address"),
+                            )
+                        )
+                if deadline is not None:
+                    deadline.raise_if_expired("position_market_batch")
+            except Exception:
+                market_batch_failed = True
+                failures += len(standard)
+        for candidate in candidates:
+            if deadline is not None:
+                deadline.raise_if_expired("position_mark_commit")
+            try:
+                if candidate.get("source_version") == SOURCE_V4:
+                    market = self.v4_market.snapshot(candidate)
+                else:
+                    if market_batch_failed:
+                        continue
+                    market = resolved.get(candidate["token_address"].lower(), {})
                 mark = self.store.mark_position(
                     candidate["token_address"], market, now
                 )
@@ -8735,8 +9534,477 @@ class RobinhoodLearningEngine:
             "checked": checked, "marked": marked, "unverified": unverified,
             "closed": closed,
             "partial_exits": partial_exits, "failures": failures,
+            "market_batch_candidates": len(standard),
+            "market_batch_requests": market_batch_requests,
+            "market_batch_failed": market_batch_failed,
+            "individual_v4_quotes": len(v4),
             "cadence": "every_learning_cycle",
         }
+
+    def _execute_lane(self, lane: str, budget_seconds: float, worker) -> dict:
+        """Run one independently owned lane with an authoritative heartbeat."""
+        started = time.monotonic()
+        deadline = CycleDeadline(float(budget_seconds))
+        run_uuid = uuid.uuid4().hex
+        self.cycle_run_uuid = run_uuid
+        stop_heartbeat = threading.Event()
+        with LearningRunLock(self.root / f".{lane}_once.lock"):
+            self.store.begin_run(run_uuid, budget_seconds, lane=lane)
+
+            def beat() -> None:
+                while not stop_heartbeat.wait(LANE_HEARTBEAT_SECONDS):
+                    try:
+                        self.store.heartbeat_run(run_uuid)
+                    except Exception:
+                        # A heartbeat is observability, never permission to
+                        # continue. The supervisor's process deadline remains
+                        # authoritative if SQLite is temporarily unavailable.
+                        pass
+
+            heartbeat = threading.Thread(target=beat, daemon=True)
+            heartbeat.start()
+            try:
+                payload = worker(deadline)
+                deadline.raise_if_expired(f"{lane}_completion")
+                summary = {
+                    "schema_version": 1,
+                    "timestamp": _utc_now(),
+                    "lane": lane,
+                    "run_id": run_uuid,
+                    "status": "complete",
+                    "deadline_seconds": float(budget_seconds),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "paper_only": True,
+                    "live_execution_enabled": False,
+                    **payload,
+                }
+                stop_heartbeat.set()
+                heartbeat.join(timeout=1.0)
+                self.store.finish_run(
+                    run_uuid, "complete", summary=summary,
+                    cursor=summary.get("cursor"),
+                    backlog=summary.get("backlog"),
+                )
+                atomic_json_write(self.root / f"{lane}_lane_summary.json", summary)
+                return summary
+            except Exception as exc:
+                stop_heartbeat.set()
+                heartbeat.join(timeout=1.0)
+                terminal_status = (
+                    "deadline_exceeded"
+                    if isinstance(exc, CycleDeadlineExceeded) else "failed")
+                failure = {
+                    "schema_version": 1, "timestamp": _utc_now(),
+                    "lane": lane, "run_id": run_uuid,
+                    "status": terminal_status,
+                    "error_type": type(exc).__name__, "error": str(exc)[:1000],
+                    "deadline_seconds": float(budget_seconds),
+                    "duration_seconds": round(time.monotonic() - started, 3),
+                    "paper_only": True, "live_execution_enabled": False,
+                }
+                self.store.finish_run(
+                    run_uuid, terminal_status,
+                    summary=failure, error=failure["error"])
+                atomic_json_write(self.root / f"{lane}_lane_summary.json", failure)
+                raise
+
+    def run_live_lane(
+        self, *, budget_seconds: float = LIVE_LANE_BUDGET_SECONDS,
+        now: float | None = None,
+    ) -> dict:
+        """Critical path: marks, current-head ingestion, identity and quotes.
+
+        Historical discovery is intentionally absent. When the cursor is too
+        old, the skipped prefix is committed to flow_backfill_queue and this
+        lane re-anchors to the current head instead of paying historical debt.
+        """
+        observed_at = time.time() if now is None else float(now)
+
+        def work(deadline: CycleDeadline) -> dict:
+            timings: dict[str, float] = {}
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                positions = self.evaluate_open_positions(
+                    observed_at, deadline=deadline)
+            timings["position_marks"] = round(time.monotonic() - stage, 3)
+            deadline.raise_if_expired("position_marks")
+
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                near_head = self.near_head_flow_pass(
+                    deadline=deadline, cursor_name="live_lane_cursor.json",
+                    max_scan_blocks=LIVE_LANE_SCAN_BLOCKS,
+                    enrichment_limit=LIVE_LANE_ENRICHMENT_LIMIT,
+                    enrichment_budget_seconds=LIVE_LANE_ENRICHMENT_BUDGET_SECONDS,
+                )
+            timings["head_ingestion_and_identity"] = round(
+                time.monotonic() - stage, 3)
+            if not near_head.get("scanned"):
+                return {
+                    "position_evaluations": positions,
+                    "near_head_flow": near_head,
+                    "observation_seal": {}, "classification": {},
+                    "stage_timings_seconds": timings,
+                    "cursor": read_json(
+                        self.root / "live_lane_cursor.json", {}) or {},
+                    "backlog": self.store.backfill_backlog(),
+                    "no_historical_scanning": True,
+                }
+
+            stage = time.monotonic()
+            touched = list(near_head.get("touched_pool_ids") or [])
+            with self._rpc_deadline(deadline):
+                observation = self.seal_near_head_observations(
+                    int(near_head.get("to_block") or 0), observed_at,
+                    pool_ids=touched, deadline=deadline,
+                    limit=LIVE_LANE_OBSERVATION_LIMIT,
+                )
+                decision_head = int(self.rpc.get_block_number())
+                classification = self.classify_sealed_observations(
+                    decision_head,
+                    observation_ids=list(observation.get("observation_ids") or []),
+                    deadline=deadline,
+                )
+            quote_delay = round(time.monotonic() - stage, 3)
+            timings["seal_and_fresh_quote"] = quote_delay
+            observation["decision_head_lag_blocks"] = max(
+                0, decision_head - int(near_head.get("to_block") or 0))
+            self.ledger.append("robinhood_live_lane", {
+                "run_id": self.cycle_run_uuid if hasattr(self, "cycle_run_uuid") else None,
+                "near_head_flow": {
+                    key: value for key, value in near_head.items()
+                    if key not in {"touched_pool_ids"}
+                },
+                "observation_seal": observation,
+                "classification": classification,
+                "paper_only": True,
+            })
+            return {
+                "position_evaluations": positions,
+                "near_head_flow": near_head,
+                "observation_seal": observation,
+                "classification": classification,
+                "ingestion_to_fresh_quote_seconds": quote_delay,
+                "stage_timings_seconds": timings,
+                "cursor": read_json(
+                    self.root / "live_lane_cursor.json", {}) or {},
+                "backlog": self.store.backfill_backlog(),
+                "no_historical_scanning": True,
+            }
+
+        return self._execute_lane("live", budget_seconds, work)
+
+    def _analyze_candidates(
+        self, now: float, limit: int, deadline: CycleDeadline,
+    ) -> dict:
+        analyses = failures = entries = producer_sealed = producer_failures = 0
+        deferred = momentum = flow_shadow = 0
+        queue_ages: list[float] = []
+        for candidate in self.store.pending_analysis(limit):
+            if deadline.remaining() < ANALYSIS_START_RESERVE_SECONDS:
+                deferred += 1
+                continue
+            try:
+                priority_reason = (
+                    "flow_shadow_priority"
+                    if candidate.get("flow_shadow_qualified") else (
+                        "liquid_momentum"
+                        if candidate.get("momentum_priority_multiple") is not None
+                        else "oldest_fairness"
+                    )
+                )
+                discovered_at = _timestamp(candidate.get("discovered_at"))
+                queue_age = (
+                    max(0.0, time.time() - discovered_at)
+                    if discovered_at is not None else None
+                )
+                report = self._analyzer().analyze_token(
+                    candidate["token_address"], seal=False,
+                    defer_cognition=True,
+                )
+                if report.get("error"):
+                    raise RuntimeError(report["error"])
+                analysis = dict(report.get("analysis") or {})
+                if candidate.get("source_version") == SOURCE_V4:
+                    market = self.v4_market.snapshot(candidate)
+                    stops = list(analysis.get("hard_stop_overrides") or [])
+                    if str(candidate.get("hooks_address") or ZERO_ADDRESS).lower() != ZERO_ADDRESS:
+                        stops.append({
+                            "code": "V4_HOOK_UNAUDITED", "severity": "High",
+                            "reason": "The V4 pool uses an unaudited hook",
+                            "action": "AVOID",
+                        })
+                    if not market.get("current_state_verified"):
+                        stops.append({
+                            "code": "V4_MARKET_STATE_UNVERIFIED", "severity": "High",
+                            "reason": "Current V4 liquidity and price could not be verified",
+                            "action": "AVOID",
+                        })
+                    analysis["hard_stop_overrides"] = stops
+                    analysis["v4_market_evidence"] = {
+                        "pool_id": candidate.get("pool_id"),
+                        "fee_tier": candidate.get("fee_tier"),
+                        "tick_spacing": candidate.get("tick_spacing"),
+                        "hooks_address": candidate.get("hooks_address"),
+                        "activation": "initialize_then_modify_liquidity_then_first_swap",
+                    }
+                else:
+                    market = _market_from_report(
+                        report, candidate["token_address"],
+                        candidate["pair_address"],
+                    )
+                self.store.record_analysis(
+                    candidate["token_address"], analysis, market,
+                    priority_reason=priority_reason,
+                    queue_age_seconds=queue_age,
+                    report_data=report.get("data") or {},
+                )
+                try:
+                    memory = self.seal_analysis_memory(
+                        self.store.candidate(candidate["token_address"]),
+                        {**report, "analysis": analysis}, market,
+                        priority_reason=priority_reason,
+                    )
+                    producer_sealed += memory.get("status") == "sealed"
+                except Exception:
+                    producer_failures += 1
+                momentum += priority_reason == "liquid_momentum"
+                flow_shadow += priority_reason == "flow_shadow_priority"
+                if queue_age is not None:
+                    queue_ages.append(queue_age)
+                latest = self.store.candidate(candidate["token_address"])
+                if self.store.open_position(latest, market):
+                    entries += 1
+                    self.ledger.append("robinhood_paper_buy", {
+                        "token_address": candidate["token_address"],
+                        "symbol": latest.get("symbol"), "score": latest.get("score"),
+                        "price_usd": market.get("price_usd"),
+                        "liquidity_usd": market.get("liquidity_usd"),
+                        "paper_only": True,
+                    })
+                analyses += 1
+            except Exception as exc:
+                failures += 1
+                self.store.record_analysis_failure(
+                    candidate["token_address"], str(exc))
+        return {
+            "analyses": analyses, "analysis_failures": failures,
+            "paper_entries": entries, "momentum_analyses": momentum,
+            "flow_shadow_analyses": flow_shadow,
+            "producer_analyses_sealed": producer_sealed,
+            "producer_failures": producer_failures,
+            "deferred_for_deadline": deferred,
+            "maximum_queue_age_seconds": (
+                round(max(queue_ages), 3) if queue_ages else None),
+        }
+
+    def run_analysis_lane(
+        self, *, budget_seconds: float = ANALYSIS_LANE_BUDGET_SECONDS,
+        analysis_limit: int = DEFAULT_ANALYSIS_LIMIT,
+        outcome_limit: int = DEFAULT_OUTCOME_LIMIT,
+        outcome_recovery_limit: int = DEFAULT_OUTCOME_RECOVERY_LIMIT,
+        market_recheck_limit: int = DEFAULT_MARKET_RECHECK_LIMIT,
+        now: float | None = None,
+    ) -> dict:
+        """Outcome and expensive-analysis lane; the only Timechain writer."""
+        observed_at = time.time() if now is None else float(now)
+
+        def work(deadline: CycleDeadline) -> dict:
+            timings: dict[str, float] = {}
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                outcomes = self.observe_outcomes(
+                    observed_at, outcome_limit, outcome_recovery_limit,
+                    deadline_monotonic=time.monotonic() + deadline.remaining(),
+                )
+            timings["outcomes"] = round(time.monotonic() - stage, 3)
+            deadline.raise_if_expired("outcomes")
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                rechecks = self.recheck_executable_markets(
+                    observed_at, market_recheck_limit)
+            timings["market_rechecks"] = round(time.monotonic() - stage, 3)
+            deadline.raise_if_expired("market_rechecks")
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                analyses = self._analyze_candidates(
+                    observed_at, analysis_limit, deadline)
+            timings["analyses"] = round(time.monotonic() - stage, 3)
+            learning = self.store.summary()
+            return {
+                "outcomes": outcomes, "market_rechecks": rechecks,
+                "candidate_analyses": analyses,
+                "stage_timings_seconds": timings,
+                "cursor": {"analysis_queue": "oldest_fairness_with_priorities"},
+                "backlog": {
+                    "pending_analysis": safe_int(
+                        (learning.get("candidates") or {}).get("pending"), 0),
+                },
+                "timechain_writer": "analysis_lane_only",
+            }
+
+        return self._execute_lane("analysis", budget_seconds, work)
+
+    def drain_flow_backfill(
+        self, deadline: CycleDeadline, *, block_limit: int,
+    ) -> dict:
+        """Drain one durable skipped range without touching the live cursor."""
+        pending = self.store.pending_backfill(limit=1)
+        if not pending:
+            return {"ranges_selected": 0, "blocks_scanned": 0,
+                    "candidates_added": 0, "backlog": self.store.backfill_backlog()}
+        row = pending[0]
+        start = safe_int(row.get("next_block"), 0) or int(row["from_block"])
+        upper_bound = int(row["to_block"])
+        if start > upper_bound:
+            self.store.complete_backfill(row["from_block"], row["to_block"])
+            return {"ranges_selected": 1, "blocks_scanned": 0,
+                    "candidates_added": 0, "completed": True,
+                    "backlog": self.store.backfill_backlog()}
+        deadline.raise_if_expired("flow_backfill")
+        end = min(upper_bound, start + max(1, int(block_limit)) - 1)
+        cursor_path = self.root / "flow_backfill_worker_cursor.json"
+        atomic_json_write(cursor_path, {
+            "next_block": start, "range_from": int(row["from_block"]),
+            "range_to": upper_bound, "updated_at": _utc_now(),
+        })
+        observer = RobinhoodV4Observer(self.rpc, self.store, cursor_path)
+        try:
+            candidates, coverage = observer.sync(
+                block_limit=end - start + 1, lookback=1,
+                activation_limit=0,
+            )
+            added = self.store.add_candidates(candidates)
+            self.store.mark_v4_promoted([
+                candidate["pool_id"] for candidate in candidates
+                if candidate.get("pool_id")
+            ])
+            next_block = int(coverage.get("to_block") or end) + 1
+            self.store.advance_backfill(
+                row["from_block"], row["to_block"], next_block)
+            completed = next_block > upper_bound
+            if completed:
+                self.store.complete_backfill(
+                    row["from_block"], row["to_block"])
+            return {
+                "ranges_selected": 1,
+                "range": [int(row["from_block"]), upper_bound],
+                "from_block": start, "to_block": next_block - 1,
+                "blocks_scanned": max(0, next_block - start),
+                "candidates_added": added, "completed": completed,
+                "backlog": self.store.backfill_backlog(),
+            }
+        except Exception as exc:
+            self.store.advance_backfill(
+                row["from_block"], row["to_block"], start,
+                error=str(exc)[:500])
+            raise
+
+    def run_backfill_lane(
+        self, *, budget_seconds: float = BACKFILL_LANE_BUDGET_SECONDS,
+        discovery_block_limit: int = DEFAULT_DISCOVERY_BLOCK_LIMIT,
+        identity_limit: int = BACKFILL_LANE_IDENTITY_LIMIT,
+        lookback: int = DEFAULT_DISCOVERY_LOOKBACK_BLOCKS,
+        now: float | None = None,
+    ) -> dict:
+        """Historical discovery, enrichment and durable gap recovery lane."""
+        observed_at = time.time() if now is None else float(now)
+
+        def work(deadline: CycleDeadline) -> dict:
+            timings: dict[str, float] = {}
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                gap_recovery = self.drain_flow_backfill(
+                    deadline, block_limit=discovery_block_limit)
+            timings["durable_gap_recovery"] = round(
+                time.monotonic() - stage, 3)
+            deadline.raise_if_expired("durable_gap_recovery")
+            if safe_int(gap_recovery.get("ranges_selected"), 0) > 0:
+                # A committed gap chunk is a complete unit of work. Continuing
+                # into two discovery cursors and historical identity made the
+                # process hit its deadline after useful progress, so every run
+                # looked failed and the successful cursor advance was hidden.
+                # Drain oldest-first until the durable queue is empty; then a
+                # later cycle resumes secondary discovery and enrichment.
+                backlog = self.store.backfill_backlog()
+                return {
+                    "new_candidates": safe_int(
+                        gap_recovery.get("candidates_added"), 0),
+                    "v2_discovery": {
+                        "deferred": True,
+                        "reason": "durable_gap_recovery_priority",
+                    },
+                    "v4_discovery": {
+                        "deferred": True,
+                        "reason": "durable_gap_recovery_priority",
+                    },
+                    "durable_gap_recovery": gap_recovery,
+                    "historical_identity_resolution": {
+                        "deferred": True,
+                        "reason": "durable_gap_recovery_priority",
+                    },
+                    "stage_timings_seconds": timings,
+                    "cursor": {
+                        "gap": read_json(
+                            self.root / "flow_backfill_worker_cursor.json", {}
+                        ) or {},
+                    },
+                    "backlog": backlog,
+                    "historical_only": True,
+                    "priority_mode": "oldest_durable_gap_first",
+                }
+
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                discovered, v2_coverage = self.observer.sync(
+                    block_limit=discovery_block_limit, lookback=lookback)
+            timings["uniswap_v2_discovery"] = round(
+                time.monotonic() - stage, 3)
+            deadline.raise_if_expired("uniswap_v2_discovery")
+
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                v4_discovered, v4_coverage = self.v4_observer.sync(
+                    block_limit=discovery_block_limit, lookback=lookback,
+                    activation_limit=BACKFILL_V4_ACTIVATION_LIMIT,
+                )
+            timings["uniswap_v4_discovery"] = round(
+                time.monotonic() - stage, 3)
+            new_candidates = self.store.add_candidates(
+                discovered + v4_discovered)
+            self.store.mark_v4_promoted([
+                row["pool_id"] for row in v4_discovered if row.get("pool_id")
+            ])
+            deadline.raise_if_expired("candidate_persistence")
+
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                identity = self.resolve_flow_participants(
+                    limit=max(0, int(identity_limit)),
+                    deadline_monotonic=time.monotonic() + min(
+                        deadline.remaining(), FLOW_IDENTITY_STAGE_BUDGET_SECONDS),
+                    head_block=None,
+                )
+            timings["historical_identity"] = round(
+                time.monotonic() - stage, 3)
+            return {
+                "new_candidates": new_candidates,
+                "v2_discovery": v2_coverage,
+                "v4_discovery": v4_coverage,
+                "durable_gap_recovery": gap_recovery,
+                "historical_identity_resolution": identity,
+                "stage_timings_seconds": timings,
+                "cursor": {
+                    "v2": read_json(self.root / "discovery_cursor.json", {}) or {},
+                    "v4": read_json(self.root / "discovery_v4_cursor.json", {}) or {},
+                    "gap": read_json(
+                        self.root / "flow_backfill_worker_cursor.json", {}) or {},
+                },
+                "backlog": self.store.backfill_backlog(),
+                "historical_only": True,
+            }
+
+        return self._execute_lane("backfill", budget_seconds, work)
 
     def run_once(self, *, discovery_block_limit=DEFAULT_DISCOVERY_BLOCK_LIMIT,
                  analysis_limit=DEFAULT_ANALYSIS_LIMIT,outcome_limit=DEFAULT_OUTCOME_LIMIT,
@@ -9235,14 +10503,18 @@ class RobinhoodLearningEngine:
         timechain_report = "disabled"
         if self.timechain_recorder is not None:
             timechain_ok, timechain_report = self.timechain_recorder.verify()
-        return {
+        result = {
             "ok": ledger_ok and sqlite_ok and timechain_ok,
             "ledger": ledger_report,
+            "event_ledger_ok": ledger_ok,
             "sqlite_integrity": sqlite_ok,
             "producer_timechain": timechain_report,
             "producer_timechain_ok": timechain_ok,
             "paper_only": True,
+            "checked_at": _utc_now(),
         }
+        atomic_json_write(self.root / "verification_status.json", result)
+        return result
 
     def repair_outcome_integrity(self) -> dict:
         if self.timechain_recorder is None:
@@ -9266,16 +10538,320 @@ class RobinhoodLearningEngine:
         }
 
 
+class _WindowsLaneJob:
+    """Own lane children without nesting the supervisor's existing job.
+
+    Task Scheduler may already place the supervisor in a job. Assigning the
+    supervisor to another job can suspend startup, while relying on the task's
+    job does not reliably kill descendants on Stop-ScheduledTask. A dedicated
+    job containing only the lane workers gives the desired invariant: when the
+    supervisor exits abruptly, Windows closes its handle and kills every lane.
+    """
+
+    def __init__(self) -> None:
+        self.handle = None
+        if os.name != "nt":
+            return
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        kernel32.CreateJobObjectW.argtypes = [ctypes.c_void_p, wintypes.LPCWSTR]
+        kernel32.CreateJobObjectW.restype = wintypes.HANDLE
+        kernel32.SetInformationJobObject.argtypes = [
+            wintypes.HANDLE, ctypes.c_int, ctypes.c_void_p, wintypes.DWORD,
+        ]
+        kernel32.SetInformationJobObject.restype = wintypes.BOOL
+        kernel32.AssignProcessToJobObject.argtypes = [
+            wintypes.HANDLE, wintypes.HANDLE,
+        ]
+        kernel32.AssignProcessToJobObject.restype = wintypes.BOOL
+        kernel32.CloseHandle.argtypes = [wintypes.HANDLE]
+        kernel32.CloseHandle.restype = wintypes.BOOL
+        handle = kernel32.CreateJobObjectW(None, None)
+        if not handle:
+            raise ctypes.WinError(ctypes.get_last_error())
+        # JOBOBJECT_EXTENDED_LIMIT_INFORMATION is 144 bytes on this x64
+        # runtime; ctypes arrays are zero-initialized, so no accidental native
+        # flags or limits can leak into the structure.
+        information = (ctypes.c_ubyte * 144)()
+        ctypes.c_uint32.from_buffer(information, 16).value = 0x00002000
+        if not kernel32.SetInformationJobObject(
+            handle, 9, ctypes.byref(information), ctypes.sizeof(information),
+        ):
+            kernel32.CloseHandle(handle)
+            raise ctypes.WinError(ctypes.get_last_error())
+        self.handle = handle
+        self._kernel32 = kernel32
+
+    def assign(self, process: subprocess.Popen) -> None:
+        if self.handle is None:
+            return
+        if not self._kernel32.AssignProcessToJobObject(
+            self.handle, wintypes.HANDLE(int(process._handle)),
+        ):
+            error = ctypes.WinError(ctypes.get_last_error())
+            try:
+                process.kill()
+            finally:
+                raise error
+
+    def close(self) -> None:
+        if self.handle is not None:
+            self._kernel32.CloseHandle(self.handle)
+            self.handle = None
+
+
+def _reconcile_dead_lane_state(
+    store: RobinhoodLearningStore, process_is_running=_process_is_running,
+) -> list[str]:
+    """Recover every abandoned run, not only the latest row per lane."""
+    recovered = store.recover_abandoned_runs(process_is_running)
+    return sorted({
+        str(item.get("lane")) for item in recovered
+        if item.get("lane") and item.get("lane") != "legacy"
+    })
+
+
+def _lane_launch_fits(
+    remaining_window_seconds: float, budget_seconds: float,
+    grace_seconds: float = LANE_TERMINATION_GRACE_SECONDS,
+) -> bool:
+    """A worker may start only when its whole kill-safe window still fits."""
+    return float(remaining_window_seconds) >= (
+        float(budget_seconds) + float(grace_seconds)
+    )
+
+
+def supervise_lanes(
+    root: str | Path, *, chain_root: str | Path,
+    skill_root: str | Path, duration_seconds: float,
+    discovery_block_limit: int, analysis_limit: int,
+    outcome_limit: int, outcome_recovery_limit: int,
+    market_recheck_limit: int,
+    live_cadence_seconds: float = LIVE_LANE_CADENCE_SECONDS,
+    analysis_cadence_seconds: float = ANALYSIS_LANE_CADENCE_SECONDS,
+    backfill_cadence_seconds: float = BACKFILL_LANE_CADENCE_SECONDS,
+) -> dict:
+    """Supervise independently killable, paper-only lane processes."""
+    root = Path(root)
+    root.mkdir(parents=True, exist_ok=True)
+    log_root = root / "logs"
+    log_root.mkdir(parents=True, exist_ok=True)
+    started_mono = time.monotonic()
+    started_wall = time.time()
+    stop_at = started_mono + max(5.0, float(duration_seconds))
+    lanes = {
+        "live": {
+            "command": "live-once", "cadence": max(10.0, live_cadence_seconds),
+            "budget": LIVE_LANE_BUDGET_SECONDS, "next": started_mono,
+        },
+        "analysis": {
+            "command": "analysis-once",
+            "cadence": max(30.0, analysis_cadence_seconds),
+            "budget": ANALYSIS_LANE_BUDGET_SECONDS, "next": started_mono + 3.0,
+        },
+        "backfill": {
+            "command": "backfill-once",
+            "cadence": max(60.0, backfill_cadence_seconds),
+            "budget": BACKFILL_LANE_BUDGET_SECONDS, "next": started_mono + 6.0,
+        },
+    }
+    active: dict[str, dict] = {}
+    launches = {lane: 0 for lane in lanes}
+    timeouts = {lane: 0 for lane in lanes}
+    failures = {lane: 0 for lane in lanes}
+    tail_skips = {lane: 0 for lane in lanes}
+    status_path = root / "scheduler_status.json"
+    supervisor_store = RobinhoodLearningStore(root / "learning.sqlite3")
+    recovered_dead_lanes = _reconcile_dead_lane_state(supervisor_store)
+    lane_job = _WindowsLaneJob()
+    worker_python = str(getattr(sys, "_base_executable", None) or sys.executable)
+    worker_environment = os.environ.copy()
+    venv_site_packages = [
+        entry for entry in sys.path
+        if "site-packages" in str(entry).lower()
+    ]
+    if venv_site_packages:
+        existing_pythonpath = worker_environment.get("PYTHONPATH", "")
+        worker_environment["PYTHONPATH"] = os.pathsep.join([
+            *venv_site_packages,
+            *([existing_pythonpath] if existing_pythonpath else []),
+        ])
+
+    def command_for(lane: str) -> list[str]:
+        command = [
+            worker_python, "-X", "utf8", str(Path(__file__).resolve()),
+            lanes[lane]["command"], "--root", str(root),
+            "--chain-root", str(chain_root), "--skill-root", str(skill_root),
+            "--lane-budget-seconds", str(lanes[lane]["budget"]),
+        ]
+        if lane == "analysis":
+            command += [
+                "--analysis-limit", str(analysis_limit),
+                "--outcome-limit", str(outcome_limit),
+                "--outcome-recovery-limit", str(outcome_recovery_limit),
+                "--market-recheck-limit", str(market_recheck_limit),
+            ]
+        elif lane == "backfill":
+            command += [
+                "--discovery-block-limit", str(discovery_block_limit)]
+        return command
+
+    def publish(status: str = "running") -> None:
+        atomic_json_write(status_path, {
+            "schema_version": 2, "status": status,
+            "mode": "lane_supervisor", "started_at": started_wall,
+            "pid": os.getpid(), "heartbeat_at": time.time(),
+            "active_lanes": {
+                lane: {
+                    "pid": item["process"].pid,
+                    "started_at": item["wall_started"],
+                    "hard_deadline_at": item["wall_deadline"],
+                } for lane, item in active.items()
+            },
+            "lane_state": supervisor_store.lane_states(),
+            "recovered_dead_lanes": recovered_dead_lanes,
+            "launches": launches, "timeouts": timeouts, "failures": failures,
+            "tail_skips": tail_skips,
+            "paper_only": True, "live_execution_enabled": False,
+        })
+
+    try:
+        while time.monotonic() < stop_at:
+            now_mono = time.monotonic()
+            for lane, item in list(active.items()):
+                process = item["process"]
+                code = process.poll()
+                if code is not None:
+                    item["stdout"].close()
+                    item["stderr"].close()
+                    failures[lane] += int(code != 0)
+                    active.pop(lane, None)
+                elif now_mono >= item["deadline"]:
+                    process.kill()
+                    try:
+                        process.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        pass
+                    item["stdout"].close()
+                    item["stderr"].close()
+                    timeouts[lane] += 1
+                    supervisor_store.terminate_lane(
+                        lane, process.pid,
+                        "supervisor_hard_deadline_exceeded")
+                    active.pop(lane, None)
+            for lane in ("live", "analysis", "backfill"):
+                schedule = lanes[lane]
+                if lane in active or now_mono < schedule["next"]:
+                    continue
+                remaining_window = max(0.0, stop_at - now_mono)
+                if not _lane_launch_fits(
+                    remaining_window, float(schedule["budget"]),
+                ):
+                    tail_skips[lane] += 1
+                    while schedule["next"] <= now_mono:
+                        schedule["next"] += float(schedule["cadence"])
+                    continue
+                stamp = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+                stdout = open(
+                    log_root / f"{lane}-{stamp}.log", "a", encoding="utf-8")
+                stderr = open(
+                    log_root / f"{lane}-{stamp}.error.log", "a", encoding="utf-8")
+                process = subprocess.Popen(
+                    command_for(lane), cwd=str(Path(__file__).resolve().parent),
+                    stdout=stdout, stderr=stderr, env=worker_environment,
+                    creationflags=(
+                        subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+                )
+                lane_job.assign(process)
+                wall_started = time.time()
+                active[lane] = {
+                    "process": process, "stdout": stdout, "stderr": stderr,
+                    "deadline": now_mono + float(schedule["budget"]) + (
+                        LANE_TERMINATION_GRACE_SECONDS),
+                    "wall_started": wall_started,
+                    "wall_deadline": wall_started + float(schedule["budget"]) + (
+                        LANE_TERMINATION_GRACE_SECONDS),
+                }
+                launches[lane] += 1
+                while schedule["next"] <= now_mono:
+                    schedule["next"] += float(schedule["cadence"])
+            publish()
+            time.sleep(1.0)
+    finally:
+        for lane, item in list(active.items()):
+            process = item["process"]
+            if process.poll() is None:
+                process.kill()
+                try:
+                    process.wait(timeout=5)
+                except subprocess.TimeoutExpired:
+                    pass
+                supervisor_store.terminate_lane(
+                    lane, process.pid, "supervisor_window_closed")
+            item["stdout"].close()
+            item["stderr"].close()
+        active.clear()
+        publish("complete")
+        lane_job.close()
+    return {
+        "status": "complete", "mode": "lane_supervisor",
+        "launches": launches, "timeouts": timeouts, "failures": failures,
+        "tail_skips": tail_skips,
+        "duration_seconds": round(time.monotonic() - started_mono, 3),
+        "paper_only": True, "live_execution_enabled": False,
+    }
+
+
+def _dashboard_integrity(
+    root: str | Path, *, chain_root: str | Path | None = None,
+    skill_root: str | Path | None = None,
+) -> dict:
+    """Read the latest full verification certificate without blocking UI."""
+    root = Path(root)
+    certificate = read_json(root / "verification_status.json", {}) or {}
+    checked_epoch = _timestamp(certificate.get("checked_at"))
+    age = time.time() - checked_epoch if checked_epoch is not None else None
+    fresh = bool(
+        age is not None and 0 <= age <= DASHBOARD_INTEGRITY_MAX_AGE_SECONDS)
+    result = {
+        "sqlite": False, "event_ledger": False, "producer_timechain": False,
+        "checked_at": certificate.get("checked_at"),
+        "age_seconds": round(age, 1) if age is not None else None,
+        "maximum_age_seconds": DASHBOARD_INTEGRITY_MAX_AGE_SECONDS,
+        "fresh": fresh,
+    }
+    if certificate:
+        result["sqlite"] = bool(certificate.get("sqlite_integrity"))
+        result["event_ledger"] = bool(certificate.get("event_ledger_ok"))
+        result["producer_timechain"] = bool(
+            certificate.get("producer_timechain_ok"))
+        result["event_ledger_report"] = certificate.get("ledger")
+        result["producer_timechain_report"] = certificate.get(
+            "producer_timechain")
+    else:
+        result["status"] = "verification_required"
+    result["ok"] = bool(
+        fresh and result["sqlite"] and result["event_ledger"]
+        and result["producer_timechain"]
+    )
+    return result
+
+
 def dashboard_snapshot(
     root: str | Path,
     *,
     store: RobinhoodLearningStore | None = None,
     live_position_markets: dict[str, dict] | None = None,
     market_refresh_errors: dict[str, str] | None = None,
+    chain_root: str | Path | None = None,
+    skill_root: str | Path | None = None,
 ) -> dict:
     root=Path(root)
     store=store or RobinhoodLearningStore(root/"learning.sqlite3")
     summary=read_json(root/"learning_summary.json",{}) or {}
+    lane_summaries = {
+        lane: read_json(root / f"{lane}_lane_summary.json", {}) or {}
+        for lane in ("live", "analysis", "backfill")
+    }
     cursor=read_json(root/"discovery_cursor.json",{}) or {}
     v4_cursor=read_json(root/"discovery_v4_cursor.json",{}) or {}
     reflection_state=read_json(root/"reflection_state.json",{}) or {}
@@ -9289,6 +10865,10 @@ def dashboard_snapshot(
         key: value for key, value in counterfactual_audit.items()
         if key != "headline_review"
     }
+    lane_performance = store.lane_performance()
+    integrity = _dashboard_integrity(
+        root, chain_root=chain_root, skill_root=skill_root)
+    stabilization = store.stabilization_summary(integrity=integrity)
     return {
         "timestamp":_utc_now(),"network":"robinhood","chain_id":ROBINHOOD_NETWORK.chain_id,
         "learning":store.summary(),
@@ -9308,12 +10888,28 @@ def dashboard_snapshot(
         "flow_evidence": store.flow_evidence_summary(),
         # Friction is the largest component of every return recorded here.
         "round_trip": store.round_trip_summary(),
+        # Duration and completion rate together; either alone misleads.
+        "lane_health": store.lane_health(),
         # Distinct from discovery_coverage, which is the BACKFILL cursor.
         "pool_discovery": store.pool_discovery_latency(),
         "flow_evidence_events": store.recent_flow_evidence_events(limit=16),
         "flow_origin_queue": store.pending_transaction_origin_counts(),
         "v4_custody": store.v4_custody_summary(),
         "last_cycle":summary.get("cycle") or {},
+        "lanes": {
+            "state": store.lane_states(),
+            "performance": lane_performance,
+            "latest": lane_summaries,
+            "backfill_backlog": store.backfill_backlog(),
+            "acceptance": {
+                "live_deadline_seconds": LIVE_LANE_BUDGET_SECONDS,
+                "live_target_p95_seconds": 30.0,
+                "no_historical_scanning_on_live_path": True,
+                "position_marks_first_on_every_live_cycle": True,
+                "timechain_writer": "analysis_lane_only",
+            },
+        },
+        "stabilization": stabilization,
         "discovery_coverage":cursor.get("coverage") or summary.get("discovery_coverage") or {},
         "discovery_coverage_by_source":{
             "uniswap_v2":cursor.get("coverage") or {},
@@ -9335,7 +10931,11 @@ def dashboard_snapshot(
 class RobinhoodDashboardMarketRefresher:
     """Coalesce exact-pool refreshes behind a short stale-safe cache."""
 
-    def __init__(self, root: str | Path, *, engine=None, read_only: bool = False):
+    def __init__(
+        self, root: str | Path, *, engine=None, read_only: bool = False,
+        chain_root: str | Path | None = None,
+        skill_root: str | Path | None = None,
+    ):
         # read_only skips the engine entirely: constructing one migrates the
         # database, which is exactly the write the dashboard must not make.
         self.read_only = bool(read_only) and engine is None
@@ -9350,6 +10950,8 @@ class RobinhoodDashboardMarketRefresher:
             self.root = self.engine.root
             self.store = self.engine.store
         self.lock = threading.Lock()
+        self.chain_root = chain_root
+        self.skill_root = skill_root
         self._markets: dict[str, dict] = {}
         self._errors: dict[str, str] = {}
         self._refreshed_monotonic = 0.0
@@ -9364,6 +10966,8 @@ class RobinhoodDashboardMarketRefresher:
                     store=self.store,
                     live_position_markets=self._markets,
                     market_refresh_errors=self._errors,
+                    chain_root=self.chain_root,
+                    skill_root=self.skill_root,
                 )
                 snapshot["market_cache"] = {
                     "refreshed_at": self._refreshed_at,
@@ -9379,7 +10983,9 @@ class RobinhoodDashboardMarketRefresher:
                 # making network calls on the viewer's behalf.
                 self._refreshed_monotonic = time.monotonic()
                 self._refreshed_at = _utc_now()
-                snapshot = dashboard_snapshot(self.root, store=self.store)
+                snapshot = dashboard_snapshot(
+                    self.root, store=self.store,
+                    chain_root=self.chain_root, skill_root=self.skill_root)
                 snapshot["market_cache"] = {
                     "refreshed_at": self._refreshed_at, "age_seconds": 0.0,
                     "ttl_seconds": DASHBOARD_MARKET_CACHE_SECONDS,
@@ -9415,6 +11021,8 @@ class RobinhoodDashboardMarketRefresher:
                 store=self.store,
                 live_position_markets=markets,
                 market_refresh_errors=errors,
+                chain_root=self.chain_root,
+                skill_root=self.skill_root,
             )
             snapshot["market_cache"] = {
                 "refreshed_at": self._refreshed_at,
@@ -9424,11 +11032,16 @@ class RobinhoodDashboardMarketRefresher:
             return snapshot
 
 
-def serve_dashboard(root: str | Path, host: str, port: int) -> None:
+def serve_dashboard(
+    root: str | Path, host: str, port: int, *,
+    chain_root: str | Path | None = None,
+    skill_root: str | Path | None = None,
+) -> None:
     if host not in {"127.0.0.1","localhost"}:
         raise ValueError("Robinhood dashboard is local-only")
     html_path=Path(__file__).with_name("robinhood_dashboard.html")
-    refresher=RobinhoodDashboardMarketRefresher(root, read_only=True)
+    refresher=RobinhoodDashboardMarketRefresher(
+        root, read_only=True, chain_root=chain_root, skill_root=skill_root)
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path in {"/","/index.html"}:
@@ -9457,7 +11070,21 @@ def serve_dashboard(root: str | Path, host: str, port: int) -> None:
     # on the request path made /api/status time out in the browser, so it is
     # computed off the request path instead and every request is served the
     # last completed build. Stale by up to a refresh interval, never hanging.
-    cached: dict = {"payload": None, "built_at": None, "building": False}
+    # The full historical snapshot can take minutes on a large corpus.  The
+    # operational verdict is a small indexed read, so publish it immediately
+    # instead of hiding the very status this dashboard exists to communicate
+    # behind an unrelated analytics warm-up.
+    initial_integrity = _dashboard_integrity(
+        root, chain_root=chain_root, skill_root=skill_root)
+    initial_payload = {
+        "warming": True, "timestamp": _utc_now(),
+        "detail": "Historical analytics are still building.",
+        "stabilization": refresher.store.stabilization_summary(
+            integrity=initial_integrity),
+        "paper_only": True, "live_execution_enabled": False,
+    }
+    cached: dict = {
+        "payload": initial_payload, "built_at": None, "building": False}
 
     def rebuild() -> None:
         while True:
@@ -9488,7 +11115,8 @@ def main() -> None:
     parser.add_argument(
         "command",
         choices=(
-            "learn-once", "status", "dashboard", "verify", "reflect",
+            "learn-once", "live-once", "analysis-once", "backfill-once",
+            "lanes", "status", "dashboard", "verify", "reflect",
             "audit", "repair-outcomes",
         ),
     )
@@ -9510,6 +11138,20 @@ def main() -> None:
         "--cycle-budget-seconds", type=float,
         default=DEFAULT_CYCLE_BUDGET_SECONDS,
     )
+    parser.add_argument("--lane-budget-seconds", type=float, default=None)
+    parser.add_argument(
+        "--backfill-identity-limit", type=int,
+        default=BACKFILL_LANE_IDENTITY_LIMIT)
+    parser.add_argument("--duration-seconds", type=float, default=285.0)
+    parser.add_argument(
+        "--live-cadence-seconds", type=float,
+        default=LIVE_LANE_CADENCE_SECONDS)
+    parser.add_argument(
+        "--analysis-cadence-seconds", type=float,
+        default=ANALYSIS_LANE_CADENCE_SECONDS)
+    parser.add_argument(
+        "--backfill-cadence-seconds", type=float,
+        default=BACKFILL_LANE_CADENCE_SECONDS)
     parser.add_argument("--lookback",type=int,default=DEFAULT_DISCOVERY_LOOKBACK_BLOCKS)
     parser.add_argument("--chain-root",default=DEFAULT_CHAIN_ROOT)
     parser.add_argument(
@@ -9518,11 +11160,38 @@ def main() -> None:
     parser.add_argument("--skill-root",default=str(default_skill_root()))
     args=parser.parse_args()
     if args.command=="dashboard":
-        serve_dashboard(args.root,args.host,args.port); return
+        serve_dashboard(
+            args.root,args.host,args.port,
+            chain_root=args.chain_root,skill_root=args.skill_root); return
     if args.command=="status":
-        print(json.dumps(dashboard_snapshot(args.root),indent=2)); return
+        print(json.dumps(dashboard_snapshot(
+            args.root,chain_root=args.chain_root,skill_root=args.skill_root
+        ),indent=2)); return
+    if args.command=="lanes":
+        result = supervise_lanes(
+            args.root, chain_root=args.chain_root,
+            skill_root=args.skill_root,
+            duration_seconds=max(5.0, args.duration_seconds),
+            discovery_block_limit=max(1, args.discovery_block_limit),
+            analysis_limit=max(0, args.analysis_limit),
+            outcome_limit=max(0, args.outcome_limit),
+            outcome_recovery_limit=max(0, args.outcome_recovery_limit),
+            market_recheck_limit=max(0, args.market_recheck_limit),
+            live_cadence_seconds=max(10.0, args.live_cadence_seconds),
+            analysis_cadence_seconds=max(30.0, args.analysis_cadence_seconds),
+            backfill_cadence_seconds=max(60.0, args.backfill_cadence_seconds),
+        )
+        print(json.dumps(result, indent=2)); return
+    producer_chain = (
+        args.chain_root
+        if args.command in {
+            "learn-once", "analysis-once", "verify", "repair-outcomes",
+            "reflect", "audit",
+        }
+        else None
+    )
     engine=RobinhoodLearningEngine(
-        args.root, chain_root=args.chain_root, skill_root=args.skill_root,
+        args.root, chain_root=producer_chain, skill_root=args.skill_root,
     )
     if args.command=="verify":
         result=engine.verify(); print(json.dumps(result,indent=2)); raise SystemExit(0 if result["ok"] else 1)
@@ -9540,6 +11209,36 @@ def main() -> None:
         print(json.dumps(reflection.run_if_due(),indent=2)); return
     if args.command=="audit":
         print(json.dumps(reflection.audit_all(),indent=2)); return
+    if args.command=="live-once":
+        summary = engine.run_live_lane(
+            budget_seconds=max(
+                5.0, args.lane_budget_seconds or LIVE_LANE_BUDGET_SECONDS))
+        print(json.dumps(summary, indent=2)); return
+    if args.command=="analysis-once":
+        summary = engine.run_analysis_lane(
+            budget_seconds=max(
+                30.0, args.lane_budget_seconds or ANALYSIS_LANE_BUDGET_SECONDS),
+            analysis_limit=max(0, args.analysis_limit),
+            outcome_limit=max(0, args.outcome_limit),
+            outcome_recovery_limit=max(0, args.outcome_recovery_limit),
+            market_recheck_limit=max(0, args.market_recheck_limit),
+        )
+        try:
+            summary["reflection"] = reflection.run_if_due()
+            summary["flow_reflection"] = reflection.run_flow_if_due()
+        except Exception as exc:
+            summary["reflection"] = {
+                "status": "retry_pending", "error": str(exc)}
+        print(json.dumps(summary, indent=2)); return
+    if args.command=="backfill-once":
+        summary = engine.run_backfill_lane(
+            budget_seconds=max(
+                30.0, args.lane_budget_seconds or BACKFILL_LANE_BUDGET_SECONDS),
+            discovery_block_limit=max(1, args.discovery_block_limit),
+            identity_limit=max(0, args.backfill_identity_limit),
+            lookback=max(1, args.lookback),
+        )
+        print(json.dumps(summary, indent=2)); return
     summary=engine.run_once(
         discovery_block_limit=max(1,args.discovery_block_limit),
         analysis_limit=max(0,args.analysis_limit),outcome_limit=max(0,args.outcome_limit),
