@@ -116,6 +116,10 @@ MARKS_LANE_BUDGET_SECONDS = 90.0
 #: drifted from the lane configuration once; anything iterating lanes reads
 #: this or the config dict, never its own copy.
 LANE_NAMES = ("live", "marks", "analysis", "backfill")
+#: How long past its deadline the supervisor lets a lane run before killing
+#: it. A censored attempt is charged deadline + this, so a reliability failure
+#: stays a reliability failure without corrupting the latency SLO.
+LANE_TERMINATION_GRACE_SECONDS = 3.0
 MARKS_LANE_CADENCE_SECONDS = 45.0
 LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
@@ -1852,7 +1856,14 @@ class RobinhoodLearningStore:
                     cursor_json TEXT NOT NULL DEFAULT '{}',
                     backlog_json TEXT NOT NULL DEFAULT '{}',
                     summary_json TEXT NOT NULL DEFAULT '{}',
-                    last_error TEXT
+                    last_error TEXT,
+                    -- Persisted BEFORE entering each blocking operation. A
+                    -- local variable cannot survive a hard kill: the
+                    -- supervisor terminates the child without its exception
+                    -- handler ever running, so the only stage attribution
+                    -- that survives is one already committed to the database.
+                    current_stage TEXT,
+                    stage_started_at REAL
                 );
                 """
             )
@@ -4363,6 +4374,21 @@ class RobinhoodLearningStore:
                     row[key.removesuffix("_json")] = {}
         return {row["lane"]: row for row in rows}
 
+    def mark_lane_stage(self, lane: str, stage: str) -> None:
+        """Commit the stage BEFORE the blocking call it names.
+
+        Ordering is the whole point: written after, it records what already
+        finished; written before, it records what the process was inside when
+        it was killed. Called ahead of ingestion, sealing, decision-head
+        retrieval and classification.
+        """
+        with self.connection() as connection:
+            connection.execute(
+                """UPDATE lane_state SET current_stage=?, stage_started_at=?
+                   WHERE lane=? AND status='running'""",
+                (str(stage), time.time(), str(lane)),
+            )
+
     def terminate_lane(self, lane: str, pid: int, reason: str) -> None:
         """Close only the run owned by the process the supervisor terminated."""
         now = time.time()
@@ -4372,10 +4398,19 @@ class RobinhoodLearningStore:
         }
         with self.connection() as connection:
             row = connection.execute(
-                """SELECT run_id FROM lane_state
+                """SELECT run_id, current_stage, stage_started_at
+                   FROM lane_state
                    WHERE lane=? AND pid=? AND status='running'""",
                 (str(lane), int(pid)),
             ).fetchone()
+            if row:
+                # The stage the process was INSIDE, read from the database
+                # rather than from a dead process's memory.
+                failure["failure_stage"] = row["current_stage"]
+                started = row["stage_started_at"]
+                failure["stage_elapsed_seconds"] = (
+                    round(now - started, 3) if started else None)
+                failure["termination_reason"] = str(reason)
             if not row:
                 return
             connection.execute(
@@ -4404,7 +4439,8 @@ class RobinhoodLearningStore:
         with self.connection() as connection:
             for lane in LANE_NAMES:
                 rows = connection.execute(
-                    """SELECT status,summary_json,started_at,completed_at
+                    """SELECT status,summary_json,started_at,completed_at,
+                              deadline_seconds
                        FROM runs WHERE lane=?
                        ORDER BY id DESC LIMIT ?""", (lane, int(limit)),
                 ).fetchall()
@@ -4421,11 +4457,28 @@ class RobinhoodLearningStore:
                     except (TypeError, ValueError):
                         duration = -1.0
                     if duration < 0 and row["status"] != "running":
-                        started_at = _timestamp(row["started_at"])
-                        completed_at = _timestamp(row["completed_at"])
-                        if started_at is not None and completed_at is not None:
-                            duration = max(0.0, completed_at - started_at)
-                            timestamp_derived += 1
+                        # A recovered run's completed_at is when the SWEEP
+                        # noticed it, not when it stopped working. Deriving
+                        # duration from it charged recovery latency to the
+                        # SLO: all-attempt p95 read ~240s for live and ~295s
+                        # for marks while successful p95 was 24.6s and 50.1s.
+                        # A censored observation is bounded by the deadline it
+                        # was killed at, plus the grace the supervisor allows
+                        # before terminating -- not by when anyone looked.
+                        if row["status"] in {"abandoned_recovered",
+                                             "deadline_exceeded"}:
+                            budget = safe_float(row["deadline_seconds"], 0.0)
+                            duration = (
+                                budget + LANE_TERMINATION_GRACE_SECONDS
+                                if budget > 0 else -1.0)
+                            if duration >= 0:
+                                timestamp_derived += 1
+                        else:
+                            started_at = _timestamp(row["started_at"])
+                            completed_at = _timestamp(row["completed_at"])
+                            if started_at is not None and completed_at is not None:
+                                duration = max(0.0, completed_at - started_at)
+                                timestamp_derived += 1
                     if duration >= 0:
                         durations.append(duration)
                         if row["status"] == "complete":
@@ -9672,6 +9725,7 @@ class RobinhoodLearningEngine:
             # that must stay near the chain head.
             positions = {"delegated_to": "marks_lane"}
             stage = time.monotonic()
+            self.store.mark_lane_stage("live", "ingestion")
             with self._rpc_deadline(deadline):
                 near_head = self.near_head_flow_pass(
                     deadline=deadline, cursor_name="live_lane_cursor.json",
@@ -9681,6 +9735,7 @@ class RobinhoodLearningEngine:
                 )
             timings["head_ingestion_and_identity"] = round(
                 time.monotonic() - stage, 3)
+            self.store.mark_lane_stage("live", "sealing")
             if not near_head.get("scanned"):
                 return {
                     "position_evaluations": positions,

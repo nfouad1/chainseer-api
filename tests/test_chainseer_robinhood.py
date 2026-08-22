@@ -7069,3 +7069,101 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         self.assertGreater(rh.MARKS_LANE_BUDGET_SECONDS, 0)
         self.assertGreater(rh.MARKS_LANE_CADENCE_SECONDS, 0)
         self.assertTrue(hasattr(rh.RobinhoodLearningEngine, "run_marks_lane"))
+
+
+def _utc_now_iso():
+    import datetime
+    return datetime.datetime.now(datetime.timezone.utc).isoformat()
+
+
+class DurableStageAttributionTests(unittest.TestCase):
+    """The stage must survive a hard kill, and censoring must not inflate p95.
+
+    A local variable cannot survive supervisor termination -- the child dies
+    without its exception handler running -- so attribution only works if the
+    stage is committed BEFORE the blocking call it names.
+    """
+
+    def _store(self, directory):
+        return rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+
+    def _running_lane(self, store, lane="live", budget=25.0):
+        with store.connection() as connection:
+            connection.execute(
+                """INSERT OR REPLACE INTO lane_state
+                       (lane,run_id,pid,status,started_at,heartbeat_at,
+                        deadline_seconds)
+                   VALUES (?,?,?,'running',?,?,?)""",
+                (lane, "r1", os.getpid(), time.time(), time.time(), budget),
+            )
+            # terminate_lane closes the RUNS row; without it the update
+            # matches nothing and the failure payload is never written.
+            connection.execute(
+                """INSERT OR REPLACE INTO runs(started_at,status,run_id,lane,
+                       pid,deadline_seconds,summary_json)
+                   VALUES (?,'running','r1',?,?,?,'{}')""",
+                (_utc_now_iso(), lane, os.getpid(), budget),
+            )
+
+    def test_the_stage_is_persisted_not_held_in_memory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._running_lane(store)
+            store.mark_lane_stage("live", "ingestion")
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT current_stage,stage_started_at FROM lane_state"
+                    " WHERE lane='live'").fetchone()
+            self.assertEqual(row["current_stage"], "ingestion")
+            self.assertIsNotNone(row["stage_started_at"])
+
+    def test_termination_records_the_stage_the_process_died_in(self):
+        for stage in ("ingestion", "sealing", "decision_head", "classification"):
+            with self.subTest(stage=stage):
+                with tempfile.TemporaryDirectory() as directory:
+                    store = self._store(directory)
+                    self._running_lane(store)
+                    store.mark_lane_stage("live", stage)
+                    store.terminate_lane("live", os.getpid(), "hard_kill")
+                    with store.connection() as connection:
+                        row = connection.execute(
+                            "SELECT summary_json FROM runs WHERE lane='live'"
+                            " ORDER BY id DESC LIMIT 1").fetchone()
+                    payload = json.loads(row["summary_json"]) if row else {}
+                    self.assertEqual(payload.get("failure_stage"), stage)
+                    self.assertIsNotNone(payload.get("stage_elapsed_seconds"))
+                    self.assertEqual(
+                        payload.get("termination_reason"), "hard_kill")
+
+    def test_a_censored_attempt_is_charged_the_deadline_not_recovery_time(self):
+        """completed_at on a recovered run is when the sweep noticed it."""
+        self.assertGreater(rh.LANE_TERMINATION_GRACE_SECONDS, 0)
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            with store.connection() as connection:
+                connection.execute(
+                    """INSERT INTO runs(started_at,status,run_id,lane,
+                           deadline_seconds,completed_at,summary_json)
+                       VALUES (?,'abandoned_recovered','r9','live',25.0,?,'{}')""",
+                    ("2026-08-22T10:00:00+00:00", "2026-08-22T10:20:00+00:00"),
+                )
+            # lane_health measures SURVIVORS by design, so a recovered run
+            # contributes no duration there -- that is correct. The bug was in
+            # the all-attempt path, which derived duration from completed_at.
+            health = store.lane_health(sample=10).get("live") or {}
+            self.assertIsNone(
+                health.get("duration_p95_seconds"),
+                "a recovered run must not appear as a successful latency",
+            )
+            self.assertEqual(health.get("completed"), 0)
+            self.assertEqual(health.get("completion_rate"), 0.0)
+            perf = store.lane_performance(limit=10).get("live") or {}
+            attempted = perf.get("duration_p95_seconds")
+            if attempted is not None:
+                self.assertLess(
+                    attempted, 60.0,
+                    "a 20-minute gap to recovery was charged to the SLO",
+                )
+                self.assertAlmostEqual(
+                    attempted, 25.0 + rh.LANE_TERMINATION_GRACE_SECONDS,
+                    delta=1.0)
