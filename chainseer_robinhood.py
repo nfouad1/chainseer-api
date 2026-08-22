@@ -10665,6 +10665,7 @@ def supervise_lanes(
     outcome_limit: int, outcome_recovery_limit: int,
     market_recheck_limit: int,
     live_cadence_seconds: float = LIVE_LANE_CADENCE_SECONDS,
+    marks_cadence_seconds: float = MARKS_LANE_CADENCE_SECONDS,
     analysis_cadence_seconds: float = ANALYSIS_LANE_CADENCE_SECONDS,
     backfill_cadence_seconds: float = BACKFILL_LANE_CADENCE_SECONDS,
 ) -> dict:
@@ -10680,6 +10681,16 @@ def supervise_lanes(
         "live": {
             "command": "live-once", "cadence": max(10.0, live_cadence_seconds),
             "budget": LIVE_LANE_BUDGET_SECONDS, "next": started_mono,
+        },
+        # Marking is its own lane: measured at 21.75s it cannot share the
+        # live lane's budget, and it depends on an external price API rather
+        # than chain RPC, so a price stall must not spend the budget that
+        # blockchain freshness needs. Offset by 1.5s so it does not start in
+        # lockstep with the live lane every cycle.
+        "marks": {
+            "command": "marks-once",
+            "cadence": max(15.0, marks_cadence_seconds),
+            "budget": MARKS_LANE_BUDGET_SECONDS, "next": started_mono + 1.5,
         },
         "analysis": {
             "command": "analysis-once",
@@ -11158,6 +11169,9 @@ def main() -> None:
             "audit", "repair-outcomes",
         ),
     )
+    parser.add_argument(
+        "--marks-cadence-seconds", type=float,
+        default=MARKS_LANE_CADENCE_SECONDS)
     parser.add_argument("--root",default=DEFAULT_ROOT)
     parser.add_argument("--host",default="127.0.0.1")
     parser.add_argument("--port",type=int,default=DEFAULT_DASHBOARD_PORT)
@@ -11216,6 +11230,9 @@ def main() -> None:
             outcome_recovery_limit=max(0, args.outcome_recovery_limit),
             market_recheck_limit=max(0, args.market_recheck_limit),
             live_cadence_seconds=max(10.0, args.live_cadence_seconds),
+            marks_cadence_seconds=max(
+                15.0, getattr(args, "marks_cadence_seconds", None)
+                or MARKS_LANE_CADENCE_SECONDS),
             analysis_cadence_seconds=max(30.0, args.analysis_cadence_seconds),
             backfill_cadence_seconds=max(60.0, args.backfill_cadence_seconds),
         )
