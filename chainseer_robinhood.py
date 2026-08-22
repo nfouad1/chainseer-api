@@ -1657,6 +1657,18 @@ class RobinhoodLearningStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_flow_obs_due
                     ON flow_observation_outcomes(status,target_at);
+                -- "Is this window already sealed?" is asked by the window
+                -- selection query, the seal queue drain and the queue depth,
+                -- and every one of them expressed it as a correlated NOT
+                -- EXISTS with nothing to answer it from. The only index on
+                -- this table was the implicit one on observation_id, so each
+                -- ask cost a full scan: measured at 141 seconds for 443 queue
+                -- rows against 17,098 observations, inside a 25-second cycle.
+                -- The queue did not create that cost, it only asked the
+                -- question often enough to expose it.
+                CREATE INDEX IF NOT EXISTS idx_flow_obs_window
+                    ON flow_observations(pool_id,window_end_block,
+                                         policy_version);
                 CREATE TABLE IF NOT EXISTS flow_signal_events (
                     event_id TEXT PRIMARY KEY,
                     policy_version TEXT NOT NULL,
@@ -11967,7 +11979,30 @@ def serve_dashboard(
 
     threading.Thread(target=rebuild_operational, daemon=True).start()
     threading.Thread(target=rebuild_historical, daemon=True).start()
-    server=ThreadingHTTPServer((host,port),Handler)
+    class _ExclusiveServer(ThreadingHTTPServer):
+        """Refuse to share the port instead of silently joining it.
+
+        HTTPServer sets allow_reuse_address, and on Windows SO_REUSEADDR lets
+        SEVERAL sockets bind one listening port -- connections then go to an
+        arbitrary one. Three instances were bound to 8769 at once, including
+        one started three days earlier, so every "restart" appeared to succeed
+        while requests kept being answered by pre-lane code. Hours went into
+        diagnosing a payload that was missing keys the running code emitted.
+
+        Binding exclusively turns that into an immediate "address already in
+        use", which names the problem at the moment it happens.
+        """
+
+        allow_reuse_address = False
+
+    try:
+        server = _ExclusiveServer((host, port), Handler)
+    except OSError as error:
+        raise SystemExit(
+            f"Port {port} is already served by another dashboard process "
+            f"({error}). Stop it first -- do not start a second one, because "
+            f"both would appear to work."
+        ) from error
     print(f"Robinhood learning dashboard: http://{host}:{port}")
     print("READ-ONLY: no write endpoints exist. Press Ctrl+C to stop.")
     try: server.serve_forever(poll_interval=.5)

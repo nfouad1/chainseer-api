@@ -7892,3 +7892,83 @@ class SealQueueDashboardTests(unittest.TestCase):
                     "minimum_deadline_headroom_seconds",
                     "live_decision_reserve_seconds"):
             self.assertIn(key, source)
+
+
+class DashboardPortExclusivityTests(unittest.TestCase):
+    """A second dashboard must fail loudly, not join the port.
+
+    HTTPServer sets allow_reuse_address, and on Windows SO_REUSEADDR lets
+    several sockets bind one listening port; connections then go to an
+    arbitrary one. Three instances were bound to 8769 at once, one of them
+    three days old, so every restart appeared to succeed while requests kept
+    being served by pre-lane code -- a payload missing keys the running code
+    demonstrably emitted.
+    """
+
+    def test_the_server_class_refuses_to_reuse_the_address(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("allow_reuse_address = False", source)
+        self.assertIn("_ExclusiveServer", source)
+
+    def test_a_second_bind_on_the_same_port_raises(self):
+        """The behaviour, not the flag: verified against a real socket."""
+        from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
+
+        class _Exclusive(ThreadingHTTPServer):
+            allow_reuse_address = False
+
+        first = _Exclusive(("127.0.0.1", 0), BaseHTTPRequestHandler)
+        try:
+            port = first.server_address[1]
+            with self.assertRaises(OSError):
+                _Exclusive(("127.0.0.1", port), BaseHTTPRequestHandler)
+        finally:
+            first.server_close()
+
+    def test_the_failure_names_the_conflict(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        block = source.split("_ExclusiveServer((host, port)", 1)[1][:600]
+        self.assertIn("already served by another dashboard", block)
+        self.assertIn("SystemExit", block)
+
+
+class SealedWindowLookupIndexTests(unittest.TestCase):
+    """"Is this window already sealed?" must not cost a table scan.
+
+    The selection query, the queue drain and the queue depth all ask it as a
+    correlated NOT EXISTS, and the only index on flow_observations was the
+    implicit one on observation_id. Measured on the live database: 141
+    seconds for 443 queue rows against 17,098 observations, inside a
+    25-second cycle. The queue did not create that cost -- it asked the
+    question often enough to expose it.
+    """
+
+    def test_the_index_exists_on_a_fresh_database(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            with store.connection() as connection:
+                names = {
+                    row[0] for row in connection.execute(
+                        "SELECT name FROM sqlite_master WHERE type='index'"
+                        " AND tbl_name='flow_observations'")
+                }
+        self.assertIn("idx_flow_obs_window", names)
+
+    def test_the_lookup_plans_a_search_not_a_scan(self):
+        """The plan, not the index name: an index nothing chooses is a scan."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            with store.connection() as connection:
+                plan = " ".join(
+                    str(row[-1]) for row in connection.execute(
+                        "EXPLAIN QUERY PLAN SELECT 1 FROM flow_seal_queue q"
+                        " WHERE q.completed_at IS NULL AND NOT EXISTS ("
+                        "   SELECT 1 FROM flow_observations o"
+                        "   WHERE o.pool_id=q.pool_id"
+                        "     AND o.window_end_block=q.window_end_block"
+                        "     AND o.policy_version=?)", ("v",))
+                )
+        self.assertIn("idx_flow_obs_window", plan)
+        self.assertNotIn("SCAN o", plan)
