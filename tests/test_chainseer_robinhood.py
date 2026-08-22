@@ -7282,3 +7282,28 @@ class StageHeadroomIntegrationTests(unittest.TestCase):
         self.assertEqual(source.count("run_id=self.cycle_run_uuid"), 4)
         self.assertEqual(source.count("remaining=deadline.remaining()"), 4)
         self.assertEqual(source.count("completed=dict(timings)"), 4)
+
+
+class DashboardLaneElementTests(unittest.TestCase):
+    """Every lane the renderer loops over must exist in the DOM.
+
+    The loop was extended to include marks while the element was not added,
+    so $('marks-lane') returned null and the whole render threw
+    "Cannot set properties of null" -- taking the entire dashboard down, not
+    just the missing row. Adding a producer without its consumer, again.
+    """
+
+    def test_every_rendered_lane_has_an_element(self):
+        html = Path("robinhood_dashboard.html").read_text(
+            encoding="utf-8", errors="replace")
+        for lane in rh.LANE_NAMES:
+            self.assertIn(
+                f'id="{lane}-lane"', html,
+                f"the renderer loops over {lane} but no element exists",
+            )
+
+    def test_the_renderer_loop_matches_the_backend_lanes(self):
+        html = Path("robinhood_dashboard.html").read_text(
+            encoding="utf-8", errors="replace")
+        for lane in rh.LANE_NAMES:
+            self.assertIn(f"'{lane}'", html)
