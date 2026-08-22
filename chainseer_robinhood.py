@@ -112,6 +112,10 @@ DEFAULT_CYCLE_BUDGET_SECONDS = 255.0
 # freshness is: a mark that is 60s old is fine, a window 60s behind the head
 # is not. Sized generously and separately, which is the whole point.
 MARKS_LANE_BUDGET_SECONDS = 90.0
+#: Every lane, in one place. Three separate hardcoded tuples had already
+#: drifted from the lane configuration once; anything iterating lanes reads
+#: this or the config dict, never its own copy.
+LANE_NAMES = ("live", "marks", "analysis", "backfill")
 MARKS_LANE_CADENCE_SECONDS = 45.0
 LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
@@ -4398,7 +4402,7 @@ class RobinhoodLearningStore:
         """
         result: dict[str, dict] = {}
         with self.connection() as connection:
-            for lane in ("live", "analysis", "backfill"):
+            for lane in LANE_NAMES:
                 rows = connection.execute(
                     """SELECT status,summary_json,started_at,completed_at
                        FROM runs WHERE lane=?
@@ -10787,8 +10791,12 @@ def supervise_lanes(
                         lane, process.pid,
                         "supervisor_hard_deadline_exceeded")
                     active.pop(lane, None)
-            for lane in ("live", "analysis", "backfill"):
-                schedule = lanes[lane]
+            # Iterate the CONFIGURATION. A hardcoded list beside a lanes dict
+            # is a second source of truth, and it silently dropped `marks`:
+            # the lane was defined, budgeted and given a cadence, and never
+            # launched once. Positions then went unmarked entirely, because
+            # marking had already been removed from the live lane.
+            for lane, schedule in lanes.items():
                 if lane in active or now_mono < schedule["next"]:
                     continue
                 remaining_window = max(0.0, stop_at - now_mono)
@@ -10899,7 +10907,7 @@ def dashboard_snapshot(
     summary=read_json(root/"learning_summary.json",{}) or {}
     lane_summaries = {
         lane: read_json(root / f"{lane}_lane_summary.json", {}) or {}
-        for lane in ("live", "analysis", "backfill")
+        for lane in LANE_NAMES
     }
     cursor=read_json(root/"discovery_cursor.json",{}) or {}
     v4_cursor=read_json(root/"discovery_v4_cursor.json",{}) or {}

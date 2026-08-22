@@ -7028,3 +7028,44 @@ class LaneSplitTests(unittest.TestCase):
         self.assertIn("else None", source)
         self.assertIn("timechain_writer", inspect.getsource(
             rh.RobinhoodLearningEngine.run_analysis_lane))
+
+
+class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
+    """A lane that is configured but never launched is worse than absent.
+
+    `marks` was defined with a budget and a cadence while the launch loop
+    iterated a hardcoded ("live","analysis","backfill") tuple beside it. It
+    launched zero times. Because marking had already been removed from the
+    live lane, positions stopped being marked entirely -- and the two runs in
+    the database were manual invocations, which were then reported as
+    evidence the lane worked.
+    """
+
+    def test_every_configured_lane_is_launched_by_the_loop(self):
+        source = inspect.getsource(rh.supervise_lanes)
+        self.assertIn(
+            "for lane, schedule in lanes.items()", source,
+            "the launch loop must iterate the configuration, not a copy",
+        )
+        for lane in rh.LANE_NAMES:
+            self.assertIn(f'"{lane}"', source, f"{lane} missing from config")
+
+    def test_no_module_keeps_its_own_lane_list(self):
+        """Three separate tuples had already drifted from the config once."""
+        source = inspect.getsource(rh)
+        self.assertNotIn(
+            '("live", "analysis", "backfill")', source,
+            "a hardcoded lane tuple is a second source of truth and will drift",
+        )
+
+    def test_the_dashboard_renders_every_lane(self):
+        html = Path("robinhood_dashboard.html").read_text(
+            encoding="utf-8", errors="replace")
+        for lane in rh.LANE_NAMES:
+            self.assertIn(f"'{lane}'", html, f"{lane} not rendered")
+
+    def test_marks_is_a_real_lane_with_its_own_budget_and_cadence(self):
+        self.assertIn("marks", rh.LANE_NAMES)
+        self.assertGreater(rh.MARKS_LANE_BUDGET_SECONDS, 0)
+        self.assertGreater(rh.MARKS_LANE_CADENCE_SECONDS, 0)
+        self.assertTrue(hasattr(rh.RobinhoodLearningEngine, "run_marks_lane"))
