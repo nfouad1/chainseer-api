@@ -4374,7 +4374,9 @@ class RobinhoodLearningStore:
                     row[key.removesuffix("_json")] = {}
         return {row["lane"]: row for row in rows}
 
-    def mark_lane_stage(self, lane: str, stage: str) -> None:
+    def mark_lane_stage(
+        self, lane: str, stage: str, run_id: str | None = None,
+    ) -> None:
         """Commit the stage BEFORE the blocking call it names.
 
         Ordering is the whole point: written after, it records what already
@@ -4385,9 +4387,27 @@ class RobinhoodLearningStore:
         with self.connection() as connection:
             connection.execute(
                 """UPDATE lane_state SET current_stage=?, stage_started_at=?
-                   WHERE lane=? AND status='running'""",
-                (str(stage), time.time(), str(lane)),
+                   WHERE lane=? AND status='running'
+                     AND (? IS NULL OR run_id=?)""",
+                (str(stage), time.time(), str(lane), run_id, run_id),
             )
+
+    def lane_failure_stage(self, lane: str, run_id: str) -> dict:
+        """The persisted stage for a run, for child-side failure payloads."""
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT current_stage, stage_started_at FROM lane_state
+                   WHERE lane=? AND run_id=?""",
+                (str(lane), str(run_id)),
+            ).fetchone()
+        if not row or not row["current_stage"]:
+            return {"failure_stage": None, "stage_elapsed_seconds": None}
+        started = row["stage_started_at"]
+        return {
+            "failure_stage": row["current_stage"],
+            "stage_elapsed_seconds": (
+                round(time.time() - started, 3) if started else None),
+        }
 
     def terminate_lane(self, lane: str, pid: int, reason: str) -> None:
         """Close only the run owned by the process the supervisor terminated."""
@@ -4506,7 +4526,7 @@ class RobinhoodLearningStore:
                     "terminal_sample_size": terminal,
                     "durations_measured": len(durations),
                     "timestamp_derived_durations": timestamp_derived,
-                    "p95_seconds": p95,
+                    "all_attempt_p95_seconds": p95,
                     "p95_scope": "all_terminal_attempts",
                     "success_p95_seconds": success_p95,
                     "completion_rate": (
@@ -4617,7 +4637,7 @@ class RobinhoodLearningStore:
             },
             "live_p95": {
                 "pass": bool(live_perf.get("target_met")),
-                "value": live_perf.get("p95_seconds"), "target": "<30s",
+                "value": live_perf.get("all_attempt_p95_seconds"), "target": "<30s",
                 "label": "Live-lane p95",
             },
             "decision_lag": {
@@ -9670,6 +9690,10 @@ class RobinhoodLearningEngine:
                     "lane": lane, "run_id": run_uuid,
                     "status": terminal_status,
                     "error_type": type(exc).__name__, "error": str(exc)[:1000],
+                    # Read the PERSISTED stage, not a local: a child that
+                    # raises and one that is hard-killed must attribute the
+                    # same way, or half the failures stay unattributable.
+                    **self.store.lane_failure_stage(lane, run_uuid),
                     "deadline_seconds": float(budget_seconds),
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "paper_only": True, "live_execution_enabled": False,
@@ -9756,7 +9780,9 @@ class RobinhoodLearningEngine:
                     pool_ids=touched, deadline=deadline,
                     limit=LIVE_LANE_OBSERVATION_LIMIT,
                 )
+                self.store.mark_lane_stage("live", "decision_head")
                 decision_head = int(self.rpc.get_block_number())
+                self.store.mark_lane_stage("live", "classification")
                 classification = self.classify_sealed_observations(
                     decision_head,
                     observation_ids=list(observation.get("observation_ids") or []),

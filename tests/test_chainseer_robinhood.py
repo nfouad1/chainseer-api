@@ -6875,7 +6875,7 @@ class LaneSplitTests(unittest.TestCase):
                      "live-censored", 1.0),
                 )
             performance = store.lane_performance()["live"]
-            self.assertEqual(performance["p95_seconds"], 28.0)
+            self.assertEqual(performance["all_attempt_p95_seconds"], 28.0)
             self.assertEqual(performance["success_p95_seconds"], 19.0)
             self.assertEqual(performance["completion_rate"], 0.8)
             self.assertEqual(performance["timestamp_derived_durations"], 1)
@@ -7157,13 +7157,14 @@ class DurableStageAttributionTests(unittest.TestCase):
             )
             self.assertEqual(health.get("completed"), 0)
             self.assertEqual(health.get("completion_rate"), 0.0)
+            # Read the ACTUAL key. The previous version asked for
+            # duration_p95_seconds, got None, and I reported the metric as
+            # empty when only the test was wrong.
             perf = store.lane_performance(limit=10).get("live") or {}
-            attempted = perf.get("duration_p95_seconds")
-            if attempted is not None:
-                self.assertLess(
-                    attempted, 60.0,
-                    "a 20-minute gap to recovery was charged to the SLO",
-                )
-                self.assertAlmostEqual(
-                    attempted, 25.0 + rh.LANE_TERMINATION_GRACE_SECONDS,
-                    delta=1.0)
+            attempted = perf.get("all_attempt_p95_seconds")
+            self.assertIsNotNone(
+                attempted, "all-attempt p95 must exist for a censored run")
+            self.assertEqual(
+                attempted, 25.0 + rh.LANE_TERMINATION_GRACE_SECONDS,
+                "a censored attempt is charged exactly deadline + grace",
+            )
