@@ -7307,3 +7307,588 @@ class DashboardLaneElementTests(unittest.TestCase):
             encoding="utf-8", errors="replace")
         for lane in rh.LANE_NAMES:
             self.assertIn(f"'{lane}'", html)
+
+
+class DashboardSplitSnapshotTests(unittest.TestCase):
+    def test_operational_snapshot_does_not_wait_for_historical_joins(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(
+                Path(directory) / "learning.sqlite3")
+            with patch.object(
+                store, "flow_summary",
+                side_effect=AssertionError("historical query reached fast path"),
+            ):
+                snapshot = rh.dashboard_operational_snapshot(
+                    directory, store=store, integrity={"ok": True})
+            self.assertIn("lanes", snapshot)
+            self.assertIn("positions", snapshot)
+            self.assertIn("stabilization", snapshot)
+            self.assertNotIn("flow_shadow", snapshot)
+            self.assertNotIn("flow_evidence", snapshot)
+
+    def test_warming_historical_cache_preserves_operational_truth(self):
+        now = rh._utc_now()
+        payload = rh._dashboard_cached_payload({
+            "operational": {"timestamp": now, "lanes": {"state": {}}},
+            "operational_built_at": now,
+            "operational_error": None,
+            "operational_building": False,
+            "historical": None,
+            "historical_built_at": None,
+            "historical_error": None,
+            "historical_building": True,
+            "historical_started_at": now,
+        })
+        self.assertTrue(payload["warming"])
+        self.assertEqual(payload["historical_state"]["status"], "warming")
+        self.assertTrue(payload["operational_state"]["data_available"])
+        self.assertIn("lanes", payload)
+        self.assertNotIn("flow_evidence", payload)
+        self.assertIn("Operational data is available", payload["detail"])
+
+    def test_old_historical_snapshot_is_labeled_stale_not_zero(self):
+        now = rh._utc_now()
+        payload = rh._dashboard_cached_payload({
+            "operational": {"timestamp": now, "lanes": {"state": {}}},
+            "operational_built_at": now,
+            "operational_error": None,
+            "operational_building": False,
+            "historical": {"flow_evidence": {"eligible_signals": 17}},
+            "historical_built_at": "2000-01-01T00:00:00+00:00",
+            "historical_error": None,
+            "historical_building": False,
+        })
+        self.assertFalse(payload["warming"])
+        self.assertEqual(payload["historical_state"]["status"], "stale")
+        self.assertEqual(payload["flow_evidence"]["eligible_signals"], 17)
+
+    def test_renderer_distinguishes_warming_from_real_zero(self):
+        html = Path("robinhood_dashboard.html").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("renderDataState", html)
+        self.assertIn("renderHistoricalUnavailable", html)
+        self.assertIn("Operational data live · historical analytics warming", html)
+        self.assertIn("historicalAvailable", html)
+
+
+class SealStageBudgetTests(unittest.TestCase):
+    """The seal stage must yield time it does not have, and lose nothing.
+
+    Attributed live-lane failures: of 64 deadline_exceeded cycles, 46 died
+    inside sealing and 18 inside classification having spent 0.26-2.82s there.
+    Successful cycles finished at a median 21.2s and a maximum 24.97s against
+    a 25.0s budget, with sealing alone taking 16.4s median and 19.9s p95. The
+    stage had no reserve and a fixed 8-window limit, so it spent the same time
+    whether the cycle had twenty seconds left or six.
+    """
+
+    HEAD = 45_000_000
+    NOW = 90_000.0
+
+    class _Market:
+        """Counts the live calls a real client would make per window."""
+
+        def __init__(self):
+            self.snapshots = 0
+            self.primed = []
+
+        def prime_window_quotes(self, windows, deadline=None):
+            self.primed.append(len(windows))
+            return {"batched": 6 * len(windows), "resolved": 6 * len(windows),
+                    "failed": 0, "windows": len(windows)}
+
+        def snapshot(self, candidate, quote_block=None):
+            self.snapshots += 1
+            return {"execution_quote": {
+                "verified": True, "anchor_in_raw": 100_000_000,
+                "anchor_out_raw": 99_000_000, "token_out_raw": 10 ** 18,
+            }}
+
+    def _engine(self, directory, store, market=None):
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.store = store
+        engine.root = Path(directory)
+        engine.v4_market = market or self._Market()
+        return engine
+
+    def _window(self, store, pool_id, window_end):
+        with store.connection() as connection:
+            connection.execute(
+                "INSERT INTO flow_signals (source_version,pool_id,"
+                " token_address,computed_at,window_blocks,window_start_block,"
+                " window_end_block,swap_count,buy_count,sell_count,"
+                " unique_sender_hints,unique_resolved_participants,"
+                " identity_coverage,buy_ratio,net_anchor_flow_fraction,"
+                " uncapped_shadow_score,shadow_score,shadow_qualified,"
+                " confidence,features_json,qualification_gaps_json,"
+                " limitations_json) VALUES ('uniswap_v4',?,?,?,1350,?,?,8,6,2,"
+                " 4,4,1.0,0.75,0.5,21.9,21.9,1,'ok','{}','[]','[]')",
+                (pool_id, TOKEN, rh._utc_now(), window_end - 1350, window_end),
+            )
+
+    def _windows(self, store, count, end=None):
+        end = self.HEAD - 10 if end is None else end
+        for index in range(count):
+            self._window(store, "0x" + ("%02x" % index) * 32, end - index)
+
+    # --- (1) sub-stage attribution --------------------------------------
+
+    def test_every_sub_stage_reports_real_measured_seconds(self):
+        """Names in the payload are worthless without numbers behind them.
+
+        Asserted as values, not as names present in the source: the previous
+        instrumentation round shipped four call sites that passed no arguments
+        at all, and the field names alone made that look wired.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 3)
+            result = self._engine(directory, store).seal_near_head_observations(
+                self.HEAD, self.NOW)
+            phases = result["phase_seconds"]
+            for name in ("selection", "prefetch", "transaction_hashes",
+                         "quote_rpc", "evidence_hash", "database_commit"):
+                self.assertIn(name, phases, name + " was never timed")
+                spread = phases[name]
+                self.assertIsInstance(spread["median"], float)
+                self.assertGreaterEqual(spread["median"], 0.0)
+                self.assertGreaterEqual(spread["total"], 0.0)
+            self.assertEqual(phases["quote_rpc"]["count"], 3)
+            self.assertEqual(phases["selection"]["count"], 1,
+                             "selection is paid once per cycle, not per window")
+
+    def test_the_spread_reports_a_tail_not_an_average(self):
+        """One stall and seven fast windows need a different fix from eight
+        even ones, and they share a total."""
+        spread = rh._spread([0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 9.0])
+        self.assertEqual(spread["slowest"], 9.0)
+        self.assertEqual(spread["median"], 0.1)
+        self.assertGreater(spread["slowest"], spread["total"] / spread["count"])
+
+    # --- (2) adaptive admission ------------------------------------------
+
+    def test_low_headroom_admits_fewer_windows_than_the_static_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 8)
+            store.set_scheduler_state(
+                "seal_window_cost", {"per_window_seconds": 2.0})
+            market = self._Market()
+            # 12s left, 5s reserved: ~7s of headroom buys three windows at
+            # the measured 2.0s each -- not the eight a fixed limit takes.
+            # Deliberately not 11.0: that lands headroom on the 6.0 boundary,
+            # where the selection query's own microseconds decide whether the
+            # answer is two windows or three.
+            result = self._engine(
+                directory, store, market,
+            ).seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(12.0),
+                limit=8, reserve_seconds=5.0,
+            )
+            self.assertEqual(result["windows_admitted"], 3)
+            self.assertEqual(market.snapshots, 3)
+            self.assertEqual(result["windows_deferred"], 5)
+
+    def test_full_headroom_admits_the_static_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 8)
+            store.set_scheduler_state(
+                "seal_window_cost", {"per_window_seconds": 0.5})
+            result = self._engine(directory, store).seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(25.0),
+                limit=8, reserve_seconds=5.0,
+            )
+            self.assertEqual(result["windows_admitted"], 8,
+                             "headroom must never admit MORE than the limit")
+
+    def test_the_cost_estimate_is_measured_not_assumed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 4)
+            engine = self._engine(directory, store)
+            self.assertEqual(engine.seal_cost_estimate(),
+                             rh.SEAL_WINDOW_COST_SECONDS_DEFAULT)
+            engine.seal_near_head_observations(self.HEAD, self.NOW)
+            stored = store.scheduler_state("seal_window_cost")
+            self.assertGreater(stored["per_window_seconds"], 0.0)
+            self.assertEqual(stored["last_sealed"], 4)
+            self.assertNotEqual(engine.seal_cost_estimate(),
+                                rh.SEAL_WINDOW_COST_SECONDS_DEFAULT)
+
+    def test_the_estimate_excludes_the_once_per_cycle_phases(self):
+        """Selection and prefetch cost the same whatever the admission count,
+        so charging them per window inflates the estimate exactly when
+        headroom is tightest -- admitting fewer windows next cycle, which
+        raises the per-window figure again."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            engine = self._engine(directory, store)
+            measured = engine.record_seal_cost({
+                "selection": [10.0], "prefetch": [10.0],
+                "quote_rpc": [1.0, 1.0], "database_commit": [0.5, 0.5],
+            }, 2)
+            self.assertEqual(measured, 1.5)
+
+    # --- (3) batched prefetch --------------------------------------------
+
+    def test_the_prefetch_batches_every_admitted_window_at_once(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 5)
+            market = self._Market()
+            result = self._engine(
+                directory, store, market,
+            ).seal_near_head_observations(self.HEAD, self.NOW)
+            self.assertEqual(market.primed, [5],
+                             "one batch per cycle, not one per window")
+            self.assertTrue(result["prefetch"]["supported"])
+            self.assertEqual(result["prefetch"]["windows"], 5)
+
+    def test_a_client_that_cannot_batch_still_seals_and_says_so(self):
+        """Falling back silently is indistinguishable from a slow provider."""
+
+        class _Sequential:
+            def snapshot(self, candidate, quote_block=None):
+                return {"execution_quote": {"verified": True}}
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 2)
+            result = self._engine(
+                directory, store, _Sequential(),
+            ).seal_near_head_observations(self.HEAD, self.NOW)
+            self.assertEqual(result["sealed_this_cycle"], 2)
+            self.assertFalse(result["prefetch"]["supported"])
+
+    # --- (4) durable deferral --------------------------------------------
+
+    def test_a_deferred_window_survives_falling_below_the_floor(self):
+        """The loss case the queue exists for.
+
+        Without a queue an unsealed window is only retried while selection can
+        still see it -- that is, while it sits above the observation floor.
+        Once the head moves on it is never selected again and the observation
+        is gone, with nothing recording that it was ever owed.
+        """
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 4)
+            store.set_scheduler_state(
+                "seal_window_cost", {"per_window_seconds": 2.0})
+            engine = self._engine(directory, store)
+            first = engine.seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(7.0),
+                limit=4, reserve_seconds=5.0,
+            )
+            self.assertEqual(first["sealed_this_cycle"], 1)
+            self.assertEqual(first["windows_queued"], 3)
+
+            # The chain moves far enough that the deferred windows now sit
+            # below the floor and are unselectable by the fresh query.
+            later = self.HEAD + 10 * rh.FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS
+            second = engine.seal_near_head_observations(
+                later, self.NOW + 30, deadline=rh.CycleDeadline(25.0),
+                limit=4, reserve_seconds=5.0,
+            )
+            self.assertEqual(
+                second["admission"]["queue_drained"], 3,
+                "windows below the floor must come back from the queue",
+            )
+            self.assertEqual(second["sealed_this_cycle"], 3)
+            with store.connection() as connection:
+                total = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observations").fetchone()[0]
+            self.assertEqual(total, 4, "every window was eventually sealed")
+
+    def test_a_sealed_window_leaves_the_queue(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 2)
+            store.set_scheduler_state(
+                "seal_window_cost", {"per_window_seconds": 2.0})
+            engine = self._engine(directory, store)
+            engine.seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(7.0),
+                limit=2, reserve_seconds=5.0,
+            )
+            self.assertEqual(store.seal_queue_backlog()["pending_windows"], 1)
+            engine.seal_near_head_observations(
+                self.HEAD, self.NOW + 30, deadline=rh.CycleDeadline(25.0),
+                limit=2, reserve_seconds=5.0,
+            )
+            self.assertEqual(
+                store.seal_queue_backlog()["pending_windows"], 0,
+                "a queue that never empties is a leak, not a buffer",
+            )
+
+    def test_the_backlog_ignores_windows_another_path_sealed(self):
+        """A batch pass can seal a queued window; the entry is then stale."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 1)
+            store.enqueue_seal([{
+                "pool_id": "0x" + "00" * 32,
+                "window_end_block": self.HEAD - 10,
+                "token_address": TOKEN,
+                "window_start_block": self.HEAD - 1360,
+            }], "test")
+            self.assertEqual(store.seal_queue_backlog()["pending_windows"], 1)
+            self._engine(directory, store).seal_near_head_observations(
+                self.HEAD, self.NOW)
+            self.assertEqual(store.seal_queue_backlog()["pending_windows"], 0)
+
+    # --- (5) the reserve --------------------------------------------------
+
+    def test_sealing_stops_while_the_reserve_is_still_unspent(self):
+        """Classification and decision-head retrieval cannot yield; sealing
+        can, because a deferred window is queued rather than lost."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 6)
+            store.set_scheduler_state(
+                "seal_window_cost", {"per_window_seconds": 0.01})
+            deadline = rh.CycleDeadline(5.4)
+            market = self._Market()
+            underlying = market.snapshot
+
+            def stall(candidate, quote_block=None):
+                time.sleep(0.12)
+                return underlying(candidate, quote_block=quote_block)
+
+            market.snapshot = stall
+            result = self._engine(
+                directory, store, market,
+            ).seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=deadline, limit=6,
+                reserve_seconds=5.0,
+            )
+            self.assertGreater(
+                deadline.remaining(), 0.0,
+                "the reserve must survive the seal loop",
+            )
+            self.assertLess(result["sealed_this_cycle"], 6)
+            self.assertGreater(result["windows_queued"], 0)
+
+    def test_no_headroom_admits_nothing_and_queues_everything(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 3)
+            market = self._Market()
+            result = self._engine(
+                directory, store, market,
+            ).seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(1.0),
+                limit=3, reserve_seconds=5.0,
+            )
+            self.assertEqual(result["windows_admitted"], 0)
+            self.assertEqual(market.snapshots, 0)
+            self.assertEqual(result["windows_queued"], 3)
+
+    def test_the_live_lane_reserve_is_large_enough_for_classification(self):
+        """Sized from the attributed kills: classification was terminated at
+        up to 2.82s in, so its true cost is at least that."""
+        self.assertGreaterEqual(rh.LIVE_LANE_DECISION_RESERVE_SECONDS, 4.0)
+        self.assertLess(
+            rh.LIVE_LANE_DECISION_RESERVE_SECONDS,
+            rh.LIVE_LANE_BUDGET_SECONDS / 2,
+            "a reserve that large would starve sealing instead of bounding it",
+        )
+
+    def test_the_live_lane_passes_its_reserve_to_the_seal_stage(self):
+        """A constant nobody reads is the defect this project keeps repeating:
+        a Job Object assigned after the child exited, a CycleDeadline created
+        and never checked, four stage call sites passing no arguments."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        live = source.split("def run_live_lane", 1)[1].split(
+            "def _analyze_candidates", 1)[0]
+        self.assertIn(
+            "reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS", live)
+
+
+class BatchedQuotePrimeTests(unittest.TestCase):
+    """One round trip for the reads that depend on nothing.
+
+    snapshot() issues about six eth_calls per window and five of them need
+    only the pool and the pinned block. Run per window they are sequential
+    HTTP round trips -- roughly 48 for the 8-window live limit, which is what
+    the 16.4s median seal stage was made of.
+    """
+
+    POOL = "0x" + "5c" * 32
+    ANCHOR = rh.USDG_ADDRESS.lower()
+    BLOCK = 44_500_000
+
+    class _RPC:
+        """Records every request shape, batched and sequential alike."""
+
+        def __init__(self, fail=False, refuse_batch=False):
+            self.batches = []
+            self.sequential = []
+            self.fail = fail
+            self.refuse_batch = refuse_batch
+            self.timeout = 5.0
+
+        def calls_at_blocks(self, calls):
+            if self.refuse_batch:
+                raise RuntimeError("RPC endpoint rejected JSON-RPC batching")
+            self.batches.append(list(calls))
+            return [
+                {"result": None, "error": {"message": "reverted"}}
+                if self.fail else
+                {"result": "0x" + "0" * 63 + "1", "error": None}
+                for _ in calls
+            ]
+
+        def call(self, address, data, block=None):
+            self.sequential.append((address, data, block))
+            return "0x" + "0" * 63 + "1"
+
+        def erc20_decimals(self, token, block=None):
+            self.sequential.append((token, "decimals", block))
+            return 18
+
+        def erc20_total_supply(self, token, block=None):
+            self.sequential.append((token, "totalSupply", block))
+            return 10 ** 24
+
+    class _Store:
+        def __init__(self, pool_id, anchor):
+            self.pool = {"pool_id": pool_id, "anchor_address": anchor,
+                         "currency0": TOKEN.lower(), "currency1": anchor,
+                         "fee_tier": 3000, "tick_spacing": 60,
+                         "hooks_address": rh.ZERO_ADDRESS}
+
+        def v4_pool(self, pool_id):
+            return dict(self.pool)
+
+    def _client(self, rpc):
+        return rh.RobinhoodV4MarketClient(
+            rpc, object(), self._Store(self.POOL, self.ANCHOR))
+
+    def _window(self, index=0):
+        return {"pool_id": self.POOL, "token_address": TOKEN,
+                "window_end_block": self.BLOCK + index}
+
+    def test_one_batch_carries_every_windows_independent_reads(self):
+        rpc = self._RPC()
+        client = self._client(rpc)
+        result = client.prime_window_quotes(
+            [self._window(0), self._window(1)])
+        self.assertEqual(len(rpc.batches), 1,
+                         "one HTTP request, not one per window")
+        self.assertEqual(rpc.sequential, [],
+                         "priming must not fall back to sequential calls")
+        self.assertGreater(result["resolved"], 0)
+        self.assertEqual(result["failed"], 0)
+
+    def test_each_call_keeps_its_own_pinned_block(self):
+        """A shared tag would re-price every window at one block, which is
+        precisely the attribution error that made sealing reject everything
+        when it compared windows against a head re-read after the pass."""
+        rpc = self._RPC()
+        self._client(rpc).prime_window_quotes(
+            [self._window(0), self._window(7)])
+        blocks = {block for _, _, block in rpc.batches[0]}
+        self.assertIn(self.BLOCK, blocks)
+        self.assertIn(self.BLOCK + 7, blocks)
+
+    def test_repeated_reads_are_planned_once(self):
+        """Windows share anchors and a token can hold several pools."""
+        rpc = self._RPC()
+        self._client(rpc).prime_window_quotes(
+            [self._window(0), self._window(0), self._window(0)])
+        planned = rpc.batches[0]
+        self.assertEqual(len(planned), len(set(planned)))
+
+    def test_a_primed_read_is_not_repeated_on_the_wire(self):
+        rpc = self._RPC()
+        client = self._client(rpc)
+        client.prime_window_quotes([self._window(0)])
+        rpc.sequential.clear()
+        self.assertEqual(client._cached_decimals(TOKEN, self.BLOCK), 1)
+        self.assertEqual(rpc.sequential, [])
+
+    def test_an_unprimed_read_delegates_to_the_client_accessor(self):
+        """The miss path must not rebuild calldata itself.
+
+        Reconstructing it here silently bypasses any override on the RPC
+        client -- not hypothetical: it broke every test whose fake answers at
+        the accessor, and would have bypassed a production wrapper just as
+        quietly.
+        """
+        rpc = self._RPC()
+        client = self._client(rpc)
+        self.assertEqual(client._cached_decimals(TOKEN, self.BLOCK), 18)
+        self.assertEqual(rpc.sequential, [(TOKEN, "decimals", self.BLOCK)])
+
+    def test_a_refused_batch_degrades_to_the_sequential_path(self):
+        """Slower, never wrong: some providers reject batching outright."""
+        rpc = self._RPC(refuse_batch=True)
+        client = self._client(rpc)
+        result = client.prime_window_quotes([self._window(0)])
+        self.assertEqual(result["resolved"], 0)
+        self.assertIn("error", result)
+        self.assertEqual(client._cached_decimals(TOKEN, self.BLOCK), 18)
+
+    def test_a_failed_call_inside_an_accepted_batch_is_not_cached(self):
+        """Caching an error would pin a broken quote to real evidence."""
+        rpc = self._RPC(fail=True)
+        client = self._client(rpc)
+        result = client.prime_window_quotes([self._window(0)])
+        self.assertEqual(result["resolved"], 0)
+        self.assertGreater(result["failed"], 0)
+        self.assertEqual(client._cached_decimals(TOKEN, self.BLOCK), 18)
+
+    def test_priming_clears_the_previous_cycles_reads(self):
+        """The singleton balance is read at `latest`, which moves."""
+        rpc = self._RPC()
+        client = self._client(rpc)
+        client.prime_window_quotes([self._window(0)])
+        self.assertTrue(client._quote_cache)
+        client.prime_window_quotes([])
+        self.assertEqual(client._quote_cache, {})
+
+
+class SealQueueDashboardTests(unittest.TestCase):
+    """A deferred window is only durable if something reads the queue.
+
+    The block-range queue spent a session reporting a skipped COUNT that
+    nothing consumed, and a lane spent a session running with no DOM element
+    to render into -- a null textContent that killed the whole page. Both
+    halves have to exist: the snapshot must publish the depth, and the page
+    must have somewhere to put it.
+    """
+
+    def test_the_snapshot_publishes_the_seal_queue_depth(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        block = source.split('"lanes": {', 1)[1].split("},", 1)[0]
+        self.assertIn("seal_queue_backlog", block)
+
+    def test_the_page_has_an_element_for_every_key_it_renders(self):
+        html = Path("robinhood_dashboard.html").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn('id="seal-queue"', html)
+        self.assertIn("renderSealQueue", html)
+        self.assertIn("seal_queue_backlog", html)
+
+    def test_the_backlog_shape_matches_what_the_page_reads(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            backlog = store.seal_queue_backlog()
+        for key in ("pending_windows", "oldest_age_seconds"):
+            self.assertIn(key, backlog)
+        self.assertEqual(backlog["pending_windows"], 0)
+        self.assertIsNone(backlog["oldest_age_seconds"])
+
+    def test_the_acceptance_block_states_the_engineering_targets(self):
+        """Targets nobody records are targets nobody can be held to."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        for key in ("seal_stage_target_p95_seconds",
+                    "live_cycle_target_p95_seconds",
+                    "minimum_deadline_headroom_seconds",
+                    "live_decision_reserve_seconds"):
+            self.assertIn(key, source)

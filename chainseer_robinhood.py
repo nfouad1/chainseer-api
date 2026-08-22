@@ -88,8 +88,12 @@ HORIZONS = (
 DEFAULT_ROOT = "robinhood_learning"
 DEFAULT_CHAIN_ROOT = "robinhood_learning_chain"
 DEFAULT_DASHBOARD_PORT = 8769
-# How often the dashboard rebuilds its snapshot off the request path.
+# The dashboard has two deliberately independent freshness domains. Operational
+# state must stay useful while historical range joins are still running.
+DASHBOARD_OPERATIONAL_REFRESH_SECONDS = 5.0
 DASHBOARD_SNAPSHOT_REFRESH_SECONDS = 30.0
+DASHBOARD_OPERATIONAL_STALE_SECONDS = 20.0
+DASHBOARD_HISTORICAL_STALE_SECONDS = 15 * 60.0
 DASHBOARD_INTEGRITY_MAX_AGE_SECONDS = 24 * 60 * 60
 DEFAULT_DISCOVERY_LOOKBACK_BLOCKS = 5_000
 DEFAULT_DISCOVERY_BLOCK_LIMIT = 5_000
@@ -130,6 +134,25 @@ LIVE_LANE_SCAN_BLOCKS = 750
 LIVE_LANE_ENRICHMENT_LIMIT = 60
 LIVE_LANE_ENRICHMENT_BUDGET_SECONDS = 6.0
 LIVE_LANE_OBSERVATION_LIMIT = 8
+#: Held back from sealing for decision-head retrieval and classification.
+#: Attributed failures showed the shape exactly: of 64 deadline_exceeded live
+#: cycles, 46 died inside sealing and 18 died inside classification having
+#: spent only 0.26-2.82s there -- sealing had already eaten the budget and
+#: left classification a remainder too small to finish in. Sealing is the one
+#: stage that can always yield, because a deferred window is queued rather
+#: than lost; classification cannot, because an unclassified observation has
+#: no decision attached to it.
+LIVE_LANE_DECISION_RESERVE_SECONDS = 5.0
+#: Cold-start per-window seal cost, replaced by a measured EWMA after the
+#: first pass. 2.0s is the observed 16.4s median over the 8-window limit.
+SEAL_WINDOW_COST_SECONDS_DEFAULT = 2.0
+#: Weight on the newest measurement. High enough to track a provider slowing
+#: down within a few cycles, low enough that one stalled window does not
+#: collapse admission to a single observation.
+SEAL_COST_SMOOTHING = 0.3
+#: Ceiling on how many queued windows one live cycle may pull ahead of fresh
+#: ones. The queue must drain, but a deep backlog must never starve the head.
+SEAL_QUEUE_DRAIN_LIMIT = 4
 LIVE_LANE_CADENCE_SECONDS = 30.0
 ANALYSIS_LANE_CADENCE_SECONDS = 60.0
 BACKFILL_LANE_CADENCE_SECONDS = 300.0
@@ -487,6 +510,11 @@ SHADOW_POLICY_PURE_TRAILING = "pure_trailing"
 PURE_TRAILING_ACTIVATION_MULTIPLE = 1.25
 ZERO_ADDRESS = "0x" + "0" * 40
 ERC20_BALANCE_OF_SELECTOR = "70a08231"
+ERC20_DECIMALS_SELECTOR = "313ce567"
+#: Distinguishes "the prime batch cached a null result" from "not cached".
+#: None is a legitimate eth_call result here, so it cannot serve as the miss.
+_CACHE_MISS = object()
+ERC20_TOTAL_SUPPLY_SELECTOR = "18160ddd"
 V4_IRRECOVERABLE_NFT_OWNERS = {
     "0x0000000000000000000000000000000000000001",
     "0x000000000000000000000000000000000000dead",
@@ -560,6 +588,27 @@ def _data_word(value: str, word: int = 0) -> int:
 def _signed_word(value: str, word: int, bits: int) -> int:
     raw = _data_word(value, word) & ((1 << bits) - 1)
     return raw - (1 << bits) if raw & (1 << (bits - 1)) else raw
+
+
+def _spread(values: list[float]) -> dict:
+    """A distribution, never a mean.
+
+    One stalled window and seven fast ones produce the same total as eight
+    even ones, and the two need opposite fixes -- bound the stall, or admit
+    fewer windows. p95 is reported beside the median for the same reason the
+    lane SLO is stated as a percentile: the tail is what breaks the budget.
+    """
+    if not values:
+        return {"count": 0, "total": 0.0, "median": None, "p95": None,
+                "slowest": None}
+    ordered = sorted(values)
+    return {
+        "count": len(ordered),
+        "total": round(sum(ordered), 3),
+        "median": round(ordered[len(ordered) // 2], 3),
+        "p95": round(ordered[max(0, int(len(ordered) * 0.95) - 1)], 3),
+        "slowest": round(ordered[-1], 3),
+    }
 
 
 def _timestamp(value) -> float | None:
@@ -1844,6 +1893,41 @@ class RobinhoodLearningStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_backfill_pending
                     ON flow_backfill_queue(completed_at, enqueued_at);
+                -- Windows the seal stage admitted but could not reach before
+                -- the cycle reserve. Without this they are only implicitly
+                -- retried: selection re-finds an unsealed window while it
+                -- still sits above the observation floor, and silently stops
+                -- finding it once the head moves on. That is a lossy retry
+                -- dressed as a durable one -- the same shape as the block
+                -- ranges above, where recording a skipped count was mistaken
+                -- for queueing the range.
+                --
+                -- Keyed by the window identity that flow_observations keys
+                -- on, so an entry cannot outlive the observation it names.
+                CREATE TABLE IF NOT EXISTS flow_seal_queue (
+                    pool_id TEXT NOT NULL,
+                    window_end_block INTEGER NOT NULL,
+                    token_address TEXT,
+                    window_start_block INTEGER,
+                    enqueued_at REAL NOT NULL,
+                    reason TEXT NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at REAL,
+                    completed_at REAL,
+                    PRIMARY KEY (pool_id, window_end_block)
+                );
+                CREATE INDEX IF NOT EXISTS idx_seal_queue_pending
+                    ON flow_seal_queue(completed_at, enqueued_at);
+                -- Small scalars the scheduler needs before it can do any
+                -- work, kept beside the data they describe rather than in a
+                -- file next to it: admission has to read the cost estimate on
+                -- every cycle, and a second durability story for one float is
+                -- one more thing that can disagree with the database.
+                CREATE TABLE IF NOT EXISTS flow_scheduler_state (
+                    key TEXT PRIMARY KEY,
+                    value_json TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS lane_state (
                     lane TEXT PRIMARY KEY,
                     run_id TEXT,
@@ -2726,6 +2810,7 @@ class RobinhoodLearningStore:
         transaction_hashes: list[str], features: dict, quote: dict,
         quote_block: int | None, now: float, role: str = "matched_control",
         gap_count: int | None = None,
+        timings: dict[str, float] | None = None,
     ) -> str | None:
         """Seal an observation and schedule its outcomes, atomically, at ingest.
 
@@ -2737,6 +2822,7 @@ class RobinhoodLearningStore:
         Returns None if this exact observation was already sealed, so a
         repeated pass is idempotent rather than duplicating the claim.
         """
+        hash_started = time.monotonic()
         digest = hashlib.sha256(
             "|".join(sorted(transaction_hashes)).encode("utf-8")
         ).hexdigest()
@@ -2758,6 +2844,14 @@ class RobinhoodLearningStore:
             entry_execution.get("verified")
             or (quote or {}).get("executable_quote_verified")
         )
+        # Canonical JSON of the features and quote payloads is part of forming
+        # the evidence, not of writing it, so it is charged to hashing.
+        features_json = _canonical(features)
+        quote_json = _canonical(quote or {})
+        round_trip = self._round_trip_return(quote)
+        if timings is not None:
+            timings["evidence_hash"] = time.monotonic() - hash_started
+        commit_started = time.monotonic()
         with self.connection() as connection:
             result = connection.execute(
                 """
@@ -2774,17 +2868,20 @@ class RobinhoodLearningStore:
                     observation_id, FLOW_EVIDENCE_POLICY_VERSION, pool_id,
                     token_address, int(observation_head), lag, _utc_now(),
                     float(now), int(window_start_block), int(window_end_block),
-                    digest, len(transaction_hashes), _canonical(features),
-                    _canonical(quote or {}),
+                    digest, len(transaction_hashes), features_json,
+                    quote_json,
                     int(quote_block) if quote_block else None,
                     int(verified), _utc_now(), FLOW_EVIDENCE_COHORT_ID,
                     str(role), gap_count,
                     # Pure friction, pinned at seal: what the position would
                     # return if bought and sold in the same block.
-                    self._round_trip_return(quote),
+                    round_trip,
                 ),
             )
             if not result.rowcount:
+                if timings is not None:
+                    timings["database_commit"] = (
+                        time.monotonic() - commit_started)
                 return None
             # Outcomes scheduled in the SAME transaction, so an observation
             # can never exist without the future it promised to measure.
@@ -2799,6 +2896,8 @@ class RobinhoodLearningStore:
                     for label, seconds in FLOW_EVIDENCE_HORIZONS
                 ],
             )
+        if timings is not None:
+            timings["database_commit"] = time.monotonic() - commit_started
         return observation_id
 
     def due_flow_observation_outcomes(self, now: float, limit: int = 50) -> list[dict]:
@@ -4078,6 +4177,115 @@ class RobinhoodLearningStore:
                 (int(from_block), int(to_block), time.time(), str(reason)),
             )
         return bool(cursor.rowcount)
+
+    def scheduler_state(self, key: str) -> dict:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT value_json FROM flow_scheduler_state WHERE key=?",
+                (str(key),)).fetchone()
+        if not row:
+            return {}
+        try:
+            value = json.loads(row["value_json"])
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return {}
+        return value if isinstance(value, dict) else {}
+
+    def set_scheduler_state(self, key: str, value: dict) -> None:
+        with self.connection() as connection:
+            connection.execute(
+                """INSERT INTO flow_scheduler_state(key,value_json,updated_at)
+                   VALUES (?,?,?)
+                   ON CONFLICT(key) DO UPDATE
+                     SET value_json=excluded.value_json,
+                         updated_at=excluded.updated_at""",
+                (str(key), _canonical(value), _utc_now()),
+            )
+
+    def enqueue_seal(self, windows: list[dict], reason: str) -> int:
+        """Defer windows durably rather than hoping selection re-finds them."""
+        rows = []
+        for window in windows:
+            pool_id = window.get("pool_id")
+            end_block = window.get("window_end_block")
+            if not pool_id or end_block is None:
+                continue
+            rows.append((
+                str(pool_id), int(end_block), window.get("token_address"),
+                safe_int(window.get("window_start_block"), 0),
+                time.time(), str(reason),
+            ))
+        if not rows:
+            return 0
+        with self.connection() as connection:
+            # A window already queued keeps its ORIGINAL enqueued_at, so
+            # repeated deferral ages the entry instead of refreshing it. An
+            # entry that keeps losing the admission race has to become the
+            # oldest one eventually, or the queue starves its own tail.
+            connection.executemany(
+                """INSERT OR IGNORE INTO flow_seal_queue
+                       (pool_id,window_end_block,token_address,
+                        window_start_block,enqueued_at,reason)
+                   VALUES (?,?,?,?,?,?)""", rows)
+        return len(rows)
+
+    def pending_seal_windows(self, limit: int = 25) -> list[dict]:
+        """Queued windows, oldest first, that are still genuinely unsealed.
+
+        The join against flow_observations is what keeps the queue honest: a
+        window sealed by any other path (a wider batch pass, a later cycle
+        that reached it) leaves an entry behind, and returning it would spend
+        the live lane's scarcest seconds re-quoting settled evidence.
+        """
+        with self.connection() as connection:
+            return [dict(row) for row in connection.execute(
+                """SELECT q.* FROM flow_seal_queue q
+                   WHERE q.completed_at IS NULL AND NOT EXISTS (
+                     SELECT 1 FROM flow_observations o
+                     WHERE o.pool_id=q.pool_id
+                       AND o.window_end_block=q.window_end_block
+                       AND o.policy_version=?
+                   ) ORDER BY q.enqueued_at LIMIT ?""",
+                (FLOW_EVIDENCE_POLICY_VERSION, int(limit)))]
+
+    def complete_seal_queue(self, windows: list[dict]) -> int:
+        """Close entries for windows this cycle actually sealed."""
+        rows = [
+            (time.time(), str(window.get("pool_id")),
+             int(window.get("window_end_block")))
+            for window in windows
+            if window.get("pool_id") and window.get("window_end_block") is not None
+        ]
+        if not rows:
+            return 0
+        with self.connection() as connection:
+            connection.executemany(
+                """UPDATE flow_seal_queue SET completed_at=?
+                   WHERE pool_id=? AND window_end_block=?
+                     AND completed_at IS NULL""", rows)
+        return len(rows)
+
+    def seal_queue_backlog(self) -> dict:
+        """Depth AND age. A queue that only grows is a leak, not a buffer."""
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT COUNT(*) windows, MIN(q.enqueued_at) oldest,
+                          MAX(q.attempts) attempts
+                   FROM flow_seal_queue q
+                   WHERE q.completed_at IS NULL AND NOT EXISTS (
+                     SELECT 1 FROM flow_observations o
+                     WHERE o.pool_id=q.pool_id
+                       AND o.window_end_block=q.window_end_block
+                       AND o.policy_version=?
+                   )""", (FLOW_EVIDENCE_POLICY_VERSION,)
+            ).fetchone()
+        oldest = row["oldest"]
+        return {
+            "pending_windows": int(row["windows"] or 0),
+            "max_attempts": int(row["attempts"] or 0),
+            "oldest_age_seconds": (
+                round(time.time() - oldest, 1) if oldest else None),
+        }
 
     def pending_backfill(self, limit: int = 10) -> list[dict]:
         """Oldest first: the deepest hole is the one most likely to be lost."""
@@ -7939,6 +8147,111 @@ class RobinhoodV4MarketClient:
         self.rpc = rpc
         self.anchors = anchors
         self.store = store
+        #: Reads a batched prime resolved ahead of the per-window seal loop.
+        #: Keyed by (to, calldata, block tag) and cleared on every prime, so a
+        #: `latest` read can never survive the cycle that fetched it.
+        self._quote_cache: dict[tuple[str, str, str], str | None] = {}
+
+    @staticmethod
+    def _quote_cache_key(to_address, data, block) -> tuple[str, str, str]:
+        return (
+            str(to_address).lower(), str(data).lower(),
+            hex(block) if isinstance(block, int) else str(block),
+        )
+
+    def _cached_call(self, to_address: str, data: str, block=None) -> str:
+        """An eth_call the prime batch may already have answered.
+
+        A miss is not an error -- it falls through to the live call -- so
+        priming stays a latency optimisation and never a correctness
+        dependency. That matters because the batch is best-effort: a provider
+        that rejects batching, or one call that errors inside an accepted
+        batch, must degrade to the sequential path rather than to no quote.
+        """
+        cached = self._quote_cache.get(
+            self._quote_cache_key(to_address, data, block), _CACHE_MISS)
+        if cached is not _CACHE_MISS:
+            return cached
+        return self.rpc.call(to_address, data, block=block)
+
+    def prime_window_quotes(
+        self, windows: list[dict], *, deadline: "CycleDeadline | None" = None,
+    ) -> dict:
+        """Resolve every window's independent reads in one batched round trip.
+
+        snapshot() issues roughly six eth_calls per window and five of them
+        depend on nothing but the pool and the pinned block: getLiquidity,
+        getSlot0, decimals(token), decimals(anchor), totalSupply(token), plus
+        the singleton balanceOf at latest. Run per window they are sequential
+        HTTP round trips -- about 48 of them for the 8-window live limit,
+        which is where the seal stage's 16.4s median (19.9s p95, against a
+        25s cycle budget) came from.
+
+        Batching is the parallel form that fits this client: one HTTP request
+        carrying every independent call, rather than threads over a session
+        whose request-id counter and provenance ledger are not synchronised.
+        The quoter's two calls per window stay sequential because the second
+        consumes the first's output; the sub-stage timers now report whether
+        that residue is worth restructuring.
+        """
+        self._quote_cache = {}
+        if not windows:
+            return {"batched": 0, "resolved": 0, "failed": 0, "windows": 0}
+        if deadline is not None and deadline.expired():
+            return {"batched": 0, "resolved": 0, "failed": 0,
+                    "windows": len(windows), "skipped": "deadline"}
+        singleton = "0x" + ERC20_BALANCE_OF_SELECTOR + "0" * 24 +             UNISWAP_V4_POOL_MANAGER.removeprefix("0x")
+        decimals_data = "0x" + ERC20_DECIMALS_SELECTOR + "0" * 56
+        supply_data = "0x" + ERC20_TOTAL_SUPPLY_SELECTOR + "0" * 56
+        # Deduplicated: windows share anchors (nearly always WETH or USDG) and
+        # a token can hold several pools, so the same call would otherwise be
+        # issued once per window.
+        planned: dict[tuple[str, str, str], tuple[str, str, object]] = {}
+
+        def plan(to_address, data, block):
+            if not to_address:
+                return
+            planned.setdefault(
+                self._quote_cache_key(to_address, data, block),
+                (to_address, data, block))
+
+        for window in windows:
+            pool_id = str(window.get("pool_id") or "")
+            if len(pool_id.removeprefix("0x")) != 64:
+                continue
+            token = window.get("token_address")
+            block = window.get("window_end_block")
+            block = int(block) if block is not None else None
+            argument = pool_id.removeprefix("0x")
+            pool = self.store.v4_pool(pool_id) or {}
+            plan(UNISWAP_V4_STATE_VIEW,
+                 "0x" + V4_GET_LIQUIDITY_SELECTOR + argument, block)
+            plan(UNISWAP_V4_STATE_VIEW,
+                 "0x" + V4_GET_SLOT0_SELECTOR + argument, block)
+            plan(token, decimals_data, block)
+            plan(pool.get("anchor_address"), decimals_data, block)
+            plan(token, supply_data, block)
+            plan(token, singleton, None)
+
+        ordered = list(planned.items())
+        try:
+            responses = self.rpc.calls_at_blocks(
+                [call for _, call in ordered])
+        except Exception as error:
+            # Batching refused or the transport failed. Every read falls back
+            # to its sequential path, so the cycle is slower but not wrong.
+            return {"batched": len(ordered), "resolved": 0,
+                    "failed": len(ordered), "windows": len(windows),
+                    "error": str(error)[:200]}
+        resolved = failed = 0
+        for (key, _), response in zip(ordered, responses):
+            if response.get("error") is not None:
+                failed += 1
+                continue
+            self._quote_cache[key] = response.get("result")
+            resolved += 1
+        return {"batched": len(ordered), "resolved": resolved,
+                "failed": failed, "windows": len(windows)}
 
     def singleton_balance_fraction(self, token: str, total_supply: int) -> float | None:
         """Diagnostic token balance at the V4 singleton, never pool reserves.
@@ -7952,7 +8265,7 @@ class RobinhoodV4MarketClient:
         if total_supply <= 0:
             return None
         try:
-            raw = self.rpc.call(
+            raw = self._cached_call(
                 token,
                 "0x" + ERC20_BALANCE_OF_SELECTOR + "0" * 24
                 + UNISWAP_V4_POOL_MANAGER.removeprefix("0x"),
@@ -7961,6 +8274,32 @@ class RobinhoodV4MarketClient:
             return None
         held = int(raw or "0x0", 16)
         return held / total_supply
+
+    def _cached_decimals(self, token: str, block=None) -> int:
+        """Cache hit decodes; a miss delegates to the RPC client's accessor.
+
+        The miss path must call erc20_decimals rather than rebuild its
+        calldata. Reconstructing it here silently bypasses any override on the
+        client -- which is not hypothetical: it broke every test whose fake
+        RPC answers at the accessor, and any deployment wrapping the accessor
+        would have been bypassed just as quietly in production.
+        """
+        raw = self._quote_cache.get(
+            self._quote_cache_key(
+                token, "0x" + ERC20_DECIMALS_SELECTOR + "0" * 56, block),
+            _CACHE_MISS)
+        if raw is _CACHE_MISS:
+            return self.rpc.erc20_decimals(token, block=block)
+        return int(raw, 16) if raw else 18
+
+    def _cached_total_supply(self, token: str, block=None) -> int:
+        raw = self._quote_cache.get(
+            self._quote_cache_key(
+                token, "0x" + ERC20_TOTAL_SUPPLY_SELECTOR + "0" * 56, block),
+            _CACHE_MISS)
+        if raw is _CACHE_MISS:
+            return self.rpc.erc20_total_supply(token, block=block)
+        return int(raw, 16) if raw else 0
 
     @staticmethod
     def _decode_slot0(raw: str) -> tuple[int, int]:
@@ -8090,12 +8429,12 @@ class RobinhoodV4MarketClient:
         if len(pool_id.removeprefix("0x")) != 64:
             return {}
         argument = pool_id.removeprefix("0x")
-        liquidity_raw = self.rpc.call(
+        liquidity_raw = self._cached_call(
             UNISWAP_V4_STATE_VIEW,
             "0x" + V4_GET_LIQUIDITY_SELECTOR + argument,
             block=quote_block,
         )
-        slot0_raw = self.rpc.call(
+        slot0_raw = self._cached_call(
             UNISWAP_V4_STATE_VIEW,
             "0x" + V4_GET_SLOT0_SELECTOR + argument,
             block=quote_block,
@@ -8109,9 +8448,9 @@ class RobinhoodV4MarketClient:
             return {}
         token = candidate["token_address"]
         anchor = pool["anchor_address"]
-        token_decimals = self.rpc.erc20_decimals(token, block=quote_block)
-        anchor_decimals = self.rpc.erc20_decimals(anchor, block=quote_block)
-        total_supply = self.rpc.erc20_total_supply(token, block=quote_block)
+        token_decimals = self._cached_decimals(token, quote_block)
+        anchor_decimals = self._cached_decimals(anchor, quote_block)
+        total_supply = self._cached_total_supply(token, quote_block)
         if str(anchor).lower() == USDG_ADDRESS.lower():
             anchor_usd, anchor_source = 1.0, "usdg_par_assumption"
         else:
@@ -8785,11 +9124,58 @@ class RobinhoodLearningEngine:
             "scope": "near_head_flow_window_v1",
         }
 
+    def seal_cost_estimate(self) -> float:
+        """Measured seconds per sealed window, or the cold-start default.
+
+        Admission needs a cost, and the only defensible one is the cost this
+        deployment last observed. A constant would have to be re-chosen every
+        time the provider, the window size or the quote path changed -- and
+        the fixed limit it replaces was chosen once and never revisited while
+        the stage grew to 16.4s median.
+        """
+        stored = self.store.scheduler_state("seal_window_cost")
+        value = safe_float(stored.get("per_window_seconds"), 0.0)
+        if value <= 0:
+            return SEAL_WINDOW_COST_SECONDS_DEFAULT
+        return value
+
+    def record_seal_cost(
+        self, phase: dict[str, list[float]], sealed: int,
+    ) -> float | None:
+        """Fold this pass into the estimate. Returns the measured cost.
+
+        Charged against the per-window phases only. The prefetch batch and the
+        selection query are paid once per cycle whatever the admission count,
+        so folding them in would make every window look more expensive as the
+        cycle admitted fewer of them -- an estimate that gets worse exactly
+        when headroom is tightest.
+        """
+        if sealed <= 0:
+            return None
+        per_window = sum(
+            sum(values) for name, values in phase.items()
+            if name not in {"selection", "prefetch"}
+        ) / sealed
+        if per_window <= 0:
+            return None
+        previous = self.seal_cost_estimate()
+        blended = (
+            SEAL_COST_SMOOTHING * per_window
+            + (1 - SEAL_COST_SMOOTHING) * previous
+        )
+        self.store.set_scheduler_state("seal_window_cost", {
+            "per_window_seconds": round(blended, 4),
+            "last_measured_seconds": round(per_window, 4),
+            "last_sealed": int(sealed),
+        })
+        return per_window
+
     def seal_near_head_observations(
         self, head_block: int, now: float, *,
         pool_ids: list[str] | None = None,
         deadline: CycleDeadline | None = None,
         limit: int | None = None,
+        reserve_seconds: float = 0.0,
     ) -> dict:
         """Seal every near-head window, pinned to the OBSERVATION head.
 
@@ -8814,7 +9200,41 @@ class RobinhoodLearningEngine:
         # remains the 120-block question, asked by classify_flow_observation.
         floor = int(head_block) - FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS
         sealed: list[str] = []
+        sealed_windows: list[dict] = []
         failures = 0
+        # Sub-stage timing, kept as distributions. A stage total cannot
+        # distinguish eight steady windows from seven fast ones and a stall,
+        # and those need opposite responses: the first wants fewer windows
+        # admitted, the second wants the stalling call bounded.
+        phase: dict[str, list[float]] = {}
+
+        def record(name: str, started: float) -> None:
+            phase.setdefault(name, []).append(time.monotonic() - started)
+
+        selection_started = time.monotonic()
+        # Queued first: these are windows an earlier cycle admitted and could
+        # not reach. They are older than anything fresh by construction, and
+        # they are the ones that age below `floor` and vanish if not drained.
+        queued = self.store.pending_seal_windows(SEAL_QUEUE_DRAIN_LIMIT)
+        queued_rows: list[dict] = []
+        if queued:
+            wanted = {
+                (str(entry["pool_id"]), int(entry["window_end_block"])): rank
+                for rank, entry in enumerate(queued)
+            }
+            with self.store.connection() as connection:
+                candidates = [dict(row) for row in connection.execute(
+                    "SELECT * FROM flow_signals WHERE pool_id IN ("
+                    + ",".join("?" * len(queued)) + ")",
+                    [entry["pool_id"] for entry in queued],
+                )]
+            queued_rows = sorted(
+                (row for row in candidates
+                 if (str(row["pool_id"]), int(row["window_end_block"]))
+                 in wanted),
+                key=lambda row: wanted[
+                    (str(row["pool_id"]), int(row["window_end_block"]))],
+            )
         with self.store.connection() as connection:
             if pool_ids is None:
                 windows = [dict(row) for row in connection.execute(
@@ -8846,12 +9266,61 @@ class RobinhoodLearningEngine:
                        ) ORDER BY fs.window_end_block DESC LIMIT 100""",
                     (floor, FLOW_EVIDENCE_POLICY_VERSION),
                 )]
+        seen: set[tuple[str, int]] = set()
+        ordered: list[dict] = []
+        for window in [*queued_rows, *windows]:
+            key = (str(window["pool_id"]), int(window["window_end_block"]))
+            if key in seen:
+                continue
+            seen.add(key)
+            ordered.append(window)
+        windows = ordered
+        record("selection", selection_started)
         windows_available = len(windows)
-        if limit is not None:
-            windows = windows[:max(0, int(limit))]
-        for window in windows:
-            if deadline is not None and deadline.expired():
+
+        # Admission by remaining headroom, not by a fixed count. A static
+        # limit of 8 spends the same time whether the cycle has 20 seconds
+        # left or 6, which is how sealing came to overrun 46 of 64 failed
+        # cycles. The estimate is measured, so it tracks a slow provider
+        # instead of assuming the cost that held when the limit was chosen.
+        static_limit = len(windows) if limit is None else max(0, int(limit))
+        cost = self.seal_cost_estimate()
+        admitted = static_limit
+        headroom = None
+        if deadline is not None:
+            headroom = max(0.0, deadline.remaining() - float(reserve_seconds))
+            admitted = (
+                0 if headroom <= 0
+                else max(1, min(static_limit, int(headroom // max(cost, 0.05))))
+            )
+        admitted = min(admitted, static_limit)
+        deferred = windows[admitted:]
+        windows = windows[:admitted]
+
+        prefetch_started = time.monotonic()
+        # Optional by construction: a market client that cannot batch still
+        # seals correctly, one round trip at a time. Reported rather than
+        # assumed, because a silent fall-back to the sequential path is
+        # exactly the 16.4s regression this stage was built to remove, and it
+        # would otherwise look identical to a slow provider.
+        primer = getattr(getattr(self, "v4_market", None),
+                         "prime_window_quotes", None)
+        if primer is None:
+            prime = {"supported": False, "reason": "client_cannot_batch"}
+        elif not windows:
+            prime = {"supported": True, "batched": 0, "windows": 0}
+        else:
+            prime = dict(primer(windows, deadline=deadline))
+            prime["supported"] = True
+        record("prefetch", prefetch_started)
+
+        for index, window in enumerate(windows):
+            # The reserve, not expiry: stopping when the deadline has already
+            # passed leaves nothing for the stages that cannot yield.
+            if deadline is not None and deadline.remaining() <= reserve_seconds:
+                deferred.extend(windows[index:])
                 break
+            hashes_started = time.monotonic()
             with self.store.connection() as connection:
                 hashes = [
                     row[0] for row in connection.execute(
@@ -8863,6 +9332,8 @@ class RobinhoodLearningEngine:
                          window["window_end_block"]),
                     )
                 ]
+            record("transaction_hashes", hashes_started)
+            quote_started = time.monotonic()
             try:
                 market = self.v4_market.snapshot(
                     {"pool_id": window["pool_id"],
@@ -8872,6 +9343,7 @@ class RobinhoodLearningEngine:
             except Exception:
                 market = {"verified": False, "reason": "observation_quote_failed"}
                 failures += 1
+            record("quote_rpc", quote_started)
             try:
                 features = json.loads(window.get("features_json") or "{}")
             except (TypeError, ValueError):
@@ -8908,8 +9380,9 @@ class RobinhoodLearningEngine:
                 features["qualification_gaps"] = gaps
                 features["round_trip_return"] = round_trip
             role = "signal" if gap_count == 0 else "matched_control"
+            seal_timings: dict[str, float] = {}
             observation_id = self.store.seal_flow_observation(
-                role=role, gap_count=gap_count,
+                role=role, gap_count=gap_count, timings=seal_timings,
                 pool_id=window["pool_id"], token_address=window["token_address"],
                 observation_head=int(head_block),
                 window_start_block=int(window["window_start_block"]),
@@ -8918,8 +9391,17 @@ class RobinhoodLearningEngine:
                 quote=market, quote_block=int(window["window_end_block"]),
                 now=now,
             )
+            for name, value in seal_timings.items():
+                phase.setdefault(name, []).append(value)
+            sealed_windows.append(window)
             if observation_id:
                 sealed.append(observation_id)
+        # Close what this cycle sealed, queue what it did not. Both halves are
+        # required: without the first the queue never empties, and without the
+        # second a window that fell below `floor` is simply never seen again.
+        self.store.complete_seal_queue(sealed_windows)
+        queued_now = self.store.enqueue_seal(deferred, "live_lane_headroom")
+        per_window = self.record_seal_cost(phase, len(sealed_windows))
         with self.store.connection() as connection:
             cumulative = connection.execute(
                 "SELECT COUNT(*) FROM flow_observations WHERE policy_version=?",
@@ -8928,7 +9410,27 @@ class RobinhoodLearningEngine:
         return {
             "windows_considered": len(windows),
             "windows_available": windows_available,
-            "windows_deferred": max(0, windows_available - len(sealed)),
+            "windows_admitted": admitted,
+            # Windows this cycle did not seal, each of which is now queued.
+            # The old figure subtracted sealed from available, which counted
+            # an already-sealed duplicate as a deferral.
+            "windows_deferred": len(deferred),
+            "windows_queued": queued_now,
+            "seal_queue_backlog": self.store.seal_queue_backlog(),
+            "admission": {
+                "static_limit": static_limit,
+                "headroom_seconds": (
+                    None if headroom is None else round(headroom, 3)),
+                "reserve_seconds": round(float(reserve_seconds), 3),
+                "cost_estimate_seconds": round(cost, 3),
+                "measured_cost_seconds": (
+                    None if per_window is None else round(per_window, 3)),
+                "queue_drained": len(queued_rows),
+            },
+            "prefetch": prime,
+            "phase_seconds": {
+                name: _spread(values) for name, values in phase.items()
+            },
             "sealed_this_cycle": len(sealed),
             "observation_ids": sealed,
             "cumulative_observations": cumulative,
@@ -9819,6 +10321,7 @@ class RobinhoodLearningEngine:
                     int(near_head.get("to_block") or 0), observed_at,
                     pool_ids=touched, deadline=deadline,
                     limit=LIVE_LANE_OBSERVATION_LIMIT,
+                    reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS,
                 )
                 self.store.mark_lane_stage(
                     "live", "decision_head", run_id=self.cycle_run_uuid,
@@ -9832,10 +10335,14 @@ class RobinhoodLearningEngine:
                     observation_ids=list(observation.get("observation_ids") or []),
                     deadline=deadline,
                 )
-            quote_delay = round(time.monotonic() - stage, 3)
-            timings["seal_and_fresh_quote"] = quote_delay
+            timings["seal_and_fresh_quote"] = round(
+                time.monotonic() - stage, 3)
+            timings["seal_stage_headroom_seconds"] = round(
+                deadline.remaining(), 3)
+            quote_delay = timings["seal_and_fresh_quote"]
             observation["decision_head_lag_blocks"] = max(
                 0, decision_head - int(near_head.get("to_block") or 0))
+            ledger_started = time.monotonic()
             self.ledger.append("robinhood_live_lane", {
                 "run_id": self.cycle_run_uuid if hasattr(self, "cycle_run_uuid") else None,
                 "near_head_flow": {
@@ -9846,6 +10353,8 @@ class RobinhoodLearningEngine:
                 "classification": classification,
                 "paper_only": True,
             })
+            timings["ledger_append"] = round(
+                time.monotonic() - ledger_started, 3)
             return {
                 "position_evaluations": positions,
                 "near_head_flow": near_head,
@@ -11018,7 +11527,7 @@ def _dashboard_integrity(
     return result
 
 
-def dashboard_snapshot(
+def dashboard_operational_snapshot(
     root: str | Path,
     *,
     store: RobinhoodLearningStore | None = None,
@@ -11026,7 +11535,15 @@ def dashboard_snapshot(
     market_refresh_errors: dict[str, str] | None = None,
     chain_root: str | Path | None = None,
     skill_root: str | Path | None = None,
+    integrity: dict | None = None,
 ) -> dict:
+    """Build the bounded state needed to operate the learner safely.
+
+    Nothing here may depend on the historical flow range joins.  This payload
+    is what lets a viewer see lane ownership, reliability, positions and
+    integrity within seconds even when the research corpus takes minutes to
+    aggregate.
+    """
     root=Path(root)
     store=store or RobinhoodLearningStore(root/"learning.sqlite3")
     summary=read_json(root/"learning_summary.json",{}) or {}
@@ -11048,8 +11565,9 @@ def dashboard_snapshot(
         if key != "headline_review"
     }
     lane_performance = store.lane_performance()
-    integrity = _dashboard_integrity(
-        root, chain_root=chain_root, skill_root=skill_root)
+    if integrity is None:
+        integrity = _dashboard_integrity(
+            root, chain_root=chain_root, skill_root=skill_root)
     stabilization = store.stabilization_summary(integrity=integrity)
     return {
         "timestamp":_utc_now(),"network":"robinhood","chain_id":ROBINHOOD_NETWORK.chain_id,
@@ -11065,27 +11583,25 @@ def dashboard_snapshot(
         "analyzed_tokens":store.recent_analyzed_tokens(
             limit=100, include_rejected=True,
         ),
-        "flow_shadow": store.flow_summary(),
-        "flow_signals": store.recent_flow_signals(limit=12),
-        "flow_evidence": store.flow_evidence_summary(),
-        # Friction is the largest component of every return recorded here.
-        "round_trip": store.round_trip_summary(),
-        # Duration and completion rate together; either alone misleads.
-        "lane_health": store.lane_health(),
-        # Distinct from discovery_coverage, which is the BACKFILL cursor.
-        "pool_discovery": store.pool_discovery_latency(),
-        "flow_evidence_events": store.recent_flow_evidence_events(limit=16),
-        "flow_origin_queue": store.pending_transaction_origin_counts(),
-        "v4_custody": store.v4_custody_summary(),
         "last_cycle":summary.get("cycle") or {},
         "lanes": {
             "state": store.lane_states(),
             "performance": lane_performance,
             "latest": lane_summaries,
             "backfill_backlog": store.backfill_backlog(),
+            # Deferred windows are only durable if something reads the queue.
+            # The block-range queue spent a session reporting a skipped COUNT
+            # that nothing could consume; publishing the depth beside the
+            # lanes is what makes a queue that never drains visible as a leak.
+            "seal_queue_backlog": store.seal_queue_backlog(),
             "acceptance": {
                 "live_deadline_seconds": LIVE_LANE_BUDGET_SECONDS,
+                "live_decision_reserve_seconds":
+                    LIVE_LANE_DECISION_RESERVE_SECONDS,
                 "live_target_p95_seconds": 30.0,
+                "seal_stage_target_p95_seconds": 12.0,
+                "live_cycle_target_p95_seconds": 20.0,
+                "minimum_deadline_headroom_seconds": 5.0,
                 "no_historical_scanning_on_live_path": True,
                 "position_marks_first_on_every_live_cycle": True,
                 "timechain_writer": "analysis_lane_only",
@@ -11108,6 +11624,52 @@ def dashboard_snapshot(
         },
         "flow_reflection": flow_reflection_state,
     }
+
+
+def dashboard_historical_snapshot(
+    root: str | Path, *, store: RobinhoodLearningStore | None = None,
+) -> dict:
+    """Build research aggregates that are allowed to finish asynchronously."""
+    root = Path(root)
+    store = store or RobinhoodLearningStore(root / "learning.sqlite3")
+    return {
+        "flow_shadow": store.flow_summary(),
+        "flow_signals": store.recent_flow_signals(limit=12),
+        "flow_evidence": store.flow_evidence_summary(),
+        # Friction is the largest component of every return recorded here.
+        "round_trip": store.round_trip_summary(),
+        # Duration and completion rate together; either alone misleads.
+        "lane_health": store.lane_health(),
+        # Distinct from discovery_coverage, which is the BACKFILL cursor.
+        "pool_discovery": store.pool_discovery_latency(),
+        "flow_evidence_events": store.recent_flow_evidence_events(limit=16),
+        "flow_origin_queue": store.pending_transaction_origin_counts(),
+        "v4_custody": store.v4_custody_summary(),
+    }
+
+
+def dashboard_snapshot(
+    root: str | Path,
+    *,
+    store: RobinhoodLearningStore | None = None,
+    live_position_markets: dict[str, dict] | None = None,
+    market_refresh_errors: dict[str, str] | None = None,
+    chain_root: str | Path | None = None,
+    skill_root: str | Path | None = None,
+) -> dict:
+    """Build the complete blocking snapshot used by CLI exports and tests."""
+    root = Path(root)
+    store = store or RobinhoodLearningStore(root / "learning.sqlite3")
+    snapshot = dashboard_operational_snapshot(
+        root,
+        store=store,
+        live_position_markets=live_position_markets,
+        market_refresh_errors=market_refresh_errors,
+        chain_root=chain_root,
+        skill_root=skill_root,
+    )
+    snapshot.update(dashboard_historical_snapshot(root, store=store))
+    return snapshot
 
 
 class RobinhoodDashboardMarketRefresher:
@@ -11214,6 +11776,77 @@ class RobinhoodDashboardMarketRefresher:
             return snapshot
 
 
+def _dashboard_cached_payload(cached: dict) -> dict:
+    """Compose one non-blocking response from independently refreshed caches."""
+    now = time.time()
+    operational = cached.get("operational")
+    historical = cached.get("historical")
+    payload = dict(operational or {})
+    if historical:
+        payload.update(historical)
+
+    def cache_state(
+        name: str, value: dict | None, built_at: str | None,
+        error: str | None, stale_after: float,
+    ) -> dict:
+        built_epoch = _timestamp(built_at)
+        age = max(0.0, now - built_epoch) if built_epoch is not None else None
+        if value is None:
+            status = "error" if error else "warming"
+        elif error:
+            status = "error"
+        elif age is not None and age > stale_after:
+            status = "stale"
+        else:
+            status = "ready"
+        state = {
+            "status": status,
+            "data_available": value is not None,
+            "built_at": built_at,
+            "age_seconds": round(age, 1) if age is not None else None,
+            "stale_after_seconds": stale_after,
+            "last_error": error,
+        }
+        started_at = cached.get(f"{name}_started_at")
+        if started_at:
+            state["build_started_at"] = started_at
+        build_seconds = cached.get(f"{name}_build_seconds")
+        if build_seconds is not None:
+            state["last_build_seconds"] = build_seconds
+        state["building"] = bool(cached.get(f"{name}_building"))
+        return state
+
+    operational_state = cache_state(
+        "operational", operational, cached.get("operational_built_at"),
+        cached.get("operational_error"), DASHBOARD_OPERATIONAL_STALE_SECONDS,
+    )
+    historical_state = cache_state(
+        "historical", historical, cached.get("historical_built_at"),
+        cached.get("historical_error"), DASHBOARD_HISTORICAL_STALE_SECONDS,
+    )
+    payload.update({
+        "warming": historical is None,
+        "response_at": _utc_now(),
+        "snapshot_built_at": cached.get("historical_built_at"),
+        "operational_state": operational_state,
+        "historical_state": historical_state,
+        "paper_only": True,
+        "live_execution_enabled": False,
+    })
+    if historical is None:
+        payload["detail"] = (
+            "Operational data is available. Historical analytics are still building."
+            if operational is not None else "Dashboard snapshots are still building."
+        )
+    elif historical_state["status"] == "stale":
+        payload["detail"] = "Historical analytics are stale; the last completed snapshot is shown."
+    elif historical_state["status"] == "error":
+        payload["detail"] = "The last historical snapshot is shown; its refresh failed."
+    else:
+        payload.pop("detail", None)
+    return payload
+
+
 def serve_dashboard(
     root: str | Path, host: str, port: int, *,
     chain_root: str | Path | None = None,
@@ -11224,20 +11857,43 @@ def serve_dashboard(
     html_path=Path(__file__).with_name("robinhood_dashboard.html")
     refresher=RobinhoodDashboardMarketRefresher(
         root, read_only=True, chain_root=chain_root, skill_root=skill_root)
+    initial_integrity = _dashboard_integrity(
+        root, chain_root=chain_root, skill_root=skill_root)
+    operational_started = time.monotonic()
+    initial_operational = dashboard_operational_snapshot(
+        root,
+        store=refresher.store,
+        chain_root=chain_root,
+        skill_root=skill_root,
+        integrity=initial_integrity,
+    )
+    operational_built_at = _utc_now()
+    cached: dict = {
+        "operational": initial_operational,
+        "operational_built_at": operational_built_at,
+        "operational_build_seconds": round(
+            time.monotonic() - operational_started, 1),
+        "operational_error": None,
+        "operational_building": False,
+        "operational_started_at": None,
+        "historical": None,
+        "historical_built_at": None,
+        "historical_build_seconds": None,
+        "historical_error": None,
+        "historical_building": False,
+        "historical_started_at": None,
+    }
+    cache_lock = threading.Lock()
+
     class Handler(BaseHTTPRequestHandler):
         def do_GET(self):
             if self.path in {"/","/index.html"}:
                 content=html_path.read_bytes(); content_type="text/html; charset=utf-8"
             elif self.path=="/api/status":
-                # Never block: say "warming" rather than hang for 70 seconds.
-                payload=cached["payload"] or {
-                    "warming": True, "timestamp": _utc_now(),
-                    "detail": "First snapshot is still building.",
-                    "error": cached.get("error"),
-                }
-                if cached["payload"] is not None:
-                    payload=dict(payload)
-                    payload["snapshot_built_at"]=cached["built_at"]
+                # Never block on SQLite aggregation. Operational and historical
+                # state have separate caches, freshness and failure semantics.
+                with cache_lock:
+                    payload = _dashboard_cached_payload(dict(cached))
                 content=json.dumps(payload).encode(); content_type="application/json"
             else:
                 self.send_error(404); return
@@ -11246,43 +11902,71 @@ def serve_dashboard(
             self.end_headers(); self.wfile.write(content)
         def log_message(self, *_args):
             return
-    # The snapshot costs ~70 seconds: flow_summary, v4_custody_summary and
+    # The historical snapshot costs minutes: flow_summary, v4_custody_summary and
     # pending_transaction_origin_counts each range-join 487k swap rows against
     # 2,176 signal windows on a BETWEEN, which no index serves. Computing that
     # on the request path made /api/status time out in the browser, so it is
     # computed off the request path instead and every request is served the
     # last completed build. Stale by up to a refresh interval, never hanging.
-    # The full historical snapshot can take minutes on a large corpus.  The
-    # operational verdict is a small indexed read, so publish it immediately
-    # instead of hiding the very status this dashboard exists to communicate
-    # behind an unrelated analytics warm-up.
-    initial_integrity = _dashboard_integrity(
-        root, chain_root=chain_root, skill_root=skill_root)
-    initial_payload = {
-        "warming": True, "timestamp": _utc_now(),
-        "detail": "Historical analytics are still building.",
-        "stabilization": refresher.store.stabilization_summary(
-            integrity=initial_integrity),
-        "paper_only": True, "live_execution_enabled": False,
-    }
-    cached: dict = {
-        "payload": initial_payload, "built_at": None, "building": False}
-
-    def rebuild() -> None:
+    def rebuild_operational() -> None:
         while True:
+            time.sleep(DASHBOARD_OPERATIONAL_REFRESH_SECONDS)
+            started_at = _utc_now()
+            with cache_lock:
+                cached["operational_building"] = True
+                cached["operational_started_at"] = started_at
             try:
                 started = time.monotonic()
-                payload = refresher.snapshot()
-                payload["snapshot_build_seconds"] = round(
-                    time.monotonic() - started, 1
+                integrity = _dashboard_integrity(
+                    root, chain_root=chain_root, skill_root=skill_root)
+                payload = dashboard_operational_snapshot(
+                    root,
+                    store=refresher.store,
+                    chain_root=chain_root,
+                    skill_root=skill_root,
+                    integrity=integrity,
                 )
-                cached["payload"] = payload
-                cached["built_at"] = _utc_now()
+                with cache_lock:
+                    cached["operational"] = payload
+                    cached["operational_built_at"] = _utc_now()
+                    cached["operational_build_seconds"] = round(
+                        time.monotonic() - started, 1)
+                    cached["operational_error"] = None
             except Exception as error:
-                cached["error"] = str(error)[:200]
+                with cache_lock:
+                    cached["operational_error"] = str(error)[:200]
+            finally:
+                with cache_lock:
+                    cached["operational_building"] = False
+                    cached["operational_started_at"] = None
+
+    def rebuild_historical() -> None:
+        while True:
+            started_at = _utc_now()
+            with cache_lock:
+                cached["historical_building"] = True
+                cached["historical_started_at"] = started_at
+            try:
+                started = time.monotonic()
+                payload = dashboard_historical_snapshot(
+                    root, store=refresher.store)
+                with cache_lock:
+                    cached["historical"] = payload
+                    cached["historical_built_at"] = _utc_now()
+                    cached["historical_build_seconds"] = round(
+                        time.monotonic() - started, 1)
+                    cached["historical_error"] = None
+            except Exception as error:
+                with cache_lock:
+                    cached["historical_error"] = str(error)[:200]
+            finally:
+                with cache_lock:
+                    cached["historical_building"] = False
+                    cached["historical_started_at"] = None
             time.sleep(DASHBOARD_SNAPSHOT_REFRESH_SECONDS)
 
-    threading.Thread(target=rebuild, daemon=True).start()
+    threading.Thread(target=rebuild_operational, daemon=True).start()
+    threading.Thread(target=rebuild_historical, daemon=True).start()
     server=ThreadingHTTPServer((host,port),Handler)
     print(f"Robinhood learning dashboard: http://{host}:{port}")
     print("READ-ONLY: no write endpoints exist. Press Ctrl+C to stop.")

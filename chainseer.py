@@ -1733,6 +1733,30 @@ class RobinhoodRPC:
             ]))
         return results
 
+    def calls_at_blocks(
+        self, calls: list[tuple[str, str, object]],
+    ) -> list[dict]:
+        """Batch read-only calls that each pin their OWN block tag.
+
+        `calls` fixes one tag for the whole batch, which is the wrong shape
+        for evidence that is pinned per record: near-head sealing quotes each
+        window at that window's own end block, so a shared tag would either
+        re-price every window at one block or force one HTTP round trip per
+        call. The near-head seal stage was measured at 16.4s median doing the
+        latter -- roughly 40 sequential eth_calls for 8 windows.
+
+        Per-call errors are returned beside successful results, so one dead
+        pool does not discard the batch.
+        """
+        results: list[dict] = []
+        for offset in range(0, len(calls), 25):
+            results.extend(self._batch_call([
+                ("eth_call", [{"to": address, "data": data},
+                              self._block_tag(block)])
+                for address, data, block in calls[offset:offset + 25]
+            ]))
+        return results
+
     def get_codes(self, addresses: list[str], block=None) -> list[dict]:
         """Batch bytecode reads while preserving per-address errors."""
         tag = self._block_tag(block)

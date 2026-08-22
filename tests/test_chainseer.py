@@ -405,6 +405,32 @@ class ImmuneLockdownReasonTests(unittest.TestCase):
 
 
 class ChainseerInfrastructureTests(unittest.TestCase):
+    def test_per_block_calls_batch_into_one_request(self):
+        """Evidence pinned per record cannot share one block tag.
+
+        Near-head sealing quotes each window at that window's own end block.
+        `calls` fixes one tag for the whole batch, so the only alternatives
+        were re-pricing every window at a single block or paying one HTTP
+        round trip per call -- the latter is what made the seal stage 16.4s
+        median against a 25s cycle budget.
+        """
+        rpc = chainseer.RobinhoodRPC("https://rpc.example.invalid")
+        rpc._session = EchoBatchSession()
+        results = rpc.calls_at_blocks([
+            ("0x" + "a" * 40, "0xdead", 100),
+            ("0x" + "b" * 40, "0xbeef", 205),
+            ("0x" + "c" * 40, "0xfeed", None),
+        ])
+        self.assertEqual(len(rpc._session.calls), 1)
+        payload = rpc._session.calls[0][1]
+        self.assertEqual(
+            [item["params"][1] for item in payload],
+            [hex(100), hex(205), "latest"],
+            "each call must keep the block it was pinned to",
+        )
+        self.assertEqual(len(results), 3)
+        self.assertTrue(all(item.get("error") is None for item in results))
+
     def test_holder_balances_use_one_json_rpc_batch(self):
         rpc = chainseer.RobinhoodRPC("https://rpc.example.invalid")
         rpc._session = EchoBatchSession()
