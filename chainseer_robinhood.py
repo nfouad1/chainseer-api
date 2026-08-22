@@ -98,6 +98,21 @@ DEFAULT_OUTCOME_LIMIT = 12
 DEFAULT_OUTCOME_RECOVERY_LIMIT = 4
 DEFAULT_MARKET_RECHECK_LIMIT = 4
 DEFAULT_CYCLE_BUDGET_SECONDS = 255.0
+# Position marking and flow ingestion are SEPARATE critical lanes. Sharing one
+# 25-second budget, each stage costing ~10-11s, left no headroom: over the last
+# 200 combined runs 197 hit the deadline and 2 completed -- a 1.0% completion
+# rate whose p95 of 22.2s was computed on two survivors and therefore looked
+# healthy. They also have different failure domains: marking depends on an
+# external price API, ingestion on chain RPC, so a price stall was consuming
+# the budget blockchain freshness needed and neither could be sized alone.
+# Marking needs more than the live lane could ever have spared: run alone it
+# still exceeded 20s at position_mark_commit. That is the finding the split
+# produced -- in the combined lane it was consuming most of the 25s and
+# leaving ingestion to fail. It is also not latency-critical in the way chain
+# freshness is: a mark that is 60s old is fine, a window 60s behind the head
+# is not. Sized generously and separately, which is the whole point.
+MARKS_LANE_BUDGET_SECONDS = 90.0
+MARKS_LANE_CADENCE_SECONDS = 45.0
 LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
@@ -9608,6 +9623,32 @@ class RobinhoodLearningEngine:
                 atomic_json_write(self.root / f"{lane}_lane_summary.json", failure)
                 raise
 
+    def run_marks_lane(
+        self, *, budget_seconds: float = MARKS_LANE_BUDGET_SECONDS,
+        now: float | None = None,
+    ) -> dict:
+        """Mark open positions, and nothing else.
+
+        Split out of the live lane so a slow market mark cannot delay
+        blockchain-event freshness. Its own budget, cursor-free by nature,
+        and its own completion rate -- which is what makes the two
+        independently sizeable instead of jointly failing.
+        """
+        observed_at = time.time() if now is None else float(now)
+
+        def work(deadline: CycleDeadline) -> dict:
+            stage = time.monotonic()
+            with self._rpc_deadline(deadline):
+                positions = self.evaluate_open_positions(
+                    observed_at, deadline=deadline)
+            return {
+                "position_evaluations": positions,
+                "stage_timings_seconds": {
+                    "position_marks": round(time.monotonic() - stage, 3)},
+            }
+
+        return self._execute_lane("marks", budget_seconds, work)
+
     def run_live_lane(
         self, *, budget_seconds: float = LIVE_LANE_BUDGET_SECONDS,
         now: float | None = None,
@@ -9622,13 +9663,10 @@ class RobinhoodLearningEngine:
 
         def work(deadline: CycleDeadline) -> dict:
             timings: dict[str, float] = {}
-            stage = time.monotonic()
-            with self._rpc_deadline(deadline):
-                positions = self.evaluate_open_positions(
-                    observed_at, deadline=deadline)
-            timings["position_marks"] = round(time.monotonic() - stage, 3)
-            deadline.raise_if_expired("position_marks")
-
+            # Position marking now runs in its own lane (run_marks_lane).
+            # Leaving it here would keep an external price API on the path
+            # that must stay near the chain head.
+            positions = {"delegated_to": "marks_lane"}
             stage = time.monotonic()
             with self._rpc_deadline(deadline):
                 near_head = self.near_head_flow_pass(
@@ -11115,7 +11153,7 @@ def main() -> None:
     parser.add_argument(
         "command",
         choices=(
-            "learn-once", "live-once", "analysis-once", "backfill-once",
+            "learn-once", "marks-once","live-once", "analysis-once", "backfill-once",
             "lanes", "status", "dashboard", "verify", "reflect",
             "audit", "repair-outcomes",
         ),
@@ -11209,6 +11247,11 @@ def main() -> None:
         print(json.dumps(reflection.run_if_due(),indent=2)); return
     if args.command=="audit":
         print(json.dumps(reflection.audit_all(),indent=2)); return
+    if args.command=="marks-once":
+        summary = engine.run_marks_lane(
+            budget_seconds=max(
+                5.0, args.lane_budget_seconds or MARKS_LANE_BUDGET_SECONDS))
+        print(json.dumps(summary, indent=2)); return
     if args.command=="live-once":
         summary = engine.run_live_lane(
             budget_seconds=max(

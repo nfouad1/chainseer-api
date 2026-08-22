@@ -980,6 +980,13 @@ class RobinhoodLearningTests(unittest.TestCase):
             self.assertEqual(rows[0]["source_version"], rh.SOURCE_V4)
             self.assertEqual(rows[0]["pool_id"], POOL_ID)
             self.assertEqual(coverage["activated_pools"], 1)
+            cursor.unlink()
+            deferred_rows, deferred_coverage = rh.RobinhoodV4Observer(
+                FakeRPC([initialize, modify, swap]), store, cursor,
+            ).sync(block_limit=5, lookback=5, activation_limit=0)
+            self.assertEqual(deferred_rows, [])
+            self.assertGreaterEqual(
+                deferred_coverage["activations_deferred"], 1)
 
     def test_v4_flow_signal_persists_deduplicated_shadow_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2265,10 +2272,11 @@ class RobinhoodLearningTests(unittest.TestCase):
         self.assertNotIn("<form", html.lower())
         self.assertNotIn("fetch('/api/", html.replace("fetch('/api/status", ""))
         for section in ("Open paper positions", "Closed positions",
-                        "Flow evidence", "Promotion", "Reflection"):
+                        "Flow evidence", "Promotion", "Reflection",
+                        "Operational stabilization"):
             self.assertIn(section, html)
         for renderer in ("renderPositions", "renderClosed", "renderEvidence",
-                         "renderReflection"):
+                         "renderReflection", "renderStabilization"):
             self.assertIn(renderer, html)
         self.assertIn("All-time net P&amp;L", html)
         self.assertIn("closed_performance", html)
@@ -6570,6 +6578,11 @@ class CycleLifecycleTests(unittest.TestCase):
             "refusing to run unowned", source,
             "an unassignable child must not be allowed to run orphaned",
         )
+        zero = source.index("WriteByte($info, $offset, 0)")
+        set_limit = source.index("WriteInt32($info, 16, 0x2000)")
+        install = source.index("[void][Win32.ChainseerJob]::SetInformationJobObject")
+        self.assertLess(zero, set_limit)
+        self.assertLess(set_limit, install)
 
     @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
     def test_a_running_status_claims_neither_completion_nor_exit_code(self):
@@ -6579,6 +6592,46 @@ class CycleLifecycleTests(unittest.TestCase):
         ).resolve().read_text(encoding="utf-8", errors="replace")
         self.assertIn('$terminal = $status -ne "running"', source)
         self.assertIn("if ($terminal)", source)
+
+    @unittest.skipUnless(sys.platform == "win32", "Job Objects are Windows-only")
+    def test_job_owned_runner_avoids_the_uv_launcher_process_hop(self):
+        source = Path(
+            "run_chainseer_robinhood_learning.ps1"
+        ).resolve().read_text(encoding="utf-8", errors="replace")
+        self.assertIn(".venv\\pyvenv.cfg", source)
+        self.assertIn("$pythonHome", source)
+        self.assertNotIn(
+            '& $venvPythonPath -c', source,
+            "scheduled startup must not invoke the uv launcher even for "
+            "interpreter discovery",
+        )
+        self.assertIn(".venv\\Lib\\site-packages", source)
+        supervisor = inspect.getsource(rh.supervise_lanes)
+        self.assertIn('getattr(sys, "_base_executable"', supervisor)
+        self.assertIn("worker_environment", supervisor)
+
+    @unittest.skipUnless(sys.platform == "win32", "Task Scheduler is Windows-only")
+    def test_scheduled_task_invokes_the_native_python_owner_directly(self):
+        source = Path(
+            "manage_chainseer_robinhood_learning_task.ps1"
+        ).resolve().read_text(encoding="utf-8", errors="replace")
+        self.assertIn(".venv\\pyvenv.cfg", source)
+        self.assertIn("run_chainseer_robinhood_learning.py", source)
+        self.assertIn("-Priority 4", source)
+        self.assertNotIn("powershell.exe", source.lower())
+        launcher = Path(
+            "run_chainseer_robinhood_learning.py"
+        ).resolve().read_text(encoding="utf-8", errors="replace")
+        self.assertIn("JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE", launcher)
+        self.assertIn("AssignProcessToJobObject", launcher)
+        self.assertIn("_ExtendedLimitInformation()", launcher)
+        supervisor = inspect.getsource(rh.supervise_lanes)
+        self.assertIn("lane_job = _WindowsLaneJob()", supervisor)
+        self.assertLess(
+            supervisor.index("lane_job.assign(process)"),
+            supervisor.index('active[lane] = {'),
+            "a lane must be owned before it is published as active",
+        )
 
 
 
@@ -6668,3 +6721,310 @@ class BackfillQueueTests(unittest.TestCase):
                 backlog["pending_ranges"],
                 "the pass must report the backlog it just created",
             )
+
+
+class LaneSplitTests(unittest.TestCase):
+    """Acceptance tests for the live/analysis/backfill process split."""
+
+    def test_each_lane_has_independent_authoritative_state(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.begin_run("live-run", 25.0, lane="live")
+            store.begin_run("backfill-run", 120.0, lane="backfill")
+            self.assertEqual(store.active_run(lane="live")["run_id"], "live-run")
+            self.assertEqual(
+                store.active_run(lane="backfill")["run_id"], "backfill-run")
+            states = store.lane_states()
+            self.assertEqual(set(states), {"backfill", "live"})
+            self.assertEqual(states["live"]["deadline_seconds"], 25.0)
+
+    def test_terminating_one_lane_cannot_close_another(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.begin_run("live-run", 25.0, lane="live")
+            live_pid = store.lane_states()["live"]["pid"]
+            store.begin_run("analysis-run", 120.0, lane="analysis")
+            store.terminate_lane("live", live_pid, "deadline")
+            self.assertIsNone(store.active_run(lane="live"))
+            self.assertIsNotNone(store.active_run(lane="analysis"))
+            self.assertEqual(
+                store.lane_states()["live"]["status"], "deadline_exceeded")
+
+    def test_supervisor_reconciles_only_dead_running_lane_owners(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.begin_run("dead-live", 25.0, lane="live")
+            store.begin_run("alive-analysis", 120.0, lane="analysis")
+            with store.connection() as connection:
+                connection.execute(
+                    "UPDATE lane_state SET pid=101 WHERE lane='live'")
+                connection.execute(
+                    "UPDATE lane_state SET pid=202 WHERE lane='analysis'")
+                connection.execute(
+                    "UPDATE runs SET pid=101 WHERE run_id='dead-live'")
+                connection.execute(
+                    "UPDATE runs SET pid=202 WHERE run_id='alive-analysis'")
+            recovered = rh._reconcile_dead_lane_state(
+                store, process_is_running=lambda pid: pid == 202,
+            )
+            states = store.lane_states()
+            self.assertEqual(recovered, ["live"])
+            self.assertEqual(states["live"]["status"], "abandoned_recovered")
+            self.assertEqual(
+                states["live"]["last_error"], "dead_owner_run_recovered")
+            self.assertEqual(states["analysis"]["status"], "running")
+
+    def test_recovery_closes_superseded_historical_running_rows(self):
+        """A one-row lane pointer must not hide an older orphan forever."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.begin_run("old-live", 25.0, lane="live")
+            store.begin_run("new-live", 25.0, lane="live")
+            recovered = store.recover_abandoned_runs(
+                process_is_running=lambda _pid: True)
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(recovered[0]["run_id"], "old-live")
+            self.assertEqual(
+                recovered[0]["reason"], "superseded_run_recovered")
+            with store.connection() as connection:
+                rows = connection.execute(
+                    "SELECT run_id,status FROM runs ORDER BY id").fetchall()
+            self.assertEqual(
+                [(row["run_id"], row["status"]) for row in rows],
+                [("old-live", "abandoned_recovered"),
+                 ("new-live", "running")],
+            )
+
+    def test_recovery_closes_pre_authoritative_running_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            with store.connection() as connection:
+                connection.execute(
+                    "INSERT INTO runs(started_at,status) VALUES (?,'running')",
+                    ("2026-01-01T00:00:00+00:00",),
+                )
+            recovered = store.recover_abandoned_runs(
+                process_is_running=lambda _pid: True)
+            self.assertEqual(len(recovered), 1)
+            self.assertEqual(
+                recovered[0]["reason"], "pre_authoritative_run_recovered")
+            self.assertEqual(store.running_run_audit()["running_rows"], 0)
+
+    def test_stabilization_requires_all_operational_gates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            live_summary = json.dumps({
+                "duration_seconds": 10.0,
+                "observation_seal": {"decision_head_lag_blocks": 100},
+                "position_evaluations": {
+                    "checked": 2, "marked": 2, "failures": 0,
+                    "unverified": 0,
+                },
+            })
+            with store.connection() as connection:
+                for index in range(100):
+                    connection.execute(
+                        """INSERT INTO runs
+                           (started_at,completed_at,status,summary_json,run_id,
+                            pid,host,heartbeat_at,deadline_seconds,lane)
+                           VALUES (?,?, 'complete', ?, ?, 1, 'test', ?, 25, 'live')""",
+                        ("2026-01-01T00:00:00+00:00",
+                         "2026-01-01T00:00:10+00:00", live_summary,
+                         f"live-{index}", float(index)),
+                    )
+                for lane, key, values in (
+                    ("analysis", "pending_analysis", (30, 20, 10)),
+                    ("backfill", "pending_blocks", (300, 200, 100)),
+                ):
+                    for index, value in enumerate(values):
+                        connection.execute(
+                            """INSERT INTO runs
+                               (started_at,completed_at,status,summary_json,run_id,
+                                pid,host,heartbeat_at,deadline_seconds,lane)
+                               VALUES (?,?, 'complete', ?, ?, 1, 'test', ?, 120, ?)""",
+                            ("2026-01-01T00:00:00+00:00",
+                             "2026-01-01T00:00:10+00:00",
+                             json.dumps({"duration_seconds": 1.0,
+                                         "backlog": {key: value}}),
+                             f"{lane}-{index}", float(index), lane),
+                        )
+            result = store.stabilization_summary(integrity={"ok": True})
+            self.assertEqual(result["status"], "STABILIZED")
+            self.assertTrue(result["stabilized"])
+            self.assertTrue(all(
+                criterion["pass"]
+                for criterion in result["criteria"].values()))
+
+    def test_live_p95_includes_timestamped_terminated_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            for index, duration in enumerate((3.0, 7.0, 11.0, 19.0)):
+                run_id = f"live-{index}"
+                store.begin_run(run_id, 25.0, lane="live")
+                store.finish_run(
+                    run_id, "complete", summary={"duration_seconds": duration})
+            with store.connection() as connection:
+                connection.execute(
+                    """INSERT INTO runs
+                       (started_at,completed_at,status,summary_json,run_id,
+                        pid,host,heartbeat_at,deadline_seconds,lane)
+                       VALUES (?,?, 'deadline_exceeded', ?, ?, 1, 'test', ?, 25, 'live')""",
+                    ("2026-01-01T00:00:00+00:00",
+                     "2026-01-01T00:00:28+00:00",
+                     json.dumps({"error": "supervisor_hard_deadline_exceeded"}),
+                     "live-censored", 1.0),
+                )
+            performance = store.lane_performance()["live"]
+            self.assertEqual(performance["p95_seconds"], 28.0)
+            self.assertEqual(performance["success_p95_seconds"], 19.0)
+            self.assertEqual(performance["completion_rate"], 0.8)
+            self.assertEqual(performance["timestamp_derived_durations"], 1)
+            self.assertTrue(performance["target_met"])
+
+    def test_open_position_marks_batch_non_v4_market_reads(self):
+        second = "0x" + "44" * 20
+        second_pair = "0x" + "55" * 20
+
+        class BatchMarket:
+            timeout = 10.0
+
+            def __init__(self):
+                self.calls = []
+
+            def snapshots_many(self, tokens):
+                self.calls.append(list(tokens))
+                pairs = {TOKEN.lower(): PAIR, second.lower(): second_pair}
+                return {
+                    token.lower(): [{
+                        "pair_address": pairs[token.lower()],
+                        "price_usd": 0.25, "liquidity_usd": 50_000,
+                        "market_cap_usd": 250_000, "fdv_usd": 300_000,
+                    }] for token in tokens
+                }
+
+            select_snapshot = staticmethod(
+                rh.RobinhoodMarketClient.select_snapshot)
+
+            def snapshot(self, *_args, **_kwargs):
+                raise AssertionError("sequential market reads must not run")
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "learning.sqlite3")
+            base_candidate = RobinhoodLearningTests._candidate()
+            candidates = [base_candidate, {
+                **base_candidate, "token_address": second,
+                "pair_address": second_pair, "transaction_hash": "0x2",
+                "log_index": 1,
+            }]
+            store.add_candidates(candidates)
+            entry = {
+                "price_usd": 0.25, "liquidity_usd": 50_000,
+                "market_cap_usd": 250_000, "fdv_usd": 300_000,
+            }
+            for candidate in candidates:
+                token = candidate["token_address"]
+                store.record_analysis(
+                    token, FakeAnalyzer().analyze_token(
+                        token, False, True)["analysis"], entry)
+                self.assertTrue(store.open_position(store.candidate(token), entry))
+
+            engine = rh.RobinhoodLearningEngine.__new__(
+                rh.RobinhoodLearningEngine)
+            engine.store = store
+            engine.market = BatchMarket()
+            engine.ledger = SimpleNamespace(append=lambda *_args: None)
+            result = engine.evaluate_open_positions(
+                time.time() + 60, deadline=rh.CycleDeadline(10.0))
+
+            self.assertEqual(len(engine.market.calls), 1)
+            self.assertEqual(len(engine.market.calls[0]), 2)
+            self.assertEqual(result["checked"], 2)
+            self.assertEqual(result["marked"], 2)
+            self.assertEqual(result["failures"], 0)
+            self.assertEqual(result["market_batch_requests"], 1)
+            self.assertFalse(result["market_batch_failed"])
+
+    def test_supervisor_tail_guard_requires_budget_plus_grace(self):
+        self.assertFalse(rh._lane_launch_fits(27.9, 25.0))
+        self.assertTrue(rh._lane_launch_fits(28.0, 25.0))
+
+    def test_the_live_lane_no_longer_marks_positions(self):
+        """Marking moved to its own lane, and that is the contract now.
+
+        Run alone, marking still took 21.75s and had exceeded a 20s budget --
+        so inside the combined 25s lane it was consuming nearly everything and
+        starving ingestion. Over the last 200 combined runs, 197 hit the
+        deadline and 2 completed. Marking is also not latency-critical the way
+        chain freshness is: a mark 60s old is fine, a window 60s behind the
+        head is not.
+        """
+        import inspect
+        source = inspect.getsource(rh.RobinhoodLearningEngine.run_live_lane)
+        self.assertIn("delegated_to", source)
+        self.assertNotIn(
+            "self.evaluate_open_positions", source,
+            "an external price API must not sit on the path that has to stay "
+            "near the chain head",
+        )
+        marks = inspect.getsource(rh.RobinhoodLearningEngine.run_marks_lane)
+        self.assertIn("self.evaluate_open_positions", marks)
+        self.assertNotIn(
+            "near_head_flow_pass", marks,
+            "the marks lane must not do chain ingestion either",
+        )
+
+    def test_marking_has_its_own_lane_and_budget(self):
+        self.assertGreater(
+            rh.MARKS_LANE_BUDGET_SECONDS, rh.LIVE_LANE_BUDGET_SECONDS,
+            "marking measured 21.75s; it cannot share the live lane's budget",
+        )
+        self.assertTrue(hasattr(rh.RobinhoodLearningEngine, "run_marks_lane"))
+
+    def test_durable_backfill_advances_without_touching_live_cursor(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            engine = rh.RobinhoodLearningEngine(
+                root, rpc=FakeRPC([], latest=100), analyzer=FakeAnalyzer(),
+                market=FakeMarket())
+            engine.store.enqueue_backfill(10, 19, "live_lane_reanchor")
+            first = engine.drain_flow_backfill(
+                rh.CycleDeadline(10.0), block_limit=5)
+            self.assertEqual(first["blocks_scanned"], 5)
+            self.assertFalse(first["completed"])
+            self.assertEqual(engine.store.backfill_backlog()["pending_blocks"], 5)
+            second = engine.drain_flow_backfill(
+                rh.CycleDeadline(10.0), block_limit=5)
+            self.assertTrue(second["completed"])
+            self.assertEqual(engine.store.backfill_backlog()["pending_ranges"], 0)
+            self.assertFalse((root / "live_lane_cursor.json").exists())
+
+    def test_committed_gap_chunk_ends_the_backfill_cycle_successfully(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine.drain_flow_backfill = lambda deadline, **kwargs: {
+                "ranges_selected": 1, "blocks_scanned": 500,
+                "candidates_added": 3, "completed": False,
+                "backlog": {"pending_ranges": 1, "pending_blocks": 500},
+            }
+            engine.observer.sync = lambda **kwargs: self.fail(
+                "secondary discovery ran after a committed gap chunk")
+            engine.v4_observer.sync = lambda **kwargs: self.fail(
+                "V4 enrichment ran after a committed gap chunk")
+            result = engine.run_backfill_lane(
+                budget_seconds=30.0, discovery_block_limit=500,
+                identity_limit=25,
+            )
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(result["priority_mode"], "oldest_durable_gap_first")
+            self.assertTrue(result["v2_discovery"]["deferred"])
+            self.assertEqual(result["new_candidates"], 3)
+
+    def test_only_analysis_lane_is_constructed_with_the_producer_chain(self):
+        source = inspect.getsource(rh.main)
+        self.assertIn('"analysis-once"', source)
+        self.assertIn("else None", source)
+        self.assertIn("timechain_writer", inspect.getsource(
+            rh.RobinhoodLearningEngine.run_analysis_lane))
