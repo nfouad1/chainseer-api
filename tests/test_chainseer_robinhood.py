@@ -7168,3 +7168,37 @@ class DurableStageAttributionTests(unittest.TestCase):
                 attempted, 25.0 + rh.LANE_TERMINATION_GRACE_SECONDS,
                 "a censored attempt is charged exactly deadline + grace",
             )
+
+
+class DashboardKeyContractTests(unittest.TestCase):
+    """The renderer must read the key the backend publishes.
+
+    p95_seconds was renamed to all_attempt_p95_seconds in the store and the
+    dashboard was missed, so the UI would have shown "no p95 yet" against a
+    perfectly healthy backend. Renaming a producer without its consumer has
+    now happened three times in this work; this test makes the interface
+    checkable rather than remembered.
+    """
+
+    def test_the_renderer_reads_the_published_p95_key(self):
+        html = Path("robinhood_dashboard.html").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("all_attempt_p95_seconds", html)
+        self.assertNotIn(
+            "perf.p95_seconds", html,
+            "the renderer is reading a key the backend no longer publishes",
+        )
+
+    def test_the_backend_publishes_what_the_renderer_reads(self):
+        source = inspect.getsource(rh.RobinhoodLearningStore.lane_performance)
+        self.assertIn('"all_attempt_p95_seconds"', source)
+
+    def test_headroom_is_recorded_beside_the_stage(self):
+        """Attribution without headroom misleads.
+
+        Five of six live failures died in classification, but four spent only
+        0.48-4.07s inside it -- an empty budget, not a slow stage.
+        """
+        source = inspect.getsource(rh.RobinhoodLearningStore.mark_lane_stage)
+        self.assertIn("deadline_remaining_at_stage_start", source)
+        self.assertIn("completed_stage_seconds", source)

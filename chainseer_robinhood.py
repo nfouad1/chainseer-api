@@ -4376,7 +4376,17 @@ class RobinhoodLearningStore:
 
     def mark_lane_stage(
         self, lane: str, stage: str, run_id: str | None = None,
+        remaining: float | None = None, completed: dict | None = None,
     ) -> None:
+        """Also record HEADROOM, not just which stage was running.
+
+        Attribution alone misleads: 5 of 6 post-change live failures died in
+        classification, but four spent only 0.48-4.07s inside it. That is not
+        a slow classification, it is an empty budget by the time classification
+        started. deadline_remaining_at_stage_start distinguishes "this stage is
+        slow" from "earlier stages left it nothing", and the completed-stage
+        durations say which earlier stage took it.
+        """
         """Commit the stage BEFORE the blocking call it names.
 
         Ordering is the whole point: written after, it records what already
@@ -4386,18 +4396,24 @@ class RobinhoodLearningStore:
         """
         with self.connection() as connection:
             connection.execute(
-                """UPDATE lane_state SET current_stage=?, stage_started_at=?
+                """UPDATE lane_state
+                   SET current_stage=?, stage_started_at=?,
+                       deadline_remaining_at_stage_start=?,
+                       completed_stage_seconds_json=?
                    WHERE lane=? AND status='running'
                      AND (? IS NULL OR run_id=?)""",
-                (str(stage), time.time(), str(lane), run_id, run_id),
+                (str(stage), time.time(), remaining,
+                 _canonical(completed or {}), str(lane), run_id, run_id),
             )
 
     def lane_failure_stage(self, lane: str, run_id: str) -> dict:
         """The persisted stage for a run, for child-side failure payloads."""
         with self.connection() as connection:
             row = connection.execute(
-                """SELECT current_stage, stage_started_at FROM lane_state
-                   WHERE lane=? AND run_id=?""",
+                """SELECT current_stage, stage_started_at,
+                          deadline_remaining_at_stage_start,
+                          completed_stage_seconds_json
+                   FROM lane_state WHERE lane=? AND run_id=?""",
                 (str(lane), str(run_id)),
             ).fetchone()
         if not row or not row["current_stage"]:
@@ -4405,6 +4421,10 @@ class RobinhoodLearningStore:
         started = row["stage_started_at"]
         return {
             "failure_stage": row["current_stage"],
+            "deadline_remaining_at_stage_start": row[
+                "deadline_remaining_at_stage_start"],
+            "completed_stage_seconds": json.loads(
+                row["completed_stage_seconds_json"] or "{}"),
             "stage_elapsed_seconds": (
                 round(time.time() - started, 3) if started else None),
         }
