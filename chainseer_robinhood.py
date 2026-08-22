@@ -1863,7 +1863,14 @@ class RobinhoodLearningStore:
                     -- handler ever running, so the only stage attribution
                     -- that survives is one already committed to the database.
                     current_stage TEXT,
-                    stage_started_at REAL
+                    stage_started_at REAL,
+                    -- Headroom at stage start, and what earlier stages spent.
+                    -- Added to CREATE TABLE as well as the migration: a live
+                    -- ALTER made this work in production while every fresh
+                    -- database -- including every test database -- lacked the
+                    -- columns entirely.
+                    deadline_remaining_at_stage_start REAL,
+                    completed_stage_seconds_json TEXT NOT NULL DEFAULT '{}'
                 );
                 """
             )
