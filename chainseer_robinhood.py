@@ -9426,14 +9426,23 @@ class RobinhoodLearningEngine:
         # Close what this cycle sealed, queue what it did not. Both halves are
         # required: without the first the queue never empties, and without the
         # second a window that fell below `floor` is simply never seen again.
+        # Timed like everything else. The per-window phases summed to 3.37s
+        # median while the enclosing stage reported 8.25s, and every guess at
+        # the missing five seconds was wrong when measured in isolation --
+        # the queries are fast on a quiet database and this one is not quiet.
+        # Attributing the remainder beats reasoning about it.
+        settle_started = time.monotonic()
         self.store.complete_seal_queue(sealed_windows)
         queued_now = self.store.enqueue_seal(deferred, "live_lane_headroom")
         per_window = self.record_seal_cost(phase, len(sealed_windows))
+        backlog = self.store.seal_queue_backlog()
         with self.store.connection() as connection:
             cumulative = connection.execute(
                 "SELECT COUNT(*) FROM flow_observations WHERE policy_version=?",
                 (FLOW_EVIDENCE_POLICY_VERSION,),
             ).fetchone()[0]
+        phase.setdefault("queue_settle", []).append(
+            time.monotonic() - settle_started)
         return {
             "windows_considered": len(windows),
             "windows_available": windows_available,
@@ -9443,7 +9452,7 @@ class RobinhoodLearningEngine:
             # an already-sealed duplicate as a deferral.
             "windows_deferred": len(deferred),
             "windows_queued": queued_now,
-            "seal_queue_backlog": self.store.seal_queue_backlog(),
+            "seal_queue_backlog": backlog,
             "admission": {
                 "static_limit": static_limit,
                 "headroom_seconds": (
@@ -10353,15 +10362,21 @@ class RobinhoodLearningEngine:
                 self.store.mark_lane_stage(
                     "live", "decision_head", run_id=self.cycle_run_uuid,
                     remaining=deadline.remaining(), completed=dict(timings))
+                head_started = time.monotonic()
                 decision_head = int(self.rpc.get_block_number())
+                timings["decision_head_seconds"] = round(
+                    time.monotonic() - head_started, 3)
                 self.store.mark_lane_stage(
                     "live", "classification", run_id=self.cycle_run_uuid,
                     remaining=deadline.remaining(), completed=dict(timings))
+                classify_started = time.monotonic()
                 classification = self.classify_sealed_observations(
                     decision_head,
                     observation_ids=list(observation.get("observation_ids") or []),
                     deadline=deadline,
                 )
+                timings["classification_seconds"] = round(
+                    time.monotonic() - classify_started, 3)
             timings["seal_and_fresh_quote"] = round(
                 time.monotonic() - stage, 3)
             timings["seal_stage_headroom_seconds"] = round(

@@ -8095,3 +8095,44 @@ class SealQueueSurvivesRecomputeTests(SealStageBudgetTests):
             self.assertEqual(row["reason"], "superseded_before_snapshot")
             self.assertEqual(
                 reopened.seal_queue_backlog()["pending_windows"], 0)
+
+
+class StageIsFullyAttributedTests(SealStageBudgetTests):
+    """The sum of the parts must reach the whole.
+
+    The per-window phases summed to 3.37s median while the enclosing
+    seal_and_fresh_quote stage reported 8.25s, and every guess at the missing
+    five seconds -- the classifications scan, the cumulative count, the
+    unscoped join -- measured fast in isolation. An instrument that leaves a
+    gap that size invites exactly the causal claims this project keeps having
+    to retract.
+    """
+
+    def test_the_post_loop_settle_is_timed(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 2)
+            result = self._engine(directory, store).seal_near_head_observations(
+                self.HEAD, self.NOW)
+            phases = result["phase_seconds"]
+            self.assertIn("queue_settle", phases)
+            self.assertIsInstance(phases["queue_settle"]["median"], float)
+
+    def test_the_backlog_is_read_once_not_twice(self):
+        """It joins against flow_observations; asking twice pays twice."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        body = source.split("def seal_near_head_observations", 1)[1].split(
+            "def classify_sealed_observations", 1)[0]
+        self.assertEqual(body.count("self.store.seal_queue_backlog()"), 1)
+
+    def test_decision_head_and_classification_are_timed_separately(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        live = source.split("def run_live_lane", 1)[1].split(
+            "def _analyze_candidates", 1)[0]
+        for key in ("decision_head_seconds", "classification_seconds"):
+            self.assertIn(key, live, key + " is inside the stage but untimed")
+        # Ordered: the head must be timed before classification consumes it.
+        self.assertLess(live.index("decision_head_seconds"),
+                        live.index("classification_seconds"))
