@@ -26,6 +26,7 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
+from types import SimpleNamespace
 
 import requests
 
@@ -53,10 +54,11 @@ from chainseer_outcome_ledger import (
 from chainseer_temporal_graph import TemporalGraphStore
 from chainseer_robinhood_commitments import (
     DecisionCommitmentStore,
+    DecisionCommitmentError,
     evaluate_integrity_certificate,
     load_integrity_certificate,
 )
-from chainseer_robinhood_gate import ExecutionGate
+from chainseer_robinhood_gate import ExecutionGate, build_commitment_spec
 from chainseer_robinhood_reflection import (
     RobinhoodReflectionCoordinator,
     default_skill_root,
@@ -8628,6 +8630,9 @@ class RobinhoodLearningEngine:
         self.market=market or RobinhoodMarketClient()
         self.v4_market=RobinhoodV4MarketClient(self.rpc,self.market,self.store)
         self.analyzer=analyzer
+        # A run id for cycles that act outside a lane context (standalone
+        # market rechecks); lanes overwrite it with their own run uuid.
+        self.cycle_run_uuid = "engine-" + uuid.uuid4().hex[:16]
         self.timechain_recorder = timechain_recorder
         if self.timechain_recorder is None and chain_root is not None:
             self.timechain_recorder = RobinhoodLearningTimechainRecorder(
@@ -8640,23 +8645,209 @@ class RobinhoodLearningEngine:
             self.root / "decision_commitments.sqlite3")
         self.execution_gate = ExecutionGate(self.commitments)
 
-    def drain_deferred_seals(self, *, limit: int = 4) -> dict:
+    # ------------------------------------------------------------------ #
+    # Production entry boundary: EVERY paper buy passes through here.      #
+    # ------------------------------------------------------------------ #
+    def guarded_paper_entry(
+        self, candidate: dict, market: dict, *, run_id: str,
+        priority_reason: str | None = None,
+    ) -> dict:
+        """The ONLY sanctioned path from an analysis verdict to a paper
+        position: evaluation -> durable commitment -> FRESH revalidation
+        snapshot -> atomic authorization -> open_position -> confirmed
+        execution. Returns a result dict; never raises for refusals.
+
+        Fail-closed: any gate refusal, missing certificate or excessive
+        seal debt prevents the entry. This is not optional -- calling
+        store.open_position directly bypasses pre-action authorization and
+        is treated as a defect.
+
+        Revalidation is GENUINELY fresh: a new RPC head, a new quote taken
+        at authorization time, hard stops recomputed from the candidate's
+        current state, and an actual pre-trade simulation result. The
+        commitment's original quote is what the fresh quote must MATCH.
+        """
+        token = str(candidate.get("token_address") or "").lower()
+        from chainseer_robinhood_commitments import (
+            _quote_projection,
+            acquire_revalidation_snapshot,
+            canonical_hard_stop_digest,
+        )
+        try:
+            evidence = {
+                "analysis": candidate.get("shadow_admission_json") or {},
+                "score": candidate.get("score"),
+                "risk_level": candidate.get("risk_level"),
+                "hard_stops_json": candidate.get("hard_stops_json") or "[]",
+            }
+            quote = {key: market[key] for key in (
+                "price_usd", "liquidity_usd", "market_cap_usd",
+                "pool_reserve_fraction", "current_state_verified")
+                if market.get(key) is not None}
+            quote = _quote_projection(
+                quote, tuple(quote.keys()))
+            hard_stops = json.loads(candidate.get("hard_stops_json") or "[]")
+        except (TypeError, ValueError):
+            hard_stops = []
+        registry_epoch = self._registry_epoch_identifier(
+            list(self.timechain_recorder.tc.iter_rings())
+            if self.timechain_recorder is not None else [])
+        verified_head = self.commitments.verified_head()
+
+        # ---- FRESH revalidation snapshot FIRST: the commitment pins the
+        # same block the snapshot acquired, so authorization compares the
+        # fresh quote against a pin taken at the same instant.
+        certificate = load_integrity_certificate(self.root)
+        rings = safe_int(certificate.get("ring_count"), 0)
+
+        def _simulate(fresh_quote: dict) -> bool:
+            # Paper-mode pre-trade simulation: the entry must still be
+            # tradable against the CURRENT quote (price/liquidity/state).
+            return bool(
+                safe_float(fresh_quote.get("price_usd"), 0.0) > 0
+                and safe_float(fresh_quote.get("liquidity_usd"), 0.0)
+                >= MINIMUM_ENTRY_LIQUIDITY_USD
+                and fresh_quote.get("current_state_verified") is not False)
+
+        def _market_snapshot(token_arg, pair_arg=None):
+            # V4 client takes the candidate; V2 client takes (token,pair).
+            if self.v4_market is not None and candidate.get("pool_id"):
+                return self.v4_market.snapshot(candidate)
+            return self.market.snapshot(token_arg, pair_arg)
+
+        try:
+            snapshot = acquire_revalidation_snapshot(
+                rpc=self.rpc, market_client=SimpleNamespace(
+                    snapshot=_market_snapshot),
+                candidate=candidate, token_address=token,
+                hard_stops=hard_stops,
+                quote_fields=tuple(quote.keys()),
+                run_pre_trade_simulation=_simulate,
+                producer_chain_rings=(
+                    list(self.timechain_recorder.tc.iter_rings())
+                    if self.timechain_recorder is not None else []),
+                certificate_ring_count=rings or None,
+            )
+        except Exception:
+            return {"entered": False, "reason": "revalidation_failed"}
+        if not snapshot.valid:
+            return {"entered": False,
+                    "reason": f"revalidation_failed_{snapshot.source}"}
+        block_pin = snapshot.block
+        spec = build_commitment_spec(
+            run_id=run_id, network="robinhood",
+            token_address=token,
+            evidence=evidence,
+            evidence_block_pin=block_pin,
+            quote=quote,
+            quote_block=block_pin,
+            decision="buy_eligible",
+            hard_stops=hard_stops,
+            policy_version=candidate.get("entry_policy_version")
+            or "robinhood-paper-v1",
+            faculty_registry_epoch=registry_epoch,
+            verified_head=verified_head,
+            simulation_ok=True,
+            risk_score=candidate.get("score"),
+            # Idempotency identifies the EXACT analysis/quote attempt --
+            # not merely the token -- so each recheck of the same token
+            # with fresh evidence is its own decision.
+            idempotency_key=(
+                f"paper-entry:{token}:{block_pin}:"
+                + canonical_hash(quote)),
+        )
+        try:
+            record = self.execution_gate.commit(spec)
+        except DecisionCommitmentError as exc:
+            return {"entered": False, "reason": exc.reason}
+        if record.get("duplicate"):
+            return {"entered": False, "reason": "duplicate_commitment"}
+
+        # Integrity input: MANDATORY with a configured Timechain, but
+        # NEVER synchronously verified here. A stale/missing certificate
+        # refuses the entry; refresh happens on the analysis lane.
+        if self.timechain_recorder is not None:
+            from chainseer_robinhood_commitments import (
+                evaluate_integrity_certificate as _eval_cert,
+            )
+            integrity_ok, integrity_reason, _ = _eval_cert(certificate)
+            if not integrity_ok:
+                self.execution_gate.record_action_result(
+                    record["commitment_id"], False, integrity_reason)
+                return {"entered": False, "reason": integrity_reason}
+            if (snapshot.producer_tail or {}).get("lag_excessive"):
+                reason = "producer_tail_lag_exceeded"
+                self.execution_gate.record_action_result(
+                    record["commitment_id"], False, reason)
+                return {"entered": False, "reason": reason}
+
+        authorized = self.execution_gate.authorize(
+            record["commitment_id"],
+            **snapshot.as_authorize_kwargs(),
+            current_ring_count=snapshot.producer_tail.get("ring_count", 0),
+            head_index=safe_int((verified_head or {}).get("head_index"), 0),
+            head_hash=str((verified_head or {}).get("head_hash")),
+            registry_epoch=spec["faculty_registry_epoch"],
+            integrity_enforced=self.timechain_recorder is not None,
+        )
+        if not authorized["allowed"]:
+            # Authorization refused: resolve the claim as aborted so no
+            # ring ever seals it as executed.
+            self.execution_gate.record_action_result(
+                record["commitment_id"], False, authorized["reason"])
+            return {"entered": False, "reason": authorized["reason"]}
+
+        # Action attempt: only a REAL open_position success confirms
+        # execution; failure aborts the commitment instead.
+        if self.store.open_position(candidate, market):
+            self.execution_gate.record_executed(
+                record["commitment_id"],
+                f"paper entry via {priority_reason or 'analysis'}")
+            self.ledger.append("robinhood_paper_buy", {
+                "token_address": token,
+                "symbol": candidate.get("symbol"),
+                "score": candidate.get("score"),
+                "commitment_id": record["commitment_id"],
+                "priority_reason": priority_reason,
+                "paper_only": True,
+            })
+            return {"entered": True, "reason": "authorized",
+                    "commitment_id": record["commitment_id"]}
+        resolved = self.execution_gate.record_action_result(
+            record["commitment_id"], False, "position_store_refused")
+        return {"entered": False, "reason": "position_store_refused",
+                "resolved": resolved.get("resolved")}
+
+    def _timechain_ring_count(self) -> int:
+        """Ring count from the last published certificate -- NEVER a live
+        full verification on this path."""
+        certificate = load_integrity_certificate(self.root)
+        return safe_int(certificate.get("ring_count"), 0)
+
+    def drain_deferred_seals(self, *, limit: int = 4,
+                             deadline: "CycleDeadline | None" = None) -> dict:
         """Consume due seal jobs and create the full Timechain rings.
 
         Called ONLY from run_analysis_lane. Each job links evidence ->
-        decision commitment -> paper event -> outcome by embedding the
-        commitment hash, its idempotency key and any recorded events in one
-        immutable ring. Exactly-once: a commitment has exactly one queue row
-        (UNIQUE) and the ring payload is keyed by the commitment hash, so a
-        retried seal re-finds its own prior ring instead of duplicating.
+        decision commitment -> action/avoidance events -> outcome context
+        in one immutable ring; a BUY commitment is not sealed until it has
+        reached a terminal state (executed or aborted) so the ring carries
+        the full chain, not just the decision.
         """
         started = time.monotonic()
         self.commitments.recover_expired_leases()
         self.commitments.requeue_retrying()
         claimed = self.commitments.claim_seal_batch(limit=limit)
-        sealed = failed = 0
+        sealed = failed = deferred_not_terminal = 0
         last_ring = None
+        graph_refreshed = False
         for job in claimed:
+            if deadline is not None and deadline.remaining() <= 0.0:
+                # Bounded: release the un-claimed work back for the next
+                # analysis cycle instead of running past the lane budget.
+                self.commitments.fail_seal(
+                    job["job_id"], "drain deadline", attempts=0)
+                continue
             commitment = self.commitments.get(job["commitment_id"])
             if commitment is None:
                 self.commitments.fail_seal(
@@ -8665,6 +8856,23 @@ class RobinhoodLearningEngine:
                 continue
             events = self.commitments.latest_events(commitment[
                 "commitment_id"])
+            statuses = {event["status"] for event in events}
+            terminal = bool(statuses & {
+                "executed", "executed_outcome", "aborted", "superseded"})
+            if commitment["decision"] != "BUY_ELIGIBLE" and not terminal:
+                # A REJECT has no action to await: it is terminal at
+                # creation (its avoidance IS the outcome).
+                terminal = True
+            if not terminal:
+                # A BUY that has neither executed nor been aborted has no
+                # action to link yet. Leave it queued (without burning a
+                # retry attempt) so the ring carries the FULL chain:
+                # evidence -> decision -> action -> outcome.
+                self.commitments.fail_seal(
+                    job["job_id"], "awaiting terminal state",
+                    attempts=max(0, int(job.get("attempts") or 1) - 1))
+                deferred_not_terminal += 1
+                continue
             payload = {
                 "summary": (
                     f"Deferred Timechain seal for decision commitment "
@@ -8707,8 +8915,12 @@ class RobinhoodLearningEngine:
                         + commitment["commitment_hash"])
                     ring = self.timechain_recorder.tc.seal(
                         "decision_commitment", payload)
-                    TemporalGraphStore(self.root).refresh(
-                        self.timechain_recorder.tc.load())
+                    if not graph_refreshed:
+                        # Throttled: at most ONE full temporal-graph
+                        # rebuild per drain, never one per ring.
+                        TemporalGraphStore(self.root).refresh(
+                            self.timechain_recorder.tc.load())
+                        graph_refreshed = True
                 self.commitments.complete_seal(
                     job["job_id"],
                     int(ring.get("index") or 0),
@@ -8732,6 +8944,7 @@ class RobinhoodLearningEngine:
                     )
         return {
             "claimed": len(claimed), "sealed": sealed, "failed": failed,
+            "deferred_not_terminal": deferred_not_terminal,
             "last_ring": last_ring,
             "duration_seconds": round(time.monotonic() - started, 3),
         }
@@ -8743,14 +8956,11 @@ class RobinhoodLearningEngine:
             return {"published": False, "reason": "timechain_disabled"}
         ok, report = self.timechain_recorder.verify()
         rings = list(self.timechain_recorder.tc.iter_rings())
-        epoch = ""
-        try:
-            registry = self.timechain_recorder.tc.load_registry() \
-                if hasattr(self.timechain_recorder.tc, "load_registry") \
-                else None
-            epoch = str(getattr(registry, "epoch", "") or "")
-        except Exception:
-            epoch = ""
+        if not rings:
+            # An empty chain is NOT a verified chain: never publish a pass
+            # certificate over nothing (that would fail open).
+            return {"published": False, "reason": "empty_chain"}
+        epoch = self._registry_epoch_identifier(rings)
         certificate = self.commitments.publish_verified_head(
             head_index=int(rings[-1]["index"]) if rings else 0,
             head_hash=str(rings[-1]["ring_hash"]) if rings else "",
@@ -8763,6 +8973,19 @@ class RobinhoodLearningEngine:
         )
         return {"published": True, "verification_ok": bool(ok),
                 "ring_count": len(rings), "certificate": certificate}
+
+    def _registry_epoch_identifier(self, rings: list) -> str:
+        """The sealed registry-epoch ring for this producer chain, or the
+        genesis hash when no epoch exists (pre-epoch chains)."""
+        for ring in reversed(rings):
+            ring_type = ring.get("ring_type")
+            if ring_type == "epoch":
+                return f"epoch-ring:{ring.get('index')}"
+            if ring_type == "genesis":
+                payload = ring.get("payload") or {}
+                if payload.get("event") == "genesis":
+                    return f"genesis:{str(ring.get('ring_hash', ''))[:16]}"
+        return "unknown-chain"
 
     @contextmanager
     def _rpc_deadline(self, deadline: CycleDeadline):
@@ -9968,18 +10191,12 @@ class RobinhoodLearningEngine:
                     # market recheck can retry the idempotent producer seal.
                     memory_failures += 1
                 latest = self.store.candidate(current["token_address"])
-                if self.store.open_position(latest, market):
+                entry = self.guarded_paper_entry(
+                    latest, market, run_id=self.cycle_run_uuid,
+                    priority_reason="executable_market_recheck",
+                )
+                if entry.get("entered"):
                     entries += 1
-                    self.ledger.append("robinhood_paper_buy", {
-                        "token_address": current["token_address"],
-                        "symbol": latest.get("symbol"),
-                        "score": latest.get("score"),
-                        "price_usd": market.get("price_usd"),
-                        "liquidity_usd": market.get("liquidity_usd"),
-                        "market_cap_usd": market.get("market_cap_usd"),
-                        "entry_trigger": "future_executable_market_recheck",
-                        "paper_only": True,
-                    })
             except Exception:
                 failures += 1
         return {
@@ -10631,15 +10848,12 @@ class RobinhoodLearningEngine:
                 if queue_age is not None:
                     queue_ages.append(queue_age)
                 latest = self.store.candidate(candidate["token_address"])
-                if self.store.open_position(latest, market):
+                entry = self.guarded_paper_entry(
+                    latest, market, run_id=self.cycle_run_uuid,
+                    priority_reason=priority_reason,
+                )
+                if entry.get("entered"):
                     entries += 1
-                    self.ledger.append("robinhood_paper_buy", {
-                        "token_address": candidate["token_address"],
-                        "symbol": latest.get("symbol"), "score": latest.get("score"),
-                        "price_usd": market.get("price_usd"),
-                        "liquidity_usd": market.get("liquidity_usd"),
-                        "paper_only": True,
-                    })
                 analyses += 1
             except Exception as exc:
                 failures += 1
@@ -10689,13 +10903,26 @@ class RobinhoodLearningEngine:
                     observed_at, analysis_limit, deadline)
             timings["analyses"] = round(time.monotonic() - stage, 3)
             stage = time.monotonic()
-            deferred_seals = self.drain_deferred_seals()
+            deferred_seals = self.drain_deferred_seals(deadline=deadline)
             timings["deferred_seals"] = round(time.monotonic() - stage, 3)
+            # Certificate refresh stays on this lane's budget but off the
+            # live path; bounded so it can never overrun the cycle.
+            certificate_refresh = None
+            if deadline.remaining() >= 30.0:
+                stage = time.monotonic()
+                try:
+                    certificate_refresh = self.publish_integrity_certificate()
+                except Exception as exc:
+                    certificate_refresh = {
+                        "published": False, "reason": str(exc)[:200]}
+                timings["certificate_refresh"] = round(
+                    time.monotonic() - stage, 3)
             learning = self.store.summary()
             return {
                 "outcomes": outcomes, "market_rechecks": rechecks,
                 "candidate_analyses": analyses,
                 "deferred_seals": deferred_seals,
+                "certificate_refresh": certificate_refresh,
                 "stage_timings_seconds": timings,
                 "cursor": {"analysis_queue": "oldest_fairness_with_priorities"},
                 "backlog": {
@@ -11114,6 +11341,21 @@ class RobinhoodLearningEngine:
                 stage_timings["market_rechecks"] = round(
                     time.monotonic() - stage_started, 3
                 )
+                # The integrity certificate must be fresh BEFORE any paper
+                # entry in this cycle: the execution gate fails closed on a
+                # missing certificate, so refresh it here (off the live
+                # lane) whenever a recorder is configured.
+                certificate_refresh = None
+                if self.timechain_recorder is not None:
+                    stage_started = time.monotonic()
+                    try:
+                        certificate_refresh = (
+                            self.publish_integrity_certificate())
+                    except Exception as exc:
+                        certificate_refresh = {
+                            "published": False, "reason": str(exc)[:200]}
+                    stage_timings["certificate_refresh"] = round(
+                        time.monotonic() - stage_started, 3)
                 stage_started = time.monotonic()
                 analyses = analysis_failures = entries = momentum_analyses = 0
                 producer_analyses_sealed = producer_failures = 0
@@ -11202,16 +11444,12 @@ class RobinhoodLearningEngine:
                         if queue_age is not None:
                             queue_ages.append(queue_age)
                         latest = self.store.candidate(candidate["token_address"])
-                        if self.store.open_position(latest, market):
+                        entry = self.guarded_paper_entry(
+                            latest, market, run_id=self.cycle_run_uuid,
+                            priority_reason=priority_reason,
+                        )
+                        if entry.get("entered"):
                             entries += 1
-                            self.ledger.append("robinhood_paper_buy", {
-                                "token_address": candidate["token_address"],
-                                "symbol": latest.get("symbol"),
-                                "score": latest.get("score"),
-                                "price_usd": market.get("price_usd"),
-                                "liquidity_usd": market.get("liquidity_usd"),
-                                "paper_only": True,
-                            })
                         analyses += 1
                     except Exception as exc:
                         analysis_failures += 1

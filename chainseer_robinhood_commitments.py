@@ -66,21 +66,166 @@ class DecisionCommitmentError(RuntimeError):
 
 
 def canonical_commitment_payload(record: dict) -> dict:
-    """The exact field set covered by ``commitment_hash``.
+    """Fields covered by the STABLE idempotency fingerprint.
 
     Volatile envelope fields (creation wall clock, expiry) are excluded:
-    two commits of the SAME evidence under one idempotency key must hash
-    identically or retry-after-crash would be misread as tampering.
+    two commits of the SAME evidence under one idempotency key must carry
+    the same fingerprint so a retry-after-crash deduplicates.
     """
     return {
         key: value for key, value in record.items()
-        if key not in ("commitment_hash", "created_at", "expires_at")
+        if key not in ("commitment_hash", "idempotency_fingerprint",
+                       "created_at", "expires_at")
     }
 
 
 def commitment_hash(record: dict) -> str:
+    """Canonical hash over the given payload mapping."""
     return hashlib.sha256(
-        canonical_json(canonical_commitment_payload(record)).encode("utf-8")
+        canonical_json(record).encode("utf-8")
+    ).hexdigest()
+
+
+def _persisted_shape(record: dict) -> dict:
+    """Normalize a commitment to its SQLite round-trip representation so
+    create-time and load-time hashing see identical bytes."""
+    return {
+        key: (int(value) if isinstance(value, bool) else value)
+        for key, value in record.items()
+    }
+
+
+def canonical_hard_stop_digest(hard_stops) -> str:
+    """Digest of a hard-stop list that is invariant to ordering and to
+    semantically identical representations (dicts vs their code strings)."""
+    normalized = sorted(
+        (item.get("code") or item.get("reason")) if isinstance(item, dict)
+        else str(item)
+        for item in (hard_stops or [])
+    )
+    return commitment_hash(normalized)
+
+
+class RevalidationSnapshot:
+    """Fresh evidence acquired AT the execution boundary.
+
+    Every field is gathered now, from the current state -- never carried
+    forward from the analysis that produced the commitment. If any field
+    cannot be acquired the snapshot is invalid and authorization must
+    refuse (fail closed).
+    """
+
+    def __init__(self, *, block: int, quote_hash: str,
+                 hard_stop_digest: str, simulation_ok: bool,
+                 producer_tail: dict, source: str):
+        self.block = int(block)
+        self.quote_hash = str(quote_hash)
+        self.hard_stop_digest = str(hard_stop_digest)
+        self.simulation_ok = bool(simulation_ok)
+        self.producer_tail = producer_tail or {}
+        self.source = source
+
+    @property
+    def valid(self) -> bool:
+        return bool(self.block > 0 and self.quote_hash
+                    and self.hard_stop_digest)
+
+    def as_authorize_kwargs(self) -> dict:
+        return {
+            "current_block": self.block,
+            "current_quote_hash": self.quote_hash,
+            "current_hard_stop_digest": self.hard_stop_digest,
+            "simulation_ok": self.simulation_ok,
+        }
+
+
+def _quote_projection(fresh_quote: dict, fields: tuple) -> dict:
+    """Canonical quote projection: float-normalized so int/float type
+    drift between data sources can never masquerade as a price change."""
+    projected = {}
+    for key in fields:
+        value = fresh_quote.get(key)
+        if value is None:
+            continue
+        projected[key] = float(value) if isinstance(value, (int, float)) \
+            and not isinstance(value, bool) else value
+    return projected
+
+
+def acquire_revalidation_snapshot(
+    *, rpc, market_client, candidate: dict, token_address: str,
+    hard_stops: list, run_pre_trade_simulation, producer_chain_rings,
+    quote_fields: tuple = ("price_usd", "liquidity_usd",
+                           "market_cap_usd"),
+    max_ring_lag: int = INTEGRITY_CERTIFICATE_MAX_RING_LAG,
+    certificate_ring_count: int | None = None,
+) -> RevalidationSnapshot:
+    """Acquire FRESH revalidation evidence at the action boundary.
+
+    - ``rpc.get_block_number()``: the real current head, not a stale pin.
+    - ``market_client.snapshot(...)``: a fresh quote taken NOW, hashed
+      over exactly ``quote_fields`` -- the same fields the commitment's
+      original quote covered.
+    - ``hard_stops`` recomputed from the candidate's CURRENT stored state.
+    - ``run_pre_trade_simulation()`` callback result -- never assumed True.
+    - Producer Timechain tail so certificate lag is measured against
+      reality; if verification has fallen too far behind, the caller sees
+      it and fails closed.
+
+    Any failure produces an INVALID snapshot with ``valid=False``.
+    """
+    try:
+        block = int(rpc.get_block_number())
+    except Exception:
+        return RevalidationSnapshot(
+            block=0, quote_hash="", hard_stop_digest="",
+            simulation_ok=False,
+            producer_tail={}, source="rpc_error")
+    try:
+        fresh_quote = market_client.snapshot(
+            token_address, candidate.get("pair_address"))
+        projected = _quote_projection(fresh_quote, quote_fields)
+        quote_hash = commitment_hash(projected)
+    except Exception:
+        return RevalidationSnapshot(
+            block=block, quote_hash="", hard_stop_digest="",
+            simulation_ok=False,
+            producer_tail={}, source="quote_error")
+    digest = canonical_hard_stop_digest(hard_stops)
+    try:
+        simulation_ok = bool(run_pre_trade_simulation(fresh_quote))
+    except Exception:
+        simulation_ok = False
+    tail = {"ring_count": len(producer_chain_rings or [])}
+    if certificate_ring_count is not None:
+        tail["certificate_lag"] = max(
+            0, tail["ring_count"] - int(certificate_ring_count))
+        tail["lag_excessive"] = (
+            tail["certificate_lag"] > max_ring_lag)
+    return RevalidationSnapshot(
+        block=block, quote_hash=quote_hash,
+        hard_stop_digest=digest, simulation_ok=simulation_ok,
+        producer_tail=tail, source="acquired")
+
+
+def idempotency_fingerprint(record: dict) -> str:
+    """Stable across retries of the same decision."""
+    return commitment_hash(canonical_commitment_payload(record))
+
+
+def complete_commitment_hash(record: dict) -> str:
+    """Covers EVERY stored field including timestamps and expiry.
+
+    Recomputed and verified whenever a commitment is loaded; any mutation
+    of the persisted row -- a flipped decision, an extended expiry --
+    breaks this hash and the commitment fails authorization.
+    """
+    payload = {
+        key: value for key, value in record.items()
+        if key != "commitment_hash"
+    }
+    return hashlib.sha256(
+        canonical_json(payload).encode("utf-8")
     ).hexdigest()
 
 
@@ -145,8 +290,40 @@ class DecisionCommitmentStore:
                     expires_at REAL NOT NULL,
                     idempotency_key TEXT NOT NULL UNIQUE,
                     commitment_hash TEXT NOT NULL,
+                    idempotency_fingerprint TEXT,
+                    executed_at REAL,
                     created_epoch REAL NOT NULL
                 );
+                """
+            )
+            self._migrate(connection)
+
+    def _migrate(self, connection: sqlite3.Connection) -> None:
+        """Backward-compatible column additions; never rewrites history."""
+        columns = {
+            row["name"] for row in connection.execute(
+                "PRAGMA table_info(decision_commitments)")
+        }
+        if "idempotency_fingerprint" not in columns:
+            connection.execute(
+                "ALTER TABLE decision_commitments"
+                " ADD COLUMN idempotency_fingerprint TEXT")
+        if "executed_at" not in columns:
+            connection.execute(
+                "ALTER TABLE decision_commitments"
+                " ADD COLUMN executed_at REAL")
+        # Durable gate metrics: process-local counters would reset every
+        # time the dashboard or a new worker built its own gate instance.
+        connection.executescript(
+            """
+            CREATE TABLE IF NOT EXISTS gate_metrics (
+                metric TEXT PRIMARY KEY,
+                value INTEGER NOT NULL DEFAULT 0
+            );
+            """
+        )
+        connection.executescript(
+            """
                 CREATE TABLE IF NOT EXISTS commitment_events (
                     event_id INTEGER PRIMARY KEY AUTOINCREMENT,
                     commitment_id TEXT NOT NULL,
@@ -171,7 +348,7 @@ class DecisionCommitmentStore:
                 );
                 """
             )
-            self._ensure_queue_table(connection)
+        self._ensure_queue_table(connection)
 
     # ------------------------------------------------------------------ #
     # Commitment creation                                                 #
@@ -226,10 +403,27 @@ class DecisionCommitmentStore:
             "expires_at": now_epoch + max(1.0, ttl),
             "idempotency_key": str(spec["idempotency_key"]),
         }
-        record["commitment_hash"] = commitment_hash(record)
+        record["idempotency_fingerprint"] = idempotency_fingerprint(record)
+        # commitment_id derives from the STABLE fingerprint (not the
+        # complete hash), so the complete hash can cover the id itself.
         commitment_id = "dc-" + hashlib.sha256(
-            (record["idempotency_key"] + record["commitment_hash"]).encode()
+            (record["idempotency_key"]
+             + record["idempotency_fingerprint"]).encode()
         ).hexdigest()[:24]
+        # The complete hash is computed over the FULL persisted shape:
+        # commitment_id and created_epoch included -- so it can be
+        # recomputed from any loaded row and catch any mutation (decision
+        # flip, expiry extension). executed_at is EXCLUDED: the atomic
+        # claim legitimately writes it after creation. Booleans are
+        # normalized to ints to match their SQLite round-trip form.
+        full = {
+            **record,
+            "commitment_id": commitment_id,
+            "created_epoch": now_epoch,
+        }
+        full.pop("executed_at", None)
+        record["commitment_hash"] = complete_commitment_hash(
+            _persisted_shape(full))
         try:
             with self.connection() as connection:
                 existing = connection.execute(
@@ -239,7 +433,11 @@ class DecisionCommitmentStore:
                 ).fetchone()
                 if existing is not None:
                     prior = dict(existing)
-                    if prior["commitment_hash"] != record["commitment_hash"]:
+                    # Compare the STABLE fingerprint, not the complete
+                    # hash: the envelope (created_at/expires_at) differs on
+                    # a legitimate retry, the evidence must not.
+                    if prior.get("idempotency_fingerprint") != record[
+                            "idempotency_fingerprint"]:
                         raise DecisionCommitmentError(
                             "idempotency_collision",
                             "same key committed with different evidence",
@@ -255,8 +453,8 @@ class DecisionCommitmentStore:
                        previous_verified_head_index,
                        previous_verified_head_hash,simulation_ok,created_at,
                        expires_at,idempotency_key,commitment_hash,
-                       created_epoch)
-                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                       idempotency_fingerprint,created_epoch)
+                       VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                     (
                         commitment_id, record["schema_version"],
                         record["run_id"], record["network"],
@@ -270,7 +468,8 @@ class DecisionCommitmentStore:
                         record["previous_verified_head_hash"],
                         int(record["simulation_ok"]), record["created_at"],
                         record["expires_at"], record["idempotency_key"],
-                        record["commitment_hash"], now_epoch,
+                        record["commitment_hash"],
+                        record["idempotency_fingerprint"], now_epoch,
                     ),
                 )
                 connection.execute(
@@ -305,7 +504,135 @@ class DecisionCommitmentStore:
                 "SELECT * FROM decision_commitments WHERE commitment_id=?",
                 (commitment_id,),
             ).fetchone()
-        return dict(row) if row else None
+        if row is None:
+            return None
+        record = dict(row)
+        for derived in ("commitment_hash_verified", "tampered"):
+            record.pop(derived, None)
+        # executed_at is written by the atomic claim AFTER creation and is
+        # excluded from the hashed shape; drop it before recomputing.
+        hash_input = {k: v for k, v in record.items()
+                      if k != "executed_at"}
+        # Tamper detection: recompute the complete hash over the FULL
+        # persisted row and compare. Any mutation -- decision flip, expiry
+        # extension -- breaks this.
+        expected = complete_commitment_hash(_persisted_shape(hash_input))
+        if record.get("commitment_hash") != expected:
+            return {
+                **record,
+                "commitment_hash_verified": False,
+                "tampered": True,
+            }
+        record["commitment_hash_verified"] = True
+        return record
+
+    def claim_execution(self, commitment_id: str) -> dict:
+        """Atomically claim the action slot (state: claimed).
+
+        Exactly one concurrent caller can move a commitment from
+        un-claimed to claimed; everyone else gets refused. The claim is
+        PENDING until the caller confirms with :meth:`confirm_action` --
+        an open_position failure must leave the commitment abortable or
+        retryable, never falsely executed.
+        """
+        now = time.time()
+        with self.connection() as connection:
+            changed = connection.execute(
+                """UPDATE decision_commitments SET executed_at=?
+                   WHERE commitment_id=? AND decision='BUY_ELIGIBLE'
+                     AND executed_at IS NULL""",
+                (now, commitment_id),
+            ).rowcount
+            if not changed:
+                row = connection.execute(
+                    "SELECT decision, executed_at FROM decision_commitments"
+                    " WHERE commitment_id=?", (commitment_id,),
+                ).fetchone()
+                if row is None:
+                    return {"claimed": False, "reason": "commitment_missing"}
+                if row["decision"] != "BUY_ELIGIBLE":
+                    return {"claimed": False, "reason": "not_a_buy_decision"}
+                if row["executed_at"] is not None:
+                    return {"claimed": False, "reason": "already_claimed"}
+                return {"claimed": False, "reason": "claim_refused"}
+            connection.execute(
+                "INSERT INTO commitment_events"
+                " (commitment_id,status,detail,at_epoch,at)"
+                " VALUES (?,'action_claimed',NULL,?,?)",
+                (commitment_id, now, _utc_now()),
+            )
+        return {"claimed": True, "reason": "action_slot_claimed"}
+
+    def confirm_action(self, commitment_id: str,
+                       detail: str | None = None) -> None:
+        """Record that the claimed action actually SUCCEEDED.
+
+        Only after this does the commitment count as executed for
+        sealing/dedup purposes. A claim without confirmation must be
+        resolved by :meth:`abort_commitment` (failure) so no ring ever
+        seals a false 'executed'.
+        """
+        self.record_event(commitment_id, "executed", detail)
+
+    def abort_commitment(self, commitment_id: str,
+                         reason: str) -> None:
+        """Resolve a claim (or an unclaimed commitment) as aborted.
+
+        Aborted commitments are terminal: they seal with their refusal
+        context and can never authorize again.
+        """
+        self.record_event(commitment_id, "aborted", reason)
+
+    def recover_expired_commitments(self, *, now: float | None = None,
+                                    grace_seconds: float = 60.0) -> int:
+        """Lifecycle recovery: expire stale commitments and resolve their
+        seal jobs. Runs at the start of every analysis-lane drain.
+
+        - Unclaimed + past expiry -> aborted(expired); seal job released.
+        - Claimed but never confirmed within the grace window (a worker
+          died between claim and confirm) -> aborted(claim_expired).
+        Returns the number of commitments resolved.
+        """
+        now = time.time() if now is None else float(now)
+        resolved = 0
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT commitment_id, decision, executed_at, expires_at
+                   FROM decision_commitments
+                   WHERE commitment_id NOT IN (
+                       SELECT DISTINCT commitment_id FROM commitment_events
+                       WHERE status IN ('executed','aborted',
+                                        'superseded','executed_outcome'))"""
+            ).fetchall()
+            for row in rows:
+                expired = now > safe_float(row["expires_at"], 0.0)
+                claimed = row["executed_at"] is not None
+                claim_stale = claimed and (
+                    now - float(row["executed_at"]) > grace_seconds)
+                if not expired and not claim_stale:
+                    continue
+                if claimed and not claim_stale:
+                    continue  # actively claimed inside its grace window
+                reason = ("claim_expired" if claim_stale
+                          else "expired_without_action")
+                connection.execute(
+                    "INSERT INTO commitment_events"
+                    " (commitment_id,status,detail,at_epoch,at)"
+                    " VALUES (?,?,?,?,?)",
+                    (row["commitment_id"], "aborted", reason,
+                     now, _utc_now()),
+                )
+                # Release the seal job immediately: aborted commitments
+                # are terminal and seal on the next drain.
+                connection.execute(
+                    """UPDATE deferred_seals SET state='pending',
+                       available_at=?, lease_until=NULL, last_error=?,
+                       updated_at=? WHERE commitment_id=? AND state IN
+                       ('claiming','retrying')""",
+                    (now, reason, _utc_now(), row["commitment_id"]),
+                )
+                resolved += 1
+        return resolved
 
     def get_by_idempotency(self, key: str) -> dict | None:
         with self.connection() as connection:
@@ -341,6 +668,31 @@ class DecisionCommitmentStore:
                 "SELECT COUNT(*) n FROM decision_commitments").fetchone()
         return int(row["n"])
 
+    def increment_metric(self, metric: str, amount: int = 1) -> None:
+        """Durable counter: survives process and dashboard restarts."""
+        with self.connection() as connection:
+            self._migrate(connection)
+            connection.execute(
+                """INSERT INTO gate_metrics (metric,value) VALUES (?,?)
+                   ON CONFLICT(metric) DO UPDATE
+                   SET value=value+excluded.value""",
+                (metric, int(amount)),
+            )
+
+    def read_metric(self, metric: str) -> int:
+        with self.connection() as connection:
+            row = connection.execute(
+                "SELECT value FROM gate_metrics WHERE metric=?",
+                (metric,),
+            ).fetchone()
+        return int(row["value"]) if row else 0
+
+    def read_all_metrics(self) -> dict[str, int]:
+        with self.connection() as connection:
+            rows = connection.execute(
+                "SELECT metric,value FROM gate_metrics").fetchall()
+        return {row["metric"]: int(row["value"]) for row in rows}
+
     # ------------------------------------------------------------------ #
     # Verified-head cache (published by asynchronous verification)         #
     # ------------------------------------------------------------------ #
@@ -360,6 +712,7 @@ class DecisionCommitmentStore:
             "verification_result": str(verification_result),
             "verifier_version": str(verifier_version),
             "published_at": _utc_now(),
+            "published_epoch": time.time(),
             "expires_at": time.time() + float(ttl_seconds),
         }
         atomic_json_write(
@@ -477,6 +830,18 @@ class DecisionCommitmentStore:
                 (job_id,),
             ).fetchone()
             used = int(row["attempts"]) if row else 1
+            if attempts is not None:
+                # Explicit attempt override (e.g. releasing a job without
+                # burning a retry for "awaiting terminal state").
+                connection.execute(
+                    """UPDATE deferred_seals SET state='retrying',
+                       attempts=?, last_error=?, lease_until=NULL,
+                       available_at=?, updated_at=? WHERE job_id=?""",
+                    (int(attempts), error[:500],
+                     now if attempts == 0 else now + 60.0,
+                     _utc_now(), job_id),
+                )
+                return "retrying"
             if used >= SEAL_RETRY_MAX_ATTEMPTS:
                 new_state = "dead_letter"
                 connection.execute(

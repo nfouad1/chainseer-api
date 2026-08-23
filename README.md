@@ -55,6 +55,27 @@ The Solana engine runs continuous cycles that:
 
 The shadow portfolio uses 0.01 SOL per position. It is purely observational — no real capital, no execution path, no slippage risk. But the positions are tracked against real market prices via Jupiter quotes, so the outcomes reflect actual market conditions.
 
+### Robinhood paper learner: four independent lanes
+
+The Robinhood learner no longer runs discovery, current-state marking, and
+historical enrichment in one serial cycle. The scheduled supervisor owns four
+separately killable paper-only processes:
+
+| Lane | Cadence / deadline | Responsibility |
+|---|---|---|
+| **Live** | 30 seconds / 25 seconds | Mark every open position first, ingest only the current head, resolve immediate identities, take a fresh decision quote, classify and alert. It never performs historical discovery. |
+| **Marks** | 45 seconds / 90 seconds | Position marking and exit evaluation against an external price API, isolated so a price stall can never consume the blockchain freshness budget. |
+| **Analysis** | 60 seconds / 120 seconds | Observe outcomes, recheck executable markets, run expensive token analyses, drain the deferred seal queue, refresh the integrity certificate, and act as the only Robinhood learner Timechain writer. |
+| **Backfill** | 5 minutes / 120 seconds | Drain skipped block ranges, advance V2/V4 discovery, and enrich historical identity evidence. |
+
+Each lane has its own run ID, PID, monotonic deadline, heartbeat, cursor,
+backlog, lock, and latest summary in `robinhood_learning/learning.sqlite3` and
+the corresponding `*_lane_summary.json`. If the live lane must re-anchor, the
+skipped range is inserted into `flow_backfill_queue`; only a committed
+backfill pass advances or completes it. The dashboard reports measured p95
+latency and does not claim the sub-30-second target until completed live runs
+demonstrate it.
+
 ## How the Solana pipeline works
 
 ```
@@ -158,7 +179,11 @@ The Timechain also carries a cognitive trace — a record of what the system's r
 └─────────────────────────────────────────────────┘
 ```
 
-**Single process. Single writer.** The Timechain is filesystem-backed and cannot be horizontally scaled. There is one Fly.io instance, one analysis worker, one Timechain lease. This is intentional.
+**Single Timechain writer.** The public API is one Fly.io instance with one
+analysis worker and one Timechain lease. The local Robinhood learner uses
+separate OS processes for failure isolation, but only its analysis lane can
+write the producer Timechain; live and backfill lanes write durable SQLite and
+hash-ledger evidence only. This is intentional.
 
 ## Entity graph
 

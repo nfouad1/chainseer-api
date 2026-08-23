@@ -1,8 +1,9 @@
 [CmdletBinding()]
 param(
-    # Robinhood produces roughly 3,000 blocks per five-minute interval.
-    # 5,000 keeps discovery ahead while retaining a bounded RPC request.
-    [ValidateRange(1, 10000)][int]$DiscoveryBlockLimit = 5000,
+    # Historical work is isolated from the live head. A committed 500-block
+    # chunk is preferable to a 5,000-block attempt that repeatedly reaches the
+    # lane deadline before it can advance its durable cursor.
+    [ValidateRange(1, 10000)][int]$DiscoveryBlockLimit = 500,
     # Analysis is the binding stage. At 2 per five-minute cycle it processed
     # 24 candidates/hour against 55/hour of discovery, so the pending queue
     # grew ~31/hour and stood at 188; entry starved to 0.6 admits/hour while
@@ -20,14 +21,47 @@ param(
     # Market-only checks are cheap; full analysis runs only after a verified
     # executable pool is found.
     [ValidateRange(0, 20)][int]$MarketRecheckLimit = 4,
-    [ValidateRange(60, 290)][int]$CycleBudgetSeconds = 255
+    # The task repeats every five minutes. Leave a small clean handoff window
+    # so a late task invocation never overlaps the next Job Object owner.
+    [ValidateRange(60, 295)][int]$SupervisorWindowSeconds = 285
 )
 $ErrorActionPreference = "Stop"
 $workspacePath = $PSScriptRoot
-$pythonPath = Join-Path $workspacePath ".venv\Scripts\python.exe"
+$bootstrapPath = Join-Path $workspacePath "robinhood_learning\runner_bootstrap.log"
+New-Item -ItemType Directory -Path (Split-Path -Parent $bootstrapPath) -Force | Out-Null
+function Write-Bootstrap([string]$phase) {
+    Add-Content -LiteralPath $bootstrapPath -Encoding utf8 -Value (
+        "{0}`tpid={1}`t{2}" -f (Get-Date).ToUniversalTime().ToString("o"), $PID, $phase
+    )
+}
+Write-Bootstrap "script_entry"
+# The venv executable is a uv launcher which spawns the real interpreter. A
+# Job Object can own the launcher while that second process breaks away, so a
+# killed task can still orphan the learner. Do not even invoke that launcher
+# during scheduled startup: under Task Scheduler it can block before status or
+# ownership is established. Resolve the base interpreter from pyvenv.cfg and
+# launch it directly with the venv packages: one OS process, one owner.
+$venvConfigPath = Join-Path $workspacePath ".venv\pyvenv.cfg"
+$venvHomeLine = Get-Content -LiteralPath $venvConfigPath | Where-Object {
+    $_ -match '^\s*home\s*='
+} | Select-Object -First 1
+if (-not $venvHomeLine) { throw "Python home is missing from $venvConfigPath" }
+$pythonHome = ($venvHomeLine -split '=', 2)[1].Trim()
+$pythonPath = Join-Path $pythonHome "python.exe"
+if (-not (Test-Path -LiteralPath $pythonPath -PathType Leaf)) {
+    throw "Base Python interpreter not found: $pythonPath"
+}
+Write-Bootstrap "base_python_resolved"
+$venvSitePackages = Join-Path $workspacePath ".venv\Lib\site-packages"
+$previousPythonPath = $env:PYTHONPATH
+$env:PYTHONPATH = if ($previousPythonPath) {
+    "$venvSitePackages;$previousPythonPath"
+} else {
+    $venvSitePackages
+}
 $learningRoot = Join-Path $workspacePath "robinhood_learning"
 $logRoot = Join-Path $learningRoot "logs"
-$statusPath = Join-Path $learningRoot "scheduler_status.json"
+$statusPath = Join-Path $learningRoot "runner_status.json"
 $started = Get-Date
 $mutex = [System.Threading.Mutex]::new($false, "Local\ChainseerRobinhoodLearnOnce")
 $owned = $false
@@ -65,15 +99,17 @@ try {
             ConvertTo-Json | Set-Content -LiteralPath $skipPath -Encoding utf8
         exit 0
     }
+    Write-Bootstrap "mutex_acquired"
     Write-Status "running" 0 $null
+    Write-Bootstrap "status_running"
     $arguments = @(
         "-X", "utf8", (Join-Path $workspacePath "chainseer_robinhood.py"),
-        "learn-once", "--root", $learningRoot,
+        "lanes", "--root", $learningRoot,
+        "--duration-seconds", "$SupervisorWindowSeconds",
         "--discovery-block-limit", "$DiscoveryBlockLimit",
         "--analysis-limit", "$AnalysisLimit", "--outcome-limit", "$OutcomeLimit",
         "--outcome-recovery-limit", "$OutcomeRecoveryLimit",
-        "--market-recheck-limit", "$MarketRecheckLimit",
-        "--cycle-budget-seconds", "$CycleBudgetSeconds"
+        "--market-recheck-limit", "$MarketRecheckLimit"
     )
     # Own the whole tree. Start-Process -Wait waits, but if this PowerShell is
     # terminated the Python child is orphaned and keeps holding the learning
@@ -95,6 +131,14 @@ public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProc);
     # 0x2000 = KILL_ON_JOB_CLOSE.
     $infoSize = 144
     $info = [Runtime.InteropServices.Marshal]::AllocHGlobal($infoSize)
+    # AllocHGlobal returns uninitialized native memory. Leaving the remaining
+    # fields as random bytes can accidentally enable CPU/process limits and,
+    # under Task Scheduler, was observed to leave the Python child suspended
+    # before it wrote its first heartbeat. Zero the complete structure and set
+    # only the one limit we intentionally own.
+    for ($offset = 0; $offset -lt $infoSize; $offset++) {
+        [Runtime.InteropServices.Marshal]::WriteByte($info, $offset, 0)
+    }
     [Runtime.InteropServices.Marshal]::WriteInt32($info, 16, 0x2000)
     [void][Win32.ChainseerJob]::SetInformationJobObject($job, 9, $info, $infoSize)
 
@@ -106,6 +150,7 @@ public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProc);
         -PassThru -NoNewWindow -RedirectStandardOutput $stdoutPath `
         -RedirectStandardError $stderrPath
     if (-not $process) { throw "learner process failed to start" }
+    Write-Bootstrap ("child_started child_pid={0}" -f $process.Id)
     $assigned = [Win32.ChainseerJob]::AssignProcessToJobObject($job, $process.Handle)
     if (-not $assigned) {
         # Refusing to proceed unowned is deliberate: an unowned child is the
@@ -113,7 +158,9 @@ public static extern bool AssignProcessToJobObject(IntPtr hJob, IntPtr hProc);
         try { $process.Kill() } catch { }
         throw "could not assign learner to job object; refusing to run unowned"
     }
+    Write-Bootstrap ("child_job_assigned child_pid={0}" -f $process.Id)
     $process.WaitForExit()
+    Write-Bootstrap ("child_exited child_pid={0} exit_code={1}" -f $process.Id, $process.ExitCode)
     $stdout = if (Test-Path -LiteralPath $stdoutPath) { Get-Content -LiteralPath $stdoutPath -Raw } else { "" }
     $stderr = if (Test-Path -LiteralPath $stderrPath) { Get-Content -LiteralPath $stderrPath -Raw } else { "" }
     if ($stdout) { Add-Content -LiteralPath $logPath -Value $stdout }
@@ -133,6 +180,7 @@ catch {
     throw
 }
 finally {
+    $env:PYTHONPATH = $previousPythonPath
     Remove-Item -LiteralPath $stdoutPath -Force -ErrorAction SilentlyContinue
     Remove-Item -LiteralPath $stderrPath -Force -ErrorAction SilentlyContinue
     if ($owned) { $mutex.ReleaseMutex() }

@@ -296,13 +296,17 @@ class RobinhoodLearningTests(unittest.TestCase):
     def test_above_cap_candidate_requires_new_below_cap_momentum(self):
         class FallingThenRisingMarket(FakeMarket):
             def __init__(self): self.price = 0.009
-            def snapshots(self, _token):
-                return [{
+            def snapshot(self, token, pair_address=None):
+                # Consistent with snapshots(): the fresh revalidation
+                # quote must come from the same source as the recheck.
+                return {
                     "pair_address": PAIR, "source_version": rh.SOURCE_V2,
                     "price_usd": self.price, "liquidity_usd": 100_000,
                     "market_cap_usd": self.price * 1_000_000_000,
                     "source": "reentry-test",
-                }]
+                }
+            def snapshots(self, _token):
+                return [self.snapshot(_token)]
 
         with tempfile.TemporaryDirectory() as directory:
             market_client = FallingThenRisingMarket()
@@ -421,6 +425,17 @@ class RobinhoodLearningTests(unittest.TestCase):
 
     def test_market_watch_uses_future_cross_pool_snapshot_and_rechecks_analysis(self):
         class CrossPoolMarket(FakeMarket):
+            def snapshot(self, token, pair_address=None):
+                # Consistent with snapshots(): the fresh revalidation
+                # quote must come from the selected V3 cross pool.
+                return {
+                    "pair_address": "0x" + "44" * 20,
+                    "source_version": rh.SOURCE_V3,
+                    "price_usd": 0.0014, "liquidity_usd": 175_000,
+                    "market_cap_usd": 1_400_000,
+                    "source": "future-cross-pool-test",
+                }
+
             def snapshots(self, _token):
                 return [
                     {
@@ -429,13 +444,7 @@ class RobinhoodLearningTests(unittest.TestCase):
                         "price_usd": 0.0016, "liquidity_usd": 500_000,
                         "market_cap_usd": 1_600_000,
                     },
-                    {
-                        "pair_address": "0x" + "44" * 20,
-                        "source_version": rh.SOURCE_V3,
-                        "price_usd": 0.0014, "liquidity_usd": 175_000,
-                        "market_cap_usd": 1_400_000,
-                        "source": "future-cross-pool-test",
-                    },
+                    self.snapshot(_token),
                 ]
 
         with tempfile.TemporaryDirectory() as directory:
