@@ -51,6 +51,12 @@ from chainseer_outcome_ledger import (
     verify_outcome_rings,
 )
 from chainseer_temporal_graph import TemporalGraphStore
+from chainseer_robinhood_commitments import (
+    DecisionCommitmentStore,
+    evaluate_integrity_certificate,
+    load_integrity_certificate,
+)
+from chainseer_robinhood_gate import ExecutionGate
 from chainseer_robinhood_reflection import (
     RobinhoodReflectionCoordinator,
     default_skill_root,
@@ -8627,6 +8633,136 @@ class RobinhoodLearningEngine:
             self.timechain_recorder = RobinhoodLearningTimechainRecorder(
                 chain_root, skill_root=skill_root or default_skill_root(),
             )
+        # Deferred Timechain sealing: the decision path only appends
+        # commitments; this store is the durable queue the analysis lane --
+        # the single authoritative Timechain writer -- drains.
+        self.commitments = DecisionCommitmentStore(
+            self.root / "decision_commitments.sqlite3")
+        self.execution_gate = ExecutionGate(self.commitments)
+
+    def drain_deferred_seals(self, *, limit: int = 4) -> dict:
+        """Consume due seal jobs and create the full Timechain rings.
+
+        Called ONLY from run_analysis_lane. Each job links evidence ->
+        decision commitment -> paper event -> outcome by embedding the
+        commitment hash, its idempotency key and any recorded events in one
+        immutable ring. Exactly-once: a commitment has exactly one queue row
+        (UNIQUE) and the ring payload is keyed by the commitment hash, so a
+        retried seal re-finds its own prior ring instead of duplicating.
+        """
+        started = time.monotonic()
+        self.commitments.recover_expired_leases()
+        self.commitments.requeue_retrying()
+        claimed = self.commitments.claim_seal_batch(limit=limit)
+        sealed = failed = 0
+        last_ring = None
+        for job in claimed:
+            commitment = self.commitments.get(job["commitment_id"])
+            if commitment is None:
+                self.commitments.fail_seal(
+                    job["job_id"], "commitment row missing")
+                failed += 1
+                continue
+            events = self.commitments.latest_events(commitment[
+                "commitment_id"])
+            payload = {
+                "summary": (
+                    f"Deferred Timechain seal for decision commitment "
+                    f"{commitment['commitment_id']} "
+                    f"({commitment['decision']}) on "
+                    f"{commitment['token_address']}; full ring created "
+                    "asynchronously by the analysis lane."
+                ),
+                "event": "robinhood_decision_commitment_sealed",
+                "network": commitment["network"],
+                "token_address": commitment["token_address"],
+                "decision_commitment": {
+                    key: value for key, value in commitment.items()
+                    if key != "id"
+                },
+                "decision_events": events,
+                # The link that makes the ring tamper-evident against the
+                # fast path: identical to what the commitment carried.
+                "evidence_hash": commitment["evidence_hash"],
+                "evidence_block_pin": commitment["evidence_block_pin"],
+                "quote_hash": commitment["quote_hash"],
+                "hard_stop_digest": commitment["hard_stop_digest"],
+                "policy_version": commitment["policy_version"],
+                "faculty_registry_epoch":
+                    commitment["faculty_registry_epoch"],
+                "paper_only": True,
+                "live_execution_enabled": False,
+            }
+            try:
+                if self.timechain_recorder is None:
+                    raise RuntimeError("producer Timechain unavailable")
+                existing = self.timechain_recorder._find(
+                    "robinhood-decision-commitment:"
+                    + commitment["commitment_hash"])
+                if existing is not None:
+                    ring = existing
+                else:
+                    payload["idempotency_key"] = (
+                        "robinhood-decision-commitment:"
+                        + commitment["commitment_hash"])
+                    ring = self.timechain_recorder.tc.seal(
+                        "decision_commitment", payload)
+                    TemporalGraphStore(self.root).refresh(
+                        self.timechain_recorder.tc.load())
+                self.commitments.complete_seal(
+                    job["job_id"],
+                    int(ring.get("index") or 0),
+                    str(ring.get("ring_hash") or ""),
+                )
+                sealed += 1
+                last_ring = {
+                    "index": int(ring.get("index") or 0),
+                    "ring_hash": str(ring.get("ring_hash") or ""),
+                    "commitment_id": commitment["commitment_id"],
+                    "decision": commitment["decision"],
+                }
+            except Exception as exc:
+                state = self.commitments.fail_seal(
+                    job["job_id"], f"{type(exc).__name__}: {exc}")
+                failed += 1
+                if state == "dead_letter":
+                    self.commitments.record_event(
+                        commitment["commitment_id"], "seal_dead_letter",
+                        str(exc)[:200],
+                    )
+        return {
+            "claimed": len(claimed), "sealed": sealed, "failed": failed,
+            "last_ring": last_ring,
+            "duration_seconds": round(time.monotonic() - started, 3),
+        }
+
+    def publish_integrity_certificate(self) -> dict:
+        """Run full-chain verification OFF the critical path and publish the
+        atomic cached certificate the execution gate consumes."""
+        if self.timechain_recorder is None:
+            return {"published": False, "reason": "timechain_disabled"}
+        ok, report = self.timechain_recorder.verify()
+        rings = list(self.timechain_recorder.tc.iter_rings())
+        epoch = ""
+        try:
+            registry = self.timechain_recorder.tc.load_registry() \
+                if hasattr(self.timechain_recorder.tc, "load_registry") \
+                else None
+            epoch = str(getattr(registry, "epoch", "") or "")
+        except Exception:
+            epoch = ""
+        certificate = self.commitments.publish_verified_head(
+            head_index=int(rings[-1]["index"]) if rings else 0,
+            head_hash=str(rings[-1]["ring_hash"]) if rings else "",
+            chain_root=canonical_hash([
+                ring.get("ring_hash") for ring in rings]),
+            registry_epoch=epoch,
+            ring_count=len(rings),
+            verification_result="pass" if ok else "fail",
+            verifier_version="robinhood-deferred-sealing-v1",
+        )
+        return {"published": True, "verification_ok": bool(ok),
+                "ring_count": len(rings), "certificate": certificate}
 
     @contextmanager
     def _rpc_deadline(self, deadline: CycleDeadline):
@@ -10335,8 +10471,12 @@ class RobinhoodLearningEngine:
                 )
             timings["head_ingestion_and_identity"] = round(
                 time.monotonic() - stage, 3)
+            # Renamed: this stage captures a fresh block-pinned quote and
+            # persists an immutable SQLite observation. It is NOT Timechain
+            # sealing -- that happens asynchronously in the analysis lane.
             self.store.mark_lane_stage(
-                    "live", "sealing", run_id=self.cycle_run_uuid,
+                    "live", "fresh_quote_and_observation",
+                    run_id=self.cycle_run_uuid,
                     remaining=deadline.remaining(), completed=dict(timings))
             if not near_head.get("scanned"):
                 return {
@@ -10548,10 +10688,14 @@ class RobinhoodLearningEngine:
                 analyses = self._analyze_candidates(
                     observed_at, analysis_limit, deadline)
             timings["analyses"] = round(time.monotonic() - stage, 3)
+            stage = time.monotonic()
+            deferred_seals = self.drain_deferred_seals()
+            timings["deferred_seals"] = round(time.monotonic() - stage, 3)
             learning = self.store.summary()
             return {
                 "outcomes": outcomes, "market_rechecks": rechecks,
                 "candidate_analyses": analyses,
+                "deferred_seals": deferred_seals,
                 "stage_timings_seconds": timings,
                 "cursor": {"analysis_queue": "oldest_fairness_with_priorities"},
                 "backlog": {
@@ -11569,6 +11713,29 @@ def _dashboard_integrity(
     return result
 
 
+def _dashboard_decision_gate(
+    root: str | Path,
+) -> dict:
+    """Decision-gate observability for the dashboard/API.
+
+    Reads only committed state (no Timechain access, no full-chain
+    verification) so it stays safe to call from request handlers.
+    """
+    root = Path(root)
+    store_path = root / "decision_commitments.sqlite3"
+    if not store_path.exists():
+        return {
+            "state": "DEGRADED",
+            "explanation": [
+                "decision commitment store has never been created; "
+                "no pre-action authorization is possible yet"],
+            "metrics": {}, "seal_debt": None, "integrity": None,
+        }
+    store = DecisionCommitmentStore(store_path)
+    gate = ExecutionGate(store)
+    return gate.snapshot()
+
+
 def dashboard_operational_snapshot(
     root: str | Path,
     *,
@@ -11650,6 +11817,7 @@ def dashboard_operational_snapshot(
             },
         },
         "stabilization": stabilization,
+        "decision_gate": _dashboard_decision_gate(root),
         "discovery_coverage":cursor.get("coverage") or summary.get("discovery_coverage") or {},
         "discovery_coverage_by_source":{
             "uniswap_v2":cursor.get("coverage") or {},
