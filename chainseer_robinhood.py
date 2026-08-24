@@ -8673,6 +8673,12 @@ class RobinhoodLearningEngine:
             acquire_revalidation_snapshot,
             canonical_hard_stop_digest,
         )
+        # Eligibility gate BEFORE any commitment: an ineligible candidate
+        # must never be committed as BUY_ELIGIBLE -- that would corrupt
+        # provenance and future training data.
+        if not candidate.get("paper_entry_allowed"):
+            return {"entered": False,
+                    "reason": "candidate_not_paper_eligible"}
         try:
             evidence = {
                 "analysis": candidate.get("shadow_admission_json") or {},
@@ -8689,9 +8695,9 @@ class RobinhoodLearningEngine:
             hard_stops = json.loads(candidate.get("hard_stops_json") or "[]")
         except (TypeError, ValueError):
             hard_stops = []
-        registry_epoch = self._registry_epoch_identifier(
-            list(self.timechain_recorder.tc.iter_rings())
-            if self.timechain_recorder is not None else [])
+        # Registry epoch from CACHED metadata: the decision path never
+        # scans the producer chain (a full pass measured ~6.3 s).
+        registry_epoch = self._registry_epoch_cached()
         verified_head = self.commitments.verified_head()
 
         # ---- FRESH revalidation snapshot FIRST: the commitment pins the
@@ -8701,8 +8707,10 @@ class RobinhoodLearningEngine:
         rings = safe_int(certificate.get("ring_count"), 0)
 
         def _simulate(fresh_quote: dict) -> bool:
-            # Paper-mode pre-trade simulation: the entry must still be
-            # tradable against the CURRENT quote (price/liquidity/state).
+            # Paper QUOTE-SANITY check against the CURRENT quote. This is
+            # NOT a transaction simulation: paper mode has no execution
+            # path to simulate. The observed result is stored on the
+            # commitment as quote_sanity_ok -- never assumed.
             return bool(
                 safe_float(fresh_quote.get("price_usd"), 0.0) > 0
                 and safe_float(fresh_quote.get("liquidity_usd"), 0.0)
@@ -8716,6 +8724,11 @@ class RobinhoodLearningEngine:
             return self.market.snapshot(token_arg, pair_arg)
 
         try:
+            # Producer tail from CONSTANT-TIME metadata: the cached
+            # certificate's ring count plus the seals WE have made since
+            # publication (tracked incrementally by drain_deferred_seals).
+            # Never materialize the chain on the decision path (reading
+            # the real 110 MB file measured ~6.3 s).
             snapshot = acquire_revalidation_snapshot(
                 rpc=self.rpc, market_client=SimpleNamespace(
                     snapshot=_market_snapshot),
@@ -8723,9 +8736,9 @@ class RobinhoodLearningEngine:
                 hard_stops=hard_stops,
                 quote_fields=tuple(quote.keys()),
                 run_pre_trade_simulation=_simulate,
-                producer_chain_rings=(
-                    list(self.timechain_recorder.tc.iter_rings())
-                    if self.timechain_recorder is not None else []),
+                producer_chain_rings=None,
+                producer_ring_count_override=(
+                    rings + getattr(self, "_rings_sealed_since_publish", 0)),
                 certificate_ring_count=rings or None,
             )
         except Exception:
@@ -8747,7 +8760,9 @@ class RobinhoodLearningEngine:
             or "robinhood-paper-v1",
             faculty_registry_epoch=registry_epoch,
             verified_head=verified_head,
-            simulation_ok=True,
+            # The OBSERVED quote-sanity result from the fresh snapshot --
+            # never assumed True. The gate re-checks it at authorization.
+            simulation_ok=snapshot.simulation_ok,
             risk_score=candidate.get("score"),
             # Idempotency identifies the EXACT analysis/quote attempt --
             # not merely the token -- so each recheck of the same token
@@ -8824,6 +8839,19 @@ class RobinhoodLearningEngine:
         certificate = load_integrity_certificate(self.root)
         return safe_int(certificate.get("ring_count"), 0)
 
+    def _registry_epoch_cached(self) -> str:
+        """Registry epoch from the CACHED certificate -- never a chain
+        scan. Falls back to the last known identifier so the decision
+        path stays O(1) in chain length."""
+        certificate = load_integrity_certificate(self.root)
+        epoch = str(certificate.get("registry_epoch") or "")
+        if epoch:
+            return epoch
+        # Certificate not published yet: reuse the last-seen value.
+        if getattr(self, "_last_registry_epoch", None):
+            return self._last_registry_epoch
+        return "unknown-chain"
+
     def drain_deferred_seals(self, *, limit: int = 4,
                              deadline: "CycleDeadline | None" = None) -> dict:
         """Consume due seal jobs and create the full Timechain rings.
@@ -8836,6 +8864,12 @@ class RobinhoodLearningEngine:
         """
         started = time.monotonic()
         self.commitments.recover_expired_leases()
+        # Lifecycle recovery (review F2/P0): expire stale commitments and
+        # reconcile claimed-but-unconfirmed ones against the position
+        # store BEFORE aborting -- a crash between open_position success
+        # and confirm_action must resolve as executed, not aborted.
+        recovered = self.commitments.recover_expired_commitments(
+            position_reconciler=self._position_exists)
         self.commitments.requeue_retrying()
         claimed = self.commitments.claim_seal_batch(limit=limit)
         sealed = failed = deferred_not_terminal = 0
@@ -8927,6 +8961,11 @@ class RobinhoodLearningEngine:
                     str(ring.get("ring_hash") or ""),
                 )
                 sealed += 1
+                # Incremental producer-tail counter: lets the decision
+                # path compute certificate lag in O(1) without ever
+                # reading the chain.
+                self._rings_sealed_since_publish = (
+                    getattr(self, "_rings_sealed_since_publish", 0) + 1)
                 last_ring = {
                     "index": int(ring.get("index") or 0),
                     "ring_hash": str(ring.get("ring_hash") or ""),
@@ -8945,9 +8984,23 @@ class RobinhoodLearningEngine:
         return {
             "claimed": len(claimed), "sealed": sealed, "failed": failed,
             "deferred_not_terminal": deferred_not_terminal,
+            "lifecycle_recovered": recovered,
             "last_ring": last_ring,
             "duration_seconds": round(time.monotonic() - started, 3),
         }
+
+    def _position_exists(self, token_address: str) -> bool:
+        """Cross-database reconciliation: does an OPEN position exist for
+        this token in the learning store?"""
+        try:
+            for position in self.store.recent_positions():
+                if (str(position.get("token_address") or "").lower()
+                        == str(token_address).lower()
+                        and position.get("status") == "open"):
+                    return True
+        except Exception:
+            return False
+        return False
 
     def publish_integrity_certificate(self) -> dict:
         """Run full-chain verification OFF the critical path and publish the
@@ -8971,6 +9024,9 @@ class RobinhoodLearningEngine:
             verification_result="pass" if ok else "fail",
             verifier_version="robinhood-deferred-sealing-v1",
         )
+        # Certificate is fresh again: reset the incremental tail counter.
+        self._rings_sealed_since_publish = 0
+        self._last_registry_epoch = epoch
         return {"published": True, "verification_ok": bool(ok),
                 "ring_count": len(rings), "certificate": certificate}
 
@@ -10905,10 +10961,24 @@ class RobinhoodLearningEngine:
             stage = time.monotonic()
             deferred_seals = self.drain_deferred_seals(deadline=deadline)
             timings["deferred_seals"] = round(time.monotonic() - stage, 3)
-            # Certificate refresh stays on this lane's budget but off the
-            # live path; bounded so it can never overrun the cycle.
+            # Certificate refresh has RESERVED budget: it runs FIRST on
+            # this lane (before analyses consume the cycle) whenever the
+            # cached certificate is missing or past half its lifetime.
+            # Starving it left entries fail-closed on a 53-minute-old
+            # certificate. Full verification is still off the live path.
             certificate_refresh = None
-            if deadline.remaining() >= 30.0:
+            certificate = load_integrity_certificate(self.root)
+            cert_age = time.time() - safe_float(
+                certificate.get("published_epoch"), 0.0)
+            cert_max_age = safe_float(
+                certificate.get("expires_at"),
+                time.time() + 1.0) - safe_float(
+                certificate.get("published_epoch"), time.time())
+            needs_refresh = (
+                not certificate
+                or cert_age > max(0.0, cert_max_age * 0.5))
+            if self.timechain_recorder is not None and (
+                    needs_refresh or deadline.remaining() >= 30.0):
                 stage = time.monotonic()
                 try:
                     certificate_refresh = self.publish_integrity_certificate()

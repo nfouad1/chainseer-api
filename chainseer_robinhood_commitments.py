@@ -154,7 +154,9 @@ def _quote_projection(fresh_quote: dict, fields: tuple) -> dict:
 
 def acquire_revalidation_snapshot(
     *, rpc, market_client, candidate: dict, token_address: str,
-    hard_stops: list, run_pre_trade_simulation, producer_chain_rings,
+    hard_stops: list, run_pre_trade_simulation,
+    producer_chain_rings: list | None = None,
+    producer_ring_count_override: int | None = None,
     quote_fields: tuple = ("price_usd", "liquidity_usd",
                            "market_cap_usd"),
     max_ring_lag: int = INTEGRITY_CERTIFICATE_MAX_RING_LAG,
@@ -196,7 +198,12 @@ def acquire_revalidation_snapshot(
         simulation_ok = bool(run_pre_trade_simulation(fresh_quote))
     except Exception:
         simulation_ok = False
-    tail = {"ring_count": len(producer_chain_rings or [])}
+    if producer_ring_count_override is not None:
+        # CONSTANT-TIME tail: cached certificate count plus seals made
+        # since publication. No chain materialization on this path.
+        tail = {"ring_count": int(producer_ring_count_override)}
+    else:
+        tail = {"ring_count": len(producer_chain_rings or [])}
     if certificate_ring_count is not None:
         tail["certificate_lag"] = max(
             0, tail["ring_count"] - int(certificate_ring_count))
@@ -583,21 +590,45 @@ class DecisionCommitmentStore:
         """
         self.record_event(commitment_id, "aborted", reason)
 
+    def producer_tail_estimate(self) -> int:
+        """Constant-time estimate of the producer chain tail.
+
+        Uses the highest sealed ring index recorded in the local queue
+        plus one (rings are appended), combined with the cached
+        certificate's ring count. This catches seals made by any writer
+        of this queue without materializing the chain.
+        """
+        with self.connection() as connection:
+            self._ensure_queue_table(connection)
+            row = connection.execute(
+                "SELECT MAX(sealed_ring_index) m FROM deferred_seals"
+                " WHERE state='sealed' AND sealed_ring_index IS NOT NULL"
+            ).fetchone()
+        max_sealed = safe_int((row or {}).get("m"), -1)
+        return max_sealed + 1 if max_sealed >= 0 else 0
+
     def recover_expired_commitments(self, *, now: float | None = None,
-                                    grace_seconds: float = 60.0) -> int:
+                                    grace_seconds: float = 60.0,
+                                    position_reconciler=None) -> int:
         """Lifecycle recovery: expire stale commitments and resolve their
         seal jobs. Runs at the start of every analysis-lane drain.
 
-        - Unclaimed + past expiry -> aborted(expired); seal job released.
+        - Unclaimed + past expiry -> resolved against the position store
+          via ``position_reconciler(token) -> bool`` (True = a position
+          actually exists): an existing position means the action DID
+          happen and the commitment is confirmed executed -- never
+          falsely aborted; no position means it truly expired aborted.
         - Claimed but never confirmed within the grace window (a worker
-          died between claim and confirm) -> aborted(claim_expired).
+          died between claim and confirm) -> reconciled the same way.
+
         Returns the number of commitments resolved.
         """
         now = time.time() if now is None else float(now)
         resolved = 0
         with self.connection() as connection:
             rows = connection.execute(
-                """SELECT commitment_id, decision, executed_at, expires_at
+                """SELECT commitment_id, decision, executed_at, expires_at,
+                          token_address
                    FROM decision_commitments
                    WHERE commitment_id NOT IN (
                        SELECT DISTINCT commitment_id FROM commitment_events
@@ -613,17 +644,32 @@ class DecisionCommitmentStore:
                     continue
                 if claimed and not claim_stale:
                     continue  # actively claimed inside its grace window
-                reason = ("claim_expired" if claim_stale
-                          else "expired_without_action")
+                # Cross-database reconciliation FIRST: a crash between
+                # open_position success and confirm_action must NOT be
+                # recorded as aborted when the position exists.
+                position_exists = False
+                if position_reconciler is not None:
+                    try:
+                        position_exists = bool(position_reconciler(
+                            row["token_address"]))
+                    except Exception:
+                        position_exists = False
+                if position_exists:
+                    status, reason = "executed", (
+                        "confirmed_by_recovery_position_open")
+                else:
+                    status, reason = "aborted", (
+                        "claim_expired" if claim_stale
+                        else "expired_without_action")
                 connection.execute(
                     "INSERT INTO commitment_events"
                     " (commitment_id,status,detail,at_epoch,at)"
                     " VALUES (?,?,?,?,?)",
-                    (row["commitment_id"], "aborted", reason,
+                    (row["commitment_id"], status, reason,
                      now, _utc_now()),
                 )
-                # Release the seal job immediately: aborted commitments
-                # are terminal and seal on the next drain.
+                # Release the seal job immediately: terminal commitments
+                # seal on the next drain.
                 connection.execute(
                     """UPDATE deferred_seals SET state='pending',
                        available_at=?, lease_until=NULL, last_error=?,
