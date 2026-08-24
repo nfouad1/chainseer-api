@@ -42,6 +42,9 @@ class FakeTimechain:
     def iter_rings(self):
         return list(self.rings)
 
+    def _current_head(self):
+        return self.rings[-1] if self.rings else None
+
     def load(self):
         return list(self.rings)
 
@@ -118,16 +121,25 @@ class AdversarialTests(unittest.TestCase):
         return self.engine.store.candidate(token)
 
     def test_stale_certificate_tail_blocks_entry_after_chain_growth(self):
-        """Certificate covers 1 ring; producer chain grows to 11 rings.
-        The tail-lag gate must refuse the entry even though the cached
-        certificate itself says 'pass'."""
+        """Certificate covers 1 ring; our sealing lane grows the producer
+        chain by 10. The durable tail gate must refuse the stale cert."""
         candidate = self.seed_candidate()
         # Publish certificate at ring_count=1.
         self.assertEqual(
             self.engine.publish_integrity_certificate()["ring_count"], 1)
-        # Grow the producer chain by 10 more sealed commitments (11 total).
+        # Grow the producer chain by 10 rings through the engine's OWN
+        # seal path (drain_deferred_seals), as production would.
+        from tests.test_chainseer_robinhood_deferred_sealing_helpers \
+            import commit_spec
         for i in range(10):
-            self.fake_tc.seal("filler", {"n": i})
+            rec = self.engine.commitments.create(commit_spec(
+                decision="reject",
+                token_address=f"0x{0xbb:040x}"[:2] + f"{i:02x}" * 19,
+                idempotency_key=f"adv-growth-{i}"))
+        drained = self.engine.drain_deferred_seals(limit=16)
+        self.assertEqual(drained["sealed"], 10)
+        self.assertEqual(len(self.fake_tc.rings), 11)
+
         result = self.engine.guarded_paper_entry(
             candidate, {"price_usd": 2.5, "liquidity_usd": 500_000.0,
                         "market_cap_usd": 100_000.0, "block_number": 5005},
@@ -138,6 +150,36 @@ class AdversarialTests(unittest.TestCase):
         positions = self.engine.store.recent_positions()
         self.assertFalse(any(p["status"] == "open" for p in positions))
 
+    def test_external_growth_survives_restart_and_blocks_entry(self):
+        """An external writer grows the chain after publication. A fresh
+        engine process has no in-memory counter, yet must still observe the
+        durable tail and refuse authorization."""
+        candidate = self.seed_candidate(
+            "0xcd00000000000000000000000000000000000000")
+        self.assertEqual(
+            self.engine.publish_integrity_certificate()["ring_count"], 1)
+        for index in range(10):
+            self.fake_tc.seal("external", {"index": index})
+
+        def forbidden_full_scan():
+            raise AssertionError("authorization materialized producer chain")
+
+        self.fake_tc.iter_rings = forbidden_full_scan
+
+        # Explicitly model a process restart: no process-local seal counter
+        # or remembered tail is available on the new engine instance.
+        restarted = object.__new__(rh.RobinhoodLearningEngine)
+        restarted.__dict__.update(self.engine.__dict__)
+        restarted.__dict__.pop("_rings_sealed_since_publish", None)
+        result = restarted.guarded_paper_entry(
+            candidate,
+            {"price_usd": 2.5, "liquidity_usd": 500_000.0,
+             "market_cap_usd": 100_000.0, "block_number": 5005},
+            run_id="adv-restart", priority_reason="external-growth")
+        self.assertFalse(result["entered"])
+        self.assertIn(result["reason"], {
+            "producer_tail_lag_exceeded", "certificate_behind_rings"})
+
     def test_open_position_failure_never_seals_executed(self):
         """open_position returns False -> commitment aborted -> the async
         seal carries an aborted event, never 'executed'."""
@@ -146,7 +188,10 @@ class AdversarialTests(unittest.TestCase):
 
         calls = {"open": 0}
 
-        def failing_open(store_self, candidate_arg, market_arg):
+        def failing_open(
+            store_self, candidate_arg, market_arg, *,
+            decision_commitment_id=None,
+        ):
             calls["open"] += 1
             return False
 
@@ -192,6 +237,23 @@ class AdversarialTests(unittest.TestCase):
         events = {e["status"] for e in self.engine.commitments.latest_events(
             record["commitment_id"])}
         self.assertIn("aborted", events)
+
+    def test_terminal_abort_is_idempotent(self):
+        """Caller cleanup after a gate refusal must not duplicate history."""
+        from tests.test_chainseer_robinhood_deferred_sealing_helpers \
+            import commit_spec
+        record = self.engine.commitments.create(commit_spec(
+            idempotency_key="one-terminal-abort"))
+        first = self.engine.execution_gate.record_action_result(
+            record["commitment_id"], False, "first")
+        second = self.engine.execution_gate.record_action_result(
+            record["commitment_id"], False, "second")
+        self.assertEqual(first["resolved"], "aborted")
+        self.assertEqual(second["resolved"], "already_terminal")
+        aborted = [event for event in self.engine.commitments.latest_events(
+            record["commitment_id"], limit=20)
+            if event["status"] == "aborted"]
+        self.assertEqual(len(aborted), 1)
 
 
 from unittest.mock import patch  # noqa: E402

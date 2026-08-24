@@ -1,5 +1,6 @@
 import os
 import sqlite3
+import subprocess
 import sys
 import inspect
 import json
@@ -20,6 +21,69 @@ from chainseer_robinhood_reflection import RobinhoodReflectionCoordinator
 TOKEN = "0x" + "11" * 20
 PAIR = "0x" + "22" * 20
 POOL_ID = "0x" + "ab" * 32
+
+
+class HashEventLedgerIntegrityTests(unittest.TestCase):
+    def test_concurrent_writers_remain_strictly_linear(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+            first = rh.HashEventLedger(path)
+            code = (
+                "import sys; from chainseer_robinhood import HashEventLedger; "
+                "ledger=HashEventLedger(sys.argv[1]); prefix=sys.argv[2]; "
+                "[ledger.append('test', {'id': f'{prefix}-{i}'}) "
+                "for i in range(10)]")
+            workers = [
+                subprocess.Popen(
+                    [sys.executable, "-X", "utf8", "-c", code,
+                     str(path), prefix], cwd=Path.cwd())
+                for prefix in ("a", "b")
+            ]
+            for worker in workers:
+                self.assertEqual(worker.wait(timeout=30), 0)
+            rows = first.load()
+            self.assertEqual([row["index"] for row in rows], list(range(20)))
+            ok, report = first.verify()
+            self.assertTrue(ok, report)
+
+    def test_anchored_legacy_fork_is_preserved_but_suffix_is_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "events.jsonl"
+
+            def event(index, previous, label):
+                value = {
+                    "index": index, "event_type": "test",
+                    "timestamp": "2026-01-01T00:00:00+00:00",
+                    "previous_hash": previous, "payload": {"id": label},
+                }
+                value["event_hash"] = hashlib.sha256(
+                    rh._canonical(value).encode("utf-8")).hexdigest()
+                return value
+
+            zero = "0" * 64
+            genesis = event(0, zero, "genesis")
+            parent = event(1, genesis["event_hash"], "parent")
+            sibling_a = event(2, parent["event_hash"], "a")
+            sibling_b = event(2, parent["event_hash"], "b")
+            continuation = event(4, sibling_b["event_hash"], "continue")
+            raw = "".join(
+                json.dumps(item, sort_keys=True) + "\n"
+                for item in (genesis, parent, sibling_a, sibling_b,
+                             continuation)).encode("utf-8")
+            path.write_bytes(raw)
+            ledger = rh.HashEventLedger(path)
+            self.assertFalse(ledger.verify()[0])
+            rh.atomic_json_write(ledger.integrity_epoch_path, {
+                "legacy_event_count": 5,
+                "legacy_prefix_sha256": hashlib.sha256(raw).hexdigest(),
+                "legacy_tail_event_hash": continuation["event_hash"],
+            })
+            ok, report = ledger.verify()
+            self.assertTrue(ok, report)
+            self.assertIn("anchored legacy anomalies", report)
+            appended = ledger.append("test", {"id": "strict-suffix"})
+            self.assertEqual(appended["index"], 5)
+            self.assertTrue(ledger.verify()[0])
 
 
 def topic(address):

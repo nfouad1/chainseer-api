@@ -87,8 +87,9 @@ class ExecutionGate:
 
         All arguments except ``simulation_ok`` are REQUIRED keyword
         arguments: passing nothing for one is a rejection, not a pass.
-        ``simulation_ok`` re-checks the live pre-trade simulation result;
-        the commitment's stored result must ALSO be true.
+        ``simulation_ok`` re-checks the action-mode safety probe. In the
+        current paper path that probe is quote sanity, not transaction
+        simulation; the commitment's stored result must ALSO be true.
 
         ``integrity_enforced`` is False ONLY in standalone paper-learning
         mode (no producer Timechain exists at all); every other caller
@@ -237,9 +238,11 @@ class ExecutionGate:
         if succeeded:
             self.store.confirm_action(commitment_id, detail)
             return {"resolved": "executed"}
-        self.store.abort_commitment(commitment_id, f"action_failed:{detail}")
-        self._bump("actions_failed")
-        return {"resolved": "aborted"}
+        appended = self.store.abort_commitment(
+            commitment_id, f"action_failed:{detail}")
+        if appended:
+            self._bump("actions_failed")
+        return {"resolved": "aborted" if appended else "already_terminal"}
 
     def record_executed(self, commitment_id: str, detail: str) -> dict:
         """Compatibility wrapper: confirm a successful action."""

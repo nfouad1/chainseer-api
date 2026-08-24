@@ -214,6 +214,9 @@ class FakeTimechain:
     def iter_rings(self):
         return list(self.rings)
 
+    def _current_head(self):
+        return self.rings[-1] if self.rings else None
+
     def load(self):
         return list(self.rings)
 

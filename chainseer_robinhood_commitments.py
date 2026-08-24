@@ -157,6 +157,7 @@ def acquire_revalidation_snapshot(
     hard_stops: list, run_pre_trade_simulation,
     producer_chain_rings: list | None = None,
     producer_ring_count_override: int | None = None,
+    producer_ring_count_reader=None,
     quote_fields: tuple = ("price_usd", "liquidity_usd",
                            "market_cap_usd"),
     max_ring_lag: int = INTEGRITY_CERTIFICATE_MAX_RING_LAG,
@@ -168,8 +169,9 @@ def acquire_revalidation_snapshot(
     - ``market_client.snapshot(...)``: a fresh quote taken NOW, hashed
       over exactly ``quote_fields`` -- the same fields the commitment's
       original quote covered.
-    - ``hard_stops`` recomputed from the candidate's CURRENT stored state.
-    - ``run_pre_trade_simulation()`` callback result -- never assumed True.
+    - ``hard_stops`` read from the candidate's CURRENT stored analysis state.
+    - ``run_pre_trade_simulation()`` callback result -- a quote-sanity
+      check in paper mode, never represented as transaction simulation.
     - Producer Timechain tail so certificate lag is measured against
       reality; if verification has fallen too far behind, the caller sees
       it and fails closed.
@@ -198,9 +200,14 @@ def acquire_revalidation_snapshot(
         simulation_ok = bool(run_pre_trade_simulation(fresh_quote))
     except Exception:
         simulation_ok = False
-    if producer_ring_count_override is not None:
-        # CONSTANT-TIME tail: cached certificate count plus seals made
-        # since publication. No chain materialization on this path.
+    if producer_ring_count_reader is not None:
+        # Read the TRUE producer tail after the remote quote work, as close
+        # as possible to authorization. The Timechain implementation uses
+        # an O(1) last-record read, so this survives restarts and external
+        # writers without materializing or verifying the full chain.
+        tail = {"ring_count": int(producer_ring_count_reader())}
+    elif producer_ring_count_override is not None:
+        # Compatibility for callers with another durable O(1) tail source.
         tail = {"ring_count": int(producer_ring_count_override)}
     else:
         tail = {"ring_count": len(producer_chain_rings or [])}
@@ -582,30 +589,26 @@ class DecisionCommitmentStore:
         self.record_event(commitment_id, "executed", detail)
 
     def abort_commitment(self, commitment_id: str,
-                         reason: str) -> None:
+                         reason: str) -> bool:
         """Resolve a claim (or an unclaimed commitment) as aborted.
 
         Aborted commitments are terminal: they seal with their refusal
         context and can never authorize again.
         """
-        self.record_event(commitment_id, "aborted", reason)
-
-    def producer_tail_estimate(self) -> int:
-        """Constant-time estimate of the producer chain tail.
-
-        Uses the highest sealed ring index recorded in the local queue
-        plus one (rings are appended), combined with the cached
-        certificate's ring count. This catches seals made by any writer
-        of this queue without materializing the chain.
-        """
         with self.connection() as connection:
-            self._ensure_queue_table(connection)
-            row = connection.execute(
-                "SELECT MAX(sealed_ring_index) m FROM deferred_seals"
-                " WHERE state='sealed' AND sealed_ring_index IS NOT NULL"
-            ).fetchone()
-        max_sealed = safe_int((row or {}).get("m"), -1)
-        return max_sealed + 1 if max_sealed >= 0 else 0
+            changed = connection.execute(
+                """INSERT INTO commitment_events
+                   (commitment_id,status,detail,at_epoch,at)
+                   SELECT ?,'aborted',?,?,?
+                   WHERE NOT EXISTS (
+                       SELECT 1 FROM commitment_events
+                       WHERE commitment_id=? AND status IN
+                       ('executed','aborted','superseded',
+                        'executed_outcome'))""",
+                (commitment_id, reason, time.time(), _utc_now(),
+                 commitment_id),
+            ).rowcount
+        return bool(changed)
 
     def recover_expired_commitments(self, *, now: float | None = None,
                                     grace_seconds: float = 60.0,
@@ -614,10 +617,10 @@ class DecisionCommitmentStore:
         seal jobs. Runs at the start of every analysis-lane drain.
 
         - Unclaimed + past expiry -> resolved against the position store
-          via ``position_reconciler(token) -> bool`` (True = a position
-          actually exists): an existing position means the action DID
-          happen and the commitment is confirmed executed -- never
-          falsely aborted; no position means it truly expired aborted.
+          via ``position_reconciler(commitment_id, token)``. The callback
+          returns ``executed``, ``absent`` or ``indeterminate``. Only an
+          exact commitment-linked position proves execution; a same-token
+          position is not causal evidence.
         - Claimed but never confirmed within the grace window (a worker
           died between claim and confirm) -> reconciled the same way.
 
@@ -644,19 +647,44 @@ class DecisionCommitmentStore:
                     continue
                 if claimed and not claim_stale:
                     continue  # actively claimed inside its grace window
-                # Cross-database reconciliation FIRST: a crash between
-                # open_position success and confirm_action must NOT be
-                # recorded as aborted when the position exists.
-                position_exists = False
+                # Cross-database reconciliation FIRST. Errors and ambiguous
+                # evidence are UNKNOWN, never silently translated to
+                # "position absent" (which would forge an aborted outcome).
+                state = "absent" if position_reconciler is None \
+                    else "indeterminate"
+                detail = None
                 if position_reconciler is not None:
                     try:
-                        position_exists = bool(position_reconciler(
-                            row["token_address"]))
-                    except Exception:
-                        position_exists = False
-                if position_exists:
+                        result = position_reconciler(
+                            row["commitment_id"], row["token_address"])
+                        if isinstance(result, dict):
+                            state = str(result.get("state") or "").lower()
+                            detail = result.get("detail")
+                        elif isinstance(result, str):
+                            state = result.lower()
+                        elif isinstance(result, bool):
+                            # Backward-compatible only; production returns a
+                            # structured tri-state result.
+                            state = "executed" if result else "absent"
+                    except Exception as exc:
+                        state = "indeterminate"
+                        detail = f"{type(exc).__name__}: {exc}"
+                if state not in {"executed", "absent"}:
+                    reason = "position_reconciliation_indeterminate"
+                    if detail:
+                        reason += ":" + str(detail)[:300]
+                    connection.execute(
+                        """UPDATE deferred_seals SET state='retrying',
+                           available_at=?, lease_until=NULL, last_error=?,
+                           updated_at=? WHERE commitment_id=? AND state IN
+                           ('pending','claiming','retrying')""",
+                        (now + max(1.0, grace_seconds), reason,
+                         _utc_now(), row["commitment_id"]),
+                    )
+                    continue
+                if state == "executed":
                     status, reason = "executed", (
-                        "confirmed_by_recovery_position_open")
+                        "confirmed_by_recovery_commitment_link")
                 else:
                     status, reason = "aborted", (
                         "claim_expired" if claim_stale

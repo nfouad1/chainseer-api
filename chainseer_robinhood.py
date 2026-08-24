@@ -655,10 +655,66 @@ def _remote_call(operation: str, callback, *, attempts: int = REMOTE_RETRY_ATTEM
     ) from last_error
 
 
+class _HashLedgerAppendLock:
+    """Blocking OS byte-range lock shared by all lane processes."""
+
+    def __init__(self, path: Path, timeout_seconds: float = 30.0):
+        self.path = path
+        self.timeout_seconds = float(timeout_seconds)
+        self.handle = None
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.path.touch(exist_ok=True)
+        self.handle = self.path.open("r+b")
+        self.handle.seek(0, os.SEEK_END)
+        if self.handle.tell() == 0:
+            self.handle.write(b" ")
+            self.handle.flush()
+        deadline = time.monotonic() + self.timeout_seconds
+        while True:
+            try:
+                if os.name == "nt":
+                    import msvcrt
+                    self.handle.seek(0)
+                    msvcrt.locking(self.handle.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    import fcntl
+                    fcntl.flock(
+                        self.handle.fileno(),
+                        fcntl.LOCK_EX | fcntl.LOCK_NB)
+                return self
+            except (OSError, BlockingIOError):
+                if time.monotonic() >= deadline:
+                    self.handle.close()
+                    self.handle = None
+                    raise TimeoutError(
+                        f"event-ledger append lock timed out: {self.path}")
+                time.sleep(0.05)
+
+    def __exit__(self, _exc_type, _exc, _tb):
+        if self.handle is None:
+            return
+        try:
+            if os.name == "nt":
+                import msvcrt
+                self.handle.seek(0)
+                msvcrt.locking(self.handle.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                import fcntl
+                fcntl.flock(self.handle.fileno(), fcntl.LOCK_UN)
+        finally:
+            self.handle.close()
+            self.handle = None
+
+
 class HashEventLedger:
     def __init__(self, path: str | Path):
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
+        self.lock_path = self.path.with_name(self.path.name + ".append.lock")
+        self.integrity_epoch_path = self.path.with_name(
+            self.path.name + ".integrity_epoch.json")
 
     def load(self) -> list[dict]:
         if not self.path.exists():
@@ -666,37 +722,122 @@ class HashEventLedger:
         with self.path.open("r", encoding="utf-8") as handle:
             return [json.loads(line) for line in handle if line.strip()]
 
+    def _tail_event(self) -> dict | None:
+        """Read the last complete JSONL record without loading 48+ MB."""
+        if not self.path.exists() or self.path.stat().st_size == 0:
+            return None
+        with self.path.open("rb") as handle:
+            handle.seek(0, os.SEEK_END)
+            end = handle.tell()
+            position = end
+            data = b""
+            while position > 0:
+                step = min(65536, position)
+                position -= step
+                handle.seek(position)
+                data = handle.read(step) + data
+                for raw in reversed(data.split(b"\n")):
+                    if not raw.strip():
+                        continue
+                    try:
+                        return json.loads(raw.decode("utf-8"))
+                    except (UnicodeDecodeError, json.JSONDecodeError):
+                        break
+        raise ValueError("event ledger tail is not valid UTF-8 JSONL")
+
     def append(self, event_type: str, payload: dict) -> dict:
-        rows = self.load()
-        event = {
-            "index": len(rows),
-            "event_type": event_type,
-            "timestamp": _utc_now(),
-            "previous_hash": rows[-1]["event_hash"] if rows else "0" * 64,
-            "payload": payload,
-        }
-        event["event_hash"] = hashlib.sha256(
-            _canonical(event).encode("utf-8")
-        ).hexdigest()
-        with self.path.open("a", encoding="utf-8") as handle:
-            handle.write(json.dumps(event, sort_keys=True) + "\n")
-        return event
+        # Each supervised lane is a separate process. Without this shared
+        # lock, two writers can read the same tail and append sibling events
+        # with duplicate indices. The 2026-08-23 production ledger contains
+        # exactly that historical fork; this prevents any new one.
+        with _HashLedgerAppendLock(self.lock_path):
+            tail = self._tail_event()
+            event = {
+                "index": int(tail["index"]) + 1 if tail else 0,
+                "event_type": event_type,
+                "timestamp": _utc_now(),
+                "previous_hash": (
+                    tail["event_hash"] if tail else "0" * 64),
+                "payload": payload,
+            }
+            event["event_hash"] = hashlib.sha256(
+                _canonical(event).encode("utf-8")
+            ).hexdigest()
+            with self.path.open("a", encoding="utf-8") as handle:
+                handle.write(json.dumps(event, sort_keys=True) + "\n")
+                handle.flush()
+                os.fsync(handle.fileno())
+            return event
 
     def verify(self) -> tuple[bool, str]:
-        previous = "0" * 64
-        rows = self.load()
-        for index, event in enumerate(rows):
-            if event.get("index") != index:
-                return False, f"index mismatch at {index}"
-            if event.get("previous_hash") != previous:
-                return False, f"previous hash mismatch at {index}"
-            expected = hashlib.sha256(
-                _canonical({k: v for k, v in event.items() if k != "event_hash"}).encode("utf-8")
-            ).hexdigest()
-            if event.get("event_hash") != expected:
-                return False, f"event hash mismatch at {index}"
-            previous = expected
-        return True, f"verified {len(rows)} Robinhood learning events"
+        if not self.path.exists():
+            return True, "verified 0 Robinhood learning events"
+        epoch = read_json(self.integrity_epoch_path, {}) or {}
+        legacy_count = safe_int(epoch.get("legacy_event_count"), 0)
+        legacy_digest = hashlib.sha256()
+        seen_hashes: set[str] = set()
+        child_counts: dict[str, int] = {}
+        previous_physical_hash = "0" * 64
+        previous_event_index = -1
+        legacy_anomalies = 0
+        legacy_tail_hash = None
+        count = 0
+        with self.path.open("rb") as handle:
+            for physical_index, raw in enumerate(handle):
+                if not raw.strip():
+                    continue
+                if physical_index < legacy_count:
+                    legacy_digest.update(raw)
+                try:
+                    event = json.loads(raw.decode("utf-8"))
+                except (UnicodeDecodeError, json.JSONDecodeError):
+                    return False, f"invalid JSONL at {physical_index}"
+                expected = hashlib.sha256(_canonical({
+                    key: value for key, value in event.items()
+                    if key != "event_hash"
+                }).encode("utf-8")).hexdigest()
+                event_hash = str(event.get("event_hash") or "")
+                if event_hash != expected:
+                    return False, f"event hash mismatch at {physical_index}"
+                predecessor = str(event.get("previous_hash") or "")
+                if physical_index == 0:
+                    if predecessor != "0" * 64:
+                        return False, "genesis previous hash mismatch"
+                elif predecessor not in seen_hashes:
+                    return False, f"unknown previous hash at {physical_index}"
+                event_index = safe_int(event.get("index"), -1)
+                index_anomaly = not (
+                    previous_event_index <= event_index <= physical_index)
+                link_anomaly = (
+                    physical_index > 0
+                    and predecessor != previous_physical_hash)
+                if index_anomaly or link_anomaly or event_index != physical_index:
+                    if not epoch or physical_index >= legacy_count:
+                        return False, (
+                            f"non-linear event after integrity epoch at "
+                            f"{physical_index}")
+                    legacy_anomalies += 1
+                child_counts[predecessor] = child_counts.get(predecessor, 0) + 1
+                seen_hashes.add(event_hash)
+                previous_physical_hash = event_hash
+                previous_event_index = event_index
+                count = physical_index + 1
+                if count == legacy_count:
+                    legacy_tail_hash = event_hash
+        if epoch:
+            if count < legacy_count:
+                return False, "event ledger shorter than integrity epoch"
+            if legacy_digest.hexdigest() != str(
+                    epoch.get("legacy_prefix_sha256") or ""):
+                return False, "legacy event prefix digest mismatch"
+            if legacy_tail_hash != str(epoch.get("legacy_tail_event_hash") or ""):
+                return False, "legacy event tail mismatch"
+        forks = sum(1 for amount in child_counts.values() if amount > 1)
+        suffix = (
+            f"; anchored legacy anomalies={legacy_anomalies}, forks={forks}"
+            if legacy_anomalies else "")
+        return True, (
+            f"verified {count} Robinhood learning events" + suffix)
 
 
 class RobinhoodLearningTimechainRecorder:
@@ -732,6 +873,16 @@ class RobinhoodLearningTimechainRecorder:
             if (ring.get("payload") or {}).get("idempotency_key")
                 == idempotency_key
         ), None)
+
+    def tail_ring_count(self) -> int:
+        """Return the true durable producer ring count in O(1) time.
+
+        Timechain's tail reader seeks backward from the JSONL file end and
+        therefore observes rings written by this process, a restarted
+        process, or another legitimate writer without a full-chain scan.
+        """
+        head = self.tc._current_head()
+        return int(head["index"]) + 1 if head is not None else 0
 
     def _ring(self, index: int | None, expected_hash: str | None) -> dict | None:
         if index is None:
@@ -1443,6 +1594,7 @@ class RobinhoodLearningStore:
                 );
                 CREATE TABLE IF NOT EXISTS positions (
                     token_address TEXT PRIMARY KEY,
+                    decision_commitment_id TEXT,
                     symbol TEXT,
                     status TEXT NOT NULL,
                     opened_at REAL NOT NULL,
@@ -2109,12 +2261,19 @@ class RobinhoodLearningStore:
                 "consecutive_unverified_marks": "INTEGER NOT NULL DEFAULT 0",
                 "last_unverified_mark_at": "REAL",
                 "last_verified_mark_at": "REAL",
+                "decision_commitment_id": "TEXT",
             }
             for name, declaration in position_migrations.items():
                 if name not in position_columns:
                     connection.execute(
                         f"ALTER TABLE positions ADD COLUMN {name} {declaration}"
                     )
+            connection.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS"
+                " idx_positions_decision_commitment"
+                " ON positions(decision_commitment_id)"
+                " WHERE decision_commitment_id IS NOT NULL"
+            )
             swap_columns = {
                 row[1] for row in connection.execute(
                     "PRAGMA table_info(swap_observations)"
@@ -6109,7 +6268,10 @@ class RobinhoodLearningStore:
                 (now,_utc_now(),token.lower()),
             )
 
-    def open_position(self, candidate: dict, market: dict) -> bool:
+    def open_position(
+        self, candidate: dict, market: dict, *,
+        decision_commitment_id: str | None = None,
+    ) -> bool:
         if not candidate.get("paper_entry_allowed"):
             return False
         if self.source_entry_risk(
@@ -6153,7 +6315,8 @@ class RobinhoodLearningStore:
             connection.execute(
                 """
                 INSERT INTO positions (
-                    token_address,symbol,status,opened_at,entry_price_usd,
+                    token_address,decision_commitment_id,symbol,status,
+                    opened_at,entry_price_usd,
                     entry_liquidity_usd,cost_usd,quantity,entry_friction_bps,
                     entry_market_cap_usd,high_multiple,last_price_usd,
                     last_liquidity_usd,last_market_cap_usd,last_market_observed_at,
@@ -6161,10 +6324,11 @@ class RobinhoodLearningStore:
                     runner_high_multiple,entry_policy_version,grandfathered_above_cap,
                     entry_pool_reserve_fraction,last_pool_reserve_fraction,
                     minimum_pool_reserve_fraction
-                ) VALUES (?,?,'open',?,?,?,?,?,?,?,1,?,?,?,?,?,?,0,1,?,0,?,?,?)
+                ) VALUES (?,?,?,'open',?,?,?,?,?,?,?,1,?,?,?,?,?,?,0,1,?,0,?,?,?)
                 """,
                 (
-                    candidate["token_address"],candidate.get("symbol") or "",time.time(),
+                    candidate["token_address"], decision_commitment_id,
+                    candidate.get("symbol") or "", time.time(),
                     price,liquidity,PAPER_COST_USD,quantity,friction_bps,
                     market_cap,price,liquidity,market_cap,_utc_now(),time.time(),
                     quantity,"staged_v1",
@@ -6183,6 +6347,36 @@ class RobinhoodLearningStore:
                 ],
             )
             return True
+
+    def position_effect_state(
+        self, commitment_id: str, token_address: str,
+    ) -> dict:
+        """Return causal action evidence for crash recovery.
+
+        A position proves this commitment executed only when it carries the
+        exact commitment id. Its current status is irrelevant: a position
+        that opened and later closed still proves the original action.
+        Database errors intentionally propagate so the caller can preserve
+        an indeterminate state instead of fabricating absence.
+        """
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT token_address,status FROM positions
+                   WHERE decision_commitment_id=?""",
+                (str(commitment_id),),
+            ).fetchone()
+        if row is None:
+            return {"state": "absent", "detail": "no_commitment_link"}
+        if str(row["token_address"] or "").lower() != \
+                str(token_address or "").lower():
+            return {
+                "state": "indeterminate",
+                "detail": "commitment_link_token_mismatch",
+            }
+        return {
+            "state": "executed",
+            "detail": f"linked_position_status:{row['status']}",
+        }
 
     def _effective_minimum_entry_score(self) -> float:
         """Module constant, or a higher floor set by the closed-position audit.
@@ -8662,10 +8856,11 @@ class RobinhoodLearningEngine:
         store.open_position directly bypasses pre-action authorization and
         is treated as a defect.
 
-        Revalidation is GENUINELY fresh: a new RPC head, a new quote taken
-        at authorization time, hard stops recomputed from the candidate's
-        current state, and an actual pre-trade simulation result. The
-        commitment's original quote is what the fresh quote must MATCH.
+        Revalidation is fresh at the action boundary: a new RPC head and
+        quote are acquired, the current stored hard-stop state is bound,
+        and paper-mode quote sanity is checked. This does not claim to be a
+        signed-transaction simulation. The commitment's original quote is
+        what the fresh quote must MATCH.
         """
         token = str(candidate.get("token_address") or "").lower()
         from chainseer_robinhood_commitments import (
@@ -8724,11 +8919,10 @@ class RobinhoodLearningEngine:
             return self.market.snapshot(token_arg, pair_arg)
 
         try:
-            # Producer tail from CONSTANT-TIME metadata: the cached
-            # certificate's ring count plus the seals WE have made since
-            # publication (tracked incrementally by drain_deferred_seals).
-            # Never materialize the chain on the decision path (reading
-            # the real 110 MB file measured ~6.3 s).
+            # Read the producer's TRUE durable tail in O(1), after the
+            # remote quote work and immediately before authorization. This
+            # catches restart and external-writer growth without a full
+            # verification or chain materialization on the decision path.
             snapshot = acquire_revalidation_snapshot(
                 rpc=self.rpc, market_client=SimpleNamespace(
                     snapshot=_market_snapshot),
@@ -8737,8 +8931,9 @@ class RobinhoodLearningEngine:
                 quote_fields=tuple(quote.keys()),
                 run_pre_trade_simulation=_simulate,
                 producer_chain_rings=None,
-                producer_ring_count_override=(
-                    rings + getattr(self, "_rings_sealed_since_publish", 0)),
+                producer_ring_count_reader=(
+                    self.timechain_recorder.tail_ring_count
+                    if self.timechain_recorder is not None else lambda: 0),
                 certificate_ring_count=rings or None,
             )
         except Exception:
@@ -8814,7 +9009,9 @@ class RobinhoodLearningEngine:
 
         # Action attempt: only a REAL open_position success confirms
         # execution; failure aborts the commitment instead.
-        if self.store.open_position(candidate, market):
+        if self.store.open_position(
+                candidate, market,
+                decision_commitment_id=record["commitment_id"]):
             self.execution_gate.record_executed(
                 record["commitment_id"],
                 f"paper entry via {priority_reason or 'analysis'}")
@@ -8869,7 +9066,7 @@ class RobinhoodLearningEngine:
         # store BEFORE aborting -- a crash between open_position success
         # and confirm_action must resolve as executed, not aborted.
         recovered = self.commitments.recover_expired_commitments(
-            position_reconciler=self._position_exists)
+            position_reconciler=self._reconcile_position_effect)
         self.commitments.requeue_retrying()
         claimed = self.commitments.claim_seal_batch(limit=limit)
         sealed = failed = deferred_not_terminal = 0
@@ -8961,11 +9158,6 @@ class RobinhoodLearningEngine:
                     str(ring.get("ring_hash") or ""),
                 )
                 sealed += 1
-                # Incremental producer-tail counter: lets the decision
-                # path compute certificate lag in O(1) without ever
-                # reading the chain.
-                self._rings_sealed_since_publish = (
-                    getattr(self, "_rings_sealed_since_publish", 0) + 1)
                 last_ring = {
                     "index": int(ring.get("index") or 0),
                     "ring_hash": str(ring.get("ring_hash") or ""),
@@ -8989,18 +9181,18 @@ class RobinhoodLearningEngine:
             "duration_seconds": round(time.monotonic() - started, 3),
         }
 
-    def _position_exists(self, token_address: str) -> bool:
-        """Cross-database reconciliation: does an OPEN position exist for
-        this token in the learning store?"""
+    def _reconcile_position_effect(
+        self, commitment_id: str, token_address: str,
+    ) -> dict:
+        """Tri-state, commitment-linked recovery evidence."""
         try:
-            for position in self.store.recent_positions():
-                if (str(position.get("token_address") or "").lower()
-                        == str(token_address).lower()
-                        and position.get("status") == "open"):
-                    return True
-        except Exception:
-            return False
-        return False
+            return self.store.position_effect_state(
+                commitment_id, token_address)
+        except Exception as exc:
+            return {
+                "state": "indeterminate",
+                "detail": f"{type(exc).__name__}: {exc}",
+            }
 
     def publish_integrity_certificate(self) -> dict:
         """Run full-chain verification OFF the critical path and publish the
@@ -9024,8 +9216,6 @@ class RobinhoodLearningEngine:
             verification_result="pass" if ok else "fail",
             verifier_version="robinhood-deferred-sealing-v1",
         )
-        # Certificate is fresh again: reset the incremental tail counter.
-        self._rings_sealed_since_publish = 0
         self._last_registry_epoch = epoch
         return {"published": True, "verification_ok": bool(ok),
                 "ring_count": len(rings), "certificate": certificate}
@@ -10939,6 +11129,32 @@ class RobinhoodLearningEngine:
 
         def work(deadline: CycleDeadline) -> dict:
             timings: dict[str, float] = {}
+            # Integrity refresh owns the first reservation in this lane.
+            # Entry-capable rechecks and analyses must never run ahead of a
+            # due certificate refresh and consume the budget it requires.
+            certificate_refresh = None
+            certificate = load_integrity_certificate(self.root)
+            cert_age = time.time() - safe_float(
+                certificate.get("published_epoch"), 0.0)
+            cert_max_age = safe_float(
+                certificate.get("expires_at"), time.time() + 1.0
+            ) - safe_float(
+                certificate.get("published_epoch"), time.time())
+            needs_refresh = (
+                not certificate
+                or cert_age > max(0.0, cert_max_age * 0.5))
+            if self.timechain_recorder is not None and needs_refresh:
+                stage = time.monotonic()
+                try:
+                    certificate_refresh = self.publish_integrity_certificate()
+                except Exception as exc:
+                    # Analysis may continue, but any exposure-increasing
+                    # action remains fail-closed on the stale certificate.
+                    certificate_refresh = {
+                        "published": False, "reason": str(exc)[:200]}
+                timings["certificate_refresh"] = round(
+                    time.monotonic() - stage, 3)
+                deadline.raise_if_expired("certificate_refresh")
             stage = time.monotonic()
             with self._rpc_deadline(deadline):
                 outcomes = self.observe_outcomes(
@@ -10961,32 +11177,6 @@ class RobinhoodLearningEngine:
             stage = time.monotonic()
             deferred_seals = self.drain_deferred_seals(deadline=deadline)
             timings["deferred_seals"] = round(time.monotonic() - stage, 3)
-            # Certificate refresh has RESERVED budget: it runs FIRST on
-            # this lane (before analyses consume the cycle) whenever the
-            # cached certificate is missing or past half its lifetime.
-            # Starving it left entries fail-closed on a 53-minute-old
-            # certificate. Full verification is still off the live path.
-            certificate_refresh = None
-            certificate = load_integrity_certificate(self.root)
-            cert_age = time.time() - safe_float(
-                certificate.get("published_epoch"), 0.0)
-            cert_max_age = safe_float(
-                certificate.get("expires_at"),
-                time.time() + 1.0) - safe_float(
-                certificate.get("published_epoch"), time.time())
-            needs_refresh = (
-                not certificate
-                or cert_age > max(0.0, cert_max_age * 0.5))
-            if self.timechain_recorder is not None and (
-                    needs_refresh or deadline.remaining() >= 30.0):
-                stage = time.monotonic()
-                try:
-                    certificate_refresh = self.publish_integrity_certificate()
-                except Exception as exc:
-                    certificate_refresh = {
-                        "published": False, "reason": str(exc)[:200]}
-                timings["certificate_refresh"] = round(
-                    time.monotonic() - stage, 3)
             learning = self.store.summary()
             return {
                 "outcomes": outcomes, "market_rechecks": rechecks,

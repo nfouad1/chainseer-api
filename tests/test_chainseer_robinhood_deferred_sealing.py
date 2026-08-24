@@ -46,6 +46,9 @@ class FakeTimechain:
     def iter_rings(self):
         return list(self.rings)
 
+    def _current_head(self):
+        return self.rings[-1] if self.rings else None
+
     def load(self):
         return list(self.rings)
 
@@ -240,6 +243,40 @@ class EngineSealingTests(unittest.TestCase):
         self.assertEqual(debt["pending_seals"], 1)
         self.assertEqual(engine.timechain_recorder.tc.seal_calls, 0,
                          "decision path performed Timechain work")
+
+    def test_due_certificate_refresh_precedes_entry_capable_work(self):
+        """A missing/stale certificate owns the first analysis-lane slot."""
+        engine = object.__new__(rh.RobinhoodLearningEngine)
+        engine.root = self.root
+        engine.root.mkdir(parents=True, exist_ok=True)
+        engine.timechain_recorder = object()
+        engine.rpc = object()
+        order = []
+
+        def execute(lane, budget, worker):
+            self.assertEqual(lane, "analysis")
+            return worker(rh.CycleDeadline(budget))
+
+        engine._execute_lane = execute
+        engine.publish_integrity_certificate = lambda: (
+            order.append("certificate_refresh") or {"published": True})
+        engine.observe_outcomes = lambda *args, **kwargs: (
+            order.append("outcomes") or {})
+        engine.recheck_executable_markets = lambda *args, **kwargs: (
+            order.append("market_rechecks") or {})
+        engine._analyze_candidates = lambda *args, **kwargs: (
+            order.append("analyses") or {})
+        engine.drain_deferred_seals = lambda *args, **kwargs: (
+            order.append("deferred_seals") or {})
+        engine.store = type("Store", (), {
+            "summary": lambda self: {"candidates": {"pending": 0}},
+        })()
+
+        result = engine.run_analysis_lane(budget_seconds=10.0)
+        self.assertEqual(order[0], "certificate_refresh")
+        self.assertEqual(order[1:], [
+            "outcomes", "market_rechecks", "analyses", "deferred_seals"])
+        self.assertTrue(result["certificate_refresh"]["published"])
 
 
 if __name__ == "__main__":
