@@ -7583,9 +7583,13 @@ class SealStageBudgetTests(unittest.TestCase):
             self.assertEqual(engine.seal_cost_estimate(),
                              rh.SEAL_WINDOW_COST_SECONDS_DEFAULT)
             engine.seal_near_head_observations(self.HEAD, self.NOW)
-            stored = store.scheduler_state("seal_window_cost")
-            self.assertGreater(stored["per_window_seconds"], 0.0)
-            self.assertEqual(stored["last_sealed"], 4)
+            model = store.scheduler_state("seal_cost_model_v2")
+            self.assertGreater(
+                model["last_measured"]["per_window_cost_p95"], 0.0)
+            self.assertEqual(model["samples_this_cycle"], 4)
+            self.assertEqual(
+                engine.seal_cost_estimate(),
+                model["per_window_cost_p95"])
             self.assertNotEqual(engine.seal_cost_estimate(),
                                 rh.SEAL_WINDOW_COST_SECONDS_DEFAULT)
 

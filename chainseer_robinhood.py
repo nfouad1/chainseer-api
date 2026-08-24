@@ -158,6 +158,20 @@ SEAL_WINDOW_COST_SECONDS_DEFAULT = 2.0
 #: down within a few cycles, low enough that one stalled window does not
 #: collapse admission to a single observation.
 SEAL_COST_SMOOTHING = 0.3
+#: Two-part observation-cost model, stored durably under
+#: SCHEDULER_STATE key "seal_cost_model_v2". The old single EWMA folded the
+#: whole stage into one number and underestimated real cost ~7x because it
+#: mixed fixed per-cycle overhead into the per-window figure.
+SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT = 0.0
+#: Cold start assumes ZERO fixed cost -- the first cycle's measurement
+#: replaces it immediately, and an optimistic first cycle beats a controller
+#: that refuses to ever seal while it has no data.
+SEAL_PER_WINDOW_COST_SECONDS_DEFAULT = SEAL_WINDOW_COST_SECONDS_DEFAULT
+#: Downstream reserve: decision-head retrieval + classification + ledger
+#: completion -- work that CANNOT yield once sealing has spent the budget.
+#: Cold-starts at the lane's own decision reserve until measured.
+DOWNSTREAM_RESERVE_SECONDS_DEFAULT = LIVE_LANE_DECISION_RESERVE_SECONDS
+SEAL_COST_MODEL_STATE_KEY = "seal_cost_model_v2"
 #: Cold-start per-observation classification cost (p95 estimate), replaced
 #: by a measured p95 after enough samples. Classification is admission-
 #: controlled like sealing: an observation admitted without enough budget
@@ -173,6 +187,11 @@ CLASSIFICATION_COST_SMOOTHING = 0.3
 #: Ceiling on how many queued windows one live cycle may pull ahead of fresh
 #: ones. The queue must drain, but a deep backlog must never starve the head.
 SEAL_QUEUE_DRAIN_LIMIT = 4
+#: Hard ceiling on unclassified rows one classify pass may materialize when
+#: no admission limit is supplied (legacy callers). The full backlog is never
+#: loaded into Python on any path.
+CLASSIFICATION_BACKLOG_SCAN_LIMIT = 500
+CLASSIFICATION_COUNTERS_STATE_KEY = "classification_cumulative_counters"
 LIVE_LANE_CADENCE_SECONDS = 30.0
 ANALYSIS_LANE_CADENCE_SECONDS = 60.0
 BACKFILL_LANE_CADENCE_SECONDS = 300.0
@@ -1829,6 +1848,13 @@ class RobinhoodLearningStore:
                 );
                 CREATE INDEX IF NOT EXISTS idx_flow_obs_due
                     ON flow_observation_outcomes(status,target_at);
+                -- Classification selection walks "unclassified observations
+                -- for this policy, oldest sealed first". Without this index
+                -- that ordering scans the whole cohort; with it the bounded
+                -- LIMIT ? query touches only the rows it returns.
+                CREATE INDEX IF NOT EXISTS idx_flow_observations_policy_sealed
+                    ON flow_observations(policy_version, sealed_at,
+                                         observation_id);
                 -- "Is this window already sealed?" is asked by the window
                 -- selection query, the seal queue drain and the queue depth,
                 -- and every one of them expressed it as a correlated NOT
@@ -2147,7 +2173,13 @@ class RobinhoodLearningStore:
                     -- database -- including every test database -- lacked the
                     -- columns entirely.
                     deadline_remaining_at_stage_start REAL,
-                    completed_stage_seconds_json TEXT NOT NULL DEFAULT '{}'
+                    completed_stage_seconds_json TEXT NOT NULL DEFAULT '{}',
+                    -- Sub-stage attribution INSIDE a stage: which window,
+                    -- which pool, which sub-operation the process was in
+                    -- when it was killed. A stage name alone cannot
+                    -- distinguish "stalled on window 3 of 8" from "slow
+                    -- provider on all eight".
+                    stage_detail_json TEXT NOT NULL DEFAULT '{}'
                 );
                 """
             )
@@ -2180,6 +2212,17 @@ class RobinhoodLearningStore:
                        SET completed_at=?, reason='superseded_before_snapshot'
                        WHERE completed_at IS NULL AND features_json IS NULL""",
                     (time.time(),))
+            lane_state_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(lane_state)")
+            }
+            if lane_state_columns and "stage_detail_json" not in lane_state_columns:
+                # Sub-stage attribution for databases created before the
+                # column existed -- same migration rule as the headroom
+                # columns above: live ALTER plus CREATE TABLE coverage.
+                connection.execute(
+                    "ALTER TABLE lane_state ADD COLUMN stage_detail_json"
+                    " TEXT NOT NULL DEFAULT '{}'")
             run_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(runs)")
             }
@@ -4813,6 +4856,7 @@ class RobinhoodLearningStore:
     def mark_lane_stage(
         self, lane: str, stage: str, run_id: str | None = None,
         remaining: float | None = None, completed: dict | None = None,
+        detail: dict | None = None,
     ) -> None:
         """Also record HEADROOM, not just which stage was running.
 
@@ -4828,18 +4872,22 @@ class RobinhoodLearningStore:
         Ordering is the whole point: written after, it records what already
         finished; written before, it records what the process was inside when
         it was killed. Called ahead of ingestion, sealing, decision-head
-        retrieval and classification.
+        retrieval and classification -- and ahead of each observation
+        sub-stage, with `detail` carrying the window index and pool id so a
+        forced termination names the exact window it died on.
         """
         with self.connection() as connection:
             connection.execute(
                 """UPDATE lane_state
                    SET current_stage=?, stage_started_at=?,
                        deadline_remaining_at_stage_start=?,
-                       completed_stage_seconds_json=?
+                       completed_stage_seconds_json=?,
+                       stage_detail_json=?
                    WHERE lane=? AND status='running'
                      AND (? IS NULL OR run_id=?)""",
                 (str(stage), time.time(), remaining,
-                 _canonical(completed or {}), str(lane), run_id, run_id),
+                 _canonical(completed or {}), _canonical(detail or {}),
+                 str(lane), run_id, run_id),
             )
 
     def lane_failure_stage(self, lane: str, run_id: str) -> dict:
@@ -4848,7 +4896,8 @@ class RobinhoodLearningStore:
             row = connection.execute(
                 """SELECT current_stage, stage_started_at,
                           deadline_remaining_at_stage_start,
-                          completed_stage_seconds_json
+                          completed_stage_seconds_json,
+                          COALESCE(stage_detail_json, '{}') AS stage_detail
                    FROM lane_state WHERE lane=? AND run_id=?""",
                 (str(lane), str(run_id)),
             ).fetchone()
@@ -4861,6 +4910,8 @@ class RobinhoodLearningStore:
                 "deadline_remaining_at_stage_start"],
             "completed_stage_seconds": json.loads(
                 row["completed_stage_seconds_json"] or "{}"),
+            "failure_substage_detail": json.loads(
+                row["stage_detail"] or "{}"),
             "stage_elapsed_seconds": (
                 round(time.time() - started, 3) if started else None),
         }
@@ -9783,51 +9834,139 @@ class RobinhoodLearningEngine:
             "scope": "near_head_flow_window_v1",
         }
 
-    def seal_cost_estimate(self) -> float:
-        """Measured seconds per sealed window, or the cold-start default.
+    def seal_cost_model(self) -> dict:
+        """Durable two-part observation-cost model.
 
-        Admission needs a cost, and the only defensible one is the cost this
-        deployment last observed. A constant would have to be re-chosen every
-        time the provider, the window size or the quote path changed -- and
-        the fixed limit it replaces was chosen once and never revisited while
-        the stage grew to 16.4s median.
+        fixed_observation_cost_p95 is paid once per cycle whatever the
+        admission count (selection + prefetch + queue settlement);
+        per_window_cost_p95 scales with each window sealed (hashes + quote
+        RPC + evidence hash + database commit); downstream_reserve_p95 is
+        the decision-critical tail (decision-head retrieval +
+        classification + ledger completion) that must NEVER be consumed by
+        sealing, because none of it can yield once started.
         """
-        stored = self.store.scheduler_state("seal_window_cost")
-        value = safe_float(stored.get("per_window_seconds"), 0.0)
-        if value <= 0:
-            return SEAL_WINDOW_COST_SECONDS_DEFAULT
-        return value
+        stored = self.store.scheduler_state(SEAL_COST_MODEL_STATE_KEY)
+        if not stored:
+            # Pre-model databases (and tests) seeded only the legacy single
+            # EWMA; its per-window figure is still the best available estimate
+            # for that component.
+            stored = {"per_window_cost_p95": safe_float(
+                self.store.scheduler_state("seal_window_cost").get(
+                    "per_window_seconds"),
+                SEAL_PER_WINDOW_COST_SECONDS_DEFAULT)}
+        model = {
+            "fixed_observation_cost_p95": safe_float(
+                stored.get("fixed_observation_cost_p95"),
+                SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT),
+            "per_window_cost_p95": safe_float(
+                stored.get("per_window_cost_p95"),
+                SEAL_PER_WINDOW_COST_SECONDS_DEFAULT),
+            "downstream_reserve_p95": safe_float(
+                stored.get("downstream_reserve_p95"),
+                DOWNSTREAM_RESERVE_SECONDS_DEFAULT),
+            "censored_samples": safe_int(stored.get("censored_samples"), 0),
+        }
+        return model
+
+    def seal_cost_estimate(self) -> float:
+        """Per-window cost from the two-part model (compatibility shim)."""
+        return self.seal_cost_model()["per_window_cost_p95"]
+
+    def _blend_seal_model(self, updates: dict, censored: bool = False,
+                          sample_count: int = 0) -> dict:
+        stored = self.store.scheduler_state(SEAL_COST_MODEL_STATE_KEY)
+        model = {
+            "fixed_observation_cost_p95": safe_float(
+                stored.get("fixed_observation_cost_p95"),
+                SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT),
+            "per_window_cost_p95": safe_float(
+                stored.get("per_window_cost_p95"),
+                SEAL_PER_WINDOW_COST_SECONDS_DEFAULT),
+            "downstream_reserve_p95": safe_float(
+                stored.get("downstream_reserve_p95"),
+                DOWNSTREAM_RESERVE_SECONDS_DEFAULT),
+        }
+        weight = SEAL_COST_SMOOTHING if not censored else 0.15
+        for key, measured in updates.items():
+            previous = model[key]
+            blended = weight * float(measured) + (1 - weight) * previous
+            # A censored (timeout) sample is a LOWER BOUND on the true cost:
+            # the stage was killed mid-flight. It may only ever RAISE the
+            # estimate -- learning "it was fast" from a killed cycle is how
+            # the estimator came to under-admit by 7x.
+            model[key] = max(previous, blended) if censored else blended
+        model["last_measured"] = {k: round(float(v), 4)
+                                  for k, v in updates.items()}
+        model["censored"] = bool(censored)
+        if censored:
+            model["censored_samples"] = (
+                safe_int(stored.get("censored_samples"), 0) + 1)
+        elif not censored and updates:
+            model["censored"] = False
+        if sample_count:
+            model["samples_this_cycle"] = int(sample_count)
+        self.store.set_scheduler_state(
+            SEAL_COST_MODEL_STATE_KEY, {
+                k: round(v, 4) if isinstance(v, float) else v
+                for k, v in model.items()})
+        return model
 
     def record_seal_cost(
         self, phase: dict[str, list[float]], sealed: int,
     ) -> float | None:
-        """Fold this pass into the estimate. Returns the measured cost.
+        """Fold this pass into the two-part model. Returns per-window cost.
 
-        Charged against the per-window phases only. The prefetch batch and the
-        selection query are paid once per cycle whatever the admission count,
-        so folding them in would make every window look more expensive as the
-        cycle admitted fewer of them -- an estimate that gets worse exactly
+        Charged against the per-window phases only. The prefetch batch, the
+        selection query and the queue settlement are FIXED cost -- paid once
+        per cycle whatever the admission count -- so folding them into the
+        per-window figure would make every window look more expensive as the
+        cycle admitted fewer of them: an estimate that gets worse exactly
         when headroom is tightest.
         """
-        if sealed <= 0:
-            return None
-        per_window = sum(
+        fixed_names = {"selection", "prefetch", "queue_settle"}
+        fixed_seconds = sum(
             sum(values) for name, values in phase.items()
-            if name not in {"selection", "prefetch"}
-        ) / sealed
-        if per_window <= 0:
+            if name in fixed_names)
+        if sealed > 0:
+            per_window = sum(
+                sum(values) for name, values in phase.items()
+                if name not in fixed_names
+            ) / sealed
+        else:
+            per_window = 0.0
+        updates = {}
+        if fixed_seconds > 0:
+            updates["fixed_observation_cost_p95"] = fixed_seconds
+        if per_window > 0:
+            updates["per_window_cost_p95"] = per_window
+        if not updates:
             return None
-        previous = self.seal_cost_estimate()
-        blended = (
-            SEAL_COST_SMOOTHING * per_window
-            + (1 - SEAL_COST_SMOOTHING) * previous
-        )
-        self.store.set_scheduler_state("seal_window_cost", {
-            "per_window_seconds": round(blended, 4),
-            "last_measured_seconds": round(per_window, 4),
-            "last_sealed": int(sealed),
-        })
+        self._blend_seal_model(updates, sample_count=int(sealed))
+        # The RAW measured figure is returned, not the blend: callers report
+        # what this pass actually cost.
         return per_window
+
+    def record_seal_cost_censored(self, elapsed_seconds: float) -> dict:
+        """Charge a timed-out attempt as a conservative censored sample.
+
+        A cycle the supervisor had to kill spent at least `elapsed_seconds`
+        sealing; treating that as one window's cost UNDERSTATES the true
+        per-window figure at worst and can only raise the estimate, which is
+        the safe direction for admission. Never learning from failures is
+        what left the old EWMA frozen while real latency tripled.
+        """
+        elapsed = max(0.05, float(elapsed_seconds))
+        return self._blend_seal_model(
+            {"per_window_cost_p95": elapsed}, censored=True)
+
+    def downstream_reserve_estimate(self) -> float:
+        return self.seal_cost_model()["downstream_reserve_p95"]
+
+    def record_downstream_reserve(self, seconds: float) -> float:
+        """Fold a completed cycle's decision-tail duration into the p95."""
+        model = self._blend_seal_model({
+            "downstream_reserve_p95": max(0.0, float(seconds))})
+        return model["downstream_reserve_p95"]
 
     def classification_cost_estimate(self) -> float:
         """Measured seconds per classified observation (EWMA p95), or a
@@ -9879,6 +10018,72 @@ class RobinhoodLearningEngine:
             "samples_this_cycle": len(ordered),
         })
         return measured
+
+    def _classification_counters(self, seed: bool = False) -> dict:
+        stored = self.store.scheduler_state(CLASSIFICATION_COUNTERS_STATE_KEY)
+        if not stored and seed:
+            # One-time reconciliation against the FULL aggregate. This is the
+            # expensive GROUP BY and it runs in the analysis / dashboard lane
+            # only -- never on the live decision path.
+            summary = self.classification_cohort_summary()
+            stored = {
+                "identity_tiers": summary["identity_tiers"],
+                "total": summary["total"],
+                "research_eligible": summary["research_eligible"],
+                "paper_eligible": summary["paper_eligible"],
+            }
+            self.store.set_scheduler_state(
+                CLASSIFICATION_COUNTERS_STATE_KEY, stored)
+        return {
+            "identity_tiers": dict(stored.get("identity_tiers") or {}),
+            "total": safe_int(stored.get("total"), 0),
+            "research_eligible": safe_int(stored.get("research_eligible"), 0),
+            "paper_eligible": safe_int(stored.get("paper_eligible"), 0),
+        }
+
+    def _bump_classification_counters(
+        self, tiers: dict[str, int], *, research_delta: int,
+        paper_delta: int, total_delta: int,
+    ) -> dict:
+        counters = self._classification_counters(seed=False)
+        for tier, count in tiers.items():
+            counters["identity_tiers"][tier] = (
+                counters["identity_tiers"].get(tier, 0) + int(count))
+        counters["total"] += int(total_delta)
+        counters["research_eligible"] += int(research_delta)
+        counters["paper_eligible"] += int(paper_delta)
+        self.store.set_scheduler_state(
+            CLASSIFICATION_COUNTERS_STATE_KEY, counters)
+        return counters
+
+    def classification_cohort_summary(self) -> dict:
+        """FULL cumulative cohort aggregation.
+
+        The analysis/dashboard lane's replacement for the aggregate the
+        classification loop used to run every cycle. Expensive by design and
+        bounded to no lane budget.
+        """
+        with self.store.connection() as connection:
+            rows = connection.execute(
+                """SELECT c.identity_tier,
+                          COUNT(*) AS tier_count,
+                          COALESCE(SUM(c.research_eligible),0) AS research,
+                          COALESCE(SUM(c.paper_eligible),0) AS paper
+                   FROM flow_observation_classifications c
+                   JOIN flow_observations o USING(observation_id)
+                   WHERE o.policy_version=? GROUP BY c.identity_tier""",
+                (FLOW_EVIDENCE_POLICY_VERSION,),
+            ).fetchall()
+        tiers = {row["identity_tier"]: int(row["tier_count"]) for row in rows}
+        research = sum(int(row["research"]) for row in rows)
+        paper = sum(int(row["paper"]) for row in rows)
+        total = sum(tiers.values())
+        return {
+            "identity_tiers": tiers, "total": total,
+            "research_eligible": research, "paper_eligible": paper,
+            "verified_fraction": (
+                round(tiers.get("verified", 0) / total, 4) if total else None),
+        }
 
     def classification_admission(
         self, candidates: int, remaining_seconds: float,
@@ -9955,6 +10160,14 @@ class RobinhoodLearningEngine:
             phase.setdefault(name, []).append(time.monotonic() - started)
 
         selection_started = time.monotonic()
+        # Sub-stage attribution begins HERE: the selection query is the first
+        # thing that can stall inside sealing, and a kill during it must be
+        # distinguishable from a kill mid-quote.
+        self.store.mark_lane_stage(
+            "live", "fresh_quote_and_observation/observation_selection",
+            run_id=getattr(self, "cycle_run_uuid", None),
+            remaining=None if deadline is None else deadline.remaining(),
+            completed={}, detail={"head_block": int(head_block)})
         # Queued first: these are windows an earlier cycle admitted and could
         # not reach. They are older than anything fresh by construction, and
         # they are the ones that age below `floor` and vanish if not drained.
@@ -9964,36 +10177,73 @@ class RobinhoodLearningEngine:
         queued_rows = [dict(entry) for entry in
                        self.store.pending_seal_windows(SEAL_QUEUE_DRAIN_LIMIT)]
         with self.store.connection() as connection:
-            if pool_ids is None:
-                windows = [dict(row) for row in connection.execute(
-                    "SELECT * FROM flow_signals WHERE window_end_block >= ?",
-                    (floor,),
-                )]
-            elif pool_ids:
-                placeholders = ",".join("?" * len(pool_ids))
-                windows = [dict(row) for row in connection.execute(
-                    """SELECT fs.* FROM flow_signals fs
-                       WHERE fs.window_end_block >= ? AND (
-                         fs.pool_id IN (""" + placeholders + """) OR NOT EXISTS (
-                           SELECT 1 FROM flow_observations o
-                           WHERE o.pool_id=fs.pool_id
-                             AND o.window_end_block=fs.window_end_block
-                             AND o.policy_version=?
-                         )
-                       ) ORDER BY fs.window_end_block DESC LIMIT 100""",
-                    [floor, *pool_ids, FLOW_EVIDENCE_POLICY_VERSION],
-                )]
+            if deadline is not None:
+                # The shared deadline ABORTS an in-flight selection query
+                # rather than merely refusing to start it.
+                with deadline.sqlite_guard(connection):
+                    if pool_ids is None:
+                        windows = [dict(row) for row in connection.execute(
+                            "SELECT * FROM flow_signals"
+                            " WHERE window_end_block >= ?", (floor,),
+                        )]
+                    elif pool_ids:
+                        placeholders = ",".join("?" * len(pool_ids))
+                        windows = [dict(row) for row in connection.execute(
+                            """SELECT fs.* FROM flow_signals fs
+                               WHERE fs.window_end_block >= ? AND (
+                                 fs.pool_id IN (""" + placeholders + """)
+                                 OR NOT EXISTS (
+                                   SELECT 1 FROM flow_observations o
+                                   WHERE o.pool_id=fs.pool_id
+                                     AND o.window_end_block=fs.window_end_block
+                                     AND o.policy_version=?
+                                 )
+                               ) ORDER BY fs.window_end_block DESC LIMIT 100""",
+                            [floor, *pool_ids, FLOW_EVIDENCE_POLICY_VERSION],
+                        )]
+                    else:
+                        windows = [dict(row) for row in connection.execute(
+                            """SELECT fs.* FROM flow_signals fs
+                               WHERE fs.window_end_block >= ? AND NOT EXISTS (
+                                 SELECT 1 FROM flow_observations o
+                                 WHERE o.pool_id=fs.pool_id
+                                   AND o.window_end_block=fs.window_end_block
+                                   AND o.policy_version=?
+                               ) ORDER BY fs.window_end_block DESC LIMIT 100""",
+                            (floor, FLOW_EVIDENCE_POLICY_VERSION),
+                        )]
             else:
-                windows = [dict(row) for row in connection.execute(
-                    """SELECT fs.* FROM flow_signals fs
-                       WHERE fs.window_end_block >= ? AND NOT EXISTS (
-                         SELECT 1 FROM flow_observations o
-                         WHERE o.pool_id=fs.pool_id
-                           AND o.window_end_block=fs.window_end_block
-                           AND o.policy_version=?
-                       ) ORDER BY fs.window_end_block DESC LIMIT 100""",
-                    (floor, FLOW_EVIDENCE_POLICY_VERSION),
-                )]
+                if pool_ids is None:
+                    windows = [dict(row) for row in connection.execute(
+                        "SELECT * FROM flow_signals WHERE window_end_block >= ?",
+                        (floor,),
+                    )]
+                elif pool_ids:
+                    placeholders = ",".join("?" * len(pool_ids))
+                    windows = [dict(row) for row in connection.execute(
+                        """SELECT fs.* FROM flow_signals fs
+                           WHERE fs.window_end_block >= ? AND (
+                             fs.pool_id IN (""" + placeholders + """)
+                             OR NOT EXISTS (
+                               SELECT 1 FROM flow_observations o
+                               WHERE o.pool_id=fs.pool_id
+                                 AND o.window_end_block=fs.window_end_block
+                                 AND o.policy_version=?
+                             )
+                           ) ORDER BY fs.window_end_block DESC LIMIT 100""",
+                        [floor, *pool_ids, FLOW_EVIDENCE_POLICY_VERSION],
+                    )]
+                else:
+                    windows = [dict(row) for row in connection.execute(
+                        """SELECT fs.* FROM flow_signals fs
+                           WHERE fs.window_end_block >= ? AND NOT EXISTS (
+                             SELECT 1 FROM flow_observations o
+                             WHERE o.pool_id=fs.pool_id
+                               AND o.window_end_block=fs.window_end_block
+                               AND o.policy_version=?
+                           ) ORDER BY fs.window_end_block DESC LIMIT 100""",
+                        (floor, FLOW_EVIDENCE_POLICY_VERSION),
+                    )]
         seen: set[tuple[str, int]] = set()
         ordered: list[dict] = []
         for window in [*queued_rows, *windows]:
@@ -10006,26 +10256,55 @@ class RobinhoodLearningEngine:
         record("selection", selection_started)
         windows_available = len(windows)
 
-        # Admission by remaining headroom, not by a fixed count. A static
+        # Admission by the two-part cost model, not by a fixed count. A static
         # limit of 8 spends the same time whether the cycle has 20 seconds
         # left or 6, which is how sealing came to overrun 46 of 64 failed
-        # cycles. The estimate is measured, so it tracks a slow provider
-        # instead of assuming the cost that held when the limit was chosen.
+        # cycles. usable = remaining - downstream_reserve - fixed cost; what
+        # is left must buy whole windows at per_window_cost_p95.
         static_limit = len(windows) if limit is None else max(0, int(limit))
-        cost = self.seal_cost_estimate()
+        model = self.seal_cost_model()
+        fixed_cost = model["fixed_observation_cost_p95"]
+        cost = model["per_window_cost_p95"]
+        downstream_reserve = max(
+            float(reserve_seconds), model["downstream_reserve_p95"])
         admitted = static_limit
         headroom = None
+        usable = None
         if deadline is not None:
-            headroom = max(0.0, deadline.remaining() - float(reserve_seconds))
-            admitted = (
-                0 if headroom <= 0
-                else max(1, min(static_limit, int(headroom // max(cost, 0.05))))
-            )
+            headroom = max(0.0, deadline.remaining())
+            usable = max(0.0, headroom - downstream_reserve - fixed_cost)
+            if usable <= 0 or cost <= 0:
+                admitted = 0
+            else:
+                # Always admit at least one window when ANY usable budget
+                # exists (matching the pre-model floor): a cycle that seals
+                # nothing while deferring everything turns the queue into a
+                # leak when every later cycle is equally tight.
+                admitted = min(
+                    static_limit,
+                    max(1, int(usable // max(cost, 0.05))))
         admitted = min(admitted, static_limit)
         deferred = windows[admitted:]
         windows = windows[:admitted]
 
+        def persist_substage(substage: str, window_detail: dict | None = None,
+                             **extra) -> None:
+            """Durable sub-stage marker: WHERE inside sealing are we?
+
+            Committed BEFORE the blocking call it names so a forced
+            termination records the exact window -- index and pool -- the
+            process was on when it was killed.
+            """
+            self.store.mark_lane_stage(
+                "live", f"fresh_quote_and_observation/{substage}",
+                run_id=getattr(self, "cycle_run_uuid", None),
+                remaining=(
+                    None if deadline is None else deadline.remaining()),
+                completed={}, detail={**(window_detail or {}), **extra})
+
         prefetch_started = time.monotonic()
+        persist_substage("quote_prefetch", windows=len(windows),
+                         deferred=len(deferred))
         # Optional by construction: a market client that cannot batch still
         # seals correctly, one round trip at a time. Reported rather than
         # assumed, because a silent fall-back to the sequential path is
@@ -10040,44 +10319,92 @@ class RobinhoodLearningEngine:
         else:
             prime = dict(primer(windows, deadline=deadline))
             prime["supported"] = True
-        record("prefetch", prefetch_started)
+        phase.setdefault("prefetch", []).append(time.monotonic() - prefetch_started)
 
-        for index, window in enumerate(windows):
-            # The reserve, not expiry: stopping when the deadline has already
-            # passed leaves nothing for the stages that cannot yield.
-            if deadline is not None and deadline.remaining() <= reserve_seconds:
-                deferred.extend(windows[index:])
-                break
-            hashes_started = time.monotonic()
-            with self.store.connection() as connection:
-                hashes = [
-                    row[0] for row in connection.execute(
-                        """
-                        SELECT transaction_hash FROM swap_observations
-                        WHERE pool_id=? AND block_number BETWEEN ? AND ?
-                        """,
-                        (window["pool_id"], window["window_start_block"],
-                         window["window_end_block"]),
+        def settle_queue() -> int:
+            """Durably queue every unsealed window. Runs even on failure."""
+            settle_started = time.monotonic()
+            persist_substage("queue_settlement",
+                             sealed=len(sealed_windows), deferred=len(deferred))
+            self.store.complete_seal_queue(sealed_windows)
+            queued_now = self.store.enqueue_seal(deferred, "live_lane_headroom")
+            per_window_cost = self.record_seal_cost(phase, len(sealed_windows))
+            phase.setdefault("queue_settle", []).append(
+                time.monotonic() - settle_started)
+            settlement["queued_now"] = queued_now
+            settlement["measured_cost_seconds"] = per_window_cost
+            return queued_now
+
+        settlement: dict = {}
+        try:
+            for index, window in enumerate(windows):
+                # The reserve, not expiry: stopping when the deadline has
+                # already passed leaves nothing for the stages that cannot
+                # yield. Checked BEFORE each remote call...
+                if (deadline is not None
+                        and deadline.remaining() <= downstream_reserve):
+                    deferred.extend(windows[index:])
+                    del windows[index:]
+                    break
+                window_detail = {
+                    "window_index": index, "pool_id": str(window["pool_id"]),
+                    "window_end_block": int(window["window_end_block"]),
+                }
+                hashes_started = time.monotonic()
+                with self.store.connection() as connection:
+                    hashes = [
+                        row[0] for row in connection.execute(
+                            """
+                            SELECT transaction_hash FROM swap_observations
+                            WHERE pool_id=? AND block_number BETWEEN ? AND ?
+                            """,
+                            (window["pool_id"],
+                             window["window_start_block"],
+                             window["window_end_block"]),
+                        )
+                    ]
+                phase.setdefault("transaction_hashes", []).append(
+                    time.monotonic() - hashes_started)
+                persist_substage("window_quote_rpc", window_detail)
+                quote_started = time.monotonic()
+                try:
+                    market = self.v4_market.snapshot(
+                        {"pool_id": window["pool_id"],
+                         "token_address": window["token_address"]},
+                        quote_block=int(window["window_end_block"]),
                     )
-                ]
-            record("transaction_hashes", hashes_started)
-            quote_started = time.monotonic()
-            try:
-                market = self.v4_market.snapshot(
-                    {"pool_id": window["pool_id"],
-                     "token_address": window["token_address"]},
-                    quote_block=int(window["window_end_block"]),
-                )
-            except Exception:
-                market = {"verified": False, "reason": "observation_quote_failed"}
-                failures += 1
-            record("quote_rpc", quote_started)
-            try:
-                features = json.loads(window.get("features_json") or "{}")
-            except (TypeError, ValueError):
-                features = {}
-            gaps = features.get("qualification_gaps")
-            gap_count = None if gaps is None else len(gaps)
+                except CycleDeadlineExceeded:
+                    # The deadline fired INSIDE the remote call. This is not
+                    # a bad quote: every remaining window is over budget and
+                    # must queue in the finally-block, and the exception
+                    # must reach the supervisor so the run is recorded as
+                    # deadline_exceeded rather than silently completing.
+                    deferred.extend(windows[index:])
+                    del windows[index:]
+                    raise
+                except Exception:
+                    market = {"verified": False,
+                              "reason": "observation_quote_failed"}
+                    failures += 1
+                quote_elapsed = time.monotonic() - quote_started
+                phase.setdefault("quote_rpc", []).append(quote_elapsed)
+                # ...and AFTER it: an individual stalled call that returned
+                # late has already consumed budget the remaining windows
+                # cannot plan around.
+                if (deadline is not None
+                        and deadline.remaining() <= downstream_reserve):
+                    deferred.append(window)
+                    deferred.extend(windows[index + 1:])
+                    del windows[index:]
+                    prime["interrupted_after_window"] = window_detail
+                    break
+                persist_substage("observation_commit", window_detail)
+                try:
+                    features = json.loads(window.get("features_json") or "{}")
+                except (TypeError, ValueError):
+                    features = {}
+                gaps = features.get("qualification_gaps")
+                gap_count = None if gaps is None else len(gaps)
             # An unexitable pool is not a signal, whatever its flow looked
             # like. The five qualification gates -- swaps, participants, net
             # flow, price direction, concentration -- say nothing about
@@ -10096,54 +10423,49 @@ class RobinhoodLearningEngine:
             # This matters beyond the labels: signal_versus_control() needs 8
             # per arm, and a signal arm filled with empty pools would produce
             # a comparison that looks like a result.
-            round_trip = self.store._round_trip_return(market)
-            exitable = bool(
-                round_trip is not None
-                and round_trip >= -FLOW_MAXIMUM_ROUND_TRIP_LOSS
-            )
-            if gap_count == 0 and not exitable:
-                gaps = list(gaps or []) + ["exitable_round_trip"]
-                gap_count = len(gaps)
-                features = dict(features)
-                features["qualification_gaps"] = gaps
-                features["round_trip_return"] = round_trip
-            role = "signal" if gap_count == 0 else "matched_control"
-            seal_timings: dict[str, float] = {}
-            observation_id = self.store.seal_flow_observation(
-                role=role, gap_count=gap_count, timings=seal_timings,
-                pool_id=window["pool_id"], token_address=window["token_address"],
-                observation_head=int(head_block),
-                window_start_block=int(window["window_start_block"]),
-                window_end_block=int(window["window_end_block"]),
-                transaction_hashes=hashes, features=features,
-                quote=market, quote_block=int(window["window_end_block"]),
-                now=now,
-            )
-            for name, value in seal_timings.items():
-                phase.setdefault(name, []).append(value)
-            sealed_windows.append(window)
-            if observation_id:
-                sealed.append(observation_id)
-        # Close what this cycle sealed, queue what it did not. Both halves are
-        # required: without the first the queue never empties, and without the
-        # second a window that fell below `floor` is simply never seen again.
-        # Timed like everything else. The per-window phases summed to 3.37s
-        # median while the enclosing stage reported 8.25s, and every guess at
-        # the missing five seconds was wrong when measured in isolation --
-        # the queries are fast on a quiet database and this one is not quiet.
-        # Attributing the remainder beats reasoning about it.
-        settle_started = time.monotonic()
-        self.store.complete_seal_queue(sealed_windows)
-        queued_now = self.store.enqueue_seal(deferred, "live_lane_headroom")
-        per_window = self.record_seal_cost(phase, len(sealed_windows))
+                round_trip = self.store._round_trip_return(market)
+                exitable = bool(
+                    round_trip is not None
+                    and round_trip >= -FLOW_MAXIMUM_ROUND_TRIP_LOSS
+                )
+                if gap_count == 0 and not exitable:
+                    gaps = list(gaps or []) + ["exitable_round_trip"]
+                    gap_count = len(gaps)
+                    features = dict(features)
+                    features["qualification_gaps"] = gaps
+                    features["round_trip_return"] = round_trip
+                role = "signal" if gap_count == 0 else "matched_control"
+                seal_timings: dict[str, float] = {}
+                observation_id = self.store.seal_flow_observation(
+                    role=role, gap_count=gap_count, timings=seal_timings,
+                    pool_id=window["pool_id"],
+                    token_address=window["token_address"],
+                    observation_head=int(head_block),
+                    window_start_block=int(window["window_start_block"]),
+                    window_end_block=int(window["window_end_block"]),
+                    transaction_hashes=hashes, features=features,
+                    quote=market, quote_block=int(window["window_end_block"]),
+                    now=now,
+                )
+                for name, value in seal_timings.items():
+                    phase.setdefault(name, []).append(value)
+                sealed_windows.append(window)
+                if observation_id:
+                    sealed.append(observation_id)
+        finally:
+            # Close what this cycle sealed, queue what it did not -- ALWAYS,
+            # including when the deadline kill lands mid-loop. Both halves
+            # matter: without the first the queue never empties, without the
+            # second a window that fell below `floor` is never seen again,
+            # and a hard termination must leave every unprocessed window in
+            # the durable queue rather than silently dropped.
+            queued_now = settle_queue()
         backlog = self.store.seal_queue_backlog()
         with self.store.connection() as connection:
             cumulative = connection.execute(
                 "SELECT COUNT(*) FROM flow_observations WHERE policy_version=?",
                 (FLOW_EVIDENCE_POLICY_VERSION,),
             ).fetchone()[0]
-        phase.setdefault("queue_settle", []).append(
-            time.monotonic() - settle_started)
         return {
             "windows_considered": len(windows),
             "windows_available": windows_available,
@@ -10158,11 +10480,20 @@ class RobinhoodLearningEngine:
                 "static_limit": static_limit,
                 "headroom_seconds": (
                     None if headroom is None else round(headroom, 3)),
-                "reserve_seconds": round(float(reserve_seconds), 3),
+                "usable_seconds": (
+                    None if usable is None else round(usable, 3)),
+                "reserve_seconds": round(float(downstream_reserve), 3),
+                "fixed_observation_cost_estimate_seconds": round(fixed_cost, 3),
                 "cost_estimate_seconds": round(cost, 3),
-                "measured_cost_seconds": (
-                    None if per_window is None else round(per_window, 3)),
+                "downstream_reserve_estimate_seconds": round(
+                    model["downstream_reserve_p95"], 3),
+                "measured_cost_seconds": next(
+                    (round(settlement[k], 3)
+                     for k in ("measured_cost_seconds",)
+                     if settlement.get(k) is not None), None),
                 "queue_drained": len(queued_rows),
+                "model_censored_samples": safe_int(
+                    model.get("censored_samples"), 0),
             },
             "prefetch": prime,
             "phase_seconds": {
@@ -10194,44 +10525,77 @@ class RobinhoodLearningEngine:
         research = paper = 0
         newly_classified = 0
         processed = 0
+        # BOUNDED selection. The old query materialized EVERY unclassified
+        # observation -- thousands of rows -- plus Python-side re-sorting,
+        # then the cumulative GROUP BY aggregated the whole cohort: all of it
+        # on the decision-critical path. Now: current-cycle ids first (they
+        # are known by primary key), then the oldest deferred rows fill the
+        # remaining admission slots via SQL ORDER BY ... LIMIT ? -- the
+        # backlog is never loaded into Python beyond what this cycle will
+        # actually process.
+        limit = (
+            None if admission_limit is None else max(0, int(admission_limit)))
+        rows: list[dict] = []
+        current_selected = 0
         with self.store.connection() as connection:
-            already = {
-                row[0] for row in connection.execute(
-                    "SELECT observation_id FROM flow_observation_classifications"
-                )
-            }
-        with self.store.connection() as connection:
-            # ALL unclassified observations for the policy, oldest-sealed
-            # first: current-cycle ids are prioritized in Python below.
-            query = """
-                SELECT o.observation_id, o.pool_id, o.token_address,
-                       fs.identity_coverage, fs.qualification_gaps_json,
-                       o.sealed_at
-                FROM flow_observations o
-                LEFT JOIN flow_signals fs ON fs.pool_id=o.pool_id
-                WHERE o.policy_version=?
-                  AND NOT EXISTS (
-                      SELECT 1 FROM flow_observation_classifications c
-                      WHERE c.observation_id = o.observation_id)
-                ORDER BY o.sealed_at ASC, o.observation_id ASC
-            """
-            rows = [dict(row) for row in connection.execute(
-                query, [FLOW_EVIDENCE_POLICY_VERSION])]
+            base_columns = """
+                    SELECT o.observation_id, o.pool_id, o.token_address,
+                           fs.identity_coverage, fs.qualification_gaps_json,
+                           o.sealed_at
+                    FROM flow_observations o
+                    LEFT JOIN flow_signals fs ON fs.pool_id=o.pool_id
+                    WHERE o.policy_version=?
+                      AND NOT EXISTS (
+                          SELECT 1 FROM flow_observation_classifications c
+                          WHERE c.observation_id = o.observation_id)
+                    """
+            order = " ORDER BY o.sealed_at ASC, o.observation_id ASC "
             if observation_ids:
                 # Current-cycle observations classify FIRST so a decision
-                # attaches while evidence is freshest; remaining budget
-                # then drains the oldest deferred rows.
-                current = set(observation_ids)
-                rows.sort(
-                    key=lambda row: 0 if row["observation_id"] in current
-                    else 1)
-        # Admission control: only the first N rows (oldest-first from the
-        # query) are classified this cycle; the rest are durably deferred.
+                # attaches while evidence is freshest. They arrive by primary
+                # key from the just-sealed batch (a handful of rows), so
+                # selecting them uncapped by the limit is bounded by
+                # construction -- and the admission report still needs to see
+                # them all to account for what was deferred.
+                ids = [str(i) for i in observation_ids]
+                chunk = max(1, min(len(ids), 500))
+                for start in range(0, len(ids), chunk):
+                    group = ids[start:start + chunk]
+                    placeholders = ",".join("?" * len(group))
+                    rows.extend(dict(row) for row in connection.execute(
+                        base_columns
+                        + f" AND o.observation_id IN ({placeholders})" + order,
+                        [FLOW_EVIDENCE_POLICY_VERSION, *group]))
+                current_selected = len(rows)
+            remaining_slots = None if limit is None else max(
+                0, limit - current_selected)
+            if limit is None or remaining_slots > 0:
+                deferred_query = (
+                    base_columns + order + " LIMIT ?")
+                params: list = [FLOW_EVIDENCE_POLICY_VERSION]
+                if limit is not None:
+                    params.append(int(remaining_slots))
+                else:
+                    # No admission limit (legacy/analysis callers): still
+                    # bounded -- the full backlog is never materialized in
+                    # one query result.
+                    params.append(CLASSIFICATION_BACKLOG_SCAN_LIMIT)
+                rows.extend(dict(row) for row in connection.execute(
+                    deferred_query, params))
+            unclassified_total = connection.execute(
+                """SELECT COUNT(*) FROM flow_observations o
+                   WHERE o.policy_version=? AND NOT EXISTS (
+                       SELECT 1 FROM flow_observation_classifications c
+                       WHERE c.observation_id=o.observation_id)""",
+                (FLOW_EVIDENCE_POLICY_VERSION,),
+            ).fetchone()[0]
         admitted_rows = rows
         admission_exceeded = 0
-        if admission_limit is not None and len(rows) > int(admission_limit):
-            admitted_rows = rows[:int(admission_limit)]
-            admission_exceeded = len(rows) - len(admitted_rows)
+        if limit is not None:
+            admitted_rows = rows[:limit]
+            # Counted, never materialized: the deferral figure covers the
+            # WHOLE remaining backlog, not just the rows this query returned.
+            admission_exceeded = max(0, int(unclassified_total) - len(admitted_rows))
         quotes_taken = quote_failures = 0
         durations: list[float] = []
         for row in admitted_rows:
@@ -10265,6 +10629,10 @@ class RobinhoodLearningEngine:
                     # A failed re-quote is not a pass. classify treats None as
                     # unactionable, which keeps the observation research-only.
                     quote_failures += 1
+                # A stalled individual re-quote must not hand its overrun to
+                # the next row: re-check AFTER the remote call returns.
+                if deadline is not None and deadline.expired():
+                    break
             verdict = self.store.classify_flow_observation(
                 row["observation_id"], decision_head=int(decision_head),
                 identity_coverage=row.get("identity_coverage"), gates=gates,
@@ -10274,7 +10642,10 @@ class RobinhoodLearningEngine:
                 scoped_tiers.get(verdict["identity_tier"], 0) + 1)
             research += verdict["research_eligible"]
             paper += verdict["paper_eligible"]
-            newly_classified += row["observation_id"] not in already
+            # Selection excludes already-classified observations, so every
+            # processed row is newly classified by construction -- without
+            # loading the whole classifications table to double-check.
+            newly_classified += 1
             processed += 1
             durations.append(time.monotonic() - started)
         # Fold this cycle's per-observation durations into the p95 cost
@@ -10287,27 +10658,28 @@ class RobinhoodLearningEngine:
                 round(measured_p95, 3) if measured_p95 is not None else None),
             "estimate_seconds": self.classification_cost_estimate(),
         }
-        with self.store.connection() as connection:
-            cumulative_rows = connection.execute(
-                """SELECT c.identity_tier,COUNT(*) count,
-                          COALESCE(SUM(c.research_eligible),0) research,
-                          COALESCE(SUM(c.paper_eligible),0) paper
-                   FROM flow_observation_classifications c
-                   JOIN flow_observations o USING(observation_id)
-                   WHERE o.policy_version=? GROUP BY c.identity_tier""",
-                (FLOW_EVIDENCE_POLICY_VERSION,),
-            ).fetchall()
-        tiers = {row["identity_tier"]: int(row["count"]) for row in cumulative_rows}
-        cumulative_research = sum(int(row["research"]) for row in cumulative_rows)
-        cumulative_paper = sum(int(row["paper"]) for row in cumulative_rows)
-        cumulative_total = sum(tiers.values())
+        # Cumulative cohort aggregation MOVED OFF the live path. The old
+        # GROUP BY over the whole classifications join cost real seconds per
+        # cycle; these counters are maintained incrementally instead and are
+        # reconciled against the full aggregate only in the analysis /
+        # dashboard lane (classification_cohort_summary).
+        cumulative = self._bump_classification_counters(
+            scoped_tiers, research_delta=research, paper_delta=paper,
+            total_delta=newly_classified)
+        tiers = dict(cumulative["identity_tiers"])
+        cumulative_total = int(cumulative["total"])
+        cumulative_research = int(cumulative["research_eligible"])
+        cumulative_paper = int(cumulative["paper_eligible"])
         verified = tiers.get("verified", 0)
         return {
             "classified_this_cycle": newly_classified,
             "reclassified_this_cycle": processed - newly_classified,
             "scoped_rows_selected": len(rows),
             "scoped_rows_processed": processed,
-            "scoped_rows_deferred": len(rows) - processed,
+            # Counted, never materialized: the deferral figure covers the
+            # WHOLE remaining backlog, not just the rows this query returned.
+            "scoped_rows_deferred": max(
+                0, int(unclassified_total) - processed),
             "admission": admission_summary,
             "scoped_identity_tiers": scoped_tiers,
             "scoped_research_eligible": research,
@@ -11053,6 +11425,11 @@ class RobinhoodLearningEngine:
             # Leaving it here would keep an external price API on the path
             # that must stay near the chain head.
             positions = {"delegated_to": "marks_lane"}
+            # Five NON-OVERLAPPING stage clocks. The old `seal_and_fresh_quote`
+            # clock started before sealing and stopped after classification,
+            # so sealing's overrun was booked to whichever stage followed it
+            # and no single number could be compared against an estimate.
+            # Each boundary below starts exactly where the previous ended.
             stage = time.monotonic()
             self.store.mark_lane_stage(
                     "live", "ingestion", run_id=self.cycle_run_uuid,
@@ -11064,7 +11441,7 @@ class RobinhoodLearningEngine:
                     enrichment_limit=LIVE_LANE_ENRICHMENT_LIMIT,
                     enrichment_budget_seconds=LIVE_LANE_ENRICHMENT_BUDGET_SECONDS,
                 )
-            timings["head_ingestion_and_identity"] = round(
+            timings["head_ingestion_and_identity_seconds"] = round(
                 time.monotonic() - stage, 3)
             # Renamed: this stage captures a fresh block-pinned quote and
             # persists an immutable SQLite observation. It is NOT Timechain
@@ -11087,62 +11464,56 @@ class RobinhoodLearningEngine:
 
             stage = time.monotonic()
             touched = list(near_head.get("touched_pool_ids") or [])
-            with self._rpc_deadline(deadline):
-                observation = self.seal_near_head_observations(
-                    int(near_head.get("to_block") or 0), observed_at,
-                    pool_ids=touched, deadline=deadline,
-                    limit=LIVE_LANE_OBSERVATION_LIMIT,
-                    reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS,
-                )
-                self.store.mark_lane_stage(
-                    "live", "decision_head", run_id=self.cycle_run_uuid,
-                    remaining=deadline.remaining(), completed=dict(timings))
-                head_started = time.monotonic()
-                decision_head = int(self.rpc.get_block_number())
-                timings["decision_head_seconds"] = round(
-                    time.monotonic() - head_started, 3)
-                self.store.mark_lane_stage(
-                    "live", "classification", run_id=self.cycle_run_uuid,
-                    remaining=deadline.remaining(), completed=dict(timings))
-                # Admission controller: classify only what safely fits the
-                # remaining budget (p95 per-observation estimate minus a
-                # completion/ledger reserve). The rest is durably deferred,
-                # never dropped.
-                classification_started = time.monotonic()
-                remaining_at_admission = deadline.remaining()
-                admission = self.classification_admission(
-                    len(observation.get("observation_ids") or []),
-                    remaining_at_admission,
-                )
-                # The UNEXPLAINED pre-classification overhead: everything
-                # between the decision-head read and the classification
-                # loop that is not accounted for by admission itself.
-                # (Measuring from the seal stage's start would fold
-                # sealing and decision-head retrieval -- both already
-                # timed separately -- into this number.)
-                unexplained_gap = round(
-                    classification_started - head_started
-                    - timings.get("decision_head_seconds", 0.0), 3)
-                timings["pre_classification_gap_seconds"] = unexplained_gap
-                timings["classification_remaining_at_admission"] = round(
-                    remaining_at_admission, 3)
-                classification = self.classify_sealed_observations(
-                    decision_head,
-                    observation_ids=list(observation.get("observation_ids") or []),
-                    deadline=deadline,
-                    admission_limit=admission["admitted"],
-                )
-                classification["admission_decision"] = admission
-                timings["classification_seconds"] = round(
-                    time.monotonic() - classification_started, 3)
-            timings["seal_and_fresh_quote"] = round(
+            try:
+                with self._rpc_deadline(deadline):
+                    observation = self.seal_near_head_observations(
+                        int(near_head.get("to_block") or 0), observed_at,
+                        pool_ids=touched, deadline=deadline,
+                        limit=LIVE_LANE_OBSERVATION_LIMIT,
+                        reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS,
+                    )
+            except CycleDeadlineExceeded:
+                # CENSORED sample: this attempt was killed inside sealing.
+                # Its elapsed time is a lower bound on what the admitted
+                # windows actually cost; folding it in (upward-only) keeps
+                # admission learning from failures instead of successes only.
+                self.record_seal_cost_censored(time.monotonic() - stage)
+                raise
+            timings["fresh_quote_and_observation_seconds"] = round(
                 time.monotonic() - stage, 3)
-            timings["seal_stage_headroom_seconds"] = round(
-                deadline.remaining(), 3)
-            quote_delay = timings["seal_and_fresh_quote"]
-            observation["decision_head_lag_blocks"] = max(
-                0, decision_head - int(near_head.get("to_block") or 0))
-            ledger_started = time.monotonic()
+            stage = time.monotonic()
+            self.store.mark_lane_stage(
+                "live", "decision_head", run_id=self.cycle_run_uuid,
+                remaining=deadline.remaining(), completed=dict(timings))
+            with self._rpc_deadline(deadline):
+                decision_head = int(self.rpc.get_block_number())
+            timings["decision_head_seconds"] = round(
+                time.monotonic() - stage, 3)
+            stage = time.monotonic()
+            self.store.mark_lane_stage(
+                "live", "classification", run_id=self.cycle_run_uuid,
+                remaining=deadline.remaining(), completed=dict(timings))
+            # Admission controller: classify only what safely fits the
+            # remaining budget (p95 per-observation estimate minus a
+            # completion/ledger reserve). The rest is durably deferred,
+            # never dropped.
+            remaining_at_admission = deadline.remaining()
+            admission = self.classification_admission(
+                len(observation.get("observation_ids") or []),
+                remaining_at_admission,
+            )
+            timings["classification_remaining_at_admission"] = round(
+                remaining_at_admission, 3)
+            classification = self.classify_sealed_observations(
+                decision_head,
+                observation_ids=list(observation.get("observation_ids") or []),
+                deadline=deadline,
+                admission_limit=admission["admitted"],
+            )
+            classification["admission_decision"] = admission
+            timings["classification_seconds"] = round(
+                time.monotonic() - stage, 3)
+            stage = time.monotonic()
             self.ledger.append("robinhood_live_lane", {
                 "run_id": self.cycle_run_uuid if hasattr(self, "cycle_run_uuid") else None,
                 "near_head_flow": {
@@ -11153,8 +11524,31 @@ class RobinhoodLearningEngine:
                 "classification": classification,
                 "paper_only": True,
             })
-            timings["ledger_append"] = round(
-                time.monotonic() - ledger_started, 3)
+            timings["ledger_append_seconds"] = round(
+                time.monotonic() - stage, 3)
+            timings["seal_stage_headroom_seconds"] = round(
+                deadline.remaining(), 3)
+            # DEPRECATED total: now DERIVED as the sum of the five disjoint
+            # stage clocks rather than measured across them. Kept because
+            # dashboards and alerts still read it; it can never exceed the
+            # budget by double-counting again.
+            timings["seal_and_fresh_quote"] = round(sum([
+                timings["head_ingestion_and_identity_seconds"],
+                timings["fresh_quote_and_observation_seconds"],
+                timings["decision_head_seconds"],
+                timings["classification_seconds"],
+                timings["ledger_append_seconds"],
+            ]), 3)
+            timings["seal_and_fresh_quote_is_derived_total"] = True
+            # Fold THIS cycle's actual downstream tail into the reserve
+            # estimate the next cycle's admission will subtract.
+            self.record_downstream_reserve(
+                timings["decision_head_seconds"]
+                + timings["classification_seconds"]
+                + timings["ledger_append_seconds"])
+            quote_delay = timings["seal_and_fresh_quote"]
+            observation["decision_head_lag_blocks"] = max(
+                0, decision_head - int(near_head.get("to_block") or 0))
             return {
                 "position_evaluations": positions,
                 "near_head_flow": near_head,
@@ -11332,12 +11726,21 @@ class RobinhoodLearningEngine:
             stage = time.monotonic()
             deferred_seals = self.drain_deferred_seals(deadline=deadline)
             timings["deferred_seals"] = round(time.monotonic() - stage, 3)
+            # The expensive full-cohort aggregation lives HERE (analysis /
+            # dashboard lane), never in classification's live path: this
+            # seeds/reconciles the incremental counters the live cycle reads.
+            try:
+                cohort_summary = self._classification_counters(seed=True)
+                cohort_summary["reconciled_at"] = _utc_now()
+            except Exception as exc:
+                cohort_summary = {"error": str(exc)[:200]}
             learning = self.store.summary()
             return {
                 "outcomes": outcomes, "market_rechecks": rechecks,
                 "candidate_analyses": analyses,
                 "deferred_seals": deferred_seals,
                 "certificate_refresh": certificate_refresh,
+                "classification_cohort": cohort_summary,
                 "stage_timings_seconds": timings,
                 "cursor": {"analysis_queue": "oldest_fairness_with_priorities"},
                 "backlog": {
@@ -12511,6 +12914,113 @@ def dashboard_historical_snapshot(
     }
 
 
+def live_lane_reliability_snapshot(
+    root: str | Path, *, store: RobinhoodLearningStore | None = None,
+    window: int = 300,
+) -> dict:
+    """Reliability telemetry for the live lane, aggregated from durable state.
+
+    Completion rate counts deadline_exceeded cycles as the failures they are
+    (a killed cycle produced no decision for its observations); latency is
+    reported as an ALL-ATTEMPT p95, not a completed-only one -- a p95 over
+    successes only describes the easy 6% of runs.
+    """
+    root = Path(root)
+    store = store or RobinhoodLearningStore(root / "learning.sqlite3")
+    durations: list[float] = []
+    statuses: dict[str, int] = {}
+    stage_timeouts: dict[str, int] = {}
+    total = 0
+    with store.connection() as connection:
+        rows = connection.execute(
+            """SELECT status, summary_json FROM runs
+               WHERE lane='live' ORDER BY started_at DESC LIMIT ?""",
+            (int(window),),
+        ).fetchall()
+        oldest_deferred = connection.execute(
+            """SELECT MIN(o.sealed_at) FROM flow_observations o
+               WHERE o.policy_version=?
+                 AND NOT EXISTS (
+                     SELECT 1 FROM flow_observation_classifications c
+                     WHERE c.observation_id=o.observation_id)""",
+            (FLOW_EVIDENCE_POLICY_VERSION,),
+        ).fetchone()[0]
+    for row in rows:
+        total += 1
+        statuses[row["status"]] = statuses.get(row["status"], 0) + 1
+        try:
+            summary = json.loads(row["summary_json"] or "{}")
+        except (TypeError, ValueError):
+            continue
+        duration = safe_float(summary.get("duration_seconds"), 0.0)
+        if duration > 0:
+            durations.append(duration)
+        if row["status"] == "deadline_exceeded":
+            stage = str(summary.get("failure_stage") or "unattributed")
+            stage_timeouts[stage] = stage_timeouts.get(stage, 0) + 1
+
+    def _p95(values: list[float]) -> float | None:
+        if not values:
+            return None
+        ordered = sorted(values)
+        index = min(len(ordered) - 1, max(0, int(round(0.95 * (len(ordered) - 1)))))
+        return round(ordered[index], 3)
+
+    model_store = store
+    model = model_store.scheduler_state(SEAL_COST_MODEL_STATE_KEY)
+    class_cost = model_store.scheduler_state("classification_observation_cost")
+    counters = model_store.scheduler_state(CLASSIFICATION_COUNTERS_STATE_KEY)
+    last_summary: dict = {}
+    try:
+        last_summary = read_json(root / "live_lane_summary.json", {}) or {}
+    except Exception:
+        last_summary = {}
+    timings = last_summary.get("stage_timings_seconds") or {}
+    observation = last_summary.get("observation_seal") or {}
+    classification = last_summary.get("classification") or {}
+    return {
+        "window_runs": total,
+        "statuses": statuses,
+        "completion_rate": (
+            round(statuses.get("complete", 0) / total, 4) if total else None),
+        # deadline_exceeded IS a failure here; complete/total already treats
+        # it as one because only 'complete' counts toward the numerator.
+        "all_attempt_p95_seconds": _p95(durations),
+        "timeout_count_by_stage": stage_timeouts,
+        "timeout_total": sum(stage_timeouts.values()),
+        "seal_cost_model": {
+            "fixed_observation_cost_p95": safe_float(
+                model.get("fixed_observation_cost_p95"),
+                SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT),
+            "per_window_cost_p95": safe_float(
+                model.get("per_window_cost_p95"),
+                SEAL_PER_WINDOW_COST_SECONDS_DEFAULT),
+            "downstream_reserve_p95": safe_float(
+                model.get("downstream_reserve_p95"),
+                DOWNSTREAM_RESERVE_SECONDS_DEFAULT),
+            "censored_samples": safe_int(model.get("censored_samples"), 0),
+        },
+        "classification_cost_estimate_seconds": safe_float(
+            class_cost.get("per_observation_seconds"),
+            CLASSIFICATION_COST_SECONDS_DEFAULT),
+        "remaining_budget_at_admission_seconds": timings.get(
+            "classification_remaining_at_admission"),
+        "windows_available": observation.get("windows_available"),
+        "windows_admitted": observation.get("windows_admitted"),
+        "windows_deferred": observation.get("windows_deferred"),
+        "windows_queued": observation.get("windows_queued"),
+        "classification_selected": classification.get(
+            "scoped_rows_selected"),
+        "classification_processed": classification.get(
+            "scoped_rows_processed"),
+        "classification_deferred": classification.get(
+            "scoped_rows_deferred"),
+        "cumulative_classification_counters": counters,
+        "oldest_deferred_observation_age_epoch": (
+            float(oldest_deferred) if oldest_deferred else None),
+    }
+
+
 def dashboard_snapshot(
     root: str | Path,
     *,
@@ -12532,6 +13042,12 @@ def dashboard_snapshot(
         skill_root=skill_root,
     )
     snapshot.update(dashboard_historical_snapshot(root, store=store))
+    try:
+        snapshot["live_lane_reliability"] = live_lane_reliability_snapshot(
+            root, store=store)
+    except Exception:
+        # Telemetry must never take the dashboard down with it.
+        snapshot["live_lane_reliability"] = {"error": "unavailable"}
     return snapshot
 
 
