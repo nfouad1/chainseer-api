@@ -158,6 +158,18 @@ SEAL_WINDOW_COST_SECONDS_DEFAULT = 2.0
 #: down within a few cycles, low enough that one stalled window does not
 #: collapse admission to a single observation.
 SEAL_COST_SMOOTHING = 0.3
+#: Cold-start per-observation classification cost (p95 estimate), replaced
+#: by a measured p95 after enough samples. Classification is admission-
+#: controlled like sealing: an observation admitted without enough budget
+#: to classify it would die mid-stage with no decision attached.
+CLASSIFICATION_COST_SECONDS_DEFAULT = 1.7
+CLASSIFICATION_COST_P95_MIN_SAMPLES = 8
+#: Completion/ledger headroom reserved OUTSIDE the per-candidate estimate:
+#: the cycle must still append its ledger entry and write summaries after
+#: classification returns.
+CLASSIFICATION_COMPLETION_RESERVE_SECONDS = 3.0
+#: Weight on the newest p95 sample for the classification cost estimate.
+CLASSIFICATION_COST_SMOOTHING = 0.3
 #: Ceiling on how many queued windows one live cycle may pull ahead of fresh
 #: ones. The queue must drain, but a deep backlog must never starve the head.
 SEAL_QUEUE_DRAIN_LIMIT = 4
@@ -9817,6 +9829,82 @@ class RobinhoodLearningEngine:
         })
         return per_window
 
+    def classification_cost_estimate(self) -> float:
+        """Measured seconds per classified observation (EWMA p95), or a
+        conservative cold-start default.
+
+        Classification is admission-controlled exactly like sealing: an
+        observation admitted into a cycle that cannot finish classifying
+        it would die mid-stage with no decision attached -- the one thing
+        sealing's yield cannot fix.
+        """
+        stored = self.store.scheduler_state("classification_observation_cost")
+        value = safe_float(stored.get("per_observation_seconds"), 0.0)
+        if value <= 0:
+            return CLASSIFICATION_COST_SECONDS_DEFAULT
+        return value
+
+    def record_classification_cost(
+        self, durations: list[float],
+    ) -> float | None:
+        """Fold this cycle's per-observation durations into the p95
+        estimate. Returns the measured p95, or None with too few samples.
+
+        Uses the p95 of the batch (not the mean) so one slow observation
+        raises the estimate: admission must plan for the worst likely
+        candidate, not the average one.
+        """
+        if not durations or len(durations) < 2:
+            return None
+        ordered = sorted(durations)
+        index = min(
+            len(ordered) - 1,
+            max(0, int(round(0.95 * (len(ordered) - 1)))))
+        measured = float(ordered[index])
+        previous = self.classification_cost_estimate()
+        blended = (
+            CLASSIFICATION_COST_SMOOTHING * measured
+            + (1 - CLASSIFICATION_COST_SMOOTHING) * previous)
+        self.store.set_scheduler_state("classification_observation_cost", {
+            "per_observation_seconds": round(blended, 4),
+            "last_measured_p95_seconds": round(measured, 4),
+            "samples_this_cycle": len(ordered),
+        })
+        return measured
+
+    def classification_admission(
+        self, candidates: int, remaining_seconds: float,
+    ) -> dict:
+        """Decide how many observations classification may take NOW.
+
+        Budget math: remaining headroom minus the completion/ledger
+        reserve, divided by the estimated per-observation cost. Anything
+        above the admitted count is durably deferred -- it stays an
+        unclassified sealed observation and is classified by a later
+        cycle; nothing is dropped.
+
+        The unexplained pre-classification gap is recorded separately so
+        the estimate can be tuned against real stage timings.
+        """
+        cost = self.classification_cost_estimate()
+        usable = max(
+            0.0,
+            remaining_seconds - CLASSIFICATION_COMPLETION_RESERVE_SECONDS)
+        if cost <= 0 or usable <= 0:
+            admitted = 0
+        else:
+            admitted = int(usable // cost)
+        deferred = max(0, candidates - admitted)
+        return {
+            "candidates": candidates,
+            "admitted": min(candidates, admitted),
+            "deferred": deferred,
+            "estimated_per_observation_seconds": round(cost, 3),
+            "remaining_seconds_at_admission": round(remaining_seconds, 3),
+            "completion_reserve_seconds":
+                CLASSIFICATION_COMPLETION_RESERVE_SECONDS,
+        }
+
     def seal_near_head_observations(
         self, head_block: int, now: float, *,
         pool_ids: list[str] | None = None,
@@ -10081,8 +10169,15 @@ class RobinhoodLearningEngine:
     def classify_sealed_observations(
         self, decision_head: int, *, observation_ids: list[str] | None = None,
         deadline: CycleDeadline | None = None,
+        admission_limit: int | None = None,
     ) -> dict:
-        """Classify sealed observations after enrichment. Never mutates them."""
+        """Classify sealed observations after enrichment. Never mutates them.
+
+        ``admission_limit`` caps how many observations this cycle may
+        classify (from the admission controller). Observations beyond the
+        cap are NOT touched: they remain unclassified sealed observations
+        and a later cycle classifies them. Nothing is dropped.
+        """
         # Cumulative totals read as a rate unless the delta is stated beside
         # them: a backlog sweep classifying 392 observations while the cycle
         # sealed 6 was misread as 47 verified per cycle when the true figure
@@ -10114,8 +10209,17 @@ class RobinhoodLearningEngine:
                 else:
                     query += " AND 1=0"
             rows = [dict(row) for row in connection.execute(query, parameters)]
+        # Admission control: only the first N rows (oldest-first from the
+        # query) are classified this cycle; the rest are durably deferred.
+        admitted_rows = rows
+        admission_exceeded = 0
+        if admission_limit is not None and len(rows) > int(admission_limit):
+            admitted_rows = rows[:int(admission_limit)]
+            admission_exceeded = len(rows) - len(admitted_rows)
         quotes_taken = quote_failures = 0
-        for row in rows:
+        durations: list[float] = []
+        for row in admitted_rows:
+            started = time.monotonic()
             if deadline is not None and deadline.expired():
                 break
             try:
@@ -10156,6 +10260,17 @@ class RobinhoodLearningEngine:
             paper += verdict["paper_eligible"]
             newly_classified += row["observation_id"] not in already
             processed += 1
+            durations.append(time.monotonic() - started)
+        # Fold this cycle's per-observation durations into the p95 cost
+        # estimate the admission controller plans with.
+        measured_p95 = self.record_classification_cost(durations)
+        admission_summary = {
+            "admission_limit": admission_limit,
+            "admission_exceeded": admission_exceeded,
+            "measured_p95_seconds": (
+                round(measured_p95, 3) if measured_p95 is not None else None),
+            "estimate_seconds": self.classification_cost_estimate(),
+        }
         with self.store.connection() as connection:
             cumulative_rows = connection.execute(
                 """SELECT c.identity_tier,COUNT(*) count,
@@ -10177,6 +10292,7 @@ class RobinhoodLearningEngine:
             "scoped_rows_selected": len(rows),
             "scoped_rows_processed": processed,
             "scoped_rows_deferred": len(rows) - processed,
+            "admission": admission_summary,
             "scoped_identity_tiers": scoped_tiers,
             "scoped_research_eligible": research,
             "scoped_paper_eligible": paper,
@@ -10972,14 +11088,33 @@ class RobinhoodLearningEngine:
                 self.store.mark_lane_stage(
                     "live", "classification", run_id=self.cycle_run_uuid,
                     remaining=deadline.remaining(), completed=dict(timings))
-                classify_started = time.monotonic()
+                # Admission controller: classify only what safely fits the
+                # remaining budget (p95 per-observation estimate minus a
+                # completion/ledger reserve). The rest is durably deferred,
+                # never dropped. The gap between the seal stage's end and
+                # this decision is recorded so the unexplained
+                # pre-classification overhead is visible in every summary.
+                classification_started = time.monotonic()
+                pre_classification_gap = round(
+                    classification_started - stage, 3)
+                remaining_at_admission = deadline.remaining()
+                admission = self.classification_admission(
+                    len(observation.get("observation_ids") or []),
+                    remaining_at_admission,
+                )
+                timings["pre_classification_gap_seconds"] = (
+                    pre_classification_gap)
+                timings["classification_remaining_at_admission"] = round(
+                    remaining_at_admission, 3)
                 classification = self.classify_sealed_observations(
                     decision_head,
                     observation_ids=list(observation.get("observation_ids") or []),
                     deadline=deadline,
+                    admission_limit=admission["admitted"],
                 )
+                classification["admission_decision"] = admission
                 timings["classification_seconds"] = round(
-                    time.monotonic() - classify_started, 3)
+                    time.monotonic() - classification_started, 3)
             timings["seal_and_fresh_quote"] = round(
                 time.monotonic() - stage, 3)
             timings["seal_stage_headroom_seconds"] = round(
