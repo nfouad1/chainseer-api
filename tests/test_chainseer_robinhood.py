@@ -7655,7 +7655,7 @@ class SealStageBudgetTests(unittest.TestCase):
                 "seal_window_cost", {"per_window_seconds": 2.0})
             engine = self._engine(directory, store)
             first = engine.seal_near_head_observations(
-                self.HEAD, self.NOW, deadline=rh.CycleDeadline(7.0),
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(8.0),
                 limit=4, reserve_seconds=5.0,
             )
             self.assertEqual(first["sealed_this_cycle"], 1)
@@ -7686,7 +7686,7 @@ class SealStageBudgetTests(unittest.TestCase):
                 "seal_window_cost", {"per_window_seconds": 2.0})
             engine = self._engine(directory, store)
             engine.seal_near_head_observations(
-                self.HEAD, self.NOW, deadline=rh.CycleDeadline(7.0),
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(8.0),
                 limit=2, reserve_seconds=5.0,
             )
             self.assertEqual(store.seal_queue_backlog()["pending_windows"], 1)
@@ -8078,7 +8078,7 @@ class SealQueueSurvivesRecomputeTests(SealStageBudgetTests):
                 "seal_window_cost", {"per_window_seconds": 2.0})
             engine = self._engine(directory, store)
             first = engine.seal_near_head_observations(
-                self.HEAD, self.NOW, deadline=rh.CycleDeadline(7.0),
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(8.0),
                 limit=2, reserve_seconds=5.0)
             self.assertEqual(first["windows_queued"], 1)
 

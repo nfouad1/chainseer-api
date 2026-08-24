@@ -11,6 +11,8 @@ no Timechain operation on the decision-critical path.
 from __future__ import annotations
 
 import json
+import multiprocessing
+import sqlite3
 import tempfile
 import time
 import unittest
@@ -138,6 +140,20 @@ def seed_observation(store, observation_id, sealed_at=1000.0):
              sealed_at, sealed_at))
 
 
+def _hard_kill_observation_worker(root_text: str) -> None:
+    """Child target for the real OS-termination durability proof."""
+    root = Path(root_text)
+    store = rh.RobinhoodLearningStore(root / "hard-kill.sqlite3")
+    seed_windows(store, 3)
+    engine = make_engine(root, store, _Market(stall=60.0))
+    with rh.LearningRunLock(root / ".live_once.lock"):
+        engine.seal_near_head_observations(
+            HEAD, time.time(), pool_ids=[POOL_ID],
+            deadline=rh.CycleDeadline(120.0), limit=3,
+            reserve_seconds=0.5,
+        )
+
+
 def lane_state(store, lane="live"):
     with store.connection() as connection:
         row = connection.execute(
@@ -185,6 +201,21 @@ class StageTimingBoundaryTests(unittest.TestCase):
             self.assertLessEqual(
                 timings["seal_and_fresh_quote"],
                 summary["duration_seconds"] + 0.05)
+
+    def test_absolute_deadline_charges_child_startup_to_same_budget(self):
+        now = time.monotonic()
+        deadline = rh.CycleDeadline(
+            25.0, deadline_monotonic=now + 10.0)
+        self.assertLessEqual(deadline.remaining(), 10.0)
+        self.assertGreater(deadline.remaining(), 9.5)
+        # Fifteen seconds were already consumed before the child constructed
+        # its deadline; started reconstructs the supervisor launch point.
+        self.assertAlmostEqual(now - deadline.started, 15.0, delta=0.1)
+        source = Path(rh.__file__).read_text(
+            encoding="utf-8", errors="replace")
+        supervisor = source.split("def supervise_lanes", 1)[1].split(
+            "def dashboard_operational_snapshot", 1)[0]
+        self.assertIn("CHAINSEER_LANE_DEADLINE_MONOTONIC", supervisor)
 
 
 class SubstageAttributionTests(unittest.TestCase):
@@ -291,6 +322,114 @@ class SubstageAttributionTests(unittest.TestCase):
             stage, _detail = lane_state(store)
             self.assertIn("fresh_quote_and_observation", stage or "")
 
+    def test_real_process_kill_preserves_prequeued_windows_and_releases_lock(self):
+        """An OS kill bypasses finally; durability must already be committed."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            context = multiprocessing.get_context("spawn")
+            process = context.Process(
+                target=_hard_kill_observation_worker,
+                args=(str(root),),
+            )
+            process.start()
+            db_path = root / "hard-kill.sqlite3"
+            deadline = time.monotonic() + 20.0
+            pending = 0
+            stage = None
+            while time.monotonic() < deadline:
+                if db_path.exists():
+                    connection = None
+                    try:
+                        # Read directly while the child owns schema setup.
+                        # Constructing a second Store here would run migrations
+                        # concurrently and turn this kill test into a schema-
+                        # initialization race unrelated to the behavior under
+                        # test.
+                        connection = sqlite3.connect(
+                            str(db_path), timeout=0.1)
+                        pending = connection.execute(
+                            "SELECT COUNT(*) FROM flow_seal_queue"
+                            " WHERE completed_at IS NULL"
+                        ).fetchone()[0]
+                        state = connection.execute(
+                            "SELECT current_stage FROM lane_state"
+                            " WHERE lane='live'"
+                        ).fetchone()
+                        stage = state[0] if state else None
+                    except (sqlite3.Error, OSError):
+                        pending = 0
+                    finally:
+                        if connection is not None:
+                            connection.close()
+                    if pending == 3 and stage and "window_quote_rpc" in stage:
+                        break
+                time.sleep(0.05)
+            self.assertEqual(pending, 3)
+            self.assertIn("window_quote_rpc", stage or "")
+
+            process.kill()
+            process.join(timeout=10.0)
+            self.assertFalse(process.is_alive())
+
+            # The selected targets were queued BEFORE the blocking quote, so
+            # no child cleanup/finally block is needed to recover them.
+            store = rh.RobinhoodLearningStore(db_path)
+            self.assertEqual(
+                store.seal_queue_backlog()["pending_windows"], 3)
+            # The OS releases the advisory handle when it kills the process;
+            # a new cycle can acquire the same lock immediately.
+            with rh.LearningRunLock(root / ".live_once.lock"):
+                pass
+            leftovers = [
+                path.name for path in root.iterdir()
+                if path.name.endswith((".tmp", ".temp"))
+                or path.name.startswith(("._", "~"))
+            ]
+            self.assertEqual(leftovers, [])
+
+    def test_supervisor_kill_carries_detail_and_records_censored_sample(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            run_id = "supervisor-kill-test"
+            fake_pid = 987654
+            store.begin_run(run_id, 25.0, lane="live")
+            with store.connection() as connection:
+                connection.execute(
+                    "UPDATE runs SET pid=? WHERE run_id=?",
+                    (fake_pid, run_id),
+                )
+                connection.execute(
+                    "UPDATE lane_state SET pid=? WHERE lane='live'",
+                    (fake_pid,),
+                )
+            store.mark_lane_stage(
+                "live", "fresh_quote_and_observation/window_quote_rpc",
+                run_id=run_id, remaining=3.0,
+                detail={"window_index": 2, "pool_id": POOL_ID},
+            )
+            time.sleep(0.02)
+            attempt_started_at = time.time() - 2.0
+            store.terminate_lane(
+                "live", fake_pid, "supervisor_hard_deadline_exceeded",
+                attempt_started_at=attempt_started_at)
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT summary_json FROM runs WHERE run_id=?",
+                    (run_id,),
+                ).fetchone()
+            summary = json.loads(row[0])
+            self.assertEqual(
+                summary["failure_substage_detail"]["window_index"], 2)
+            self.assertEqual(
+                summary["failure_substage_detail"]["pool_id"], POOL_ID)
+            self.assertGreaterEqual(summary["duration_seconds"], 2.0)
+            model = store.scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY)
+            self.assertEqual(model["censored_samples"], 1)
+            self.assertEqual(model["last_censored_stage"],
+                             "fresh_quote_and_observation/window_quote_rpc")
+            self.assertGreaterEqual(len(model["per_window_samples"]), 1)
+
 
 class AdmissionEstimatorTests(unittest.TestCase):
     """Requirements 4 (+ zero-headroom half of 3)."""
@@ -313,6 +452,40 @@ class AdmissionEstimatorTests(unittest.TestCase):
             self.assertEqual(market.snapshots, 0)
             self.assertEqual(result["windows_admitted"], 0)
             self.assertEqual(result["windows_queued"], 5)
+
+    def test_positive_but_sub_window_headroom_admits_zero(self):
+        """A durable queue is safer than knowingly consuming the tail reserve."""
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            seed_windows(store, 3)
+            store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "fixed_observation_cost_p95": 1.0,
+                "queue_settlement_p95": 1.0,
+                "per_window_cost_p95": 4.0,
+                "downstream_reserve_p95": 5.0,
+            })
+            # Roughly 0.5s is usable after fixed + downstream costs: positive,
+            # but less than one predicted 4s window.
+            result = make_engine(root, store).seal_near_head_observations(
+                HEAD, time.time(), pool_ids=[POOL_ID],
+                deadline=rh.CycleDeadline(6.55), limit=3,
+                reserve_seconds=5.0,
+            )
+            self.assertEqual(result["windows_admitted"], 0)
+            self.assertEqual(result["windows_queued"], 3)
+
+    def test_cost_model_is_nearest_rank_p95_of_durable_samples(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            engine = make_engine(root, store)
+            engine._blend_seal_model({
+                "per_window_cost_p95": [float(i) for i in range(1, 21)]
+            })
+            model = engine.seal_cost_model()
+            self.assertEqual(model["per_window_cost_p95"], 19.0)
+            self.assertEqual(model["per_window_sample_count"], 20)
 
     def test_admission_follows_the_two_part_formula(self):
         with tempfile.TemporaryDirectory() as directory:

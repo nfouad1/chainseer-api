@@ -12,6 +12,7 @@ import ctypes
 from ctypes import wintypes
 import hashlib
 import json
+import math
 import os
 import random
 import re
@@ -159,10 +160,14 @@ SEAL_WINDOW_COST_SECONDS_DEFAULT = 2.0
 #: collapse admission to a single observation.
 SEAL_COST_SMOOTHING = 0.3
 #: Two-part observation-cost model, stored durably under
-#: SCHEDULER_STATE key "seal_cost_model_v2". The old single EWMA folded the
-#: whole stage into one number and underestimated real cost ~7x because it
-#: mixed fixed per-cycle overhead into the per-window figure.
+#: SCHEDULER_STATE key "seal_cost_model_v2". The old single scalar could not
+#: represent fixed cycle work, per-window work and the downstream reserve as
+#: separate populations, which made safe admission impossible to audit.
 SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT = 0.0
+#: Queue completion is part of fixed cost but must also remain explicitly
+#: reserved while the per-window loop is running; otherwise the final quote
+#: can consume the headroom needed to make deferral durable.
+QUEUE_SETTLEMENT_COST_SECONDS_DEFAULT = 1.0
 #: Cold start assumes ZERO fixed cost -- the first cycle's measurement
 #: replaces it immediately, and an optimistic first cycle beats a controller
 #: that refuses to ever seal while it has no data.
@@ -172,6 +177,12 @@ SEAL_PER_WINDOW_COST_SECONDS_DEFAULT = SEAL_WINDOW_COST_SECONDS_DEFAULT
 #: Cold-starts at the lane's own decision reserve until measured.
 DOWNSTREAM_RESERVE_SECONDS_DEFAULT = LIVE_LANE_DECISION_RESERVE_SECONDS
 SEAL_COST_MODEL_STATE_KEY = "seal_cost_model_v2"
+#: Raw successful/censored timing samples retained for the observation
+#: admission model.  A scalar EWMA labelled "p95" is not a percentile and,
+#: worse, cannot distinguish a healthy distribution from one lucky pass.
+#: Keeping a bounded durable window makes the percentile reproducible after a
+#: restart without letting the scheduler-state row grow without bound.
+SEAL_COST_SAMPLE_WINDOW = 128
 #: Cold-start per-observation classification cost (p95 estimate), replaced
 #: by a measured p95 after enough samples. Classification is admission-
 #: controlled like sealing: an observation admitted without enough budget
@@ -354,15 +365,26 @@ class CycleDeadline:
     a deadline and a suggestion.
     """
 
-    __slots__ = ("started", "seconds", "_expired_at")
+    __slots__ = ("started", "seconds", "deadline", "_expired_at")
 
-    def __init__(self, seconds: float):
-        self.started = time.monotonic()
+    def __init__(self, seconds: float,
+                 deadline_monotonic: float | None = None):
         self.seconds = max(0.0, float(seconds))
+        now = time.monotonic()
+        if deadline_monotonic is None:
+            self.started = now
+            self.deadline = now + self.seconds
+        else:
+            # The supervisor starts this clock BEFORE spawning the child.
+            # Reconstructing started from the shared absolute monotonic
+            # deadline makes import/database startup part of the same budget
+            # instead of giving the child a second, later 25-second window.
+            self.deadline = float(deadline_monotonic)
+            self.started = self.deadline - self.seconds
         self._expired_at: float | None = None
 
     def remaining(self) -> float:
-        return max(0.0, self.seconds - (time.monotonic() - self.started))
+        return max(0.0, self.deadline - time.monotonic())
 
     def expired(self) -> bool:
         if self.remaining() > 0:
@@ -641,11 +663,12 @@ def _spread(values: list[float]) -> dict:
         return {"count": 0, "total": 0.0, "median": None, "p95": None,
                 "slowest": None}
     ordered = sorted(values)
+    p95_index = min(len(ordered) - 1, max(0, math.ceil(0.95 * len(ordered)) - 1))
     return {
         "count": len(ordered),
         "total": round(sum(ordered), 3),
         "median": round(ordered[len(ordered) // 2], 3),
-        "p95": round(ordered[max(0, int(len(ordered) * 0.95) - 1)], 3),
+        "p95": round(ordered[p95_index], 3),
         "slowest": round(ordered[-1], 3),
     }
 
@@ -4916,18 +4939,25 @@ class RobinhoodLearningStore:
                 round(time.time() - started, 3) if started else None),
         }
 
-    def terminate_lane(self, lane: str, pid: int, reason: str) -> None:
+    def terminate_lane(
+        self, lane: str, pid: int, reason: str,
+        attempt_started_at: float | None = None,
+    ) -> None:
         """Close only the run owned by the process the supervisor terminated."""
         now = time.time()
         failure = {
             "lane": str(lane), "status": "deadline_exceeded",
             "pid": int(pid), "error": str(reason), "timestamp": _utc_now(),
         }
+        if attempt_started_at is not None:
+            failure["duration_seconds"] = round(
+                max(0.0, now - float(attempt_started_at)), 3)
         with self.connection() as connection:
             row = connection.execute(
                 """SELECT run_id, current_stage, stage_started_at,
                           deadline_remaining_at_stage_start,
-                          completed_stage_seconds_json
+                          completed_stage_seconds_json,
+                          COALESCE(stage_detail_json, '{}') AS stage_detail_json
                    FROM lane_state
                    WHERE lane=? AND pid=? AND status='running'""",
                 (str(lane), int(pid)),
@@ -4943,10 +4973,83 @@ class RobinhoodLearningStore:
                         row["completed_stage_seconds_json"] or "{}")
                 except (TypeError, ValueError):
                     failure["completed_stage_seconds"] = {}
+                try:
+                    failure["failure_substage_detail"] = json.loads(
+                        row["stage_detail_json"] or "{}")
+                except (TypeError, ValueError):
+                    failure["failure_substage_detail"] = {}
                 started = row["stage_started_at"]
                 failure["stage_elapsed_seconds"] = (
                     round(now - started, 3) if started else None)
                 failure["termination_reason"] = str(reason)
+                # A hard-killed worker cannot execute run_live_lane's except
+                # block, so the SUPERVISOR must commit the censored latency
+                # sample.  Attribute it to the persisted substage and clamp
+                # it upward: a killed duration is a lower bound, never proof
+                # that the operation was fast.
+                stage = str(row["current_stage"] or "")
+                elapsed = safe_float(failure["stage_elapsed_seconds"], 0.0)
+                if elapsed > 0 and stage.startswith(
+                        "fresh_quote_and_observation"):
+                    state_row = connection.execute(
+                        "SELECT value_json FROM flow_scheduler_state WHERE key=?",
+                        (SEAL_COST_MODEL_STATE_KEY,),
+                    ).fetchone()
+                    try:
+                        model_state = json.loads(
+                            state_row[0] if state_row else "{}")
+                    except (TypeError, ValueError):
+                        model_state = {}
+                    if stage.endswith("queue_settlement"):
+                        targets = (
+                            ("queue_settlement_samples",
+                             "queue_settlement_p95",
+                             QUEUE_SETTLEMENT_COST_SECONDS_DEFAULT),
+                            ("fixed_observation_samples",
+                             "fixed_observation_cost_p95",
+                             SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT),
+                        )
+                    elif stage.endswith(("observation_selection",
+                                         "quote_prefetch")):
+                        targets = ((
+                            "fixed_observation_samples",
+                            "fixed_observation_cost_p95",
+                            SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT,
+                        ),)
+                    else:
+                        targets = ((
+                            "per_window_samples", "per_window_cost_p95",
+                            SEAL_PER_WINDOW_COST_SECONDS_DEFAULT,
+                        ),)
+                    for sample_field, scalar_field, fallback in targets:
+                        samples = model_state.get(sample_field)
+                        samples = list(samples) if isinstance(samples, list) else []
+                        current = safe_float(
+                            model_state.get(scalar_field), fallback)
+                        samples.append(max(current, elapsed))
+                        samples = samples[-SEAL_COST_SAMPLE_WINDOW:]
+                        model_state[sample_field] = samples
+                        ordered = sorted(float(value) for value in samples)
+                        index = min(
+                            len(ordered) - 1,
+                            max(0, math.ceil(0.95 * len(ordered)) - 1),
+                        )
+                        model_state[scalar_field] = round(
+                            ordered[index], 4)
+                    model_state["censored"] = True
+                    model_state["censored_samples"] = (
+                        safe_int(model_state.get("censored_samples"), 0) + 1)
+                    model_state["last_censored_stage"] = stage
+                    model_state["last_censored_seconds"] = round(elapsed, 4)
+                    connection.execute(
+                        """INSERT INTO flow_scheduler_state(key,value_json,updated_at)
+                           VALUES (?,?,?)
+                           ON CONFLICT(key) DO UPDATE SET
+                             value_json=excluded.value_json,
+                             updated_at=excluded.updated_at""",
+                        (SEAL_COST_MODEL_STATE_KEY,
+                         _canonical(model_state), _utc_now()),
+                    )
             if not row:
                 return
             connection.execute(
@@ -9846,27 +9949,66 @@ class RobinhoodLearningEngine:
         sealing, because none of it can yield once started.
         """
         stored = self.store.scheduler_state(SEAL_COST_MODEL_STATE_KEY)
-        if not stored:
-            # Pre-model databases (and tests) seeded only the legacy single
-            # EWMA; its per-window figure is still the best available estimate
-            # for that component.
-            stored = {"per_window_cost_p95": safe_float(
+
+        def samples(name: str) -> list[float]:
+            values = stored.get(name)
+            if not isinstance(values, list):
+                return []
+            return [
+                float(value) for value in values
+                if isinstance(value, (int, float))
+                and math.isfinite(float(value)) and float(value) >= 0
+            ][-SEAL_COST_SAMPLE_WINDOW:]
+
+        fixed_samples = samples("fixed_observation_samples")
+        settlement_samples = samples("queue_settlement_samples")
+        window_samples = samples("per_window_samples")
+        downstream_samples = samples("downstream_samples")
+
+        # Migrate the previous scalar model without discarding what it had
+        # learned.  New writes always persist raw bounded samples; the scalar
+        # fields remain derived compatibility/telemetry values.
+        legacy_window = safe_float(
+            stored.get("per_window_cost_p95"), 0.0) or safe_float(
                 self.store.scheduler_state("seal_window_cost").get(
-                    "per_window_seconds"),
-                SEAL_PER_WINDOW_COST_SECONDS_DEFAULT)}
-        model = {
-            "fixed_observation_cost_p95": safe_float(
-                stored.get("fixed_observation_cost_p95"),
-                SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT),
-            "per_window_cost_p95": safe_float(
-                stored.get("per_window_cost_p95"),
-                SEAL_PER_WINDOW_COST_SECONDS_DEFAULT),
-            "downstream_reserve_p95": safe_float(
-                stored.get("downstream_reserve_p95"),
-                DOWNSTREAM_RESERVE_SECONDS_DEFAULT),
+                    "per_window_seconds"), 0.0)
+
+        def p95(values: list[float], fallback: float) -> float:
+            if not values:
+                return float(fallback)
+            ordered = sorted(values)
+            index = min(
+                len(ordered) - 1,
+                max(0, math.ceil(0.95 * len(ordered)) - 1),
+            )
+            return round(float(ordered[index]), 4)
+
+        return {
+            "fixed_observation_cost_p95": p95(
+                fixed_samples,
+                safe_float(stored.get("fixed_observation_cost_p95"),
+                           SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT),
+            ),
+            "queue_settlement_p95": p95(
+                settlement_samples,
+                safe_float(stored.get("queue_settlement_p95"),
+                           QUEUE_SETTLEMENT_COST_SECONDS_DEFAULT),
+            ),
+            "per_window_cost_p95": p95(
+                window_samples,
+                legacy_window or SEAL_PER_WINDOW_COST_SECONDS_DEFAULT,
+            ),
+            "downstream_reserve_p95": p95(
+                downstream_samples,
+                safe_float(stored.get("downstream_reserve_p95"),
+                           DOWNSTREAM_RESERVE_SECONDS_DEFAULT),
+            ),
+            "fixed_sample_count": len(fixed_samples),
+            "queue_settlement_sample_count": len(settlement_samples),
+            "per_window_sample_count": len(window_samples),
+            "downstream_sample_count": len(downstream_samples),
             "censored_samples": safe_int(stored.get("censored_samples"), 0),
         }
-        return model
 
     def seal_cost_estimate(self) -> float:
         """Per-window cost from the two-part model (compatibility shim)."""
@@ -9874,42 +10016,74 @@ class RobinhoodLearningEngine:
 
     def _blend_seal_model(self, updates: dict, censored: bool = False,
                           sample_count: int = 0) -> dict:
+        """Append raw timing samples and derive a real nearest-rank p95.
+
+        Kept under the historical method name for compatibility with callers,
+        but no EWMA blending occurs.  Each percentile is reproducible from a
+        bounded durable sample window.  A censored value is a lower bound and
+        is clamped to the current p95 so recording a timeout can never lower
+        admission's estimate.
+        """
         stored = self.store.scheduler_state(SEAL_COST_MODEL_STATE_KEY)
-        model = {
-            "fixed_observation_cost_p95": safe_float(
-                stored.get("fixed_observation_cost_p95"),
-                SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT),
-            "per_window_cost_p95": safe_float(
-                stored.get("per_window_cost_p95"),
-                SEAL_PER_WINDOW_COST_SECONDS_DEFAULT),
-            "downstream_reserve_p95": safe_float(
-                stored.get("downstream_reserve_p95"),
-                DOWNSTREAM_RESERVE_SECONDS_DEFAULT),
+        current = self.seal_cost_model()
+        field_for = {
+            "fixed_observation_cost_p95": "fixed_observation_samples",
+            "queue_settlement_p95": "queue_settlement_samples",
+            "per_window_cost_p95": "per_window_samples",
+            "downstream_reserve_p95": "downstream_samples",
         }
-        weight = SEAL_COST_SMOOTHING if not censored else 0.15
-        for key, measured in updates.items():
-            previous = model[key]
-            blended = weight * float(measured) + (1 - weight) * previous
-            # A censored (timeout) sample is a LOWER BOUND on the true cost:
-            # the stage was killed mid-flight. It may only ever RAISE the
-            # estimate -- learning "it was fast" from a killed cycle is how
-            # the estimator came to under-admit by 7x.
-            model[key] = max(previous, blended) if censored else blended
-        model["last_measured"] = {k: round(float(v), 4)
-                                  for k, v in updates.items()}
-        model["censored"] = bool(censored)
-        if censored:
-            model["censored_samples"] = (
-                safe_int(stored.get("censored_samples"), 0) + 1)
-        elif not censored and updates:
-            model["censored"] = False
+        payload = dict(stored)
+        for key, measured_values in updates.items():
+            field = field_for[key]
+            values = payload.get(field)
+            values = list(values) if isinstance(values, list) else []
+            incoming = (
+                list(measured_values)
+                if isinstance(measured_values, (list, tuple))
+                else [measured_values]
+            )
+            clean = [
+                max(0.0, float(value)) for value in incoming
+                if isinstance(value, (int, float))
+                and math.isfinite(float(value))
+            ]
+            if censored:
+                clean = [max(current[key], value) for value in clean]
+            values.extend(clean)
+            payload[field] = values[-SEAL_COST_SAMPLE_WINDOW:]
+        payload["last_measured"] = {
+            key: round(max(value) if isinstance(value, (list, tuple))
+                       else float(value), 4)
+            for key, value in updates.items()
+        }
+        payload["censored"] = bool(censored)
+        payload["censored_samples"] = (
+            safe_int(stored.get("censored_samples"), 0) + int(censored))
         if sample_count:
-            model["samples_this_cycle"] = int(sample_count)
-        self.store.set_scheduler_state(
-            SEAL_COST_MODEL_STATE_KEY, {
-                k: round(v, 4) if isinstance(v, float) else v
-                for k, v in model.items()})
-        return model
+            payload["samples_this_cycle"] = int(sample_count)
+
+        # Derive compatibility scalar fields from the updated samples before
+        # writing them.  Use a small local percentile helper to avoid a second
+        # read/write race through scheduler_state.
+        defaults = {
+            "fixed_observation_cost_p95":
+                SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT,
+            "queue_settlement_p95": QUEUE_SETTLEMENT_COST_SECONDS_DEFAULT,
+            "per_window_cost_p95": SEAL_PER_WINDOW_COST_SECONDS_DEFAULT,
+            "downstream_reserve_p95": DOWNSTREAM_RESERVE_SECONDS_DEFAULT,
+        }
+        for key, field in field_for.items():
+            values = [float(value) for value in payload.get(field, [])]
+            if values:
+                ordered = sorted(values)
+                index = min(len(ordered) - 1,
+                            max(0, math.ceil(0.95 * len(ordered)) - 1))
+                payload[key] = round(ordered[index], 4)
+            else:
+                payload[key] = round(
+                    safe_float(stored.get(key), defaults[key]), 4)
+        self.store.set_scheduler_state(SEAL_COST_MODEL_STATE_KEY, payload)
+        return self.seal_cost_model()
 
     def record_seal_cost(
         self, phase: dict[str, list[float]], sealed: int,
@@ -9927,33 +10101,47 @@ class RobinhoodLearningEngine:
         fixed_seconds = sum(
             sum(values) for name, values in phase.items()
             if name in fixed_names)
-        if sealed > 0:
-            per_window = sum(
+        raw_window_samples = [
+            float(value) for value in phase.get("window_total", [])
+            if isinstance(value, (int, float)) and float(value) >= 0
+        ]
+        if not raw_window_samples and sealed > 0:
+            raw_window_samples = [sum(
                 sum(values) for name, values in phase.items()
                 if name not in fixed_names
-            ) / sealed
-        else:
-            per_window = 0.0
+            ) / sealed]
         updates = {}
         if fixed_seconds > 0:
             updates["fixed_observation_cost_p95"] = fixed_seconds
-        if per_window > 0:
-            updates["per_window_cost_p95"] = per_window
+        queue_samples = [
+            float(value) for value in phase.get("queue_settle", [])
+            if isinstance(value, (int, float)) and float(value) >= 0
+        ]
+        if queue_samples:
+            updates["queue_settlement_p95"] = queue_samples
+        if raw_window_samples:
+            updates["per_window_cost_p95"] = raw_window_samples
         if not updates:
             return None
         self._blend_seal_model(updates, sample_count=int(sealed))
-        # The RAW measured figure is returned, not the blend: callers report
-        # what this pass actually cost.
-        return per_window
+        # Report the actual nearest-rank p95 of this pass, not the historical
+        # model and not a per-window mean.
+        ordered = sorted(raw_window_samples)
+        if not ordered:
+            return 0.0
+        return round(ordered[min(
+            len(ordered) - 1,
+            max(0, math.ceil(0.95 * len(ordered)) - 1),
+        )], 4)
 
     def record_seal_cost_censored(self, elapsed_seconds: float) -> dict:
         """Charge a timed-out attempt as a conservative censored sample.
 
-        A cycle the supervisor had to kill spent at least `elapsed_seconds`
-        sealing; treating that as one window's cost UNDERSTATES the true
-        per-window figure at worst and can only raise the estimate, which is
-        the safe direction for admission. Never learning from failures is
-        what left the old EWMA frozen while real latency tripled.
+        A cycle that timed out spent at least `elapsed_seconds` in the stage.
+        Treating that lower bound as a per-window sample is intentionally
+        conservative and may overestimate; it can never make admission more
+        aggressive. Supervisor hard kills record a more precisely attributed
+        censored sample in ``terminate_lane`` because child cleanup cannot run.
         """
         elapsed = max(0.05, float(elapsed_seconds))
         return self._blend_seal_model(
@@ -10253,6 +10441,13 @@ class RobinhoodLearningEngine:
             seen.add(key)
             ordered.append(window)
         windows = ordered
+        # PRE-ENQUEUE every resolved target before the first blocking remote
+        # call.  A supervisor hard kill does not execute Python finally
+        # blocks; queuing only during settlement therefore lost fresh windows
+        # if the OS terminated the worker.  INSERT OR IGNORE keeps this
+        # idempotent for entries already pulled from the durable queue.
+        prequeued_now = self.store.enqueue_seal(
+            windows, "live_lane_preclaim") if windows else 0
         record("selection", selection_started)
         windows_available = len(windows)
 
@@ -10264,6 +10459,7 @@ class RobinhoodLearningEngine:
         static_limit = len(windows) if limit is None else max(0, int(limit))
         model = self.seal_cost_model()
         fixed_cost = model["fixed_observation_cost_p95"]
+        settlement_reserve = model["queue_settlement_p95"]
         cost = model["per_window_cost_p95"]
         downstream_reserve = max(
             float(reserve_seconds), model["downstream_reserve_p95"])
@@ -10276,13 +10472,9 @@ class RobinhoodLearningEngine:
             if usable <= 0 or cost <= 0:
                 admitted = 0
             else:
-                # Always admit at least one window when ANY usable budget
-                # exists (matching the pre-model floor): a cycle that seals
-                # nothing while deferring everything turns the queue into a
-                # leak when every later cycle is equally tight.
                 admitted = min(
                     static_limit,
-                    max(1, int(usable // max(cost, 0.05))))
+                    int(usable // max(cost, 0.05)))
         admitted = min(admitted, static_limit)
         deferred = windows[admitted:]
         windows = windows[:admitted]
@@ -10327,10 +10519,21 @@ class RobinhoodLearningEngine:
             persist_substage("queue_settlement",
                              sealed=len(sealed_windows), deferred=len(deferred))
             self.store.complete_seal_queue(sealed_windows)
-            queued_now = self.store.enqueue_seal(deferred, "live_lane_headroom")
-            per_window_cost = self.record_seal_cost(phase, len(sealed_windows))
+            # Idempotent belt-and-suspenders write for callers that supplied a
+            # malformed row during preclaim.  enqueue_seal historically
+            # returns rows attempted (not rows inserted), so it must not be
+            # added to the preclaim count or telemetry double-counts every
+            # deferred window.
+            self.store.enqueue_seal(deferred, "live_lane_headroom")
             phase.setdefault("queue_settle", []).append(
                 time.monotonic() - settle_started)
+            per_window_cost = self.record_seal_cost(
+                phase, len(sealed_windows))
+            # Public telemetry keeps its historical meaning: how many
+            # selected windows remain deferred after this pass.  Preclaim may
+            # have attempted more inserts, but sealed entries are completed
+            # before this count is returned.
+            queued_now = len(deferred)
             settlement["queued_now"] = queued_now
             settlement["measured_cost_seconds"] = per_window_cost
             return queued_now
@@ -10338,11 +10541,15 @@ class RobinhoodLearningEngine:
         settlement: dict = {}
         try:
             for index, window in enumerate(windows):
+                window_started = time.monotonic()
                 # The reserve, not expiry: stopping when the deadline has
                 # already passed leaves nothing for the stages that cannot
-                # yield. Checked BEFORE each remote call...
+                # yield.  Queue settlement is separately reserved because it
+                # is what makes deferral durable. Checked BEFORE each remote
+                # call...
                 if (deadline is not None
-                        and deadline.remaining() <= downstream_reserve):
+                        and deadline.remaining() <= (
+                            downstream_reserve + settlement_reserve)):
                     deferred.extend(windows[index:])
                     del windows[index:]
                     break
@@ -10392,7 +10599,8 @@ class RobinhoodLearningEngine:
                 # late has already consumed budget the remaining windows
                 # cannot plan around.
                 if (deadline is not None
-                        and deadline.remaining() <= downstream_reserve):
+                        and deadline.remaining() <= (
+                            downstream_reserve + settlement_reserve)):
                     deferred.append(window)
                     deferred.extend(windows[index + 1:])
                     del windows[index:]
@@ -10452,6 +10660,8 @@ class RobinhoodLearningEngine:
                 sealed_windows.append(window)
                 if observation_id:
                     sealed.append(observation_id)
+                phase.setdefault("window_total", []).append(
+                    time.monotonic() - window_started)
         finally:
             # Close what this cycle sealed, queue what it did not -- ALWAYS,
             # including when the deadline kill lands mid-loop. Both halves
@@ -10484,6 +10694,8 @@ class RobinhoodLearningEngine:
                     None if usable is None else round(usable, 3)),
                 "reserve_seconds": round(float(downstream_reserve), 3),
                 "fixed_observation_cost_estimate_seconds": round(fixed_cost, 3),
+                "queue_settlement_reserve_seconds": round(
+                    settlement_reserve, 3),
                 "cost_estimate_seconds": round(cost, 3),
                 "downstream_reserve_estimate_seconds": round(
                     model["downstream_reserve_p95"], 3),
@@ -10494,6 +10706,7 @@ class RobinhoodLearningEngine:
                 "queue_drained": len(queued_rows),
                 "model_censored_samples": safe_int(
                     model.get("censored_samples"), 0),
+                "windows_preclaimed": int(prequeued_now),
             },
             "prefetch": prime,
             "phase_seconds": {
@@ -11312,8 +11525,16 @@ class RobinhoodLearningEngine:
 
     def _execute_lane(self, lane: str, budget_seconds: float, worker) -> dict:
         """Run one independently owned lane with an authoritative heartbeat."""
-        started = time.monotonic()
-        deadline = CycleDeadline(float(budget_seconds))
+        inherited_deadline = safe_float(
+            os.environ.get("CHAINSEER_LANE_DEADLINE_MONOTONIC"), 0.0)
+        deadline = CycleDeadline(
+            float(budget_seconds),
+            deadline_monotonic=(
+                inherited_deadline if inherited_deadline > 0 else None),
+        )
+        started = deadline.started
+        startup_consumed = max(
+            0.0, time.monotonic() - deadline.started)
         run_uuid = uuid.uuid4().hex
         self.cycle_run_uuid = run_uuid
         stop_heartbeat = threading.Event()
@@ -11342,6 +11563,7 @@ class RobinhoodLearningEngine:
                     "run_id": run_uuid,
                     "status": "complete",
                     "deadline_seconds": float(budget_seconds),
+                    "startup_consumed_seconds": round(startup_consumed, 3),
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "paper_only": True,
                     "live_execution_enabled": False,
@@ -11372,6 +11594,7 @@ class RobinhoodLearningEngine:
                     # same way, or half the failures stay unattributable.
                     **self.store.lane_failure_stage(lane, run_uuid),
                     "deadline_seconds": float(budget_seconds),
+                    "startup_consumed_seconds": round(startup_consumed, 3),
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "paper_only": True, "live_execution_enabled": False,
                 }
@@ -12665,7 +12888,8 @@ def supervise_lanes(
                     timeouts[lane] += 1
                     supervisor_store.terminate_lane(
                         lane, process.pid,
-                        "supervisor_hard_deadline_exceeded")
+                        "supervisor_hard_deadline_exceeded",
+                        attempt_started_at=item["wall_started"])
                     active.pop(lane, None)
             # Iterate the CONFIGURATION. A hardcoded list beside a lanes dict
             # is a second source of truth, and it silently dropped `marks`:
@@ -12688,9 +12912,13 @@ def supervise_lanes(
                     log_root / f"{lane}-{stamp}.log", "a", encoding="utf-8")
                 stderr = open(
                     log_root / f"{lane}-{stamp}.error.log", "a", encoding="utf-8")
+                child_deadline = now_mono + float(schedule["budget"])
+                lane_environment = dict(worker_environment)
+                lane_environment[
+                    "CHAINSEER_LANE_DEADLINE_MONOTONIC"] = repr(child_deadline)
                 process = subprocess.Popen(
                     command_for(lane), cwd=str(Path(__file__).resolve().parent),
-                    stdout=stdout, stderr=stderr, env=worker_environment,
+                    stdout=stdout, stderr=stderr, env=lane_environment,
                     creationflags=(
                         subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
                 )
@@ -12698,8 +12926,7 @@ def supervise_lanes(
                 wall_started = time.time()
                 active[lane] = {
                     "process": process, "stdout": stdout, "stderr": stderr,
-                    "deadline": now_mono + float(schedule["budget"]) + (
-                        LANE_TERMINATION_GRACE_SECONDS),
+                    "deadline": child_deadline + LANE_TERMINATION_GRACE_SECONDS,
                     "wall_started": wall_started,
                     "wall_deadline": wall_started + float(schedule["budget"]) + (
                         LANE_TERMINATION_GRACE_SECONDS),
@@ -12719,7 +12946,8 @@ def supervise_lanes(
                 except subprocess.TimeoutExpired:
                     pass
                 supervisor_store.terminate_lane(
-                    lane, process.pid, "supervisor_window_closed")
+                    lane, process.pid, "supervisor_window_closed",
+                    attempt_started_at=item["wall_started"])
             item["stdout"].close()
             item["stderr"].close()
         active.clear()
@@ -12933,7 +13161,8 @@ def live_lane_reliability_snapshot(
     total = 0
     with store.connection() as connection:
         rows = connection.execute(
-            """SELECT status, summary_json FROM runs
+            """SELECT status, summary_json, started_at, completed_at,
+                      deadline_seconds FROM runs
                WHERE lane='live' ORDER BY started_at DESC LIMIT ?""",
             (int(window),),
         ).fetchall()
@@ -12953,6 +13182,15 @@ def live_lane_reliability_snapshot(
         except (TypeError, ValueError):
             continue
         duration = safe_float(summary.get("duration_seconds"), 0.0)
+        if duration <= 0:
+            started = _timestamp(row["started_at"])
+            completed = _timestamp(row["completed_at"])
+            if started is not None and completed is not None:
+                duration = max(0.0, completed - started)
+            elif row["status"] == "deadline_exceeded":
+                duration = max(
+                    0.0, safe_float(row["deadline_seconds"], 0.0)
+                    + LANE_TERMINATION_GRACE_SECONDS)
         if duration > 0:
             durations.append(duration)
         if row["status"] == "deadline_exceeded":
@@ -12992,6 +13230,9 @@ def live_lane_reliability_snapshot(
             "fixed_observation_cost_p95": safe_float(
                 model.get("fixed_observation_cost_p95"),
                 SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT),
+            "queue_settlement_p95": safe_float(
+                model.get("queue_settlement_p95"),
+                QUEUE_SETTLEMENT_COST_SECONDS_DEFAULT),
             "per_window_cost_p95": safe_float(
                 model.get("per_window_cost_p95"),
                 SEAL_PER_WINDOW_COST_SECONDS_DEFAULT),
@@ -12999,6 +13240,14 @@ def live_lane_reliability_snapshot(
                 model.get("downstream_reserve_p95"),
                 DOWNSTREAM_RESERVE_SECONDS_DEFAULT),
             "censored_samples": safe_int(model.get("censored_samples"), 0),
+            "fixed_sample_count": safe_int(
+                model.get("fixed_sample_count"), 0),
+            "queue_settlement_sample_count": safe_int(
+                model.get("queue_settlement_sample_count"), 0),
+            "per_window_sample_count": safe_int(
+                model.get("per_window_sample_count"), 0),
+            "downstream_sample_count": safe_int(
+                model.get("downstream_sample_count"), 0),
         },
         "classification_cost_estimate_seconds": safe_float(
             class_cost.get("per_observation_seconds"),
@@ -13016,8 +13265,9 @@ def live_lane_reliability_snapshot(
         "classification_deferred": classification.get(
             "scoped_rows_deferred"),
         "cumulative_classification_counters": counters,
-        "oldest_deferred_observation_age_epoch": (
-            float(oldest_deferred) if oldest_deferred else None),
+        "oldest_deferred_observation_age_seconds": (
+            max(0.0, time.time() - _timestamp(oldest_deferred))
+            if _timestamp(oldest_deferred) is not None else None),
     }
 
 
