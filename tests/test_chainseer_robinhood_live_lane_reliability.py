@@ -217,6 +217,133 @@ class StageTimingBoundaryTests(unittest.TestCase):
             "def dashboard_operational_snapshot", 1)[0]
         self.assertIn("CHAINSEER_LANE_DEADLINE_MONOTONIC", supervisor)
 
+    def test_shared_deadline_startup_is_partitioned_into_phases(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            engine = make_engine(root, store)
+            deadline = rh.CycleDeadline(25.0)
+            launch = deadline.started
+            engine._startup_milestones = {
+                "shared_deadline": True,
+                "module_import_started": launch + 1.0,
+                "imports_completed": launch + 3.0,
+                "engine_initialization_started": launch + 3.5,
+                "engine_initialization_completed": launch + 5.0,
+            }
+            phases = engine._startup_phase_telemetry(
+                deadline, execute_entered=launch + 5.5,
+                lane_registered=launch + 6.0)
+            self.assertEqual(phases["python_bootstrap_seconds"], 1.0)
+            self.assertEqual(phases["module_import_seconds"], 2.0)
+            self.assertEqual(phases["engine_initialization_seconds"], 1.5)
+            self.assertEqual(phases["lane_registration_seconds"], 0.5)
+            self.assertEqual(phases["total_seconds"], 6.0)
+
+
+class IngestionAdmissionTests(unittest.TestCase):
+    """Ingestion may yield, but it may never consume the decision tail."""
+
+    def test_insufficient_ingestion_headroom_is_a_non_success_deferral(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            engine = make_engine(root, store)
+            engine.ingestion_tail_reserve = lambda: 20.0
+            engine.near_head_flow_pass = lambda **_kwargs: self.fail(
+                "remote ingestion must not start without tail headroom")
+            summary = engine.run_live_lane(budget_seconds=8.0)
+            self.assertEqual(summary["status"], "deferred")
+            self.assertTrue(summary["controlled_deferral"])
+            self.assertEqual(
+                summary["deferral_reason"],
+                "insufficient_ingestion_headroom")
+            reliability = rh.live_lane_reliability_snapshot(root, store=store)
+            self.assertEqual(reliability["completion_rate"], 0.0)
+            self.assertEqual(reliability["controlled_deferral_total"], 1)
+
+    def test_slow_startup_scales_the_scan_instead_of_spending_the_tail(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            engine = make_engine(root, store)
+            seen = {}
+            engine.ingestion_cost_model = lambda: {
+                "p95_seconds": 40.0, "sample_count": 10,
+                "censored_samples": 0, "samples": [40.0]}
+            engine.ingestion_tail_reserve = lambda: 6.0
+
+            def observe(**kwargs):
+                seen["max_scan_blocks"] = kwargs["max_scan_blocks"]
+                return {"supported": False, "scanned": False,
+                        "reason": "offline_test"}
+
+            engine.near_head_flow_pass = observe
+            summary = engine.run_live_lane(budget_seconds=25.0)
+            self.assertEqual(summary["status"], "complete")
+            self.assertLess(
+                seen["max_scan_blocks"], rh.LIVE_LANE_SCAN_BLOCKS)
+            self.assertGreater(seen["max_scan_blocks"], 0)
+
+    def test_observation_selection_is_skipped_when_its_fixed_tail_wont_fit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            engine = make_engine(root, store)
+            engine.ingestion_cost_model = lambda: {
+                "p95_seconds": 1.0, "sample_count": 10,
+                "censored_samples": 0, "samples": [1.0]}
+            engine.ingestion_tail_reserve = lambda: 0.1
+            engine.record_ingestion_cost = lambda *_args, **_kwargs: {}
+            engine.near_head_flow_pass = lambda **_kwargs: {
+                "supported": True, "scanned": True, "to_block": HEAD,
+                "touched_pool_ids": [POOL_ID]}
+            engine.seal_cost_model = lambda: {
+                "fixed_observation_cost_p95": 20.0,
+                "queue_settlement_p95": 1.0,
+                "per_window_cost_p95": 1.0,
+                "downstream_reserve_p95": 5.0,
+            }
+            engine.seal_near_head_observations = lambda *_args, **_kwargs: (
+                self.fail("selection must not start when fixed cost won't fit"))
+            engine.classify_sealed_observations = lambda *_args, **_kwargs: {
+                "scoped_rows_selected": 0, "scoped_rows_processed": 0,
+                "scoped_rows_deferred": 0}
+            engine.record_downstream_reserve = lambda _seconds: 0.0
+            summary = engine.run_live_lane(budget_seconds=10.0)
+            self.assertEqual(summary["status"], "complete")
+            self.assertTrue(summary["observation_seal"]["controlled_deferral"])
+            self.assertEqual(
+                summary["observation_seal"]["reason"],
+                "insufficient_observation_headroom")
+
+
+class SupervisorPriorityTests(unittest.TestCase):
+    """Background startup must yield around the live cadence."""
+
+    def test_background_launch_is_blocked_while_live_is_active_or_due(self):
+        self.assertTrue(rh._low_priority_launch_blocked(
+            "analysis", {"live": object()}, now=100.0, next_live=130.0))
+        self.assertTrue(rh._low_priority_launch_blocked(
+            "backfill", {}, now=100.0,
+            next_live=100.0 + rh.LIVE_LANE_LAUNCH_GUARD_SECONDS))
+        self.assertFalse(rh._low_priority_launch_blocked(
+            "analysis", {}, now=100.0,
+            next_live=101.0 + rh.LIVE_LANE_LAUNCH_GUARD_SECONDS))
+        self.assertFalse(rh._low_priority_launch_blocked(
+            "live", {"live": object()}, now=100.0, next_live=100.0))
+
+    @unittest.skipUnless(rh.os.name == "nt", "Windows priority classes")
+    def test_live_process_priority_exceeds_background_priority(self):
+        live = rh._lane_creation_flags("live")
+        analysis = rh._lane_creation_flags("analysis")
+        self.assertTrue(
+            live & rh.subprocess.ABOVE_NORMAL_PRIORITY_CLASS)
+        self.assertTrue(
+            analysis & rh.subprocess.BELOW_NORMAL_PRIORITY_CLASS)
+        self.assertFalse(
+            analysis & rh.subprocess.ABOVE_NORMAL_PRIORITY_CLASS)
+
 
 class SubstageAttributionTests(unittest.TestCase):
     """Requirement 2 (+ part of 3): WHERE inside sealing are we?"""

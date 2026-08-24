@@ -7,6 +7,14 @@ from expensive analysis so new-pair intake remains bounded and observable.
 
 from __future__ import annotations
 
+import time
+
+# Earliest Python-visible startup marker.  The supervisor's absolute
+# monotonic deadline starts before process creation; this marker separates
+# OS/Python bootstrap from module-import time instead of reporting both as an
+# opaque ``startup_consumed_seconds`` outlier.
+PROCESS_MODULE_IMPORT_STARTED_MONOTONIC = time.monotonic()
+
 import argparse
 import ctypes
 from ctypes import wintypes
@@ -20,7 +28,6 @@ import sqlite3
 import subprocess
 import sys
 import threading
-import time
 import uuid
 from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
@@ -64,6 +71,8 @@ from chainseer_robinhood_reflection import (
     RobinhoodReflectionCoordinator,
     default_skill_root,
 )
+
+PROCESS_IMPORTS_COMPLETED_MONOTONIC = time.monotonic()
 
 
 PAIR_CREATED_TOPIC = (
@@ -206,6 +215,26 @@ CLASSIFICATION_COUNTERS_STATE_KEY = "classification_cumulative_counters"
 LIVE_LANE_CADENCE_SECONDS = 30.0
 ANALYSIS_LANE_CADENCE_SECONDS = 60.0
 BACKFILL_LANE_CADENCE_SECONDS = 300.0
+# Do not start another worker while the latency-critical live worker is
+# starting/running or about to become due.  The failed acceptance cohort
+# measured a 21.95s live startup while the analysis lane was at its hard
+# deadline; launching more interpreters in the same window makes that tail
+# worse and is never freshness-positive.
+LIVE_LANE_LAUNCH_GUARD_SECONDS = 8.0
+# A low-priority hard kill can leave Windows closing handles and SQLite
+# releasing locks for a short interval.  Delay (not skip) a due live launch
+# through that cleanup window so it receives a fresh full budget.
+LIVE_LANE_POST_KILL_QUIET_SECONDS = 3.0
+# Starting marks, analysis and backfill interpreters together was another
+# avoidable import/SQLite burst.  Only the most-overdue background lane may
+# start in a tick, and background starts are spaced before the live guard.
+BACKGROUND_LANE_LAUNCH_SPACING_SECONDS = 2.0
+# Ingestion gets a child deadline which expires this much before the derived
+# observation/decision tail.  It may safely retry because the cursor advances
+# only after the whole pass commits; it may not consume the completion tail.
+LIVE_LANE_INGESTION_MARGIN_SECONDS = 0.5
+INGESTION_COST_MODEL_STATE_KEY = "live_ingestion_cost_v1"
+INGESTION_COST_SAMPLE_WINDOW = 128
 LANE_HEARTBEAT_SECONDS = 5.0
 LANE_TERMINATION_GRACE_SECONDS = 3.0
 ANALYSIS_START_RESERVE_SECONDS = 45.0
@@ -9937,6 +9966,77 @@ class RobinhoodLearningEngine:
             "scope": "near_head_flow_window_v1",
         }
 
+    def ingestion_cost_model(self) -> dict:
+        """Durable nearest-rank p95 for completed/censored ingestion.
+
+        The value is used to scale the newest-block scan when startup has
+        already consumed unusual headroom.  Raw bounded samples make the
+        decision reproducible after restart; censored samples are lower
+        bounds and therefore may only raise, never lower, the estimate.
+        """
+        stored = self.store.scheduler_state(INGESTION_COST_MODEL_STATE_KEY)
+        raw = stored.get("samples")
+        samples = [
+            float(value) for value in (raw if isinstance(raw, list) else [])
+            if isinstance(value, (int, float))
+            and math.isfinite(float(value)) and float(value) >= 0
+        ][-INGESTION_COST_SAMPLE_WINDOW:]
+        if samples:
+            ordered = sorted(samples)
+            p95 = ordered[min(
+                len(ordered) - 1,
+                max(0, math.ceil(0.95 * len(ordered)) - 1),
+            )]
+        else:
+            # The live corpus measured 14.719s across the latest 128
+            # completed attempts.  This is planning telemetry, not a risk
+            # threshold; the first completed pass begins replacing it.
+            p95 = safe_float(stored.get("p95_seconds"), 14.719)
+        return {
+            "p95_seconds": round(float(p95), 4),
+            "sample_count": len(samples),
+            "censored_samples": safe_int(stored.get("censored_samples"), 0),
+            "samples": samples,
+        }
+
+    def record_ingestion_cost(
+        self, seconds: float, *, censored: bool = False,
+    ) -> dict:
+        """Append one ingestion sample without rewarding a timeout."""
+        current = self.ingestion_cost_model()
+        measured = max(0.0, float(seconds))
+        if censored:
+            measured = max(measured, current["p95_seconds"])
+        samples = [*current["samples"], measured][
+            -INGESTION_COST_SAMPLE_WINDOW:]
+        ordered = sorted(samples)
+        p95 = ordered[min(
+            len(ordered) - 1,
+            max(0, math.ceil(0.95 * len(ordered)) - 1),
+        )]
+        payload = {
+            "samples": samples,
+            "p95_seconds": round(float(p95), 4),
+            "last_measured_seconds": round(measured, 4),
+            "last_sample_censored": bool(censored),
+            "censored_samples": (
+                current["censored_samples"] + int(bool(censored))),
+        }
+        self.store.set_scheduler_state(INGESTION_COST_MODEL_STATE_KEY, payload)
+        return self.ingestion_cost_model()
+
+    def ingestion_tail_reserve(self) -> float:
+        """Headroom ingestion must leave for observation and completion."""
+        model = self.seal_cost_model()
+        return round(
+            max(LIVE_LANE_DECISION_RESERVE_SECONDS,
+                model["downstream_reserve_p95"])
+            + model["fixed_observation_cost_p95"]
+            + model["queue_settlement_p95"]
+            + LIVE_LANE_INGESTION_MARGIN_SECONDS,
+            4,
+        )
+
     def seal_cost_model(self) -> dict:
         """Durable two-part observation-cost model.
 
@@ -11523,6 +11623,52 @@ class RobinhoodLearningEngine:
             "cadence": "every_learning_cycle",
         }
 
+    def _startup_phase_telemetry(
+        self, deadline: CycleDeadline, *, execute_entered: float,
+        lane_registered: float,
+    ) -> dict:
+        """Partition shared-deadline startup into actionable phases."""
+        milestones = getattr(self, "_startup_milestones", {}) or {}
+        if not milestones.get("shared_deadline"):
+            return {
+                "shared_deadline": False,
+                "total_seconds": round(
+                    max(0.0, lane_registered - deadline.started), 3),
+            }
+
+        launch = deadline.started
+        module_started = max(
+            launch, safe_float(
+                milestones.get("module_import_started"), launch))
+        imports_completed = max(
+            module_started, safe_float(
+                milestones.get("imports_completed"), module_started))
+        engine_started = max(
+            imports_completed, safe_float(
+                milestones.get("engine_initialization_started"),
+                imports_completed))
+        engine_completed = max(
+            engine_started, safe_float(
+                milestones.get("engine_initialization_completed"),
+                engine_started))
+        execute_entered = max(engine_completed, float(execute_entered))
+        lane_registered = max(execute_entered, float(lane_registered))
+        return {
+            "shared_deadline": True,
+            "python_bootstrap_seconds": round(module_started - launch, 3),
+            "module_import_seconds": round(
+                imports_completed - module_started, 3),
+            "pre_engine_gap_seconds": round(
+                engine_started - imports_completed, 3),
+            "engine_initialization_seconds": round(
+                engine_completed - engine_started, 3),
+            "pre_execute_gap_seconds": round(
+                execute_entered - engine_completed, 3),
+            "lane_registration_seconds": round(
+                lane_registered - execute_entered, 3),
+            "total_seconds": round(lane_registered - launch, 3),
+        }
+
     def _execute_lane(self, lane: str, budget_seconds: float, worker) -> dict:
         """Run one independently owned lane with an authoritative heartbeat."""
         inherited_deadline = safe_float(
@@ -11533,13 +11679,17 @@ class RobinhoodLearningEngine:
                 inherited_deadline if inherited_deadline > 0 else None),
         )
         started = deadline.started
-        startup_consumed = max(
-            0.0, time.monotonic() - deadline.started)
+        execute_entered = time.monotonic()
         run_uuid = uuid.uuid4().hex
         self.cycle_run_uuid = run_uuid
         stop_heartbeat = threading.Event()
         with LearningRunLock(self.root / f".{lane}_once.lock"):
             self.store.begin_run(run_uuid, budget_seconds, lane=lane)
+            lane_registered = time.monotonic()
+            startup_phases = self._startup_phase_telemetry(
+                deadline, execute_entered=execute_entered,
+                lane_registered=lane_registered)
+            startup_consumed = startup_phases["total_seconds"]
 
             def beat() -> None:
                 while not stop_heartbeat.wait(LANE_HEARTBEAT_SECONDS):
@@ -11554,16 +11704,21 @@ class RobinhoodLearningEngine:
             heartbeat = threading.Thread(target=beat, daemon=True)
             heartbeat.start()
             try:
+                deadline.raise_if_expired(f"{lane}_startup")
                 payload = worker(deadline)
                 deadline.raise_if_expired(f"{lane}_completion")
+                terminal_status = (
+                    "deferred" if payload.get("controlled_deferral")
+                    else "complete")
                 summary = {
                     "schema_version": 1,
                     "timestamp": _utc_now(),
                     "lane": lane,
                     "run_id": run_uuid,
-                    "status": "complete",
+                    "status": terminal_status,
                     "deadline_seconds": float(budget_seconds),
                     "startup_consumed_seconds": round(startup_consumed, 3),
+                    "startup_phases": startup_phases,
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "paper_only": True,
                     "live_execution_enabled": False,
@@ -11572,7 +11727,7 @@ class RobinhoodLearningEngine:
                 stop_heartbeat.set()
                 heartbeat.join(timeout=1.0)
                 self.store.finish_run(
-                    run_uuid, "complete", summary=summary,
+                    run_uuid, terminal_status, summary=summary,
                     cursor=summary.get("cursor"),
                     backlog=summary.get("backlog"),
                 )
@@ -11595,6 +11750,7 @@ class RobinhoodLearningEngine:
                     **self.store.lane_failure_stage(lane, run_uuid),
                     "deadline_seconds": float(budget_seconds),
                     "startup_consumed_seconds": round(startup_consumed, 3),
+                    "startup_phases": startup_phases,
                     "duration_seconds": round(time.monotonic() - started, 3),
                     "paper_only": True, "live_execution_enabled": False,
                 }
@@ -11654,18 +11810,115 @@ class RobinhoodLearningEngine:
             # and no single number could be compared against an estimate.
             # Each boundary below starts exactly where the previous ended.
             stage = time.monotonic()
+            ingestion_model = self.ingestion_cost_model()
+            ingestion_tail_reserve = self.ingestion_tail_reserve()
+            ingestion_available = max(
+                0.0, deadline.remaining() - ingestion_tail_reserve)
+            predicted_ingestion = max(
+                0.05, ingestion_model["p95_seconds"])
+            scan_fraction = min(
+                1.0, max(0.15, ingestion_available / predicted_ingestion))
+            admitted_scan_blocks = max(
+                1, min(
+                    LIVE_LANE_SCAN_BLOCKS,
+                    int(LIVE_LANE_SCAN_BLOCKS * scan_fraction)))
+            ingestion_admission = {
+                "remaining_seconds": round(deadline.remaining(), 3),
+                "tail_reserve_seconds": ingestion_tail_reserve,
+                "available_seconds": round(ingestion_available, 3),
+                "estimated_p95_seconds": round(predicted_ingestion, 3),
+                "configured_scan_blocks": LIVE_LANE_SCAN_BLOCKS,
+                "admitted_scan_blocks": admitted_scan_blocks,
+                "scan_fraction": round(scan_fraction, 4),
+            }
             self.store.mark_lane_stage(
                     "live", "ingestion", run_id=self.cycle_run_uuid,
-                    remaining=deadline.remaining(), completed=dict(timings))
-            with self._rpc_deadline(deadline):
-                near_head = self.near_head_flow_pass(
-                    deadline=deadline, cursor_name="live_lane_cursor.json",
-                    max_scan_blocks=LIVE_LANE_SCAN_BLOCKS,
-                    enrichment_limit=LIVE_LANE_ENRICHMENT_LIMIT,
-                    enrichment_budget_seconds=LIVE_LANE_ENRICHMENT_BUDGET_SECONDS,
-                )
+                    remaining=deadline.remaining(), completed=dict(timings),
+                    detail={"admission": ingestion_admission})
+            if ingestion_available <= 0:
+                near_head = {
+                    "supported": True, "scanned": False,
+                    "reason": "insufficient_ingestion_headroom",
+                    "controlled_deferral": True,
+                }
+                timings["head_ingestion_and_identity_seconds"] = 0.0
+                return {
+                    "controlled_deferral": True,
+                    "deferral_stage": "ingestion_admission",
+                    "deferral_reason": near_head["reason"],
+                    "ingestion_admission": ingestion_admission,
+                    "position_evaluations": positions,
+                    "near_head_flow": near_head,
+                    "observation_seal": {}, "classification": {},
+                    "stage_timings_seconds": timings,
+                    "cursor": read_json(
+                        self.root / "live_lane_cursor.json", {}) or {},
+                    "backlog": self.store.backfill_backlog(),
+                    "no_historical_scanning": True,
+                }
+
+            # Give ingestion an EARLIER child deadline.  A stalled getLogs
+            # call is interrupted while the root deadline still owns enough
+            # time to write an authoritative deferred result.  The cursor is
+            # committed only at the end of near_head_flow_pass, so retrying
+            # the partial range is idempotent and no blocks disappear.
+            ingestion_deadline = CycleDeadline(ingestion_available)
+            try:
+                with self._rpc_deadline(ingestion_deadline):
+                    near_head = self.near_head_flow_pass(
+                        deadline=ingestion_deadline,
+                        cursor_name="live_lane_cursor.json",
+                        max_scan_blocks=admitted_scan_blocks,
+                        enrichment_limit=LIVE_LANE_ENRICHMENT_LIMIT,
+                        enrichment_budget_seconds=min(
+                            LIVE_LANE_ENRICHMENT_BUDGET_SECONDS,
+                            max(0.0, ingestion_available / 2.0)),
+                    )
+            except CycleDeadlineExceeded as exc:
+                elapsed = time.monotonic() - stage
+                self.record_ingestion_cost(elapsed, censored=True)
+                timings["head_ingestion_and_identity_seconds"] = round(
+                    elapsed, 3)
+                return {
+                    "controlled_deferral": True,
+                    "deferral_stage": "ingestion",
+                    "deferral_reason": str(exc),
+                    "ingestion_admission": ingestion_admission,
+                    "position_evaluations": positions,
+                    "near_head_flow": {
+                        "supported": True, "scanned": False,
+                        "reason": str(exc), "controlled_deferral": True,
+                    },
+                    "observation_seal": {}, "classification": {},
+                    "stage_timings_seconds": timings,
+                    "cursor": read_json(
+                        self.root / "live_lane_cursor.json", {}) or {},
+                    "backlog": self.store.backfill_backlog(),
+                    "no_historical_scanning": True,
+                }
+            ingestion_elapsed = time.monotonic() - stage
             timings["head_ingestion_and_identity_seconds"] = round(
-                time.monotonic() - stage, 3)
+                ingestion_elapsed, 3)
+            if ingestion_deadline.expired() and not near_head.get("scanned"):
+                self.record_ingestion_cost(ingestion_elapsed, censored=True)
+                return {
+                    "controlled_deferral": True,
+                    "deferral_stage": "ingestion",
+                    "deferral_reason": (
+                        near_head.get("reason") or "ingestion_deadline"),
+                    "ingestion_admission": ingestion_admission,
+                    "position_evaluations": positions,
+                    "near_head_flow": {
+                        **near_head, "controlled_deferral": True},
+                    "observation_seal": {}, "classification": {},
+                    "stage_timings_seconds": timings,
+                    "cursor": read_json(
+                        self.root / "live_lane_cursor.json", {}) or {},
+                    "backlog": self.store.backfill_backlog(),
+                    "no_historical_scanning": True,
+                }
+            if near_head.get("scanned"):
+                self.record_ingestion_cost(ingestion_elapsed)
             # Renamed: this stage captures a fresh block-pinned quote and
             # persists an immutable SQLite observation. It is NOT Timechain
             # sealing -- that happens asynchronously in the analysis lane.
@@ -11676,6 +11929,7 @@ class RobinhoodLearningEngine:
             if not near_head.get("scanned"):
                 return {
                     "position_evaluations": positions,
+                    "ingestion_admission": ingestion_admission,
                     "near_head_flow": near_head,
                     "observation_seal": {}, "classification": {},
                     "stage_timings_seconds": timings,
@@ -11687,21 +11941,45 @@ class RobinhoodLearningEngine:
 
             stage = time.monotonic()
             touched = list(near_head.get("touched_pool_ids") or [])
-            try:
-                with self._rpc_deadline(deadline):
-                    observation = self.seal_near_head_observations(
-                        int(near_head.get("to_block") or 0), observed_at,
-                        pool_ids=touched, deadline=deadline,
-                        limit=LIVE_LANE_OBSERVATION_LIMIT,
-                        reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS,
-                    )
-            except CycleDeadlineExceeded:
-                # CENSORED sample: this attempt was killed inside sealing.
-                # Its elapsed time is a lower bound on what the admitted
-                # windows actually cost; folding it in (upward-only) keeps
-                # admission learning from failures instead of successes only.
-                self.record_seal_cost_censored(time.monotonic() - stage)
-                raise
+            observation_model = self.seal_cost_model()
+            observation_minimum = (
+                max(LIVE_LANE_DECISION_RESERVE_SECONDS,
+                    observation_model["downstream_reserve_p95"])
+                + observation_model["fixed_observation_cost_p95"]
+                + observation_model["queue_settlement_p95"])
+            if deadline.remaining() <= observation_minimum:
+                # Selection itself is a measured fixed cost.  Starting it
+                # when that cost cannot fit caused the second failed soak
+                # attempt to enter classification with 0.313s left even
+                # though sealing correctly admitted zero remote windows.
+                # Fresh rows remain discoverable through NOT EXISTS and
+                # queued rows remain in flow_seal_queue, so skipping the
+                # selection query loses nothing.
+                observation = {
+                    "windows_considered": 0,
+                    "sealed_this_cycle": 0,
+                    "observation_ids": [],
+                    "controlled_deferral": True,
+                    "reason": "insufficient_observation_headroom",
+                    "remaining_seconds": round(deadline.remaining(), 3),
+                    "required_seconds": round(observation_minimum, 3),
+                }
+            else:
+                try:
+                    with self._rpc_deadline(deadline):
+                        observation = self.seal_near_head_observations(
+                            int(near_head.get("to_block") or 0), observed_at,
+                            pool_ids=touched, deadline=deadline,
+                            limit=LIVE_LANE_OBSERVATION_LIMIT,
+                            reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS,
+                        )
+                except CycleDeadlineExceeded:
+                    # CENSORED sample: this attempt was killed inside sealing.
+                    # Its elapsed time is a lower bound on what the admitted
+                    # windows actually cost; folding it in (upward-only) keeps
+                    # admission learning from failures instead of successes only.
+                    self.record_seal_cost_censored(time.monotonic() - stage)
+                    raise
             timings["fresh_quote_and_observation_seconds"] = round(
                 time.monotonic() - stage, 3)
             stage = time.monotonic()
@@ -11774,6 +12052,7 @@ class RobinhoodLearningEngine:
                 0, decision_head - int(near_head.get("to_block") or 0))
             return {
                 "position_evaluations": positions,
+                "ingestion_admission": ingestion_admission,
                 "near_head_flow": near_head,
                 "observation_seal": observation,
                 "classification": classification,
@@ -12761,6 +13040,31 @@ def _lane_launch_fits(
     )
 
 
+def _lane_creation_flags(lane: str) -> int:
+    """Windows scheduler priority is part of the lane isolation contract."""
+    if os.name != "nt":
+        return 0
+    flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
+    if lane == "live":
+        flags |= int(getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0))
+    elif lane in {"analysis", "backfill"}:
+        flags |= int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
+    return flags
+
+
+def _low_priority_launch_blocked(
+    lane: str, active_lanes, *, now: float, next_live: float,
+    guard_seconds: float = LIVE_LANE_LAUNCH_GUARD_SECONDS,
+) -> bool:
+    """Reserve worker-startup capacity around every live launch."""
+    if lane == "live":
+        return False
+    if "live" in active_lanes:
+        return True
+    seconds_to_live = float(next_live) - float(now)
+    return 0.0 <= seconds_to_live <= float(guard_seconds)
+
+
 def supervise_lanes(
     root: str | Path, *, chain_root: str | Path,
     skill_root: str | Path, duration_seconds: float,
@@ -12811,6 +13115,10 @@ def supervise_lanes(
     timeouts = {lane: 0 for lane in lanes}
     failures = {lane: 0 for lane in lanes}
     tail_skips = {lane: 0 for lane in lanes}
+    priority_deferrals = {lane: 0 for lane in lanes}
+    live_quiet_until = started_mono
+    last_background_launch = started_mono - (
+        BACKGROUND_LANE_LAUNCH_SPACING_SECONDS)
     status_path = root / "scheduler_status.json"
     supervisor_store = RobinhoodLearningStore(root / "learning.sqlite3")
     recovered_dead_lanes = _reconcile_dead_lane_state(supervisor_store)
@@ -12857,12 +13165,14 @@ def supervise_lanes(
                     "pid": item["process"].pid,
                     "started_at": item["wall_started"],
                     "hard_deadline_at": item["wall_deadline"],
+                    "priority": item["priority"],
                 } for lane, item in active.items()
             },
             "lane_state": supervisor_store.lane_states(),
             "recovered_dead_lanes": recovered_dead_lanes,
             "launches": launches, "timeouts": timeouts, "failures": failures,
             "tail_skips": tail_skips,
+            "priority_deferrals": priority_deferrals,
             "paper_only": True, "live_execution_enabled": False,
         })
 
@@ -12890,14 +13200,46 @@ def supervise_lanes(
                         lane, process.pid,
                         "supervisor_hard_deadline_exceeded",
                         attempt_started_at=item["wall_started"])
+                    if lane != "live":
+                        live_quiet_until = max(
+                            live_quiet_until,
+                            time.monotonic()
+                            + LIVE_LANE_POST_KILL_QUIET_SECONDS)
                     active.pop(lane, None)
             # Iterate the CONFIGURATION. A hardcoded list beside a lanes dict
             # is a second source of truth, and it silently dropped `marks`:
             # the lane was defined, budgeted and given a cadence, and never
             # launched once. Positions then went unmarked entirely, because
             # marking had already been removed from the live lane.
+            due_background = [
+                (lane, schedule) for lane, schedule in lanes.items()
+                if lane != "live" and lane not in active
+                and now_mono >= float(schedule["next"])
+            ]
+            background_candidate = (
+                max(
+                    due_background,
+                    key=lambda item: now_mono - float(item[1]["next"]),
+                )[0]
+                if due_background else None)
             for lane, schedule in lanes.items():
                 if lane in active or now_mono < schedule["next"]:
+                    continue
+                if lane != "live" and lane != background_candidate:
+                    priority_deferrals[lane] += 1
+                    continue
+                if (lane != "live" and now_mono - last_background_launch
+                        < BACKGROUND_LANE_LAUNCH_SPACING_SECONDS):
+                    priority_deferrals[lane] += 1
+                    continue
+                if lane == "live" and now_mono < live_quiet_until:
+                    priority_deferrals[lane] += 1
+                    continue
+                if _low_priority_launch_blocked(
+                    lane, active, now=now_mono,
+                    next_live=float(lanes["live"]["next"]),
+                ):
+                    priority_deferrals[lane] += 1
                     continue
                 remaining_window = max(0.0, stop_at - now_mono)
                 if not _lane_launch_fits(
@@ -12919,8 +13261,7 @@ def supervise_lanes(
                 process = subprocess.Popen(
                     command_for(lane), cwd=str(Path(__file__).resolve().parent),
                     stdout=stdout, stderr=stderr, env=lane_environment,
-                    creationflags=(
-                        subprocess.CREATE_NO_WINDOW if os.name == "nt" else 0),
+                    creationflags=_lane_creation_flags(lane),
                 )
                 lane_job.assign(process)
                 wall_started = time.time()
@@ -12930,8 +13271,14 @@ def supervise_lanes(
                     "wall_started": wall_started,
                     "wall_deadline": wall_started + float(schedule["budget"]) + (
                         LANE_TERMINATION_GRACE_SECONDS),
+                    "priority": (
+                        "above_normal" if lane == "live" else (
+                            "below_normal" if lane in {"analysis", "backfill"}
+                            else "normal")),
                 }
                 launches[lane] += 1
+                if lane != "live":
+                    last_background_launch = now_mono
                 while schedule["next"] <= now_mono:
                     schedule["next"] += float(schedule["cadence"])
             publish()
@@ -12957,6 +13304,7 @@ def supervise_lanes(
         "status": "complete", "mode": "lane_supervisor",
         "launches": launches, "timeouts": timeouts, "failures": failures,
         "tail_skips": tail_skips,
+        "priority_deferrals": priority_deferrals,
         "duration_seconds": round(time.monotonic() - started_mono, 3),
         "paper_only": True, "live_execution_enabled": False,
     }
@@ -13206,6 +13554,8 @@ def live_lane_reliability_snapshot(
 
     model_store = store
     model = model_store.scheduler_state(SEAL_COST_MODEL_STATE_KEY)
+    ingestion_model = model_store.scheduler_state(
+        INGESTION_COST_MODEL_STATE_KEY)
     class_cost = model_store.scheduler_state("classification_observation_cost")
     counters = model_store.scheduler_state(CLASSIFICATION_COUNTERS_STATE_KEY)
     last_summary: dict = {}
@@ -13226,6 +13576,16 @@ def live_lane_reliability_snapshot(
         "all_attempt_p95_seconds": _p95(durations),
         "timeout_count_by_stage": stage_timeouts,
         "timeout_total": sum(stage_timeouts.values()),
+        "controlled_deferral_total": statuses.get("deferred", 0),
+        "ingestion_cost_model": {
+            "p95_seconds": safe_float(
+                ingestion_model.get("p95_seconds"), 14.719),
+            "sample_count": len(
+                ingestion_model.get("samples")
+                if isinstance(ingestion_model.get("samples"), list) else []),
+            "censored_samples": safe_int(
+                ingestion_model.get("censored_samples"), 0),
+        },
         "seal_cost_model": {
             "fixed_observation_cost_p95": safe_float(
                 model.get("fixed_observation_cost_p95"),
@@ -13254,6 +13614,8 @@ def live_lane_reliability_snapshot(
             CLASSIFICATION_COST_SECONDS_DEFAULT),
         "remaining_budget_at_admission_seconds": timings.get(
             "classification_remaining_at_admission"),
+        "startup_phases": last_summary.get("startup_phases") or {},
+        "ingestion_admission": last_summary.get("ingestion_admission") or {},
         "windows_available": observation.get("windows_available"),
         "windows_admitted": observation.get("windows_admitted"),
         "windows_deferred": observation.get("windows_deferred"),
@@ -13714,9 +14076,18 @@ def main() -> None:
         }
         else None
     )
+    engine_initialization_started = time.monotonic()
     engine=RobinhoodLearningEngine(
         args.root, chain_root=producer_chain, skill_root=args.skill_root,
     )
+    engine._startup_milestones = {
+        "shared_deadline": bool(safe_float(
+            os.environ.get("CHAINSEER_LANE_DEADLINE_MONOTONIC"), 0.0) > 0),
+        "module_import_started": PROCESS_MODULE_IMPORT_STARTED_MONOTONIC,
+        "imports_completed": PROCESS_IMPORTS_COMPLETED_MONOTONIC,
+        "engine_initialization_started": engine_initialization_started,
+        "engine_initialization_completed": time.monotonic(),
+    }
     if args.command=="verify":
         result=engine.verify(); print(json.dumps(result,indent=2)); raise SystemExit(0 if result["ok"] else 1)
     if args.command=="repair-outcomes":
