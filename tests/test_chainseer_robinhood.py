@@ -7715,6 +7715,67 @@ class SealStageBudgetTests(unittest.TestCase):
                 self.HEAD, self.NOW)
             self.assertEqual(store.seal_queue_backlog()["pending_windows"], 0)
 
+    def test_live_mode_can_exclude_the_historical_queue(self):
+        """Durable old work must not consume the prospective quote budget."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 1)
+            queued = {
+                "pool_id": "0x" + "ab" * 32,
+                "window_end_block": self.HEAD - 50_000,
+                "window_start_block": self.HEAD - 51_350,
+                "token_address": TOKEN,
+                "features_json": json.dumps({"qualification_gaps": []}),
+            }
+            store.enqueue_seal([queued], "test")
+            result = self._engine(directory, store).seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(25.0),
+                limit=1, reserve_seconds=5.0, queue_drain_limit=0,
+            )
+            self.assertEqual(result["sealed_this_cycle"], 1)
+            with store.connection() as connection:
+                historical = connection.execute(
+                    "SELECT completed_at FROM flow_seal_queue"
+                    " WHERE pool_id=? AND window_end_block=?",
+                    (queued["pool_id"], queued["window_end_block"]),
+                ).fetchone()
+                fresh = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observations"
+                    " WHERE window_end_block>=?", (self.HEAD - 100,)
+                ).fetchone()[0]
+            self.assertIsNone(historical["completed_at"])
+            self.assertEqual(fresh, 1)
+
+    def test_background_mode_drains_only_the_historical_queue(self):
+        """The queue has an explicit non-live consumer; nothing is dropped."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 1)
+            queued = []
+            for index in range(2):
+                queued.append({
+                    "pool_id": "0x" + f"{index + 20:02x}" * 32,
+                    "window_end_block": self.HEAD - 50_000 - index,
+                    "window_start_block": self.HEAD - 51_350 - index,
+                    "token_address": TOKEN,
+                    "features_json": json.dumps({"qualification_gaps": []}),
+                })
+            store.enqueue_seal(queued, "test")
+            result = self._engine(directory, store).seal_near_head_observations(
+                self.HEAD, self.NOW, deadline=rh.CycleDeadline(25.0),
+                limit=2, reserve_seconds=5.0, queue_drain_limit=2,
+                include_fresh=False, stage_lane="backfill",
+            )
+            self.assertEqual(result["sealed_this_cycle"], 2)
+            self.assertEqual(result["admission"]["queue_drained"], 2)
+            self.assertEqual(store.seal_queue_backlog()["pending_windows"], 0)
+            with store.connection() as connection:
+                fresh = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observations"
+                    " WHERE window_end_block>=?", (self.HEAD - 100,)
+                ).fetchone()[0]
+            self.assertEqual(fresh, 0)
+
     # --- (5) the reserve --------------------------------------------------
 
     def test_sealing_stops_while_the_reserve_is_still_unspent(self):

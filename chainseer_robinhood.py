@@ -151,7 +151,12 @@ BACKFILL_V4_ACTIVATION_LIMIT = 25
 LIVE_LANE_SCAN_BLOCKS = 750
 LIVE_LANE_ENRICHMENT_LIMIT = 60
 LIVE_LANE_ENRICHMENT_BUDGET_SECONDS = 6.0
-LIVE_LANE_OBSERVATION_LIMIT = 8
+# The live lane is for a fresh decision, not historical queue throughput.
+# The first clean 100-attempt cohort completed 100/100, but only 81 decisions
+# landed within 120 blocks because the quote stage handled eight windows. A
+# two-window cap keeps the prospective sample while the backfill lane owns the
+# durable historical queue below.
+LIVE_LANE_OBSERVATION_LIMIT = 2
 #: Held back from sealing for decision-head retrieval and classification.
 #: Attributed failures showed the shape exactly: of 64 deadline_exceeded live
 #: cycles, 46 died inside sealing and 18 died inside classification having
@@ -207,6 +212,11 @@ CLASSIFICATION_COST_SMOOTHING = 0.3
 #: Ceiling on how many queued windows one live cycle may pull ahead of fresh
 #: ones. The queue must drain, but a deep backlog must never starve the head.
 SEAL_QUEUE_DRAIN_LIMIT = 4
+# Five-minute backfill cadence needs a materially larger bounded batch than
+# the 30-second live cadence. The same cohort produced about 23 new durable
+# windows/minute; 120 per backfill pass provides convergence headroom while
+# the two-part cost model and shared deadline still cap actual admission.
+BACKFILL_SEAL_QUEUE_DRAIN_LIMIT = 120
 #: Hard ceiling on unclassified rows one classify pass may materialize when
 #: no admission limit is supplied (legacy callers). The full backlog is never
 #: loaded into Python on any path.
@@ -10412,6 +10422,9 @@ class RobinhoodLearningEngine:
         deadline: CycleDeadline | None = None,
         limit: int | None = None,
         reserve_seconds: float = 0.0,
+        queue_drain_limit: int = SEAL_QUEUE_DRAIN_LIMIT,
+        include_fresh: bool = True,
+        stage_lane: str = "live",
     ) -> dict:
         """Seal every near-head window, pinned to the OBSERVATION head.
 
@@ -10452,7 +10465,7 @@ class RobinhoodLearningEngine:
         # thing that can stall inside sealing, and a kill during it must be
         # distinguishable from a kill mid-quote.
         self.store.mark_lane_stage(
-            "live", "fresh_quote_and_observation/observation_selection",
+            stage_lane, "fresh_quote_and_observation/observation_selection",
             run_id=getattr(self, "cycle_run_uuid", None),
             remaining=None if deadline is None else deadline.remaining(),
             completed={}, detail={"head_block": int(head_block)})
@@ -10462,10 +10475,15 @@ class RobinhoodLearningEngine:
         # Used as-is. Re-reading flow_signals here is what made the queue
         # undrainable: that table keys on pool_id alone and is replaced on
         # every recompute, so the window a queued row named no longer existed.
-        queued_rows = [dict(entry) for entry in
-                       self.store.pending_seal_windows(SEAL_QUEUE_DRAIN_LIMIT)]
+        queued_rows = (
+            [dict(entry) for entry in self.store.pending_seal_windows(
+                max(0, int(queue_drain_limit)))]
+            if queue_drain_limit > 0 else []
+        )
         with self.store.connection() as connection:
-            if deadline is not None:
+            if not include_fresh:
+                windows = []
+            elif deadline is not None:
                 # The shared deadline ABORTS an in-flight selection query
                 # rather than merely refusing to start it.
                 with deadline.sqlite_guard(connection):
@@ -10588,7 +10606,7 @@ class RobinhoodLearningEngine:
             process was on when it was killed.
             """
             self.store.mark_lane_stage(
-                "live", f"fresh_quote_and_observation/{substage}",
+                stage_lane, f"fresh_quote_and_observation/{substage}",
                 run_id=getattr(self, "cycle_run_uuid", None),
                 remaining=(
                     None if deadline is None else deadline.remaining()),
@@ -11972,6 +11990,11 @@ class RobinhoodLearningEngine:
                             pool_ids=touched, deadline=deadline,
                             limit=LIVE_LANE_OBSERVATION_LIMIT,
                             reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS,
+                            # Historical durable work must not consume the
+                            # freshness budget. It is drained by backfill.
+                            queue_drain_limit=0,
+                            include_fresh=True,
+                            stage_lane="live",
                         )
                 except CycleDeadlineExceeded:
                     # CENSORED sample: this attempt was killed inside sealing.
@@ -12321,6 +12344,26 @@ class RobinhoodLearningEngine:
 
         def work(deadline: CycleDeadline) -> dict:
             timings: dict[str, float] = {}
+            # Drain historical observation work outside the decision path.
+            # These rows are durable snapshots, so moving them does not lose
+            # evidence; it only stops old quote RPCs consuming live freshness.
+            stage = time.monotonic()
+            seal_queue = {}
+            if self.store.seal_queue_backlog().get("pending_windows", 0):
+                with self._rpc_deadline(deadline):
+                    queue_head = int(self.rpc.get_block_number())
+                    seal_queue = self.seal_near_head_observations(
+                        queue_head, observed_at,
+                        pool_ids=[], deadline=deadline,
+                        limit=BACKFILL_SEAL_QUEUE_DRAIN_LIMIT,
+                        reserve_seconds=10.0,
+                        queue_drain_limit=BACKFILL_SEAL_QUEUE_DRAIN_LIMIT,
+                        include_fresh=False,
+                        stage_lane="backfill",
+                    )
+            timings["durable_observation_queue"] = round(
+                time.monotonic() - stage, 3)
+            deadline.raise_if_expired("durable_observation_queue")
             stage = time.monotonic()
             with self._rpc_deadline(deadline):
                 gap_recovery = self.drain_flow_backfill(
@@ -12348,6 +12391,7 @@ class RobinhoodLearningEngine:
                         "reason": "durable_gap_recovery_priority",
                     },
                     "durable_gap_recovery": gap_recovery,
+                    "durable_observation_queue": seal_queue,
                     "historical_identity_resolution": {
                         "deferred": True,
                         "reason": "durable_gap_recovery_priority",
@@ -12401,6 +12445,7 @@ class RobinhoodLearningEngine:
                 "v2_discovery": v2_coverage,
                 "v4_discovery": v4_coverage,
                 "durable_gap_recovery": gap_recovery,
+                "durable_observation_queue": seal_queue,
                 "historical_identity_resolution": identity,
                 "stage_timings_seconds": timings,
                 "cursor": {
