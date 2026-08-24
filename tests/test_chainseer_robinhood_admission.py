@@ -112,27 +112,72 @@ class DeferredNotDroppedTests(unittest.TestCase):
                 },
             )
 
-    def test_admission_limit_defers_rows_without_dropping_them(self):
-        """Rows beyond the admission limit stay unclassified and are still
-        selectable by a later cycle -- durably deferred, never dropped."""
-        for i in range(6):
-            self._seed_observation(f"obs-{i}")
+    def test_production_two_cycle_deferral(self):
+        """Production shape: each cycle passes its OWN observation_ids.
+        Cycle 1 seals obs A and B but can only classify one; B is
+        durably deferred. Cycle 2 passes C and D -- and must STILL
+        revisit deferred B (prioritized behind current-cycle ids),
+        proving deferral is revisited by the production path."""
+        for i in range(4):
+            self._seed_observation(f"obs-{chr(65 + i)}")
         decision_head = 12345
-        result_limited = self.engine.classify_sealed_observations(
-            decision_head, admission_limit=2)
-        self.assertEqual(result_limited["scoped_rows_selected"], 6)
-        self.assertEqual(result_limited["scoped_rows_processed"], 2)
-        self.assertEqual(result_limited["scoped_rows_deferred"], 4)
+
+        # Cycle 1: sealed A, B. Budget admits only 1; the other 3
+        # UNCLASSIFIED rows (B plus the two not yet sealed) are deferred.
+        cycle1 = self.engine.classify_sealed_observations(
+            decision_head,
+            observation_ids=["obs-A", "obs-B"],
+            admission_limit=1)
+        self.assertEqual(cycle1["scoped_rows_processed"], 1)
         self.assertEqual(
-            result_limited["admission"]["admission_limit"], 2)
-        self.assertEqual(
-            result_limited["admission"]["admission_exceeded"], 4)
-        # The deferred rows remain classifiable by a later cycle.
-        result_rest = self.engine.classify_sealed_observations(
-            decision_head, admission_limit=10)
-        self.assertGreaterEqual(
-            result_rest["scoped_rows_processed"],
-            6 - result_limited["scoped_rows_processed"])
+            cycle1["admission"]["admission_exceeded"], 3)
+        processed_first = {
+            e["observation_id"] for e in
+            self.engine.store.recent_classified_observations()
+        } if hasattr(self.engine.store,
+                     "recent_classified_observations") else None
+        with self.engine.store.connection() as connection:
+            classified = {row[0] for row in connection.execute(
+                "SELECT observation_id FROM"
+                " flow_observation_classifications")}
+        self.assertEqual(len(classified), 1)
+        # Deferred observation survives unclassified.
+        self.assertNotIn("obs-B", classified)
+
+        # Cycle 2 (production shape): pass ONLY current-cycle ids C, D --
+        # yet deferred B must still be revisited and classified.
+        cycle2 = self.engine.classify_sealed_observations(
+            decision_head,
+            observation_ids=["obs-C", "obs-D"],
+            admission_limit=10)
+        with self.engine.store.connection() as connection:
+            classified = {row[0] for row in connection.execute(
+                "SELECT observation_id FROM"
+                " flow_observation_classifications")}
+        self.assertEqual(len(classified), 4)
+        self.assertIn("obs-B", classified)
+
+    def test_current_cycle_ids_prioritized_over_deferred(self):
+        """With limited budget, current-cycle observations classify before
+        older deferred ones."""
+        for i in range(3):
+            self._seed_observation(f"old-{i}")
+        # Classify all old ones first so they are no longer pending.
+        self.engine.classify_sealed_observations(1, admission_limit=10)
+        # Now seal two new ones; budget admits only 1.
+        self._seed_observation("new-0")
+        self._seed_observation("new-1")
+        result = self.engine.classify_sealed_observations(
+            2,
+            observation_ids=["new-0", "new-1"],
+            admission_limit=1)
+        self.assertEqual(result["scoped_rows_processed"], 1)
+        with self.engine.store.connection() as connection:
+            classified = {row[0] for row in connection.execute(
+                "SELECT observation_id FROM"
+                " flow_observation_classifications")}
+        self.assertIn("new-0", classified)
+        self.assertNotIn("new-1", classified)
 
 
 if __name__ == "__main__":

@@ -9848,23 +9848,31 @@ class RobinhoodLearningEngine:
         self, durations: list[float],
     ) -> float | None:
         """Fold this cycle's per-observation durations into the p95
-        estimate. Returns the measured p95, or None with too few samples.
+        estimate. Returns the measured p95, or None with no samples.
 
-        Uses the p95 of the batch (not the mean) so one slow observation
-        raises the estimate: admission must plan for the worst likely
-        candidate, not the average one.
+        Single-sample cycles ARE learned from -- conservatively: a lone
+        observation is treated as a worst-case sample and blended at a
+        reduced weight, because admission must plan for the slow case and
+        the alternative (discarding the cycle) means the estimator never
+        learns when admission keeps allowing one observation.
         """
-        if not durations or len(durations) < 2:
+        if not durations:
             return None
         ordered = sorted(durations)
-        index = min(
-            len(ordered) - 1,
-            max(0, int(round(0.95 * (len(ordered) - 1)))))
-        measured = float(ordered[index])
+        if len(ordered) >= 2:
+            index = min(
+                len(ordered) - 1,
+                max(0, int(round(0.95 * (len(ordered) - 1)))))
+            measured = float(ordered[index])
+            weight = CLASSIFICATION_COST_SMOOTHING
+        else:
+            # Conservative single-sample update: assume it IS the p95,
+            # but move the estimate only part of the way.
+            measured = float(ordered[0])
+            weight = CLASSIFICATION_COST_SMOOTHING / 2
         previous = self.classification_cost_estimate()
         blended = (
-            CLASSIFICATION_COST_SMOOTHING * measured
-            + (1 - CLASSIFICATION_COST_SMOOTHING) * previous)
+            weight * measured + (1 - weight) * previous)
         self.store.set_scheduler_state("classification_observation_cost", {
             "per_observation_seconds": round(blended, 4),
             "last_measured_p95_seconds": round(measured, 4),
@@ -10193,22 +10201,30 @@ class RobinhoodLearningEngine:
                 )
             }
         with self.store.connection() as connection:
+            # ALL unclassified observations for the policy, oldest-sealed
+            # first: current-cycle ids are prioritized in Python below.
             query = """
                 SELECT o.observation_id, o.pool_id, o.token_address,
-                       fs.identity_coverage, fs.qualification_gaps_json
+                       fs.identity_coverage, fs.qualification_gaps_json,
+                       o.sealed_at
                 FROM flow_observations o
                 LEFT JOIN flow_signals fs ON fs.pool_id=o.pool_id
                 WHERE o.policy_version=?
-                """
-            parameters: list = [FLOW_EVIDENCE_POLICY_VERSION]
-            if observation_ids is not None:
-                if observation_ids:
-                    query += " AND o.observation_id IN (" + ",".join(
-                        "?" * len(observation_ids)) + ")"
-                    parameters.extend(observation_ids)
-                else:
-                    query += " AND 1=0"
-            rows = [dict(row) for row in connection.execute(query, parameters)]
+                  AND NOT EXISTS (
+                      SELECT 1 FROM flow_observation_classifications c
+                      WHERE c.observation_id = o.observation_id)
+                ORDER BY o.sealed_at ASC, o.observation_id ASC
+            """
+            rows = [dict(row) for row in connection.execute(
+                query, [FLOW_EVIDENCE_POLICY_VERSION])]
+            if observation_ids:
+                # Current-cycle observations classify FIRST so a decision
+                # attaches while evidence is freshest; remaining budget
+                # then drains the oldest deferred rows.
+                current = set(observation_ids)
+                rows.sort(
+                    key=lambda row: 0 if row["observation_id"] in current
+                    else 1)
         # Admission control: only the first N rows (oldest-first from the
         # query) are classified this cycle; the rest are durably deferred.
         admitted_rows = rows
@@ -11091,19 +11107,23 @@ class RobinhoodLearningEngine:
                 # Admission controller: classify only what safely fits the
                 # remaining budget (p95 per-observation estimate minus a
                 # completion/ledger reserve). The rest is durably deferred,
-                # never dropped. The gap between the seal stage's end and
-                # this decision is recorded so the unexplained
-                # pre-classification overhead is visible in every summary.
+                # never dropped.
                 classification_started = time.monotonic()
-                pre_classification_gap = round(
-                    classification_started - stage, 3)
                 remaining_at_admission = deadline.remaining()
                 admission = self.classification_admission(
                     len(observation.get("observation_ids") or []),
                     remaining_at_admission,
                 )
-                timings["pre_classification_gap_seconds"] = (
-                    pre_classification_gap)
+                # The UNEXPLAINED pre-classification overhead: everything
+                # between the decision-head read and the classification
+                # loop that is not accounted for by admission itself.
+                # (Measuring from the seal stage's start would fold
+                # sealing and decision-head retrieval -- both already
+                # timed separately -- into this number.)
+                unexplained_gap = round(
+                    classification_started - head_started
+                    - timings.get("decision_head_seconds", 0.0), 3)
+                timings["pre_classification_gap_seconds"] = unexplained_gap
                 timings["classification_remaining_at_admission"] = round(
                     remaining_at_admission, 3)
                 classification = self.classify_sealed_observations(
