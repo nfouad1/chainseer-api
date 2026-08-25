@@ -9671,6 +9671,15 @@ class RobinhoodLearningEngine:
                     attempts=1,
                 )
             except Exception:
+                # A failed remote batch consumed real freshness budget too.
+                # Previously only successful calls updated ``batch_seconds``;
+                # after an expensive failure the next batch therefore saw a
+                # zero estimate and was admitted with fictitious headroom.
+                # Cohort 3 measured exactly that signature: 25 failed origins,
+                # a second batch, 128-block decision lag, and a separate
+                # near_head_commit deferral after ingestion exceeded its p95.
+                observed = time.monotonic() - batch_started
+                batch_seconds = max(observed, batch_seconds * 0.5)
                 failures += len(chunk)
                 continue
             # Exponential-ish tracking: react to a slow batch immediately,
@@ -9771,11 +9780,14 @@ class RobinhoodLearningEngine:
             "candidates": len(candidates),
             "truncated": truncated,
             "attempted": batch["attempted"],
+            "deferred_for_deadline": max(
+                0, len(selected) - batch["attempted"]),
             "resolved": batch["resolved"],
             "unavailable": batch["unavailable"],
             "failures": batch["failures"],
             "affected_pools": batch["affected_pools"],
             "stopped_at_deadline": batch["stopped_at_deadline"],
+            "observed_batch_seconds": batch["observed_batch_seconds"],
             "window_fully_enriched": bool(
                 not truncated and batch["attempted"] == len(selected)
                 and not batch["failures"]

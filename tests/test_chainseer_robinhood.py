@@ -3904,6 +3904,56 @@ class IdentityDeadlineTests(unittest.TestCase):
             result = engine.resolve_flow_participants(limit=30)
             self.assertEqual(result["stopped_at_deadline"], 0)
 
+    def test_failed_batch_cost_prevents_a_second_batch_with_false_headroom(self):
+        class FailingFirstBatchRPC(FakeRPC):
+            def __init__(self):
+                super().__init__([], latest=100)
+                self.batches = 0
+
+            def get_transactions(self, hashes):
+                self.batches += 1
+                time.sleep(0.2)
+                if self.batches == 1:
+                    raise RuntimeError("synthetic provider failure")
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            rpc = FailingFirstBatchRPC()
+            engine = self._engine(directory, rpc)
+            result = engine._resolve_origin_batches(
+                [f"0xfailure{index:04d}" for index in range(50)],
+                time.monotonic() + 0.3,
+            )
+            self.assertEqual(rpc.batches, 1)
+            self.assertEqual(result["attempted"], rh.FLOW_ORIGIN_BATCH_SIZE)
+            self.assertEqual(result["failures"], rh.FLOW_ORIGIN_BATCH_SIZE)
+            self.assertEqual(result["stopped_at_deadline"], 1)
+            self.assertGreaterEqual(result["observed_batch_seconds"], 0.18)
+
+    def test_near_head_enrichment_exposes_cost_and_deferred_work(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._engine(directory, self.SlowRPC())
+            engine.store.unresolved_transaction_hashes = lambda hashes: [
+                "0x01", "0x02", "0x03",
+            ]
+            engine._resolve_origin_batches = lambda hashes, deadline: {
+                "attempted": 1,
+                "resolved": 0,
+                "unavailable": 0,
+                "failures": 1,
+                "affected_pools": 0,
+                "stopped_at_deadline": 1,
+                "observed_batch_seconds": 0.234,
+            }
+            result = engine.enrich_near_head_window([
+                {"transaction_hash": "0x01"},
+                {"transaction_hash": "0x02"},
+                {"transaction_hash": "0x03"},
+            ])
+            self.assertEqual(result["deferred_for_deadline"], 2)
+            self.assertEqual(result["observed_batch_seconds"], 0.234)
+            self.assertFalse(result["window_fully_enriched"])
+
 
 class StaleArmExperimentTests(unittest.TestCase):
     """Windows fresh at observation but stale at decision become evidence.
