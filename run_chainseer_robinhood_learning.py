@@ -14,6 +14,7 @@ from ctypes import wintypes
 from datetime import datetime, timezone
 import faulthandler
 import json
+import os
 from pathlib import Path
 import subprocess
 import sys
@@ -31,6 +32,41 @@ JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 JOB_OBJECT_EXTENDED_LIMIT_INFORMATION_CLASS = 9
 _JOB_HANDLE: int | None = None
 _JOB_MODE = "uninitialized"
+
+
+def _workspace_revision(root: Path = WORKSPACE) -> str:
+    """Read the current Git commit directly, including worktree gitdirs.
+
+    The runner stamps this into the environment before importing the learner,
+    so every estimator record identifies the code revision that produced it.
+    No subprocess or network dependency is needed during supervised startup.
+    """
+    git_dir = root / ".git"
+    try:
+        if git_dir.is_file():
+            marker = git_dir.read_text(encoding="utf-8").strip()
+            if not marker.lower().startswith("gitdir:"):
+                return "unknown"
+            git_dir = (root / marker.split(":", 1)[1].strip()).resolve()
+        head = (git_dir / "HEAD").read_text(encoding="ascii").strip()
+        if not head.startswith("ref:"):
+            return head[:12] if head else "unknown"
+        ref = head.split(":", 1)[1].strip()
+        ref_path = git_dir / ref
+        if ref_path.exists():
+            value = ref_path.read_text(encoding="ascii").strip()
+            return value[:12] if value else "unknown"
+        packed = git_dir / "packed-refs"
+        if packed.exists():
+            for line in packed.read_text(encoding="ascii").splitlines():
+                if not line or line.startswith(("#", "^")):
+                    continue
+                value, name = line.split(" ", 1)
+                if name.strip() == ref:
+                    return value[:12]
+    except (OSError, ValueError):
+        return "unknown"
+    return "unknown"
 
 
 class _BasicLimitInformation(ctypes.Structure):
@@ -183,6 +219,8 @@ def main() -> int:
         # Import only after ownership and status are authoritative. This module
         # is intentionally large; a scheduled startup must never disappear
         # into an unobservable import before the Job Object exists.
+        os.environ.setdefault(
+            "CHAINSEER_CODE_REVISION", _workspace_revision(WORKSPACE))
         startup_trace = root / "runner_startup_trace.log"
         with startup_trace.open("ab", buffering=0) as trace_stream:
             faulthandler.dump_traceback_later(

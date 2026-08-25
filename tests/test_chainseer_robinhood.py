@@ -7043,7 +7043,14 @@ class LaneSplitTests(unittest.TestCase):
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
             live_summary = json.dumps({
                 "duration_seconds": 10.0,
-                "observation_seal": {"decision_head_lag_blocks": 100},
+                "observation_seal": {
+                    "decision_head_lag_blocks": 100,
+                    "sealed_this_cycle": 1,
+                },
+                "classification": {
+                    "scoped_rows_selected": 1,
+                    "scoped_rows_processed": 1,
+                },
                 "position_evaluations": {
                     "checked": 2, "marked": 2, "failures": 0,
                     "unverified": 0,
@@ -7076,6 +7083,19 @@ class LaneSplitTests(unittest.TestCase):
                                          "backlog": {key: value}}),
                              f"{lane}-{index}", float(index), lane),
                         )
+            now = time.time()
+            store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "epoch": rh.SEAL_COST_MODEL_EPOCH,
+                "revision": "test-revision",
+                "fixed_observation_samples": [{
+                    "value": 0.4,
+                    "epoch": rh.SEAL_COST_MODEL_EPOCH,
+                    "run_id": f"model-{index}",
+                    "at": now + index,
+                    "revision": "test-revision",
+                    "status": "success",
+                } for index in range(rh.SEAL_STALL_GUARD_MIN_SAMPLES)],
+            })
             result = store.stabilization_summary(integrity={"ok": True})
             self.assertEqual(result["status"], "STABILIZED")
             self.assertTrue(result["stabilized"])
@@ -7886,10 +7906,25 @@ class SealStageBudgetTests(unittest.TestCase):
                 limit=4, reserve_seconds=5.0,
             )
             self.assertEqual(
-                second["admission"]["queue_drained"], 3,
-                "windows below the floor must come back from the queue",
+                second["admission"]["queue_drained"], 0,
+                "block-stale windows must never re-enter live admission",
             )
-            self.assertEqual(second["sealed_this_cycle"], 3)
+            self.assertEqual(second["windows_expired_stale"], 3)
+            with store.connection() as connection:
+                expired = connection.execute(
+                    "SELECT COUNT(*) FROM flow_seal_queue"
+                    " WHERE queue_state='expired_stale'"
+                    " AND completed_at IS NULL").fetchone()[0]
+            self.assertEqual(expired, 3, "research debt must be preserved")
+
+            # The non-live consumer can still seal the preserved evidence.
+            background = engine.seal_near_head_observations(
+                later, self.NOW + 60, deadline=rh.CycleDeadline(25.0),
+                limit=4, reserve_seconds=5.0, include_fresh=False,
+                stage_lane="backfill",
+            )
+            self.assertEqual(background["admission"]["queue_drained"], 3)
+            self.assertEqual(background["sealed_this_cycle"], 3)
             with store.connection() as connection:
                 total = connection.execute(
                     "SELECT COUNT(*) FROM flow_observations").fetchone()[0]

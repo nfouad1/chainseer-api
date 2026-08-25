@@ -1,12 +1,14 @@
 """Epoch/provenance estimator tests: stall separation, epoch reset,
 stale queue expiry, three-way acceptance metrics."""
 import json
+import os
 import tempfile
 import time
 import unittest
 from pathlib import Path
 
 import chainseer_robinhood as rh
+import run_chainseer_robinhood_learning as runner
 from chainseer_robinhood_commitments import DecisionCommitmentStore
 
 from tests.test_chainseer_robinhood_live_lane_reliability import (
@@ -69,6 +71,83 @@ class StallSeparationTests(unittest.TestCase):
         fresh = self.engine.seal_cost_model()["per_window_cost_p95"]
         self.assertEqual(fresh, 0.5)
 
+    def test_reader_recomputes_counts_and_p95_from_provenance_records(self):
+        self.engine._blend_seal_model({
+            "per_window_cost_p95": [0.25, 0.5, 0.75]})
+        model = self.engine.seal_cost_model()
+        self.assertEqual(model["per_window_sample_count"], 3)
+        self.assertEqual(model["per_window_cost_p95"], 0.75)
+        self.assertEqual(model["epoch"], rh.SEAL_COST_MODEL_EPOCH)
+
+    def test_censored_record_raises_effective_cost_without_becoming_success(self):
+        self.engine._blend_seal_model({"per_window_cost_p95": [0.4] * 10})
+        self.engine._blend_seal_model(
+            {"per_window_cost_p95": 9.0}, censored=True)
+        model = self.engine.seal_cost_model()
+        self.assertEqual(model["per_window_sample_count"], 10)
+        self.assertEqual(model["per_window_censored_count"], 1)
+        self.assertEqual(model["per_window_cost_p95_successful_p95"], 0.4)
+        self.assertGreaterEqual(model["per_window_cost_p95"], 9.0)
+
+    def test_cold_start_stall_cannot_become_the_epoch_baseline(self):
+        self.engine._blend_seal_model({"fixed_observation_cost_p95": 60.0})
+        model = self.engine.seal_cost_model()
+        stored = self.store.scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY)
+        self.assertEqual(model["fixed_sample_count"], 0)
+        self.assertEqual(model["fixed_stall_count"], 1)
+        self.assertEqual(
+            stored["fixed_observation_samples"][0]["status"], "stalled")
+
+    def test_excessive_stall_rate_activates_tighten_only_guard(self):
+        for _ in range(rh.SEAL_STALL_GUARD_MIN_SAMPLES):
+            self.engine._blend_seal_model(
+                {"fixed_observation_cost_p95": 0.4})
+        self.engine._blend_seal_model({"fixed_observation_cost_p95": 60.0})
+        model = self.engine.seal_cost_model()
+        self.assertTrue(model["stall_guard_active"])
+        self.assertGreater(model["fixed_stall_rate"], rh.SEAL_STALL_RATE_MAX)
+
+    def test_active_stall_guard_caps_admission_to_one_probe(self):
+        for _ in range(rh.SEAL_STALL_GUARD_MIN_SAMPLES):
+            self.engine._blend_seal_model(
+                {"fixed_observation_cost_p95": 0.4})
+        self.engine._blend_seal_model({"fixed_observation_cost_p95": 60.0})
+        seed_windows(self.store, 4)
+        result = self.engine.seal_near_head_observations(
+            HEAD, time.time(), pool_ids=[POOL_ID],
+            deadline=rh.CycleDeadline(20.0), limit=4,
+            reserve_seconds=0.5)
+        admission = result["admission"]
+        self.assertTrue(admission["stall_guard_active"])
+        self.assertEqual(admission["stall_guard_action"],
+                         "cap_one_recovery_probe")
+        self.assertEqual(result["windows_admitted"], 1)
+
+    def test_supervisor_censor_writer_uses_same_record_schema(self):
+        self.engine._blend_seal_model({"per_window_cost_p95": [0.4] * 10})
+        run_id = "epoch-two-supervisor-kill"
+        fake_pid = 987654
+        self.store.begin_run(run_id, 25.0, lane="live")
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE runs SET pid=? WHERE run_id=?", (fake_pid, run_id))
+            connection.execute(
+                "UPDATE lane_state SET pid=? WHERE lane='live'",
+                (fake_pid,))
+        self.store.mark_lane_stage(
+            "live", "fresh_quote_and_observation/window_quote_rpc",
+            run_id=run_id, remaining=0.5)
+        time.sleep(0.01)
+        self.store.terminate_lane(
+            "live", fake_pid, "supervisor_hard_deadline_exceeded")
+        state = self.store.scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY)
+        records = state["per_window_samples"]
+        self.assertTrue(all(isinstance(record, dict) for record in records))
+        self.assertEqual(records[-1]["status"], "censored")
+        self.assertEqual(records[-1]["run_id"], run_id)
+        self.assertGreaterEqual(
+            self.engine.seal_cost_model()["per_window_cost_p95"], 0.4)
+
 
 class StaleQueueExpiryTests(unittest.TestCase):
     def setUp(self):
@@ -79,7 +158,8 @@ class StaleQueueExpiryTests(unittest.TestCase):
     def tearDown(self):
         self._tmp.cleanup()
 
-    def _enqueue(self, pool_suffix: str, enqueued_at: float):
+    def _enqueue(self, pool_suffix: str, enqueued_at: float,
+                 window_end_block: int = 200):
         with self.store.connection() as c:
             c.execute(
                 """INSERT INTO flow_seal_queue (
@@ -87,22 +167,30 @@ class StaleQueueExpiryTests(unittest.TestCase):
                        window_end_block, enqueued_at, reason
                    ) VALUES (?, '0x' || '11', 100, 200, ?, 'live_lane_headroom')""",
                 (POOL_ID[:-4] + pool_suffix, enqueued_at))
+            c.execute(
+                "UPDATE flow_seal_queue SET window_end_block=? WHERE pool_id=?",
+                (int(window_end_block), POOL_ID[:-4] + pool_suffix))
 
     def test_stale_entries_marked_expired_and_excluded(self):
-        old = time.time() - rh.SEAL_QUEUE_STALE_SECONDS - 60
-        self._enqueue("0001", old)
-        self._enqueue("0002", time.time() - 10)
-        expired = self.store.expire_stale_seal_queue()
+        same_time = time.time() - 10
+        self._enqueue("0001", same_time, HEAD - 121)
+        self._enqueue("0002", same_time, HEAD - 120)
+        expired = self.store.expire_stale_seal_queue(head_block=HEAD)
         self.assertEqual(expired, 1)
-        # Preserved for research, stamped completed.
+        # Preserved for research in an explicit non-live state.
         with self.store.connection() as c:
             row = dict(list(c.execute(
                 "SELECT * FROM flow_seal_queue"
-                " WHERE completed_at IS NOT NULL"))[0])
+                " WHERE queue_state='expired_stale'"))[0])
         self.assertIn("expired_stale", row["reason"])
+        self.assertIsNone(row["completed_at"])
         # Live admission no longer sees it.
         pending = self.store.pending_seal_windows(25)
         self.assertEqual([p["pool_id"][-4:] for p in pending], ["0002"])
+        research = self.store.pending_seal_windows(
+            25, include_expired_stale=True)
+        self.assertEqual(
+            sorted(p["pool_id"][-4:] for p in research), ["0001", "0002"])
 
     def test_expiry_runs_inside_seal_stage(self):
         """The seal stage expires stale entries before draining the queue."""
@@ -122,7 +210,14 @@ class ThreeWayMetricsTests(unittest.TestCase):
             root = Path(directory)
             store = rh.RobinhoodLearningStore(root / "l.sqlite3")
             runs = [
-                ("complete", {"duration_seconds": 8.0}),
+                ("complete", {
+                    "duration_seconds": 8.0,
+                    "observation_seal": {"sealed_this_cycle": 1},
+                    "classification": {
+                        "scoped_rows_selected": 1,
+                        "scoped_rows_processed": 1,
+                    },
+                }),
                 ("complete", {"duration_seconds": 9.0}),
                 ("deferred", {"duration_seconds": 6.0}),
                 ("deadline_exceeded", {"duration_seconds": 25.5,
@@ -132,12 +227,55 @@ class ThreeWayMetricsTests(unittest.TestCase):
                 store.begin_run(f"run-{i}", 25.0, lane="live")
                 store.finish_run(f"run-{i}", status, summary=summary)
             snap = rh.live_lane_reliability_snapshot(root, store=store)
-        self.assertEqual(snap["useful_completions"], 2)
+        self.assertEqual(snap["useful_completions"], 1)
+        self.assertEqual(snap["decision_opportunities"], 2)
         self.assertAlmostEqual(snap["useful_completion_rate"], 0.5)
+        self.assertAlmostEqual(snap["productive_cycle_rate"], 0.25)
+        self.assertEqual(snap["idle_completions"], 1)
         self.assertEqual(snap["controlled_deferrals"], 1)
         self.assertAlmostEqual(snap["controlled_deferral_rate"], 0.25)
         self.assertEqual(snap["uncontrolled_failures"], 1)
         self.assertAlmostEqual(snap["uncontrolled_failure_rate"], 0.25)
+
+    def test_running_attempt_is_not_a_terminal_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            store.begin_run("done", 25.0, lane="live")
+            store.finish_run("done", "complete", summary={
+                "duration_seconds": 1.0,
+                "observation_seal": {"sealed_this_cycle": 1},
+                "classification": {
+                    "scoped_rows_selected": 1,
+                    "scoped_rows_processed": 1,
+                },
+            })
+            store.begin_run("still-running", 25.0, lane="live")
+            snap = rh.live_lane_reliability_snapshot(root, store=store)
+        self.assertEqual(snap["window_runs"], 1)
+        self.assertEqual(snap["uncontrolled_failures"], 0)
+        self.assertEqual(snap["useful_completion_rate"], 1.0)
+
+
+class RevisionProvenanceTests(unittest.TestCase):
+    def test_runner_reads_branch_revision_without_spawning_git(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            git_dir = root / ".git"
+            (git_dir / "refs" / "heads").mkdir(parents=True)
+            (git_dir / "HEAD").write_text(
+                "ref: refs/heads/main\n", encoding="ascii")
+            (git_dir / "refs" / "heads" / "main").write_text(
+                "0123456789abcdef0123456789abcdef01234567\n",
+                encoding="ascii")
+            self.assertEqual(runner._workspace_revision(root), "0123456789ab")
+
+
+class DashboardContractTests(unittest.TestCase):
+    def test_new_readiness_criteria_have_explicit_renderers(self):
+        html = Path("robinhood_dashboard.html").read_text(encoding="utf-8")
+        self.assertIn("key==='decision_usefulness'", html)
+        self.assertIn("key==='seal_stall_guard'", html)
 
 
 if __name__ == "__main__":

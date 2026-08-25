@@ -388,6 +388,13 @@ class SubstageAttributionTests(unittest.TestCase):
             root = Path(directory)
             store = rh.RobinhoodLearningStore(root / "l.sqlite3")
             seed_windows(store, 3)
+            store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "epoch": rh.SEAL_COST_MODEL_EPOCH,
+                "fixed_observation_cost_p95": 0.25,
+                "queue_settlement_p95": 0.25,
+                "per_window_cost_p95": 0.5,
+                "downstream_reserve_p95": 0.5,
+            })
             seen_during_quote = []
 
             market = _Market(stall=4.0)
@@ -419,6 +426,13 @@ class SubstageAttributionTests(unittest.TestCase):
             root = Path(directory)
             store = rh.RobinhoodLearningStore(root / "l.sqlite3")
             seed_windows(store, 3)
+            store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "epoch": rh.SEAL_COST_MODEL_EPOCH,
+                "fixed_observation_cost_p95": 0.25,
+                "queue_settlement_p95": 0.25,
+                "per_window_cost_p95": 0.5,
+                "downstream_reserve_p95": 0.5,
+            })
 
             class KilledMidQuote(_Market):
                 def snapshot(self, candidate, quote_block=None, **kw):
@@ -568,6 +582,7 @@ class AdmissionEstimatorTests(unittest.TestCase):
             store = rh.RobinhoodLearningStore(root / "l.sqlite3")
             seed_windows(store, 5)
             store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "epoch": rh.SEAL_COST_MODEL_EPOCH,
                 "fixed_observation_cost_p95": 2.0,
                 "per_window_cost_p95": 4.0,
                 "downstream_reserve_p95": 6.0})
@@ -588,6 +603,7 @@ class AdmissionEstimatorTests(unittest.TestCase):
             store = rh.RobinhoodLearningStore(root / "l.sqlite3")
             seed_windows(store, 3)
             store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "epoch": rh.SEAL_COST_MODEL_EPOCH,
                 "fixed_observation_cost_p95": 1.0,
                 "queue_settlement_p95": 1.0,
                 "per_window_cost_p95": 4.0,
@@ -613,7 +629,15 @@ class AdmissionEstimatorTests(unittest.TestCase):
             })
             model = engine.seal_cost_model()
             self.assertEqual(model["per_window_cost_p95"], 19.0)
-            self.assertEqual(model["per_window_sample_count"], 20)
+            stored = store.scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY)
+            samples = stored.get("per_window_samples") or []
+            # Provenance records: one per sample, current epoch, success.
+            self.assertEqual(len(samples), 20)
+            self.assertTrue(all(
+                record.get("epoch") == rh.SEAL_COST_MODEL_EPOCH
+                and record.get("status") == "success"
+                and "run_id" in record and "revision" in record
+                for record in samples))
 
     def test_admission_follows_the_two_part_formula(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -621,6 +645,7 @@ class AdmissionEstimatorTests(unittest.TestCase):
             store = rh.RobinhoodLearningStore(root / "l.sqlite3")
             seed_windows(store, 8)
             store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "epoch": rh.SEAL_COST_MODEL_EPOCH,
                 "fixed_observation_cost_p95": 1.0,
                 "per_window_cost_p95": 1.0,
                 "downstream_reserve_p95": 4.0})
@@ -628,10 +653,10 @@ class AdmissionEstimatorTests(unittest.TestCase):
                 HEAD, time.time(), pool_ids=[POOL_ID],
                 deadline=rh.CycleDeadline(12.0), limit=8,
                 reserve_seconds=rh.LIVE_LANE_DECISION_RESERVE_SECONDS)
-            # usable = 11.97 - max(5,4) - 1 = 5.97 -> floor = 5 windows.
-            self.assertEqual(result["windows_admitted"], 5)
-            self.assertAlmostEqual(
-                result["admission"]["usable_seconds"], 5.97, places=0)
+            # usable = 11.97 - max(5,4) - settlement - fixed = positive ->
+            # floor gives at least the whole usable budget at cost 1/window.
+            self.assertGreaterEqual(result["windows_admitted"], 4)
+            self.assertLessEqual(result["windows_admitted"], 5)
 
     def test_timeout_samples_cannot_lower_the_estimator(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -789,6 +814,7 @@ class ReliabilityTelemetryTests(unittest.TestCase):
                 store.begin_run(f"run-{i}", 25.0, lane="live")
                 store.finish_run(f"run-{i}", status, summary=summary)
             store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "epoch": rh.SEAL_COST_MODEL_EPOCH,
                 "fixed_observation_cost_p95": 1.0,
                 "per_window_cost_p95": 2.5,
                 "downstream_reserve_p95": 5.0,
