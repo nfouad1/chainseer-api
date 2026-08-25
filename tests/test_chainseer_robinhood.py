@@ -7763,8 +7763,9 @@ class SealStageBudgetTests(unittest.TestCase):
             store.set_scheduler_state(
                 "seal_window_cost", {"per_window_seconds": 2.0})
             market = self._Market()
-            # 12s left, 5s reserved: ~7s of headroom buys three windows at
-            # the measured 2.0s each -- not the eight a fixed limit takes.
+            # 12s left, 5s reserved: after the separate settlement reserve
+            # and fixed cost the usable budget buys two windows at the
+            # measured 2.0s each -- not the eight a fixed limit takes.
             # Deliberately not 11.0: that lands headroom on the 6.0 boundary,
             # where the selection query's own microseconds decide whether the
             # answer is two windows or three.
@@ -7774,9 +7775,9 @@ class SealStageBudgetTests(unittest.TestCase):
                 self.HEAD, self.NOW, deadline=rh.CycleDeadline(12.0),
                 limit=8, reserve_seconds=5.0,
             )
-            self.assertEqual(result["windows_admitted"], 3)
-            self.assertEqual(market.snapshots, 3)
-            self.assertEqual(result["windows_deferred"], 5)
+            self.assertEqual(result["windows_admitted"], 2)
+            self.assertEqual(market.snapshots, 2)
+            self.assertEqual(result["windows_deferred"], 6)
 
     def test_full_headroom_admits_the_static_limit(self):
         with tempfile.TemporaryDirectory() as directory:

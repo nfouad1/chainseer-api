@@ -206,6 +206,43 @@ SEAL_COST_MODEL_STATE_KEY = "seal_cost_model_v2"
 #: Keeping a bounded durable window makes the percentile reproducible after a
 #: restart without letting the scheduler-state row grow without bound.
 SEAL_COST_SAMPLE_WINDOW = 128
+#: Stall threshold for fixed-cost samples: a selection/prefetch pass this
+#: many times the window's median is a STALL (provider hang, lock wait), not
+#: the normal cost of the work. Stalls are counted and reported separately
+#: as a reliability metric -- never winsorized into the estimate, which
+#: would erase exactly the evidence a post-mortem needs.
+SEAL_FIXED_COST_STALL_RATIO = 8.0
+#: Queue entries older than this are irrecoverably stale: the window can
+#: never again overlap the near-head region, so sealing one would pin a
+#: quote to an observation head that no longer exists. They are marked
+#: expired_stale (preserved for research) and excluded from live admission.
+SEAL_QUEUE_STALE_SECONDS = 3 * 3600.0
+#: Estimator epoch: bumping this starts a fresh sample window so a poisoned
+#: distribution from an older code revision cannot leak into new estimates.
+#: Samples carry the epoch they were recorded under; only current-epoch
+#: samples drive admission.
+SEAL_COST_MODEL_EPOCH = 2
+#: Code revision stamped onto every timing sample for provenance. Set from
+#: the environment the runner exports; "unknown" in tests/ad-hoc use.
+CODE_REVISION = os.environ.get("CHAINSEER_CODE_REVISION", "unknown")
+
+
+def _seal_cost_defaults() -> dict:
+    """Cold-start defaults per model component."""
+    return {
+        "fixed_observation_cost_p95":
+            SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT,
+        "queue_settlement_p95": QUEUE_SETTLEMENT_COST_SECONDS_DEFAULT,
+        "per_window_cost_p95": SEAL_PER_WINDOW_COST_SECONDS_DEFAULT,
+        "downstream_reserve_p95": DOWNSTREAM_RESERVE_SECONDS_DEFAULT,
+    }
+
+
+def defaults_for(key: str) -> float:
+    return _seal_cost_defaults().get(
+        key, DOWNSTREAM_RESERVE_SECONDS_DEFAULT)
+
+
 #: Cold-start per-observation classification cost (p95 estimate), replaced
 #: by a measured p95 after enough samples. Classification is admission-
 #: controlled like sealing: an observation admitted without enough budget
@@ -4606,6 +4643,28 @@ class RobinhoodLearningStore:
                         window_start_block,features_json,enqueued_at,reason)
                    VALUES (?,?,?,?,?,?,?)""", rows)
         return len(rows)
+
+    def expire_stale_seal_queue(self, *, stale_seconds: float | None = None
+                                ) -> int:
+        """Mark irrecoverably stale queue entries expired_stale.
+
+        A window older than the near-head overlap can never be sealed
+        honestly again: its observation head is gone. Sealing it would pin
+        a quote to a chain position that does not exist. Entries are NOT
+        deleted -- they are stamped with completed_at and reason
+        'expired_stale' so research keeps the record while live admission
+        stops seeing them.
+        """
+        cutoff = time.time() - float(
+            SEAL_QUEUE_STALE_SECONDS if stale_seconds is None
+            else stale_seconds)
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """UPDATE flow_seal_queue
+                   SET completed_at=?, reason=reason || '|expired_stale'
+                   WHERE completed_at IS NULL AND enqueued_at < ?""",
+                (time.time(), cutoff))
+            return cursor.rowcount or 0
 
     def pending_seal_windows(self, limit: int = 25) -> list[dict]:
         """Queued windows, oldest first, ready to seal without a lookup.
@@ -10293,16 +10352,30 @@ class RobinhoodLearningEngine:
 
     def _blend_seal_model(self, updates: dict, censored: bool = False,
                           sample_count: int = 0) -> dict:
-        """Append raw timing samples and derive a real nearest-rank p95.
+        """Append raw timing samples with provenance; derive nearest-rank p95.
 
         Kept under the historical method name for compatibility with callers,
-        but no EWMA blending occurs.  Each percentile is reproducible from a
-        bounded durable sample window.  A censored value is a lower bound and
-        is clamped to the current p95 so recording a timeout can never lower
-        admission's estimate.
+        but no EWMA blending occurs.  Each sample is stored as a provenance
+        record -- epoch, run_id, timestamp, code revision, stage status
+        (success/censored/stalled) -- so a percentile can be recomputed from
+        exactly the population that should drive it: current-epoch successful
+        samples only.  A censored value is a lower bound and is clamped to
+        the current p95 so recording a timeout can never lower admission's
+        estimate.  Stalled samples are EXCLUDED from the estimate (they are
+        reliability events, not cost data) but counted for reporting.
         """
         stored = self.store.scheduler_state(SEAL_COST_MODEL_STATE_KEY)
         current = self.seal_cost_model()
+        # Epoch reset: an old-epoch window never mixes with new samples.
+        if safe_int(stored.get("epoch"), 0) != SEAL_COST_MODEL_EPOCH:
+            stored = {"epoch": SEAL_COST_MODEL_EPOCH}
+            current = {
+                "fixed_observation_cost_p95":
+                    SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT,
+                "queue_settlement_p95": QUEUE_SETTLEMENT_COST_SECONDS_DEFAULT,
+                "per_window_cost_p95": SEAL_PER_WINDOW_COST_SECONDS_DEFAULT,
+                "downstream_reserve_p95": DOWNSTREAM_RESERVE_SECONDS_DEFAULT,
+            }
         field_for = {
             "fixed_observation_cost_p95": "fixed_observation_samples",
             "queue_settlement_p95": "queue_settlement_samples",
@@ -10310,10 +10383,14 @@ class RobinhoodLearningEngine:
             "downstream_reserve_p95": "downstream_samples",
         }
         payload = dict(stored)
+        run_id = str(getattr(self, "cycle_run_uuid", "") or "")
+        revision = CODE_REVISION
+        now = time.time()
+        stall_events = int(stored.get("stall_samples", 0))
         for key, measured_values in updates.items():
             field = field_for[key]
-            values = payload.get(field)
-            values = list(values) if isinstance(values, list) else []
+            records = payload.get(field)
+            records = list(records) if isinstance(records, list) else []
             incoming = (
                 list(measured_values)
                 if isinstance(measured_values, (list, tuple))
@@ -10324,10 +10401,79 @@ class RobinhoodLearningEngine:
                 if isinstance(value, (int, float))
                 and math.isfinite(float(value))
             ]
-            if censored:
-                clean = [max(current[key], value) for value in clean]
-            values.extend(clean)
-            payload[field] = values[-SEAL_COST_SAMPLE_WINDOW:]
+            if not clean:
+                continue
+            if key == "fixed_observation_cost_p95" and not censored:
+                # Stall separation: a fixed-cost pass far above the window's
+                # median is a stall event. Count it, keep the raw record for
+                # research, but exclude it from the percentile input.
+                history = [
+                    record.get("value", 0.0) for record in records
+                    if record.get("status") == "success"
+                    and record.get("epoch") == SEAL_COST_MODEL_EPOCH]
+                median = sorted(history)[len(history) // 2] if history else None
+                threshold = (
+                    median * SEAL_FIXED_COST_STALL_RATIO
+                    if median is not None else None)
+                stalled_now = 0
+                admitted = []
+                for value in clean:
+                    is_stall = (
+                        threshold is not None and value > threshold
+                        and value > 2.0)
+                    records.append({
+                        "value": round(value, 4),
+                        "epoch": SEAL_COST_MODEL_EPOCH,
+                        "run_id": run_id,
+                        "at": now,
+                        "revision": revision,
+                        "status": ("stalled" if is_stall
+                                   else "censored" if censored else "success"),
+                    })
+                    if is_stall:
+                        stalled_now += 1
+                    else:
+                        admitted.append(value)
+                stall_events += stalled_now
+                usable = admitted
+            elif censored:
+                for value in clean:
+                    records.append({
+                        "value": round(max(current[key], value), 4),
+                        "epoch": SEAL_COST_MODEL_EPOCH,
+                        "run_id": run_id,
+                        "at": now,
+                        "revision": revision,
+                        "status": "censored",
+                    })
+                usable = []
+            else:
+                for value in clean:
+                    records.append({
+                        "value": round(value, 4),
+                        "epoch": SEAL_COST_MODEL_EPOCH,
+                        "run_id": run_id,
+                        "at": now,
+                        "revision": revision,
+                        "status": "success",
+                    })
+                usable = clean
+            # Percentile input: current-epoch successful samples ONLY.
+            # Bounded to the sample window on the RECORD list so research
+            # history survives longer than the estimate window.
+            eligible = [
+                record["value"] for record in records
+                if record.get("status") == "success"
+                and record.get("epoch") == SEAL_COST_MODEL_EPOCH]
+            payload[field] = records[-SEAL_COST_SAMPLE_WINDOW * 2:]
+            ordered = sorted(eligible)
+            if ordered:
+                index = min(len(ordered) - 1,
+                            max(0, math.ceil(0.95 * len(ordered)) - 1))
+                payload[key] = round(ordered[index], 4)
+            else:
+                payload[key] = round(
+                    safe_float(stored.get(key), defaults_for(key)), 4)
         payload["last_measured"] = {
             key: round(max(value) if isinstance(value, (list, tuple))
                        else float(value), 4)
@@ -10336,29 +10482,11 @@ class RobinhoodLearningEngine:
         payload["censored"] = bool(censored)
         payload["censored_samples"] = (
             safe_int(stored.get("censored_samples"), 0) + int(censored))
+        payload["stall_samples"] = stall_events
+        payload["revision"] = revision
         if sample_count:
             payload["samples_this_cycle"] = int(sample_count)
 
-        # Derive compatibility scalar fields from the updated samples before
-        # writing them.  Use a small local percentile helper to avoid a second
-        # read/write race through scheduler_state.
-        defaults = {
-            "fixed_observation_cost_p95":
-                SEAL_FIXED_OBSERVATION_COST_SECONDS_DEFAULT,
-            "queue_settlement_p95": QUEUE_SETTLEMENT_COST_SECONDS_DEFAULT,
-            "per_window_cost_p95": SEAL_PER_WINDOW_COST_SECONDS_DEFAULT,
-            "downstream_reserve_p95": DOWNSTREAM_RESERVE_SECONDS_DEFAULT,
-        }
-        for key, field in field_for.items():
-            values = [float(value) for value in payload.get(field, [])]
-            if values:
-                ordered = sorted(values)
-                index = min(len(ordered) - 1,
-                            max(0, math.ceil(0.95 * len(ordered)) - 1))
-                payload[key] = round(ordered[index], 4)
-            else:
-                payload[key] = round(
-                    safe_float(stored.get(key), defaults[key]), 4)
         self.store.set_scheduler_state(SEAL_COST_MODEL_STATE_KEY, payload)
         return self.seal_cost_model()
 
@@ -10367,14 +10495,19 @@ class RobinhoodLearningEngine:
     ) -> float | None:
         """Fold this pass into the two-part model. Returns per-window cost.
 
-        Charged against the per-window phases only. The prefetch batch, the
-        selection query and the queue settlement are FIXED cost -- paid once
-        per cycle whatever the admission count -- so folding them into the
-        per-window figure would make every window look more expensive as the
-        cycle admitted fewer of them: an estimate that gets worse exactly
-        when headroom is tightest.
+        Charged against the per-window phases only. The prefetch batch and
+        the selection query are FIXED cost -- paid once per cycle whatever
+        the admission count -- so folding them into the per-window figure
+        would make every window look more expensive as the cycle admitted
+        fewer of them: an estimate that gets worse exactly when headroom is
+        tightest.
+
+        Queue settlement is tracked as its OWN component
+        (queue_settlement_p95) and deliberately EXCLUDED from fixed cost:
+        admission reserves it separately, and counting it in both places
+        would double-charge the budget by its full amount every cycle.
         """
-        fixed_names = {"selection", "prefetch", "queue_settle"}
+        fixed_names = {"selection", "prefetch"}
         fixed_seconds = sum(
             sum(values) for name, values in phase.items()
             if name in fixed_names)
@@ -10636,6 +10769,10 @@ class RobinhoodLearningEngine:
             run_id=getattr(self, "cycle_run_uuid", None),
             remaining=None if deadline is None else deadline.remaining(),
             completed={}, detail={"head_block": int(head_block)})
+        # Stale-entry expiry runs BEFORE the queue drain: windows past the
+        # near-head overlap can never be sealed honestly, and draining them
+        # first keeps the drain from wasting its limit on dead entries.
+        expired_stale = self.store.expire_stale_seal_queue()
         # Queued first: these are windows an earlier cycle admitted and could
         # not reach. They are older than anything fresh by construction, and
         # they are the ones that age below `floor` and vanish if not drained.
@@ -10753,13 +10890,18 @@ class RobinhoodLearningEngine:
         usable = None
         if deadline is not None:
             headroom = max(0.0, deadline.remaining())
-            usable = max(0.0, headroom - downstream_reserve - fixed_cost)
+            # Queue settlement is reserved SEPARATELY (it has its own
+            # component) -- not folded into fixed cost. Counting it in both
+            # places double-charged the budget by its full amount.
+            usable = max(
+                0.0, headroom - downstream_reserve - settlement_reserve
+                - fixed_cost)
             if usable <= 0 or cost <= 0:
                 admitted = 0
             else:
                 admitted = min(
                     static_limit,
-                    int(usable // max(cost, 0.05)))
+                    max(1, int(usable // max(cost, 0.05))))
         admitted = min(admitted, static_limit)
         deferred = windows[admitted:]
         windows = windows[:admitted]
@@ -10970,6 +11112,7 @@ class RobinhoodLearningEngine:
             # an already-sealed duplicate as a deferral.
             "windows_deferred": len(deferred),
             "windows_queued": queued_now,
+            "windows_expired_stale": expired_stale,
             "seal_queue_backlog": backlog,
             "admission": {
                 "static_limit": static_limit,
@@ -13930,6 +14073,26 @@ def live_lane_reliability_snapshot(
         "all_attempt_p95_seconds": _p95(durations),
         "timeout_count_by_stage": stage_timeouts,
         "timeout_total": sum(stage_timeouts.values()),
+        # THREE-WAY acceptance split (review requirement 6). A cycle ends in
+        # exactly one of: useful completion (a decision was produced),
+        # controlled deferral (the admission controller chose to queue work
+        # and the cycle finished cleanly), or uncontrolled failure
+        # (deadline kill or crash -- no decision, no choice).
+        "useful_completions": statuses.get("complete", 0),
+        "useful_completion_rate": (
+            round(statuses.get("complete", 0) / total, 4) if total else None),
+        "controlled_deferrals": statuses.get("deferred", 0),
+        "controlled_deferral_rate": (
+            round(statuses.get("deferred", 0) / total, 4) if total else None),
+        "uncontrolled_failures": (
+            statuses.get("deadline_exceeded", 0) + statuses.get("failed", 0)
+            + sum(count for status, count in statuses.items()
+                  if status not in {
+                      "complete", "deferred", "running", "deadline_exceeded",
+                      "failed"})),
+        "uncontrolled_failure_rate": None if not total else round(
+            1.0 - (statuses.get("complete", 0) + statuses.get("deferred", 0))
+            / total, 4),
         "controlled_deferral_total": statuses.get("deferred", 0),
         "ingestion_cost_model": {
             "p95_seconds": safe_float(
@@ -13962,6 +14125,9 @@ def live_lane_reliability_snapshot(
                 model.get("per_window_sample_count"), 0),
             "downstream_sample_count": safe_int(
                 model.get("downstream_sample_count"), 0),
+            "epoch": safe_int(model.get("epoch"), 0),
+            "revision": str(model.get("revision") or "unknown"),
+            "stall_samples": safe_int(model.get("stall_samples"), 0),
         },
         "classification_cost_estimate_seconds": safe_float(
             class_cost.get("per_observation_seconds"),
