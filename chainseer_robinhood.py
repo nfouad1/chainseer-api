@@ -137,7 +137,7 @@ MARKS_LANE_BUDGET_SECONDS = 90.0
 #: Every lane, in one place. Three separate hardcoded tuples had already
 #: drifted from the lane configuration once; anything iterating lanes reads
 #: this or the config dict, never its own copy.
-LANE_NAMES = ("live", "marks", "analysis", "backfill")
+LANE_NAMES = ("live", "marks", "evidence", "analysis", "backfill")
 #: How long past its deadline the supervisor lets a lane run before killing
 #: it. A censored attempt is charged deadline + this, so a reliability failure
 #: stays a reliability failure without corrupting the latency SLO.
@@ -145,12 +145,21 @@ LANE_TERMINATION_GRACE_SECONDS = 3.0
 MARKS_LANE_CADENCE_SECONDS = 45.0
 LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
+EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
 LIVE_LANE_SCAN_BLOCKS = 750
 LIVE_LANE_ENRICHMENT_LIMIT = 60
 LIVE_LANE_ENRICHMENT_BUDGET_SECONDS = 6.0
+# Promotion evidence must be prospective, but its remote quotes and outcome
+# observations are not latency-critical.  The live lane therefore commits
+# only bounded metadata while a separate supervised lane owns every remote
+# evidence call.  These limits are throughput bounds, never admission gates.
+EVIDENCE_LANE_CADENCE_SECONDS = 60.0
+EVIDENCE_ENTRY_QUOTE_LIMIT = 8
+EVIDENCE_EVENT_OUTCOME_LIMIT = 12
+EVIDENCE_OBSERVATION_OUTCOME_LIMIT = 12
 # The live lane is for a fresh decision, not historical queue throughput.
 # The first clean 100-attempt cohort completed 100/100, but only 81 decisions
 # landed within 120 blocks because the quote stage handled eight windows. A
@@ -3638,6 +3647,7 @@ class RobinhoodLearningStore:
 
     def capture_flow_signal_events(
         self, head_block: int, now: float, *, ingest_head_block: int | None = None,
+        pool_ids: list[str] | None = None,
     ) -> dict:
         """Freeze current signal rows into immutable prospective observations.
 
@@ -3653,10 +3663,33 @@ class RobinhoodLearningStore:
         controls_created = 0
         historical_created = 0
         stale_arm_created = 0
+        scoped_pool_ids = (
+            None if pool_ids is None else list(dict.fromkeys(
+                str(pool_id) for pool_id in pool_ids if pool_id
+            ))[:100]
+        )
         with self.connection() as connection:
-            rows = [dict(row) for row in connection.execute(
-                "SELECT * FROM flow_signals ORDER BY window_end_block,pool_id"
-            )]
+            if scoped_pool_ids is None:
+                rows = [dict(row) for row in connection.execute(
+                    "SELECT * FROM flow_signals"
+                    " ORDER BY window_end_block,pool_id"
+                )]
+            else:
+                # The live path supplies only pools touched by its near-head
+                # pass.  Scanning the cumulative signal table here would put
+                # historical work back on the critical path and recreate the
+                # coupling the lane split removed.  An empty explicit scope
+                # means no work; it must never fall back to the whole table.
+                if scoped_pool_ids:
+                    placeholders = ",".join("?" * len(scoped_pool_ids))
+                    rows = [dict(row) for row in connection.execute(
+                        "SELECT * FROM flow_signals WHERE pool_id IN ("
+                        + placeholders
+                        + ") ORDER BY window_end_block,pool_id",
+                        scoped_pool_ids,
+                    )]
+                else:
+                    rows = []
             for row in rows:
                 row["qualification_gaps"] = json.loads(
                     row.pop("qualification_gaps_json") or "[]"
@@ -3805,6 +3838,12 @@ class RobinhoodLearningStore:
             "historical_created": historical_created,
             "stale_arm_created": stale_arm_created,
             "head_block": head_block, "cohort_id": cohort_id,
+            "capture_scope": (
+                "all_flow_signals" if pool_ids is None else "touched_pools"
+            ),
+            "capture_scope_pools": (
+                None if scoped_pool_ids is None else len(scoped_pool_ids)
+            ),
         }
 
     def pending_flow_quotes(self, limit: int = 20) -> list[dict]:
@@ -11038,9 +11077,28 @@ class RobinhoodLearningEngine:
         capture = self.store.capture_flow_signal_events(
             head_block, now, ingest_head_block=ingest_head_block,
         )
+        capture.update(self.quote_pending_flow_evidence())
+        return capture
+
+    def quote_pending_flow_evidence(
+        self, *, limit: int = EVIDENCE_ENTRY_QUOTE_LIMIT,
+        deadline: CycleDeadline | None = None,
+    ) -> dict:
+        """Price already-captured events outside the freshness-critical lane.
+
+        Event metadata is committed prospectively by ``run_live_lane``.  The
+        quote is still pinned to the event's immutable window end, so moving
+        this remote call to the evidence lane changes latency ownership, not
+        the evidence being measured.  Pending rows are durable and retryable.
+        """
         quoted = 0
         quote_failures = 0
-        for event in self.store.pending_flow_quotes():
+        selected = self.store.pending_flow_quotes(max(0, int(limit)))
+        deferred = 0
+        for index, event in enumerate(selected):
+            if deadline is not None and deadline.expired():
+                deferred = len(selected) - index
+                break
             candidate = {
                 "pool_id": event["pool_id"],
                 "token_address": event["token_address"],
@@ -11064,11 +11122,17 @@ class RobinhoodLearningEngine:
                 quoted += 1
             else:
                 quote_failures += 1
-        capture.update({"entry_quotes_verified": quoted, "quote_failures": quote_failures})
-        return capture
+        return {
+            "entry_quotes_selected": len(selected),
+            "entry_quotes_verified": quoted,
+            "quote_failures": quote_failures,
+            "entry_quotes_deferred": deferred,
+            "limit": max(0, int(limit)),
+        }
 
     def observe_flow_observation_outcomes(
         self, now: float, limit: int = 40,
+        *, deadline: CycleDeadline | None = None,
     ) -> dict:
         """Resolve due observation horizons against a block-pinned exit quote.
 
@@ -11086,7 +11150,11 @@ class RobinhoodLearningEngine:
         # priced for the position the observation actually claimed.
         due_rows = self.store.due_flow_observation_outcomes(now, limit)
         resolved = non_exitable = failures = 0
-        for due in due_rows:
+        deferred = 0
+        for index, due in enumerate(due_rows):
+            if deadline is not None and deadline.expired():
+                deferred = len(due_rows) - index
+                break
             try:
                 head = int(self.rpc.get_block_number())
             except Exception:
@@ -11126,16 +11194,21 @@ class RobinhoodLearningEngine:
         return {
             "due": len(due_rows), "resolved_this_cycle": resolved,
             "non_exitable_this_cycle": non_exitable, "failures": failures,
-            "limit": limit,
+            "deferred": deferred, "limit": limit,
         }
 
     def observe_flow_evidence_outcomes(
         self, now: float, head_block: int, limit: int = 30,
+        *, deadline: CycleDeadline | None = None,
     ) -> dict:
         due_rows = self.store.due_flow_outcomes(now, limit)
         observed = 0
         non_exitable = 0
-        for due in due_rows:
+        deferred = 0
+        for index, due in enumerate(due_rows):
+            if deadline is not None and deadline.expired():
+                deferred = len(due_rows) - index
+                break
             entry = json.loads(due.get("entry_quote_json") or "{}")
             entry_quote = dict(entry.get("market", {}).get("execution_quote") or {})
             token_decimals = safe_int(entry_quote.get("token_decimals"), 18)
@@ -11164,7 +11237,7 @@ class RobinhoodLearningEngine:
             )
         return {
             "selected": len(due_rows), "observed": observed,
-            "non_exitable": non_exitable,
+            "non_exitable": non_exitable, "deferred": deferred,
         }
 
     def _best_executable_market(self, candidate: dict) -> dict:
@@ -11804,6 +11877,84 @@ class RobinhoodLearningEngine:
 
         return self._execute_lane("marks", budget_seconds, work)
 
+    def run_evidence_lane(
+        self, *, budget_seconds: float = EVIDENCE_LANE_BUDGET_SECONDS,
+        now: float | None = None,
+        entry_quote_limit: int = EVIDENCE_ENTRY_QUOTE_LIMIT,
+        event_outcome_limit: int = EVIDENCE_EVENT_OUTCOME_LIMIT,
+        observation_outcome_limit: int = EVIDENCE_OBSERVATION_OUTCOME_LIMIT,
+    ) -> dict:
+        """Price and follow prospective evidence, never execute positions.
+
+        The split-lane supervisor orphaned these stages in the legacy
+        ``run_once`` path: observations continued for four days while the
+        promotion event ledger stopped at 14 rows.  Fresh event identity is
+        now committed by the live lane; this independently killable lane owns
+        every remote quote and outcome call so a provider stall cannot spend
+        the live lane's 25-second freshness budget.
+        """
+        observed_at = time.time() if now is None else float(now)
+
+        def work(deadline: CycleDeadline) -> dict:
+            timings: dict[str, float] = {}
+            stage = time.monotonic()
+            self.store.mark_lane_stage(
+                "evidence", "entry_quotes", run_id=self.cycle_run_uuid,
+                remaining=deadline.remaining(), completed=dict(timings))
+            with self._rpc_deadline(deadline):
+                entry_quotes = self.quote_pending_flow_evidence(
+                    limit=max(0, int(entry_quote_limit)), deadline=deadline)
+            timings["entry_quotes_seconds"] = round(
+                time.monotonic() - stage, 3)
+
+            stage = time.monotonic()
+            self.store.mark_lane_stage(
+                "evidence", "event_outcomes", run_id=self.cycle_run_uuid,
+                remaining=deadline.remaining(), completed=dict(timings))
+            event_outcomes: dict
+            if deadline.expired():
+                event_outcomes = {
+                    "selected": 0, "observed": 0, "non_exitable": 0,
+                    "deferred": 0, "reason": "deadline_exhausted",
+                }
+            else:
+                with self._rpc_deadline(deadline):
+                    outcome_head = int(self.rpc.get_block_number())
+                    event_outcomes = self.observe_flow_evidence_outcomes(
+                        observed_at, outcome_head,
+                        limit=max(0, int(event_outcome_limit)),
+                        deadline=deadline,
+                    )
+                event_outcomes["head_block"] = outcome_head
+            timings["event_outcomes_seconds"] = round(
+                time.monotonic() - stage, 3)
+
+            stage = time.monotonic()
+            self.store.mark_lane_stage(
+                "evidence", "observation_outcomes",
+                run_id=self.cycle_run_uuid,
+                remaining=deadline.remaining(), completed=dict(timings))
+            with self._rpc_deadline(deadline):
+                observation_outcomes = self.observe_flow_observation_outcomes(
+                    observed_at,
+                    limit=max(0, int(observation_outcome_limit)),
+                    deadline=deadline,
+                )
+            timings["observation_outcomes_seconds"] = round(
+                time.monotonic() - stage, 3)
+            return {
+                "entry_quotes": entry_quotes,
+                "event_outcomes": event_outcomes,
+                "observation_outcomes": observation_outcomes,
+                "stage_timings_seconds": timings,
+                "paper_only": True,
+                "live_execution_enabled": False,
+                "timechain_writer": None,
+                "source": "prospective_flow_evidence",
+            }
+
+        return self._execute_lane("evidence", budget_seconds, work)
+
     def run_live_lane(
         self, *, budget_seconds: float = LIVE_LANE_BUDGET_SECONDS,
         now: float | None = None,
@@ -11822,7 +11973,7 @@ class RobinhoodLearningEngine:
             # Leaving it here would keep an external price API on the path
             # that must stay near the chain head.
             positions = {"delegated_to": "marks_lane"}
-            # Five NON-OVERLAPPING stage clocks. The old `seal_and_fresh_quote`
+            # Six NON-OVERLAPPING stage clocks. The old `seal_and_fresh_quote`
             # clock started before sealing and stopped after classification,
             # so sealing's overrun was booked to whichever stage followed it
             # and no single number could be compared against an estimate.
@@ -12015,6 +12166,26 @@ class RobinhoodLearningEngine:
                 time.monotonic() - stage, 3)
             stage = time.monotonic()
             self.store.mark_lane_stage(
+                "live", "flow_evidence_capture",
+                run_id=self.cycle_run_uuid,
+                remaining=deadline.remaining(), completed=dict(timings),
+                detail={"touched_pools": len(touched)},
+            )
+            # Prospective identity belongs at decision time.  Only bounded
+            # SQLite metadata for pools touched by this near-head pass is
+            # committed here: no Timechain call and no remote quote/outcome
+            # call is allowed on the live path.  The evidence lane prices and
+            # follows these durable events asynchronously.
+            flow_evidence_capture = self.store.capture_flow_signal_events(
+                decision_head, time.time(),
+                ingest_head_block=int(near_head.get("to_block") or 0) or None,
+                pool_ids=touched,
+            )
+            flow_evidence_capture["remote_work_delegated_to"] = "evidence_lane"
+            timings["flow_evidence_capture_seconds"] = round(
+                time.monotonic() - stage, 3)
+            stage = time.monotonic()
+            self.store.mark_lane_stage(
                 "live", "classification", run_id=self.cycle_run_uuid,
                 remaining=deadline.remaining(), completed=dict(timings))
             # Admission controller: classify only what safely fits the
@@ -12060,6 +12231,7 @@ class RobinhoodLearningEngine:
                 timings["head_ingestion_and_identity_seconds"],
                 timings["fresh_quote_and_observation_seconds"],
                 timings["decision_head_seconds"],
+                timings["flow_evidence_capture_seconds"],
                 timings["classification_seconds"],
                 timings["ledger_append_seconds"],
             ]), 3)
@@ -12068,6 +12240,7 @@ class RobinhoodLearningEngine:
             # estimate the next cycle's admission will subtract.
             self.record_downstream_reserve(
                 timings["decision_head_seconds"]
+                + timings["flow_evidence_capture_seconds"]
                 + timings["classification_seconds"]
                 + timings["ledger_append_seconds"])
             quote_delay = timings["seal_and_fresh_quote"]
@@ -12079,6 +12252,7 @@ class RobinhoodLearningEngine:
                 "near_head_flow": near_head,
                 "observation_seal": observation,
                 "classification": classification,
+                "flow_evidence_capture": flow_evidence_capture,
                 "ingestion_to_fresh_quote_seconds": quote_delay,
                 "stage_timings_seconds": timings,
                 "cursor": read_json(
@@ -13118,6 +13292,7 @@ def supervise_lanes(
     market_recheck_limit: int,
     live_cadence_seconds: float = LIVE_LANE_CADENCE_SECONDS,
     marks_cadence_seconds: float = MARKS_LANE_CADENCE_SECONDS,
+    evidence_cadence_seconds: float = EVIDENCE_LANE_CADENCE_SECONDS,
     analysis_cadence_seconds: float = ANALYSIS_LANE_CADENCE_SECONDS,
     backfill_cadence_seconds: float = BACKFILL_LANE_CADENCE_SECONDS,
 ) -> dict:
@@ -13143,6 +13318,12 @@ def supervise_lanes(
             "command": "marks-once",
             "cadence": max(15.0, marks_cadence_seconds),
             "budget": MARKS_LANE_BUDGET_SECONDS, "next": started_mono + 1.5,
+        },
+        "evidence": {
+            "command": "evidence-once",
+            "cadence": max(30.0, evidence_cadence_seconds),
+            "budget": EVIDENCE_LANE_BUDGET_SECONDS,
+            "next": started_mono + 2.25,
         },
         "analysis": {
             "command": "analysis-once",
@@ -14040,7 +14221,8 @@ def main() -> None:
     parser.add_argument(
         "command",
         choices=(
-            "learn-once", "marks-once","live-once", "analysis-once", "backfill-once",
+            "learn-once", "marks-once", "live-once", "evidence-once",
+            "analysis-once", "backfill-once",
             "lanes", "status", "dashboard", "verify", "reflect",
             "audit", "repair-outcomes",
         ),
@@ -14048,6 +14230,9 @@ def main() -> None:
     parser.add_argument(
         "--marks-cadence-seconds", type=float,
         default=MARKS_LANE_CADENCE_SECONDS)
+    parser.add_argument(
+        "--evidence-cadence-seconds", type=float,
+        default=EVIDENCE_LANE_CADENCE_SECONDS)
     parser.add_argument("--root",default=DEFAULT_ROOT)
     parser.add_argument("--host",default="127.0.0.1")
     parser.add_argument("--port",type=int,default=DEFAULT_DASHBOARD_PORT)
@@ -14109,6 +14294,9 @@ def main() -> None:
             marks_cadence_seconds=max(
                 15.0, getattr(args, "marks_cadence_seconds", None)
                 or MARKS_LANE_CADENCE_SECONDS),
+            evidence_cadence_seconds=max(
+                30.0, getattr(args, "evidence_cadence_seconds", None)
+                or EVIDENCE_LANE_CADENCE_SECONDS),
             analysis_cadence_seconds=max(30.0, args.analysis_cadence_seconds),
             backfill_cadence_seconds=max(60.0, args.backfill_cadence_seconds),
         )
@@ -14158,6 +14346,12 @@ def main() -> None:
         summary = engine.run_live_lane(
             budget_seconds=max(
                 5.0, args.lane_budget_seconds or LIVE_LANE_BUDGET_SECONDS))
+        print(json.dumps(summary, indent=2)); return
+    if args.command=="evidence-once":
+        summary = engine.run_evidence_lane(
+            budget_seconds=max(
+                30.0, args.lane_budget_seconds
+                or EVIDENCE_LANE_BUDGET_SECONDS))
         print(json.dumps(summary, indent=2)); return
     if args.command=="analysis-once":
         summary = engine.run_analysis_lane(

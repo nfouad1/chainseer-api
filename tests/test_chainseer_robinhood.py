@@ -3322,6 +3322,46 @@ class FlowEvidenceEndToEndTests(unittest.TestCase):
                 self.assertEqual(row["freshness"], "historical")
                 self.assertFalse(row["eligible_for_evaluation"])
 
+    def test_live_capture_is_bounded_to_the_explicit_touched_pools(self):
+        """A live capture must not scan or emit cumulative historical rows."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            control = "0x" + "dd" * 32
+            excluded = "0x" + "ff" * 32
+            self._signal(store, self.POOL, qualified=True,
+                         end_block=self.HEAD - 10, score=75.0)
+            self._signal(store, control, qualified=False,
+                         end_block=self.HEAD - 12, score=30.0)
+            self._signal(store, excluded, qualified=True,
+                         end_block=self.HEAD - 8, score=80.0)
+
+            captured = store.capture_flow_signal_events(
+                self.HEAD, now=1_000.0,
+                pool_ids=[self.POOL, control],
+            )
+            with store.connection() as connection:
+                pools = {
+                    row[0] for row in connection.execute(
+                        "SELECT pool_id FROM flow_signal_events")
+                }
+            self.assertEqual(captured["capture_scope"], "touched_pools")
+            self.assertEqual(captured["capture_scope_pools"], 2)
+            self.assertIn(self.POOL, pools)
+            self.assertIn(control, pools)
+            self.assertNotIn(excluded, pools)
+
+    def test_an_empty_explicit_capture_scope_does_not_fall_back_to_all(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._signal(store, self.POOL, qualified=True,
+                         end_block=self.HEAD - 10, score=75.0)
+            captured = store.capture_flow_signal_events(
+                self.HEAD, now=1_000.0, pool_ids=[])
+            self.assertEqual(captured["created"], 0)
+            with store.connection() as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM flow_signal_events").fetchone()[0], 0)
+
 
 class NearHeadFlowPassTests(unittest.TestCase):
     """Flow windows must end near the chain head to be prospective at all.
@@ -7047,6 +7087,60 @@ class LaneSplitTests(unittest.TestCase):
             "the marks lane must not do chain ingestion either",
         )
 
+    def test_live_commits_only_bounded_evidence_metadata(self):
+        source = inspect.getsource(rh.RobinhoodLearningEngine.run_live_lane)
+        self.assertIn("capture_flow_signal_events", source)
+        self.assertIn("pool_ids=touched", source)
+        self.assertIn("remote_work_delegated_to", source)
+        self.assertNotIn("quote_pending_flow_evidence", source)
+        self.assertNotIn("observe_flow_evidence_outcomes", source)
+        self.assertNotIn("observe_flow_observation_outcomes", source)
+
+    def test_evidence_lane_owns_remote_quotes_and_both_outcome_streams(self):
+        source = inspect.getsource(rh.RobinhoodLearningEngine.run_evidence_lane)
+        for call in (
+            "quote_pending_flow_evidence",
+            "observe_flow_evidence_outcomes",
+            "observe_flow_observation_outcomes",
+        ):
+            self.assertIn(call, source)
+        self.assertNotIn("capture_flow_signal_events", source)
+
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=50_000_000),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            calls = []
+            engine.quote_pending_flow_evidence = lambda **kwargs: (
+                calls.append("quotes") or {
+                    "entry_quotes_selected": 0,
+                    "entry_quotes_verified": 0,
+                    "quote_failures": 0,
+                    "entry_quotes_deferred": 0,
+                }
+            )
+            engine.observe_flow_evidence_outcomes = lambda *args, **kwargs: (
+                calls.append("events") or {
+                    "selected": 0, "observed": 0,
+                    "non_exitable": 0, "deferred": 0,
+                }
+            )
+            engine.observe_flow_observation_outcomes = (
+                lambda *args, **kwargs: (
+                    calls.append("observations") or {
+                        "due": 0, "resolved_this_cycle": 0,
+                        "non_exitable_this_cycle": 0,
+                        "failures": 0, "deferred": 0,
+                    }
+                )
+            )
+            result = engine.run_evidence_lane(budget_seconds=30.0)
+            self.assertEqual(result["status"], "complete")
+            self.assertEqual(calls, ["quotes", "events", "observations"])
+            self.assertTrue(result["paper_only"])
+            self.assertFalse(result["live_execution_enabled"])
+            self.assertIsNone(result["timechain_writer"])
+
     def test_marking_has_its_own_lane_and_budget(self):
         self.assertGreater(
             rh.MARKS_LANE_BUDGET_SECONDS, rh.LIVE_LANE_BUDGET_SECONDS,
@@ -7142,6 +7236,13 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         self.assertGreater(rh.MARKS_LANE_BUDGET_SECONDS, 0)
         self.assertGreater(rh.MARKS_LANE_CADENCE_SECONDS, 0)
         self.assertTrue(hasattr(rh.RobinhoodLearningEngine, "run_marks_lane"))
+
+    def test_evidence_is_a_real_lane_with_its_own_budget_and_cadence(self):
+        self.assertIn("evidence", rh.LANE_NAMES)
+        self.assertGreater(rh.EVIDENCE_LANE_BUDGET_SECONDS, 0)
+        self.assertGreater(rh.EVIDENCE_LANE_CADENCE_SECONDS, 0)
+        self.assertTrue(hasattr(
+            rh.RobinhoodLearningEngine, "run_evidence_lane"))
 
 
 def _utc_now_iso():
@@ -7351,10 +7452,10 @@ class StageHeadroomIntegrationTests(unittest.TestCase):
 
     def test_every_live_call_site_supplies_the_new_arguments(self):
         source = inspect.getsource(rh.RobinhoodLearningEngine.run_live_lane)
-        self.assertEqual(source.count("mark_lane_stage"), 4)
-        self.assertEqual(source.count("run_id=self.cycle_run_uuid"), 4)
-        self.assertEqual(source.count("remaining=deadline.remaining()"), 4)
-        self.assertEqual(source.count("completed=dict(timings)"), 4)
+        self.assertEqual(source.count("mark_lane_stage"), 5)
+        self.assertEqual(source.count("run_id=self.cycle_run_uuid"), 5)
+        self.assertEqual(source.count("remaining=deadline.remaining()"), 5)
+        self.assertEqual(source.count("completed=dict(timings)"), 5)
 
 
 class DashboardLaneElementTests(unittest.TestCase):

@@ -168,7 +168,7 @@ def lane_state(store, lane="live"):
 
 
 class StageTimingBoundaryTests(unittest.TestCase):
-    """Requirement 1: five disjoint clocks, and the deprecated total derived."""
+    """Requirement 1: disjoint clocks, and the deprecated total derived."""
 
     def test_stage_timings_are_disjoint_and_total_is_derived(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -181,23 +181,24 @@ class StageTimingBoundaryTests(unittest.TestCase):
                 "touched_pool_ids": [POOL_ID]}
             summary = engine.run_live_lane(budget_seconds=25.0)
             timings = summary["stage_timings_seconds"]
-            five = [
+            stages = [
                 "head_ingestion_and_identity_seconds",
                 "fresh_quote_and_observation_seconds",
-                "decision_head_seconds", "classification_seconds",
+                "decision_head_seconds", "flow_evidence_capture_seconds",
+                "classification_seconds",
                 "ledger_append_seconds",
             ]
-            for key in five:
+            for key in stages:
                 self.assertIn(key, timings)
                 self.assertGreaterEqual(timings[key], 0.0)
-            # Derived total equals the sum of the five -- it cannot
+            # Derived total equals the sum of the disjoint stages -- it cannot
             # double-count stages the way the old measured clock did.
             self.assertTrue(timings["seal_and_fresh_quote_is_derived_total"])
             self.assertEqual(
                 timings["seal_and_fresh_quote"],
-                round(sum(timings[key] for key in five), 3))
+                round(sum(timings[key] for key in stages), 3))
             # Each stage's clock starts only when the previous ended, so the
-            # sum of five covers the whole lane body: nothing else ran.
+            # sum covers the whole lane body: nothing else ran.
             self.assertLessEqual(
                 timings["seal_and_fresh_quote"],
                 summary["duration_seconds"] + 0.05)
