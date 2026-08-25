@@ -302,20 +302,20 @@ FLOW_IDENTITY_STAGE_BUDGET_SECONDS = 60.0
 FLOW_ORIGIN_MAXIMUM_ATTEMPTS = 3
 FLOW_MINIMUM_IDENTITY_COVERAGE = 0.80
 FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS = 120
-# Cohort 4 separated wall-clock latency from chain-time freshness: 99 of 100
-# attempts completed with a 16.219s p95, yet three otherwise-complete attempts
-# landed 121-149 blocks behind the observation head. Their post-enrichment
-# path consumed as many as 55 blocks. Reserve that measured tail before
-# starting optional origin enrichment; the public 120-block decision gate is
-# deliberately unchanged.
-FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS = 55
+# Cohort 5 proved that the Cohort 4 reserve was not conservative enough across
+# chain conditions: the post-ingestion tail reached 67 blocks at p99/max.
+# Reserve that measured tail before optional origin enrichment; the public
+# 120-block decision gate is deliberately unchanged.
+FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS = 67
 FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS = (
     FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
     - FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS
 )
 # A rate floor prevents a quiet first few seconds from making the plan
-# optimistic. The live cohorts have been near ten blocks/second.
-FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND = 8.0
+# optimistic. Cohort 5's enrichment-rate LOWER BOUND was 18.51 blocks/s at
+# p95 and 20.11 at max (using the admitted budget as the denominator, which
+# can only understate the real rate). Round upward rather than fitting it.
+FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND = 20.5
 # A first origin batch has no local cost history. Cohort 4 observed a 2.156s
 # maximum batch, so a smaller allowance cannot honestly claim to bound it.
 FLOW_MINIMUM_FIRST_ORIGIN_BATCH_SECONDS = 2.25
@@ -9672,6 +9672,8 @@ class RobinhoodLearningEngine:
         resolved = unavailable = failures = affected_pools = attempted = 0
         deadline_stops = 0
         batch_seconds = 0.0
+        remote_seconds = 0.0
+        commit_seconds = 0.0
         for offset in range(0, len(hashes), FLOW_ORIGIN_BATCH_SIZE):
             if deadline_monotonic is not None:
                 remaining = deadline_monotonic - time.monotonic()
@@ -9697,13 +9699,24 @@ class RobinhoodLearningEngine:
                 # near_head_commit deferral after ingestion exceeded its p95.
                 observed = time.monotonic() - batch_started
                 batch_seconds = max(observed, batch_seconds * 0.5)
+                remote_seconds = max(observed, remote_seconds * 0.5)
                 failures += len(chunk)
                 continue
-            # Exponential-ish tracking: react to a slow batch immediately,
-            # decay back down as fast batches follow.
+            remote_observed = time.monotonic() - batch_started
+            commit_started = time.monotonic()
+            result = self.store.record_transaction_origins(records)
+            commit_observed = time.monotonic() - commit_started
+            # The scheduled unit is RPC PLUS the database write and flow
+            # recomputation. Cohort 5 showed the old clock stopped before
+            # record_transaction_origins: admission priced only the remote
+            # call, started another batch, then 34/100 cycles expired at
+            # near_head_commit while unmeasured commit work consumed the
+            # child deadline. Track the complete atomic unit, while retaining
+            # its substages so future diagnosis cannot repeat that mistake.
             observed = time.monotonic() - batch_started
             batch_seconds = max(observed, batch_seconds * 0.5)
-            result = self.store.record_transaction_origins(records)
+            remote_seconds = max(remote_observed, remote_seconds * 0.5)
+            commit_seconds = max(commit_observed, commit_seconds * 0.5)
             resolved += result["resolved"]
             unavailable += result["unavailable"]
             affected_pools += result["affected_pools"]
@@ -9713,6 +9726,8 @@ class RobinhoodLearningEngine:
             "affected_pools": affected_pools,
             "stopped_at_deadline": deadline_stops,
             "observed_batch_seconds": round(batch_seconds, 3),
+            "observed_remote_seconds": round(remote_seconds, 3),
+            "observed_commit_seconds": round(commit_seconds, 3),
         }
 
     def _near_head_logs(
@@ -9805,6 +9820,8 @@ class RobinhoodLearningEngine:
             "affected_pools": batch["affected_pools"],
             "stopped_at_deadline": batch["stopped_at_deadline"],
             "observed_batch_seconds": batch["observed_batch_seconds"],
+            "observed_remote_seconds": batch["observed_remote_seconds"],
+            "observed_commit_seconds": batch["observed_commit_seconds"],
             "window_fully_enriched": bool(
                 not truncated and batch["attempted"] == len(selected)
                 and not batch["failures"]

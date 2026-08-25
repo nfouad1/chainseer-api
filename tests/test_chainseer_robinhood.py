@@ -3426,14 +3426,14 @@ class NearHeadFlowPassTests(unittest.TestCase):
     def test_enrichment_admission_reserves_downstream_block_tail(self):
         plan = rh.RobinhoodLearningEngine.near_head_enrichment_admission(
             observation_head=1_000,
-            current_head=1_040,
+            current_head=1_000,
             elapsed_seconds=5.0,
             configured_seconds=6.0,
         )
-        self.assertEqual(plan["head_lag_blocks"], 40)
-        self.assertEqual(plan["remaining_preseal_blocks"], 25)
-        self.assertEqual(plan["planning_blocks_per_second"], 8.0)
-        self.assertEqual(plan["admitted_seconds"], 3.125)
+        self.assertEqual(plan["head_lag_blocks"], 0)
+        self.assertEqual(plan["remaining_preseal_blocks"], 53)
+        self.assertEqual(plan["planning_blocks_per_second"], 20.5)
+        self.assertEqual(plan["admitted_seconds"], 2.585)
         self.assertEqual(plan["reason"], "block_budget_capped")
         self.assertEqual(
             plan["preseal_lag_limit_blocks"]
@@ -3444,11 +3444,11 @@ class NearHeadFlowPassTests(unittest.TestCase):
     def test_enrichment_admission_skips_an_unbounded_first_batch(self):
         plan = rh.RobinhoodLearningEngine.near_head_enrichment_admission(
             observation_head=1_000,
-            current_head=1_060,
+            current_head=1_040,
             elapsed_seconds=6.0,
             configured_seconds=6.0,
         )
-        self.assertEqual(plan["raw_block_budget_seconds"], 0.5)
+        self.assertEqual(plan["raw_block_budget_seconds"], 0.634)
         self.assertEqual(plan["admitted_seconds"], 0.0)
         self.assertEqual(plan["reason"], "insufficient_first_batch_headroom")
 
@@ -3970,6 +3970,28 @@ class IdentityDeadlineTests(unittest.TestCase):
             self.assertEqual(result["stopped_at_deadline"], 1)
             self.assertGreaterEqual(result["observed_batch_seconds"], 0.18)
 
+    def test_successful_batch_cost_includes_commit_and_recompute(self):
+        """Admission must price the whole unit, not stop its clock at RPC."""
+        with tempfile.TemporaryDirectory() as directory:
+            rpc = self.SlowRPC(seconds_per_batch=0.01)
+            engine = self._engine(directory, rpc)
+
+            def slow_commit(_records):
+                time.sleep(0.2)
+                return {"resolved": 0, "unavailable": 0, "affected_pools": 0}
+
+            engine.store.record_transaction_origins = slow_commit
+            result = engine._resolve_origin_batches(
+                [f"0xcommit{index:04d}" for index in range(50)],
+                time.monotonic() + 0.3,
+            )
+            self.assertEqual(rpc.batches, 1)
+            self.assertEqual(result["attempted"], rh.FLOW_ORIGIN_BATCH_SIZE)
+            self.assertEqual(result["stopped_at_deadline"], 1)
+            self.assertGreaterEqual(result["observed_batch_seconds"], 0.20)
+            self.assertGreaterEqual(result["observed_commit_seconds"], 0.18)
+            self.assertLess(result["observed_remote_seconds"], 0.10)
+
     def test_near_head_enrichment_exposes_cost_and_deferred_work(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = self._engine(directory, self.SlowRPC())
@@ -3984,6 +4006,8 @@ class IdentityDeadlineTests(unittest.TestCase):
                 "affected_pools": 0,
                 "stopped_at_deadline": 1,
                 "observed_batch_seconds": 0.234,
+                "observed_remote_seconds": 0.123,
+                "observed_commit_seconds": 0.111,
             }
             result = engine.enrich_near_head_window([
                 {"transaction_hash": "0x01"},
@@ -3992,6 +4016,7 @@ class IdentityDeadlineTests(unittest.TestCase):
             ])
             self.assertEqual(result["deferred_for_deadline"], 2)
             self.assertEqual(result["observed_batch_seconds"], 0.234)
+            self.assertEqual(result["observed_commit_seconds"], 0.111)
             self.assertFalse(result["window_fully_enriched"])
 
 
