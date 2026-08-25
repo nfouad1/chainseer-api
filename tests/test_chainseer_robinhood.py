@@ -3418,9 +3418,49 @@ class NearHeadFlowPassTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             rpc = self.HeadRPC(1_000_000, advance=7)
             result = self._engine(directory, rpc).near_head_flow_pass()
-            self.assertEqual(result["head_block_after"], 1_000_007)
-            self.assertEqual(result["elapsed_blocks"], 7)
+            self.assertEqual(result["head_block_before_enrichment"], 1_000_007)
+            self.assertEqual(result["head_block_after"], 1_000_014)
+            self.assertEqual(result["elapsed_blocks"], 14)
             self.assertTrue(result["within_prospective_bound"])
+
+    def test_enrichment_admission_reserves_downstream_block_tail(self):
+        plan = rh.RobinhoodLearningEngine.near_head_enrichment_admission(
+            observation_head=1_000,
+            current_head=1_040,
+            elapsed_seconds=5.0,
+            configured_seconds=6.0,
+        )
+        self.assertEqual(plan["head_lag_blocks"], 40)
+        self.assertEqual(plan["remaining_preseal_blocks"], 25)
+        self.assertEqual(plan["planning_blocks_per_second"], 8.0)
+        self.assertEqual(plan["admitted_seconds"], 3.125)
+        self.assertEqual(plan["reason"], "block_budget_capped")
+        self.assertEqual(
+            plan["preseal_lag_limit_blocks"]
+            + plan["downstream_reserve_blocks"],
+            rh.FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
+        )
+
+    def test_enrichment_admission_skips_an_unbounded_first_batch(self):
+        plan = rh.RobinhoodLearningEngine.near_head_enrichment_admission(
+            observation_head=1_000,
+            current_head=1_060,
+            elapsed_seconds=6.0,
+            configured_seconds=6.0,
+        )
+        self.assertEqual(plan["raw_block_budget_seconds"], 0.5)
+        self.assertEqual(plan["admitted_seconds"], 0.0)
+        self.assertEqual(plan["reason"], "insufficient_first_batch_headroom")
+
+    def test_enrichment_admission_fails_closed_without_a_current_head(self):
+        plan = rh.RobinhoodLearningEngine.near_head_enrichment_admission(
+            observation_head=1_000,
+            current_head=None,
+            elapsed_seconds=4.0,
+            configured_seconds=6.0,
+        )
+        self.assertEqual(plan["admitted_seconds"], 0.0)
+        self.assertEqual(plan["reason"], "current_head_unavailable")
 
     def test_a_slow_pass_reports_itself_out_of_bound(self):
         with tempfile.TemporaryDirectory() as directory:

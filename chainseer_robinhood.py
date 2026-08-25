@@ -302,6 +302,23 @@ FLOW_IDENTITY_STAGE_BUDGET_SECONDS = 60.0
 FLOW_ORIGIN_MAXIMUM_ATTEMPTS = 3
 FLOW_MINIMUM_IDENTITY_COVERAGE = 0.80
 FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS = 120
+# Cohort 4 separated wall-clock latency from chain-time freshness: 99 of 100
+# attempts completed with a 16.219s p95, yet three otherwise-complete attempts
+# landed 121-149 blocks behind the observation head. Their post-enrichment
+# path consumed as many as 55 blocks. Reserve that measured tail before
+# starting optional origin enrichment; the public 120-block decision gate is
+# deliberately unchanged.
+FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS = 55
+FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS = (
+    FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+    - FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS
+)
+# A rate floor prevents a quiet first few seconds from making the plan
+# optimistic. The live cohorts have been near ten blocks/second.
+FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND = 8.0
+# A first origin batch has no local cost history. Cohort 4 observed a 2.156s
+# maximum batch, so a smaller allowance cannot honestly claim to bound it.
+FLOW_MINIMUM_FIRST_ORIGIN_BATCH_SECONDS = 2.25
 # Enrichment targeting is a SEPARATE bound from decision freshness. Applying
 # the 120-block decision bound to a pool's last swap matched 1 of 1,895 pools,
 # because these pools trade a few times per 1,350 blocks -- so the prospective
@@ -9794,6 +9811,75 @@ class RobinhoodLearningEngine:
             ),
         }
 
+    @staticmethod
+    def near_head_enrichment_admission(
+        *, observation_head: int, current_head: int | None,
+        elapsed_seconds: float, configured_seconds: float,
+    ) -> dict:
+        """Plan optional enrichment in block-time, failing closed on doubt.
+
+        A seconds-only budget cannot protect a block-based freshness covenant:
+        Cohort 4 completed quickly but missed freshness when block production
+        accelerated. This plan reserves the measured downstream block tail,
+        estimates the rate already observed in the pass, and admits enrichment
+        only when at least one empirically bounded first batch fits.
+        """
+        configured = max(0.0, float(configured_seconds))
+        elapsed = max(0.001, float(elapsed_seconds))
+        if current_head is None:
+            return {
+                "admitted_seconds": 0.0,
+                "configured_seconds": round(configured, 3),
+                "reason": "current_head_unavailable",
+                "observation_head": int(observation_head),
+                "current_head": None,
+                "head_lag_blocks": None,
+                "observed_blocks_per_second": None,
+                "planning_blocks_per_second": (
+                    FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND),
+                "preseal_lag_limit_blocks": (
+                    FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS),
+                "downstream_reserve_blocks": (
+                    FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS),
+            }
+        lag = max(0, int(current_head) - int(observation_head))
+        observed_rate = lag / elapsed
+        planning_rate = max(
+            FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND, observed_rate)
+        remaining_blocks = max(
+            0, FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS - lag)
+        raw_seconds = remaining_blocks / planning_rate
+        bounded_seconds = min(configured, raw_seconds)
+        if lag >= FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS:
+            admitted = 0.0
+            reason = "preseal_headroom_exhausted"
+        elif bounded_seconds < FLOW_MINIMUM_FIRST_ORIGIN_BATCH_SECONDS:
+            admitted = 0.0
+            reason = "insufficient_first_batch_headroom"
+        else:
+            admitted = bounded_seconds
+            reason = (
+                "configured_budget_admitted"
+                if admitted >= configured
+                else "block_budget_capped"
+            )
+        return {
+            "admitted_seconds": round(admitted, 3),
+            "raw_block_budget_seconds": round(raw_seconds, 3),
+            "configured_seconds": round(configured, 3),
+            "reason": reason,
+            "observation_head": int(observation_head),
+            "current_head": int(current_head),
+            "head_lag_blocks": lag,
+            "remaining_preseal_blocks": remaining_blocks,
+            "observed_blocks_per_second": round(observed_rate, 3),
+            "planning_blocks_per_second": round(planning_rate, 3),
+            "preseal_lag_limit_blocks": FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS,
+            "downstream_reserve_blocks": FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS,
+            "minimum_first_batch_seconds": (
+                FLOW_MINIMUM_FIRST_ORIGIN_BATCH_SECONDS),
+        }
+
     def near_head_flow_pass(
         self, *, deadline: CycleDeadline | None = None,
         cursor_name: str = "near_head_cursor.json",
@@ -9988,10 +10074,22 @@ class RobinhoodLearningEngine:
         # record_transaction_origins recomputes it again with the real ones, so
         # the seal that follows carries the identity evidence that actually
         # existed at observation time.
+        try:
+            head_before_enrichment = int(self.rpc.get_block_number())
+        except Exception:
+            head_before_enrichment = None
+        freshness_admission = self.near_head_enrichment_admission(
+            observation_head=head,
+            current_head=head_before_enrichment,
+            elapsed_seconds=time.monotonic() - started,
+            configured_seconds=enrichment_budget_seconds,
+        )
         enrichment = self.enrich_near_head_window(
             events, limit=enrichment_limit,
-            budget_seconds=enrichment_budget_seconds, deadline=deadline,
+            budget_seconds=freshness_admission["admitted_seconds"],
+            deadline=deadline,
         )
+        enrichment["freshness_admission"] = freshness_admission
         if deadline is not None:
             deadline.raise_if_expired("near_head_commit")
         atomic_json_write(cursor_path, {"last_scanned_block": int(head)})
@@ -10018,6 +10116,7 @@ class RobinhoodLearningEngine:
             # Attributed to THIS pass's pools, never read off the whole table.
             "window_coverage": self.store.flow_window_coverage(touched),
             "enrichment": enrichment,
+            "head_block_before_enrichment": head_before_enrichment,
             "head_block_after": head_after,
             "elapsed_blocks": max(0, head_after - head),
             "duration_seconds": round(time.monotonic() - started, 3),
