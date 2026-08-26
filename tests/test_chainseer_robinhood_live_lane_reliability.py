@@ -318,6 +318,59 @@ class IngestionAdmissionTests(unittest.TestCase):
                 summary["observation_seal"]["reason"],
                 "insufficient_observation_headroom")
 
+    def test_decision_head_without_reserved_tail_is_controlled_deferral(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            engine = make_engine(root, store)
+            engine.ingestion_tail_reserve = lambda: 0.1
+            engine.near_head_flow_pass = lambda **_kwargs: {
+                "supported": True, "scanned": True, "to_block": HEAD,
+                "touched_pool_ids": [POOL_ID]}
+            engine.seal_cost_model = lambda: {
+                "fixed_observation_cost_p95": 0.0,
+                "queue_settlement_p95": 0.0,
+                "per_window_cost_p95": 1.0,
+                "downstream_reserve_p95": 5.0,
+            }
+
+            def consume_tail(*_args, **_kwargs):
+                time.sleep(1.2)
+                return {"observation_ids": ["durable-observation"],
+                        "sealed_this_cycle": 1}
+
+            engine.seal_near_head_observations = consume_tail
+            engine.rpc.get_block_number = lambda: self.fail(
+                "decision-head RPC must not start without its reserved tail")
+            summary = engine.run_live_lane(budget_seconds=6.0)
+            self.assertEqual(summary["status"], "deferred")
+            self.assertEqual(summary["deferral_stage"], "decision_head")
+            self.assertEqual(
+                summary["deferral_reason"],
+                "insufficient_decision_head_headroom")
+            self.assertEqual(
+                summary["classification"]["scoped_rows_deferred"], 1)
+
+    def test_decision_head_transport_failure_is_infrastructure_deferral(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            engine = make_engine(root, store)
+            engine.ingestion_tail_reserve = lambda: 0.1
+            engine.near_head_flow_pass = lambda **_kwargs: {
+                "supported": True, "scanned": True, "to_block": HEAD,
+                "touched_pool_ids": []}
+            engine.seal_near_head_observations = lambda *_a, **_k: {
+                "observation_ids": [], "sealed_this_cycle": 0}
+            engine.rpc.get_block_number = lambda: (_ for _ in ()).throw(
+                rh.RPCError("synthetic timeout", -2))
+            summary = engine.run_live_lane(budget_seconds=12.0)
+            self.assertEqual(summary["status"], "deferred")
+            self.assertTrue(summary["infrastructure_indeterminate"])
+            self.assertEqual(
+                summary["deferral_reason"],
+                "decision_head_infrastructure_indeterminate")
+
 
 class SupervisorPriorityTests(unittest.TestCase):
     """Background startup must yield around the live cadence."""

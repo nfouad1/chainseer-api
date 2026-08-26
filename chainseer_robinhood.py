@@ -45,6 +45,7 @@ from chainseer import (
     UNISWAP_V4_POOL_MANAGER,
     WETH_ADDRESS,
     Chainseer,
+    RPCError,
     RobinhoodRPC,
     _load_timechain_module,
     ensure_utf8_runtime,
@@ -12611,8 +12612,51 @@ class RobinhoodLearningEngine:
             self.store.mark_lane_stage(
                 "live", "decision_head", run_id=self.cycle_run_uuid,
                 remaining=deadline.remaining(), completed=dict(timings))
-            with self._rpc_deadline(deadline):
-                decision_head = int(self.rpc.get_block_number())
+
+            def defer_decision_head(
+                reason: str, *, infrastructure_indeterminate: bool = False,
+                error: str | None = None,
+            ) -> dict:
+                timings["decision_head_seconds"] = round(
+                    time.monotonic() - stage, 3)
+                return {
+                    "controlled_deferral": True,
+                    "deferral_stage": "decision_head",
+                    "deferral_reason": reason,
+                    "infrastructure_indeterminate":
+                        bool(infrastructure_indeterminate),
+                    "infrastructure_error": error,
+                    "position_evaluations": positions,
+                    "ingestion_admission": ingestion_admission,
+                    "near_head_flow": near_head,
+                    "observation_seal": observation,
+                    "classification": {
+                        "scoped_rows_selected": 0,
+                        "scoped_rows_processed": 0,
+                        "scoped_rows_deferred": len(
+                            observation.get("observation_ids") or []),
+                    },
+                    "stage_timings_seconds": timings,
+                    "cursor": read_json(
+                        self.root / "live_lane_cursor.json", {}) or {},
+                    "backlog": self.store.backfill_backlog(),
+                    "no_historical_scanning": True,
+                }
+
+            decision_head_remaining = deadline.remaining()
+            if decision_head_remaining <= LIVE_LANE_DECISION_RESERVE_SECONDS:
+                return defer_decision_head(
+                    "insufficient_decision_head_headroom")
+            try:
+                with self._rpc_deadline(deadline):
+                    decision_head = int(self.rpc.get_block_number())
+            except RPCError as exc:
+                # A transport failure says nothing about token safety.  The
+                # observation is already durable; leave it unclassified and
+                # retry against an authoritative head in a later cycle.
+                return defer_decision_head(
+                    "decision_head_infrastructure_indeterminate",
+                    infrastructure_indeterminate=True, error=str(exc))
             timings["decision_head_seconds"] = round(
                 time.monotonic() - stage, 3)
             stage = time.monotonic()
