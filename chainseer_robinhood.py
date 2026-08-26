@@ -235,6 +235,8 @@ SEAL_COST_MODEL_EPOCH = 3
 #: Code revision stamped onto every timing sample for provenance. Set from
 #: the environment the runner exports; "unknown" in tests/ad-hoc use.
 CODE_REVISION = os.environ.get("CHAINSEER_CODE_REVISION", "unknown")
+ACCEPTANCE_COHORT_SCHEMA_VERSION = 1
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v1"
 
 
 def _seal_cost_defaults() -> dict:
@@ -937,6 +939,35 @@ def _utc_now() -> str:
 
 def _canonical(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
+
+
+def operational_acceptance_policy(sample_target: int = 100) -> dict:
+    """The immutable safety/SLO policy pinned to an acceptance cohort.
+
+    A cohort is evidence only when its target and thresholds cannot drift
+    underneath it.  This is deliberately operational policy; strategy
+    promotion remains a separate fail-closed gate.
+    """
+    return {
+        "schema_version": ACCEPTANCE_COHORT_SCHEMA_VERSION,
+        "policy_version": ACCEPTANCE_COHORT_POLICY_VERSION,
+        "sample_target": max(1, int(sample_target)),
+        "paper_only": True,
+        "live_execution_enabled": False,
+        "live_lane_budget_seconds": LIVE_LANE_BUDGET_SECONDS,
+        "live_lane_cadence_seconds": LIVE_LANE_CADENCE_SECONDS,
+        "live_all_attempt_p95_target_seconds": 30.0,
+        "decision_lag_maximum_blocks":
+            FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
+        "decision_lag_minimum_rate": 0.99,
+        "decision_usefulness_minimum_rate": 0.99,
+        "seal_stall_rate_maximum": SEAL_STALL_RATE_MAX,
+        "seal_stall_minimum_samples": SEAL_STALL_GUARD_MIN_SAMPLES,
+        "seal_cost_model_epoch": SEAL_COST_MODEL_EPOCH,
+        "live_observation_limit": LIVE_LANE_OBSERVATION_LIMIT,
+        "live_decision_reserve_seconds":
+            LIVE_LANE_DECISION_RESERVE_SECONDS,
+    }
 
 
 def _topic_address(value: str) -> str:
@@ -2015,6 +2046,18 @@ class RobinhoodLearningStore:
                     status TEXT NOT NULL,
                     summary_json TEXT
                 );
+                CREATE TABLE IF NOT EXISTS acceptance_cohorts (
+                    cohort_id TEXT PRIMARY KEY,
+                    schema_version INTEGER NOT NULL,
+                    started_at TEXT NOT NULL,
+                    revision TEXT NOT NULL,
+                    sample_target INTEGER NOT NULL,
+                    policy_json TEXT NOT NULL,
+                    policy_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    closed_at TEXT,
+                    close_reason TEXT
+                );
                 CREATE TABLE IF NOT EXISTS position_policy_states (
                     token_address TEXT NOT NULL,
                     policy TEXT NOT NULL,
@@ -2610,6 +2653,8 @@ class RobinhoodLearningStore:
                 "heartbeat_at": "REAL",
                 "deadline_seconds": "REAL",
                 "lane": "TEXT NOT NULL DEFAULT 'legacy'",
+                "revision": "TEXT",
+                "acceptance_cohort_id": "TEXT",
             }.items():
                 if name not in run_columns:
                     connection.execute(
@@ -2619,6 +2664,9 @@ class RobinhoodLearningStore:
             connection.execute(
                 "CREATE INDEX IF NOT EXISTS idx_runs_lane_status"
                 " ON runs(lane,status,heartbeat_at)")
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_runs_acceptance_cohort"
+                " ON runs(acceptance_cohort_id,lane,id)")
             outcome_columns = {
                 row[1] for row in connection.execute(
                     "PRAGMA table_info(flow_observation_outcomes)"
@@ -4862,6 +4910,96 @@ class RobinhoodLearningStore:
                 (str(key), _canonical(value), _utc_now()),
             )
 
+    def acceptance_cohort(self) -> dict:
+        """Return the newest durable operational acceptance boundary."""
+        try:
+            with self.connection() as connection:
+                row = connection.execute(
+                    """SELECT * FROM acceptance_cohorts
+                       ORDER BY started_at DESC, cohort_id DESC LIMIT 1"""
+                ).fetchone()
+                if not row:
+                    return {}
+                result = dict(row)
+                counts = connection.execute(
+                    """SELECT COUNT(*) terminal_attempts,
+                              COALESCE(SUM(status='complete'),0) complete_attempts,
+                              COALESCE(SUM(status='deadline_exceeded'),0) timeouts,
+                              COALESCE(SUM(status='failed'),0) failures,
+                              COALESCE(SUM(revision!=?),0) revision_mismatches
+                       FROM runs
+                       WHERE acceptance_cohort_id=? AND lane='live'
+                         AND status!='running'""",
+                    (result["revision"], result["cohort_id"]),
+                ).fetchone()
+        except sqlite3.OperationalError as error:
+            # A read-only dashboard may start before the first writer has
+            # migrated an older database.  Absence means no cohort yet; every
+            # actual cohort start uses a writable initialized store.
+            if "no such table" in str(error).lower():
+                return {}
+            raise
+        try:
+            result["policy"] = json.loads(result.pop("policy_json"))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            result["policy"] = {}
+            result.pop("policy_json", None)
+        result.update({
+            key: int(counts[key] or 0) for key in (
+                "terminal_attempts", "complete_attempts", "timeouts",
+                "failures", "revision_mismatches",
+            )
+        })
+        target = max(1, safe_int(result.get("sample_target"), 100))
+        result["collection_complete"] = (
+            result["terminal_attempts"] >= target)
+        result["remaining_attempts"] = max(
+            0, target - result["terminal_attempts"])
+        return result
+
+    def start_acceptance_cohort(
+        self, *, revision: str, sample_target: int = 100,
+        cohort_id: str | None = None,
+    ) -> dict:
+        """Open a frozen revision/policy cohort while no lane owns a run.
+
+        Old cohorts are retained and explicitly superseded.  Each future run
+        is stamped with this cohort id in ``begin_run``; a rolling window can
+        therefore never wash an early failure out of the acceptance result.
+        """
+        revision = str(revision or "").strip()
+        if not revision or revision == "unknown":
+            raise ValueError("a concrete code revision is required")
+        ownership = self.running_run_audit()
+        if ownership["active"] or ownership["stale"]:
+            raise RuntimeError(
+                "cannot start an acceptance cohort while a lane run exists")
+        target = max(1, int(sample_target))
+        policy = operational_acceptance_policy(target)
+        policy_hash = hashlib.sha256(
+            _canonical(policy).encode("utf-8")).hexdigest()
+        started_at = _utc_now()
+        if not cohort_id:
+            stamp = re.sub(r"[^0-9]", "", started_at)[:14]
+            clean_revision = re.sub(r"[^0-9A-Za-z._-]", "", revision)[:12]
+            cohort_id = f"live-acceptance-{stamp}-{clean_revision}"
+        with self.connection() as connection:
+            connection.execute(
+                """UPDATE acceptance_cohorts
+                   SET status='superseded',closed_at=?,close_reason=?
+                   WHERE status='collecting'""",
+                (started_at, f"superseded_by:{cohort_id}"),
+            )
+            connection.execute(
+                """INSERT INTO acceptance_cohorts
+                   (cohort_id,schema_version,started_at,revision,sample_target,
+                    policy_json,policy_hash,status)
+                   VALUES (?,?,?,?,?,?,?,'collecting')""",
+                (str(cohort_id), ACCEPTANCE_COHORT_SCHEMA_VERSION, started_at,
+                 revision, target, _canonical(policy), policy_hash),
+            )
+        return self.acceptance_cohort()
+
     def enqueue_seal(self, windows: list[dict], reason: str) -> int:
         """Defer windows durably rather than hoping selection re-finds them."""
         rows = []
@@ -5051,12 +5189,20 @@ class RobinhoodLearningStore:
         import os as _os, socket as _socket
         now = time.time()
         with self.connection() as connection:
+            cohort = connection.execute(
+                """SELECT cohort_id FROM acceptance_cohorts
+                   WHERE status='collecting'
+                   ORDER BY started_at DESC LIMIT 1"""
+            ).fetchone()
+            cohort_id = cohort["cohort_id"] if cohort else None
             row_id = connection.execute(
                 """INSERT INTO runs(started_at,status,run_id,pid,host,
-                       heartbeat_at,deadline_seconds,lane)
-                   VALUES (?,'running',?,?,?,?,?,?)""",
+                       heartbeat_at,deadline_seconds,lane,revision,
+                       acceptance_cohort_id)
+                   VALUES (?,'running',?,?,?,?,?,?,?,?)""",
                 (_utc_now(), run_id, _os.getpid(), _socket.gethostname(),
-                 now, float(deadline_seconds), str(lane)),
+                 now, float(deadline_seconds), str(lane), CODE_REVISION,
+                 cohort_id),
             ).lastrowid
             if lane != "legacy":
                 connection.execute(
@@ -5467,7 +5613,10 @@ class RobinhoodLearningStore:
                  str(lane), int(pid)),
             )
 
-    def lane_performance(self, limit: int = 100) -> dict[str, dict]:
+    def lane_performance(
+        self, limit: int = 100, *, cohort_id: str | None = None,
+        revision: str | None = None,
+    ) -> dict[str, dict]:
         """Measured lane latency/reliability, including terminated attempts.
 
         A supervisor-terminated worker may never get to write duration_seconds.
@@ -5479,11 +5628,23 @@ class RobinhoodLearningStore:
         result: dict[str, dict] = {}
         with self.connection() as connection:
             for lane in LANE_NAMES:
+                filters = ["lane=?"]
+                parameters: list[object] = [lane]
+                order = "DESC"
+                if cohort_id:
+                    filters.extend([
+                        "acceptance_cohort_id=?", "status!='running'"])
+                    parameters.append(str(cohort_id))
+                    order = "ASC"
+                if revision:
+                    filters.append("revision=?")
+                    parameters.append(str(revision))
+                parameters.append(int(limit))
                 rows = connection.execute(
                     """SELECT status,summary_json,started_at,completed_at,
                               deadline_seconds
-                       FROM runs WHERE lane=?
-                       ORDER BY id DESC LIMIT ?""", (lane, int(limit)),
+                       FROM runs WHERE """ + " AND ".join(filters)
+                    + f" ORDER BY id {order} LIMIT ?", parameters,
                 ).fetchall()
                 durations: list[float] = []
                 successful_durations: list[float] = []
@@ -5564,34 +5725,69 @@ class RobinhoodLearningStore:
         self, *, integrity: dict | None = None, sample_target: int = 100,
     ) -> dict:
         """Fail-closed operational readiness, separate from strategy promotion."""
-        target = max(1, int(sample_target))
-        performance = self.lane_performance(limit=target)
+        cohort = self.acceptance_cohort()
+        cohort_id = str(cohort.get("cohort_id") or "") or None
+        cohort_revision = str(cohort.get("revision") or "") or None
+        target = max(1, int(
+            cohort.get("sample_target") if cohort_id else sample_target))
+        performance = self.lane_performance(
+            limit=target, cohort_id=cohort_id, revision=cohort_revision)
         ownership = self.running_run_audit()
         with self.connection() as connection:
-            live_rows = [dict(row) for row in connection.execute(
-                """SELECT status,summary_json FROM runs
-                   WHERE lane='live' AND status='complete'
-                   ORDER BY id DESC LIMIT ?""", (target,)
-            )]
-            recent_live_statuses = [dict(row) for row in connection.execute(
-                """SELECT status FROM runs WHERE lane='live'
-                   ORDER BY id DESC LIMIT ?""", (target,)
-            )]
-            decision_rows = [dict(row) for row in connection.execute(
-                """SELECT status,summary_json FROM runs
-                   WHERE lane='live' AND status!='running'
-                   ORDER BY id DESC LIMIT ?""", (max(1_000, target * 10),)
-            )]
+            if cohort_id:
+                attempt_rows = [dict(row) for row in connection.execute(
+                    """SELECT status,summary_json FROM runs
+                       WHERE lane='live' AND status!='running'
+                         AND acceptance_cohort_id=? AND revision=?
+                       ORDER BY id ASC LIMIT ?""",
+                    (cohort_id, cohort_revision, target),
+                )]
+                live_rows = [
+                    row for row in attempt_rows
+                    if row["status"] == "complete"]
+                recent_live_statuses = attempt_rows
+                decision_rows = attempt_rows
+                mark_rows = [dict(row) for row in connection.execute(
+                    """SELECT status,summary_json FROM runs
+                       WHERE lane='marks' AND status!='running'
+                         AND acceptance_cohort_id=? AND revision=?
+                       ORDER BY id ASC LIMIT ?""",
+                    (cohort_id, cohort_revision, target),
+                )]
+            else:
+                live_rows = [dict(row) for row in connection.execute(
+                    """SELECT status,summary_json FROM runs
+                       WHERE lane='live' AND status='complete'
+                       ORDER BY id DESC LIMIT ?""", (target,)
+                )]
+                recent_live_statuses = [dict(row) for row in connection.execute(
+                    """SELECT status,summary_json FROM runs WHERE lane='live'
+                       ORDER BY id DESC LIMIT ?""", (target,)
+                )]
+                decision_rows = [dict(row) for row in connection.execute(
+                    """SELECT status,summary_json FROM runs
+                       WHERE lane='live' AND status!='running'
+                       ORDER BY id DESC LIMIT ?""", (max(1_000, target * 10),)
+                )]
+                mark_rows = []
             identity_violations = int(connection.execute(
                 """SELECT COUNT(*) FROM flow_observation_classifications
                    WHERE paper_eligible=1 AND identity_tier!='verified'"""
             ).fetchone()[0])
 
             def backlog_series(lane: str, key: str) -> list[int]:
+                filters = ["lane=?", "status='complete'"]
+                parameters: list[object] = [lane]
+                order = "DESC"
+                if cohort_id:
+                    filters.extend([
+                        "acceptance_cohort_id=?", "revision=?"])
+                    parameters.extend([cohort_id, cohort_revision])
+                parameters.append(10)
                 rows = connection.execute(
-                    """SELECT summary_json FROM runs
-                       WHERE lane=? AND status='complete'
-                       ORDER BY id DESC LIMIT 10""", (lane,)
+                    "SELECT summary_json FROM runs WHERE "
+                    + " AND ".join(filters)
+                    + f" ORDER BY id {order} LIMIT ?", parameters,
                 ).fetchall()
                 values: list[int] = []
                 for item in reversed(rows):
@@ -5618,14 +5814,30 @@ class RobinhoodLearningStore:
                 "decision_head_lag_blocks")
             if lag is not None:
                 lags.append(safe_float(lag, float("inf")))
-            marks = summary.get("position_evaluations") or {}
-            if (
-                safe_int(marks.get("checked"), 0)
-                == safe_int(marks.get("marked"), 0)
-                and safe_int(marks.get("failures"), 0) == 0
-                and safe_int(marks.get("unverified"), 0) == 0
-            ):
-                marks_complete += 1
+            if not cohort_id:
+                marks = summary.get("position_evaluations") or {}
+                if (
+                    safe_int(marks.get("checked"), 0)
+                    == safe_int(marks.get("marked"), 0)
+                    and safe_int(marks.get("failures"), 0) == 0
+                    and safe_int(marks.get("unverified"), 0) == 0
+                ):
+                    marks_complete += 1
+        if cohort_id:
+            for row in mark_rows:
+                try:
+                    summary = json.loads(row.get("summary_json") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    summary = {}
+                marks = summary.get("position_evaluations") or {}
+                if (
+                    row["status"] == "complete"
+                    and safe_int(marks.get("checked"), 0)
+                    == safe_int(marks.get("marked"), 0)
+                    and safe_int(marks.get("failures"), 0) == 0
+                    and safe_int(marks.get("unverified"), 0) == 0
+                ):
+                    marks_complete += 1
 
         def trend(values: list[int]) -> dict:
             current = values[-1] if values else None
@@ -5641,12 +5853,14 @@ class RobinhoodLearningStore:
             }
 
         completed = len(live_rows)
+        terminal_attempts = len(recent_live_statuses)
         lag_rate = (
             sum(value <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
                 for value in lags) / len(lags)
             if lags else None
         )
-        mark_rate = marks_complete / completed if completed else None
+        mark_samples = len(mark_rows) if cohort_id else completed
+        mark_rate = marks_complete / mark_samples if mark_samples else None
         live_perf = performance.get("live") or {}
         reliability_pass = bool(
             len(recent_live_statuses) >= target
@@ -5684,19 +5898,45 @@ class RobinhoodLearningStore:
             if decision_opportunities else None)
         seal_model = _seal_cost_model_from_state(
             self.scheduler_state(SEAL_COST_MODEL_STATE_KEY))
-        stall_population = safe_int(
-            seal_model.get("fixed_stall_population"), 0)
+        if cohort_id:
+            fixed_records = _valid_seal_sample_records(
+                self.scheduler_state(SEAL_COST_MODEL_STATE_KEY).get(
+                    "fixed_observation_samples"))
+            cohort_started = _timestamp(cohort.get("started_at")) or 0.0
+            cohort_fixed = [
+                record for record in fixed_records
+                if safe_int(record.get("epoch"), -1) == SEAL_COST_MODEL_EPOCH
+                and str(record.get("revision") or "") == cohort_revision
+                and safe_float(record.get("at"), 0.0) >= cohort_started
+            ]
+            fixed_success = sum(
+                record["status"] == "success" for record in cohort_fixed)
+            fixed_stalls = sum(
+                record["status"] == "stalled" for record in cohort_fixed)
+            stall_population = fixed_success + fixed_stalls
+            stall_rate = (
+                fixed_stalls / stall_population if stall_population else 0.0)
+            stall_guard_active = bool(
+                stall_population >= SEAL_STALL_GUARD_MIN_SAMPLES
+                and stall_rate > SEAL_STALL_RATE_MAX)
+        else:
+            stall_population = safe_int(
+                seal_model.get("fixed_stall_population"), 0)
+            stall_rate = safe_float(
+                seal_model.get("fixed_stall_rate"), 0.0)
+            stall_guard_active = bool(seal_model.get("stall_guard_active"))
         stall_guard_pass = bool(
             stall_population >= SEAL_STALL_GUARD_MIN_SAMPLES
-            and not seal_model.get("stall_guard_active"))
+            and not stall_guard_active)
         backfill_trend = trend(backfill_values)
         analysis_trend = trend(analysis_values)
         integrity = dict(integrity or {})
         integrity_pass = bool(integrity.get("ok"))
         criteria = {
             "live_cycle_sample": {
-                "pass": completed >= target, "value": completed,
-                "target": target, "label": "Completed live cycles",
+                "pass": terminal_attempts >= target,
+                "value": terminal_attempts,
+                "target": target, "label": "Terminal live attempts",
             },
             "live_p95": {
                 "pass": bool(live_perf.get("target_met")),
@@ -5709,8 +5949,13 @@ class RobinhoodLearningStore:
                 "label": "Decision-lag SLO",
             },
             "position_marks": {
-                "pass": bool(mark_rate is not None and mark_rate >= 1.0),
-                "value": mark_rate, "samples": completed, "target": "100%",
+                "pass": bool(
+                    mark_rate is not None and mark_rate >= 1.0
+                    and (not cohort_id or mark_samples >= target)),
+                "value": mark_rate, "samples": mark_samples,
+                "target": (
+                    f"100% across {target} cohort marks"
+                    if cohort_id else "100%"),
                 "label": "Complete position marks",
             },
             "run_ownership": {
@@ -5737,10 +5982,9 @@ class RobinhoodLearningStore:
             },
             "seal_stall_guard": {
                 "pass": stall_guard_pass,
-                "value": safe_float(
-                    seal_model.get("fixed_stall_rate"), 0.0),
+                "value": stall_rate,
                 "samples": stall_population,
-                "active": bool(seal_model.get("stall_guard_active")),
+                "active": stall_guard_active,
                 "target": (
                     f"<={SEAL_STALL_RATE_MAX:.1%} after "
                     f">={SEAL_STALL_GUARD_MIN_SAMPLES} samples"),
@@ -5763,10 +6007,32 @@ class RobinhoodLearningStore:
                 "target": "all verified", "label": "Ledger / DB / Timechain",
             },
         }
+        if cohort_id:
+            expected_policy_hash = hashlib.sha256(
+                _canonical(cohort.get("policy") or {}).encode("utf-8")
+            ).hexdigest()
+            provenance_ok = bool(
+                cohort.get("policy_hash") == expected_policy_hash
+                and safe_int(cohort.get("revision_mismatches"), 0) == 0)
+            criteria["cohort_provenance"] = {
+                "pass": provenance_ok,
+                "value": {
+                    "cohort_id": cohort_id,
+                    "revision": cohort_revision,
+                    "revision_mismatches": safe_int(
+                        cohort.get("revision_mismatches"), 0),
+                    "policy_hash": cohort.get("policy_hash"),
+                },
+                "target": "pinned revision / unchanged policy",
+                "label": "Frozen cohort provenance",
+            }
         all_pass = all(item["pass"] for item in criteria.values())
-        critical_fail = any(not criteria[key]["pass"] for key in (
-            "run_ownership", "identity_fail_closed", "integrity",
-        ))
+        critical_keys = [
+            "run_ownership", "identity_fail_closed", "integrity"]
+        if cohort_id:
+            critical_keys.append("cohort_provenance")
+        critical_fail = any(
+            not criteria[key]["pass"] for key in critical_keys)
         operational_fail = any(not criteria[key]["pass"] for key in (
             "live_p95", "position_marks", "live_reliability",
             "decision_usefulness", "seal_stall_guard",
@@ -5775,7 +6041,7 @@ class RobinhoodLearningStore:
             status = "STABILIZED"
         elif critical_fail:
             status = "DEGRADED"
-        elif completed < target:
+        elif terminal_attempts < target:
             status = "COLLECTING_DATA"
         elif operational_fail:
             status = "DEGRADED"
@@ -5785,6 +6051,8 @@ class RobinhoodLearningStore:
             "schema_version": 1, "status": status,
             "stabilized": all_pass, "sample_target": target,
             "completed_live_cycles": completed,
+            "terminal_live_attempts": terminal_attempts,
+            "acceptance_cohort": cohort,
             "criteria_passed": sum(item["pass"] for item in criteria.values()),
             "criteria_total": len(criteria), "criteria": criteria,
             "run_ownership": ownership,
@@ -14783,7 +15051,7 @@ def main() -> None:
             "learn-once", "marks-once", "live-once", "evidence-once",
             "analysis-once", "backfill-once",
             "lanes", "status", "dashboard", "verify", "reflect",
-            "audit", "repair-outcomes",
+            "audit", "repair-outcomes", "cohort-start", "cohort-status",
         ),
     )
     parser.add_argument(
@@ -14826,6 +15094,9 @@ def main() -> None:
         default=BACKFILL_LANE_CADENCE_SECONDS)
     parser.add_argument("--lookback",type=int,default=DEFAULT_DISCOVERY_LOOKBACK_BLOCKS)
     parser.add_argument("--chain-root",default=DEFAULT_CHAIN_ROOT)
+    parser.add_argument("--cohort-target",type=int,default=100)
+    parser.add_argument("--cohort-id",default=None)
+    parser.add_argument("--cohort-revision",default=CODE_REVISION)
     parser.add_argument(
         "--todo", default=str(Path(__file__).with_name("TODO.md"))
     )
@@ -14839,6 +15110,17 @@ def main() -> None:
         print(json.dumps(dashboard_snapshot(
             args.root,chain_root=args.chain_root,skill_root=args.skill_root
         ),indent=2)); return
+    if args.command in {"cohort-start", "cohort-status"}:
+        store = RobinhoodLearningStore(Path(args.root) / "learning.sqlite3")
+        if args.command == "cohort-start":
+            result = store.start_acceptance_cohort(
+                revision=args.cohort_revision,
+                sample_target=max(1, args.cohort_target),
+                cohort_id=args.cohort_id,
+            )
+        else:
+            result = store.acceptance_cohort()
+        print(json.dumps(result, indent=2)); return
     if args.command=="lanes":
         result = supervise_lanes(
             args.root, chain_root=args.chain_root,

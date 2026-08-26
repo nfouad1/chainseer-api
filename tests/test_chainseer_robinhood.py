@@ -7103,6 +7103,111 @@ class LaneSplitTests(unittest.TestCase):
                 criterion["pass"]
                 for criterion in result["criteria"].values()))
 
+    def test_acceptance_cohort_stamps_revision_policy_and_future_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            cohort = store.start_acceptance_cohort(
+                revision="abc123", sample_target=3,
+                cohort_id="acceptance-test-1")
+            self.assertEqual(cohort["cohort_id"], "acceptance-test-1")
+            self.assertEqual(cohort["revision"], "abc123")
+            self.assertEqual(cohort["policy"]["sample_target"], 3)
+            self.assertFalse(cohort["policy"]["live_execution_enabled"])
+            expected_hash = hashlib.sha256(
+                rh._canonical(cohort["policy"]).encode("utf-8")
+            ).hexdigest()
+            self.assertEqual(cohort["policy_hash"], expected_hash)
+            with patch.object(rh, "CODE_REVISION", "abc123"):
+                store.begin_run("cohort-live-1", 25.0, lane="live")
+                store.finish_run(
+                    "cohort-live-1", "complete",
+                    summary={"duration_seconds": 1.0})
+            with store.connection() as connection:
+                row = connection.execute(
+                    """SELECT revision,acceptance_cohort_id FROM runs
+                       WHERE run_id='cohort-live-1'""").fetchone()
+            self.assertEqual(row["revision"], "abc123")
+            self.assertEqual(row["acceptance_cohort_id"], "acceptance-test-1")
+
+    def test_read_only_legacy_database_reports_no_acceptance_cohort(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "legacy.sqlite3"
+            connection = sqlite3.connect(path)
+            try:
+                connection.execute(
+                    """CREATE TABLE runs (
+                       id INTEGER PRIMARY KEY, started_at TEXT,
+                       status TEXT, summary_json TEXT)""")
+                connection.commit()
+            finally:
+                connection.close()
+            store = rh.RobinhoodLearningStore(path, read_only=True)
+            self.assertEqual(store.acceptance_cohort(), {})
+
+    def test_acceptance_cohort_is_oldest_first_and_never_washes_out_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            # Legacy runs must not contaminate a new boundary.
+            with store.connection() as connection:
+                for index in range(5):
+                    connection.execute(
+                        """INSERT INTO runs
+                           (started_at,completed_at,status,summary_json,run_id,
+                            pid,host,heartbeat_at,deadline_seconds,lane)
+                           VALUES (?,?, 'failed', '{}', ?, 1, 'test', ?, 25,
+                                   'live')""",
+                        ("2026-01-01T00:00:00+00:00",
+                         "2026-01-01T00:00:10+00:00",
+                         f"legacy-{index}", float(index)),
+                    )
+            store.start_acceptance_cohort(
+                revision="frozen-revision", sample_target=2,
+                cohort_id="frozen-two")
+            useful = {
+                "duration_seconds": 1.0,
+                "observation_seal": {
+                    "sealed_this_cycle": 1,
+                    "decision_head_lag_blocks": 1,
+                },
+                "classification": {
+                    "scoped_rows_selected": 1,
+                    "scoped_rows_processed": 1,
+                },
+            }
+            with patch.object(rh, "CODE_REVISION", "frozen-revision"):
+                store.begin_run("first-failed", 25.0, lane="live")
+                store.finish_run(
+                    "first-failed", "failed",
+                    summary={**useful, "failure_stage": "classification"})
+                for run_id in ("second-complete", "third-complete"):
+                    store.begin_run(run_id, 25.0, lane="live")
+                    store.finish_run(run_id, "complete", summary=useful)
+            result = store.stabilization_summary(integrity={"ok": True})
+            self.assertEqual(result["terminal_live_attempts"], 2)
+            self.assertEqual(
+                result["criteria"]["live_reliability"]["value"], 1)
+            self.assertEqual(
+                result["criteria"]["live_reliability"]["samples"], 2)
+            self.assertFalse(result["criteria"]["live_reliability"]["pass"])
+            self.assertEqual(
+                result["acceptance_cohort"]["terminal_attempts"], 3)
+
+    def test_acceptance_cohort_fails_closed_on_revision_mismatch(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="expected", sample_target=1, cohort_id="revision-test")
+            with patch.object(rh, "CODE_REVISION", "unexpected"):
+                store.begin_run("wrong-revision", 25.0, lane="live")
+                store.finish_run(
+                    "wrong-revision", "complete",
+                    summary={"duration_seconds": 1.0})
+            result = store.stabilization_summary(integrity={"ok": True})
+            provenance = result["criteria"]["cohort_provenance"]
+            self.assertFalse(provenance["pass"])
+            self.assertEqual(provenance["value"]["revision_mismatches"], 1)
+            self.assertEqual(result["status"], "DEGRADED")
+
     def test_live_p95_includes_timestamped_terminated_attempts(self):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
