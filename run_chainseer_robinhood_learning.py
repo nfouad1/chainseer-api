@@ -201,7 +201,11 @@ def _probe() -> int:
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duration-seconds", type=float, default=285.0)
-    parser.add_argument("--discovery-block-limit", type=int, default=500)
+    # The chain has recently grown faster than 500 blocks per five-minute
+    # backfill cadence, so 500 guaranteed backlog growth even with perfect
+    # runs. One thousand provides measured convergence headroom while the
+    # lane's own deadline/admission controller remains authoritative.
+    parser.add_argument("--discovery-block-limit", type=int, default=1000)
     parser.add_argument("--analysis-limit", type=int, default=8)
     parser.add_argument("--outcome-limit", type=int, default=12)
     parser.add_argument("--outcome-recovery-limit", type=int, default=4)

@@ -150,7 +150,12 @@ EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
-LIVE_LANE_SCAN_BLOCKS = 750
+# The supervised live cadence is 30 seconds and this chain has recently
+# produced roughly ten blocks/second. Scan one cadence of newest blocks on
+# the decision path; any older prefix is durably re-anchored into backfill.
+# Cohort evidence showed the former 750-block cap consumed p95 14.6 seconds
+# and left 24/100 attempts expiring at near_head_commit.
+LIVE_LANE_SCAN_BLOCKS = 300
 LIVE_LANE_ENRICHMENT_LIMIT = 60
 LIVE_LANE_ENRICHMENT_BUDGET_SECONDS = 6.0
 # Promotion evidence must be prospective, but its remote quotes and outcome
@@ -236,7 +241,7 @@ SEAL_COST_MODEL_EPOCH = 4
 #: the environment the runner exports; "unknown" in tests/ad-hoc use.
 CODE_REVISION = os.environ.get("CHAINSEER_CODE_REVISION", "unknown")
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 1
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v1"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v2"
 
 
 def _seal_cost_defaults() -> dict:
@@ -982,6 +987,10 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "live_execution_enabled": False,
         "live_lane_budget_seconds": LIVE_LANE_BUDGET_SECONDS,
         "live_lane_cadence_seconds": LIVE_LANE_CADENCE_SECONDS,
+        "live_scan_blocks": LIVE_LANE_SCAN_BLOCKS,
+        "live_enrichment_limit": LIVE_LANE_ENRICHMENT_LIMIT,
+        "live_enrichment_budget_seconds": (
+            LIVE_LANE_ENRICHMENT_BUDGET_SECONDS),
         "live_all_attempt_p95_target_seconds": 30.0,
         "decision_lag_maximum_blocks":
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
@@ -5762,7 +5771,7 @@ class RobinhoodLearningStore:
         with self.connection() as connection:
             if cohort_id:
                 attempt_rows = [dict(row) for row in connection.execute(
-                    """SELECT status,summary_json FROM runs
+                    """SELECT run_id,status,summary_json FROM runs
                        WHERE lane='live' AND status!='running'
                          AND acceptance_cohort_id=? AND revision=?
                        ORDER BY id ASC LIMIT ?""",
@@ -5772,7 +5781,19 @@ class RobinhoodLearningStore:
                     row for row in attempt_rows
                     if row["status"] == "complete"]
                 recent_live_statuses = attempt_rows
-                decision_rows = attempt_rows
+                # Reliability is an immutable first-N attempt cohort. Useful
+                # decisions are a different population: idle cycles are not
+                # opportunities, so inspect enough cohort attempts to collect
+                # N actual decision-bearing opportunities. Limiting this to
+                # the first N attempts made a 100-opportunity target
+                # mathematically impossible whenever even one cycle was idle.
+                decision_rows = [dict(row) for row in connection.execute(
+                    """SELECT run_id,status,summary_json FROM runs
+                       WHERE lane='live' AND status!='running'
+                         AND acceptance_cohort_id=? AND revision=?
+                       ORDER BY id ASC LIMIT ?""",
+                    (cohort_id, cohort_revision, max(1_000, target * 20)),
+                )]
                 mark_rows = [dict(row) for row in connection.execute(
                     """SELECT status,summary_json FROM runs
                        WHERE lane='marks' AND status!='running'
@@ -5934,11 +5955,16 @@ class RobinhoodLearningStore:
                 once_per_cycle_records.extend(
                     _valid_seal_sample_records(cohort_model_state.get(field)))
             cohort_started = _timestamp(cohort.get("started_at")) or 0.0
+            cohort_run_ids = {
+                str(row.get("run_id") or "") for row in attempt_rows
+                if row.get("run_id")
+            }
             cohort_fixed = [
                 record for record in once_per_cycle_records
                 if safe_int(record.get("epoch"), -1) == SEAL_COST_MODEL_EPOCH
                 and str(record.get("revision") or "") == cohort_revision
                 and safe_float(record.get("at"), 0.0) >= cohort_started
+                and str(record.get("run_id") or "") in cohort_run_ids
             ]
             fixed_success = sum(
                 record["status"] == "success" for record in cohort_fixed)
@@ -10756,6 +10782,15 @@ class RobinhoodLearningEngine:
             })
         if events:
             self.store.apply_v4_events(events)
+        # The scan and its raw events are durable at this point. Advance the
+        # cursor BEFORE optional origin enrichment so an expensive identity
+        # lookup cannot make the next cycle ingest the same blocks again.
+        # Identity evidence still fails closed: unresolved origins retain
+        # incomplete coverage and cannot become paper eligible. The durable
+        # origin queue lets the analysis/backfill lanes revisit them without
+        # putting historical recovery on the live decision path.
+        atomic_json_write(cursor_path, {"last_scanned_block": int(head)})
+        cursor_committed_before_enrichment = True
         # Enrich BETWEEN computing the window and sealing it. apply_v4_events
         # has just recomputed the flow signal with zero resolved participants;
         # record_transaction_origins recomputes it again with the real ones, so
@@ -10779,7 +10814,6 @@ class RobinhoodLearningEngine:
         enrichment["freshness_admission"] = freshness_admission
         if deadline is not None:
             deadline.raise_if_expired("near_head_commit")
-        atomic_json_write(cursor_path, {"last_scanned_block": int(head)})
         try:
             head_after = int(self.rpc.get_block_number())
         except Exception:
@@ -10798,6 +10832,8 @@ class RobinhoodLearningEngine:
             "logs_seen": len(logs), "swaps_ingested": len(events),
             "initialize_logs_seen": len(init_logs),
             "pools_admitted_on_sight": len(born),
+            "cursor_committed_before_enrichment": (
+                cursor_committed_before_enrichment),
             "pools_touched": len(touched),
             "touched_pool_ids": touched,
             # Attributed to THIS pass's pools, never read off the whole table.

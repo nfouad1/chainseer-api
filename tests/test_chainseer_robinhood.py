@@ -5252,6 +5252,21 @@ class NearHeadEnrichmentOrderingTests(unittest.TestCase):
             self.assertFalse(enrichment["supported"])
             self.assertFalse(enrichment["window_fully_enriched"])
 
+    def test_raw_cursor_is_durable_before_optional_enrichment(self):
+        """An enrichment deadline cannot make raw blocks replay forever."""
+        swaps = [self._log(i, "a" * 40) for i in range(3)]
+        with tempfile.TemporaryDirectory() as directory:
+            engine, _store = self._engine(directory, swaps)
+            with patch.object(
+                engine, "enrich_near_head_window",
+                side_effect=rh.CycleDeadlineExceeded("near_head_commit"),
+            ):
+                with self.assertRaises(rh.CycleDeadlineExceeded):
+                    engine.near_head_flow_pass()
+            cursor = rh.read_json(
+                Path(directory) / "near_head_cursor.json", {})
+            self.assertEqual(cursor["last_scanned_block"], self.HEAD)
+
 
 class NearHeadFlowEventTests(unittest.TestCase):
     """The near-head pass seals what it did, attributed to its own pools.
@@ -7238,6 +7253,68 @@ class LaneSplitTests(unittest.TestCase):
             self.assertFalse(provenance["pass"])
             self.assertEqual(provenance["value"]["revision_mismatches"], 1)
             self.assertEqual(result["status"], "DEGRADED")
+
+    def test_decision_usefulness_collects_opportunities_beyond_first_n_attempts(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="useful-revision", sample_target=2,
+                cohort_id="useful-two")
+            useful = {
+                "duration_seconds": 1.0,
+                "observation_seal": {"sealed_this_cycle": 1},
+                "classification": {
+                    "scoped_rows_selected": 1,
+                    "scoped_rows_processed": 1,
+                },
+            }
+            with patch.object(rh, "CODE_REVISION", "useful-revision"):
+                for run_id, summary in (
+                    ("idle-1", {"duration_seconds": 1.0}),
+                    ("idle-2", {"duration_seconds": 1.0}),
+                    ("useful-1", useful), ("useful-2", useful),
+                ):
+                    store.begin_run(run_id, 25.0, lane="live")
+                    store.finish_run(run_id, "complete", summary=summary)
+            criterion = store.stabilization_summary(
+                integrity={"ok": True})["criteria"]["decision_usefulness"]
+            self.assertTrue(criterion["pass"])
+            self.assertEqual(criterion["samples"], 2)
+            self.assertEqual(criterion["useful"], 2)
+
+    def test_cohort_stall_guard_excludes_other_lanes_and_later_runs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="stall-revision", sample_target=1,
+                cohort_id="stall-one")
+            with patch.object(rh, "CODE_REVISION", "stall-revision"):
+                store.begin_run("live-first", 25.0, lane="live")
+                store.finish_run(
+                    "live-first", "complete",
+                    summary={"duration_seconds": 1.0})
+            now = time.time() + 1.0
+            records = [{
+                "value": 0.4, "epoch": rh.SEAL_COST_MODEL_EPOCH,
+                "run_id": "live-first", "at": now + index / 1000,
+                "revision": "stall-revision", "status": "success",
+            } for index in range(rh.SEAL_STALL_GUARD_MIN_SAMPLES)]
+            records.extend({
+                "value": 50.0, "epoch": rh.SEAL_COST_MODEL_EPOCH,
+                "run_id": "backfill-later", "at": now + 2 + index / 1000,
+                "revision": "stall-revision", "status": "stalled",
+            } for index in range(40))
+            store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
+                "epoch": rh.SEAL_COST_MODEL_EPOCH,
+                "revision": "stall-revision",
+                "fixed_observation_samples": records,
+            })
+            criterion = store.stabilization_summary(
+                integrity={"ok": True})["criteria"]["seal_stall_guard"]
+            self.assertTrue(criterion["pass"])
+            self.assertEqual(criterion["samples"],
+                             rh.SEAL_STALL_GUARD_MIN_SAMPLES)
+            self.assertEqual(criterion["value"], 0.0)
 
     def test_live_p95_includes_timestamped_terminated_attempts(self):
         with tempfile.TemporaryDirectory() as directory:

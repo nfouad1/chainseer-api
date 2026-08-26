@@ -1,9 +1,10 @@
 [CmdletBinding()]
 param(
-    # Historical work is isolated from the live head. A committed 500-block
-    # chunk is preferable to a 5,000-block attempt that repeatedly reaches the
+    # Historical work is isolated from the live head. A committed 1,000-block
+    # chunk now exceeds measured chain growth while remaining far below the
+    # 5,000-block attempts that repeatedly reached the
     # lane deadline before it can advance its durable cursor.
-    [ValidateRange(1, 10000)][int]$DiscoveryBlockLimit = 500,
+    [ValidateRange(1, 10000)][int]$DiscoveryBlockLimit = 1000,
     # Analysis is the binding stage. At 2 per five-minute cycle it processed
     # 24 candidates/hour against 55/hour of discovery, so the pending queue
     # grew ~31/hour and stood at 188; entry starved to 0.6 admits/hour while
