@@ -151,11 +151,13 @@ BACKFILL_LANE_BUDGET_SECONDS = 120.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
 # The supervised live cadence is 30 seconds and this chain has recently
-# produced roughly ten blocks/second. Scan one cadence of newest blocks on
-# the decision path; any older prefix is durably re-anchored into backfill.
-# Cohort evidence showed the former 750-block cap consumed p95 14.6 seconds
-# and left 24/100 attempts expiring at near_head_commit.
-LIVE_LANE_SCAN_BLOCKS = 300
+# produced roughly ten blocks/second. Scan a bounded newest-head slice on the
+# decision path; any older prefix is durably re-anchored into backfill.
+# Cohort evidence showed 199-212 blocks still cost 7.8-10.1 seconds and put
+# 3/5 early decisions beyond 120 blocks. A 100-block newest-head slice leaves
+# the remaining lag budget for sealing/classification; history is recovered
+# by the independently scheduled backfill lane.
+LIVE_LANE_SCAN_BLOCKS = 100
 LIVE_LANE_ENRICHMENT_LIMIT = 60
 LIVE_LANE_ENRICHMENT_BUDGET_SECONDS = 6.0
 # Promotion evidence must be prospective, but its remote quotes and outcome
@@ -515,7 +517,11 @@ CLASSIFICATION_BACKLOG_SCAN_LIMIT = 500
 CLASSIFICATION_COUNTERS_STATE_KEY = "classification_cumulative_counters"
 LIVE_LANE_CADENCE_SECONDS = 30.0
 ANALYSIS_LANE_CADENCE_SECONDS = 60.0
-BACKFILL_LANE_CADENCE_SECONDS = 300.0
+# With the live lane deliberately observing only the newest ~100 blocks,
+# re-anchored history arrives faster. A three-minute cadence at the scheduled
+# 1,000-block quantum has ~20k blocks/hour of nominal recovery capacity,
+# above the ~16k/hour re-anchor rate measured in the failed v2 cohort.
+BACKFILL_LANE_CADENCE_SECONDS = 180.0
 # Do not start another worker while the latency-critical live worker is
 # starting/running or about to become due.  The failed acceptance cohort
 # measured a 21.95s live startup while the analysis lane was at its hard
@@ -991,6 +997,8 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "live_enrichment_limit": LIVE_LANE_ENRICHMENT_LIMIT,
         "live_enrichment_budget_seconds": (
             LIVE_LANE_ENRICHMENT_BUDGET_SECONDS),
+        "backfill_lane_cadence_seconds": BACKFILL_LANE_CADENCE_SECONDS,
+        "scheduled_backfill_block_limit": 1000,
         "live_all_attempt_p95_target_seconds": 30.0,
         "decision_lag_maximum_blocks":
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,

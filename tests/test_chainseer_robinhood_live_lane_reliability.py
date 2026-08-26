@@ -245,6 +245,17 @@ class StageTimingBoundaryTests(unittest.TestCase):
 class IngestionAdmissionTests(unittest.TestCase):
     """Ingestion may yield, but it may never consume the decision tail."""
 
+    def test_frozen_policy_pins_latest_head_and_backfill_capacity(self):
+        policy = rh.operational_acceptance_policy(100)
+        self.assertEqual(rh.LIVE_LANE_SCAN_BLOCKS, 100)
+        self.assertLess(
+            rh.LIVE_LANE_SCAN_BLOCKS,
+            rh.FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
+        )
+        self.assertEqual(policy["live_scan_blocks"], 100)
+        self.assertEqual(policy["backfill_lane_cadence_seconds"], 180.0)
+        self.assertEqual(policy["scheduled_backfill_block_limit"], 1000)
+
     def test_insufficient_ingestion_headroom_is_a_non_success_deferral(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
