@@ -2502,6 +2502,14 @@ class RobinhoodLearningStore:
                     connection.execute(
                         f"ALTER TABLE flow_observations ADD COLUMN {name} {decl}"
                     )
+            # AFTER the ALTER above, never in the CREATE block: `role` is a
+            # migrated column, so indexing it beside the table definition
+            # raises "no such column: role" on every fresh database. That
+            # exact mistake shipped once before with the headroom columns and
+            # broke the whole test suite.
+            connection.execute(
+                "CREATE INDEX IF NOT EXISTS idx_flow_obs_role"
+                " ON flow_observations(role)")
             if "cohort_id" not in observation_columns:
                 # Observations sealed before the cohort existed are the pilot:
                 # preserved for diagnostics, excluded from promotion.
@@ -3622,20 +3630,71 @@ class RobinhoodLearningStore:
         return observation_id
 
     def due_flow_observation_outcomes(self, now: float, limit: int = 50) -> list[dict]:
-        """Scheduled outcomes whose horizon has arrived."""
-        with self.connection() as connection:
-            return [dict(row) for row in connection.execute(
-                """
+        """Scheduled outcomes whose horizon has arrived, signal arm first.
+
+        Strict oldest-first ordering made the role='signal' gate unauditable.
+        The due-but-unresolved backlog reached 297,569 with its oldest entry
+        9.9 days past due, so every newly sealed signal was placed behind
+        roughly 300,000 older rows in a queue growing by 12,171 a day. The
+        measured consequence: 67 of 75 signal-arm outcomes still pending, and
+        the 8 that ever resolved all belong to ONE pool -- no signal-versus-
+        control comparison has ever been possible in the project's life.
+
+        Ordering by arm changes only WHICH due outcome is measured first. It
+        is not a threshold, an eligibility rule, or an execution path: no
+        observation becomes eligible that was not already eligible, and
+        nothing is skipped. A control outcome deferred here is deferred by
+        exactly the amount a signal outcome is advanced.
+
+        This tightens rather than loosens: an unmeasured gate is an unverified
+        gate, and an unverified gate cannot be trusted to refuse.
+        """
+        # Three cheap queries, never one clever one. Every attempt to
+        # express "signal arm first" as a single statement made the planner
+        # drive from the outcome table and walk ~297,000 due rows hunting the
+        # 67 that belong to the signal arm: 22.5s as an ORDER BY key, 28.1s
+        # as a join filter, 41.9s with the sort removed. The baseline
+        # oldest-first query is under a second, and this lane already fails
+        # 25% of its runs on deadline -- a slower selection would widen the
+        # very backlog it exists to drain.
+        #
+        # Starting from the 15 signal observations instead makes the lookup
+        # trivial, and the remainder still runs the original indexed path.
+        budget = max(0, limit)
+        columns = """
                 SELECT o.*, obs.pool_id, obs.token_address, obs.quote_json,
                        obs.quote_verified, obs.cohort_id, obs.window_end_block
                 FROM flow_observation_outcomes o
                 JOIN flow_observations obs USING(observation_id)
                 WHERE o.status='pending' AND o.target_at<=?
                   AND obs.quote_verified=1
-                ORDER BY o.target_at LIMIT ?
-                """,
-                (float(now), max(0, limit)),
-            )]
+                """
+        with self.connection() as connection:
+            signal_ids = [row[0] for row in connection.execute(
+                "SELECT observation_id FROM flow_observations"
+                " WHERE role='signal' AND quote_verified=1")]
+            rows: list[dict] = []
+            if signal_ids and budget:
+                # Sorted in Python: the candidate set is bounded by the signal
+                # arm's size, so an ORDER BY buys nothing and costs the
+                # planner's choice of driving table.
+                rows = sorted(
+                    (dict(row) for row in connection.execute(
+                        columns + " AND o.observation_id IN ("
+                        + ",".join("?" * len(signal_ids)) + ")",
+                        (float(now), *signal_ids))),
+                    key=lambda row: safe_float(row.get("target_at"), 0.0),
+                )[:budget]
+            remaining = budget - len(rows)
+            if remaining > 0:
+                # Everything the signal pass did not take, in the original
+                # order and on the original index.
+                rows.extend(dict(row) for row in connection.execute(
+                    columns
+                    + " AND obs.role<>'signal' ORDER BY o.target_at LIMIT ?",
+                    (float(now), remaining),
+                ))
+        return rows
 
     def record_flow_observation_outcome(
         self, due: dict, exit_quote: dict, quote_block: int, now: float,

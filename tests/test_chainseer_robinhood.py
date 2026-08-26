@@ -8739,3 +8739,119 @@ class StageIsFullyAttributedTests(SealStageBudgetTests):
         # Ordered: the head must be timed before classification consumes it.
         self.assertLess(live.index("decision_head_seconds"),
                         live.index("classification_seconds"))
+
+
+class SignalArmResolutionPriorityTests(unittest.TestCase):
+    """An unmeasured gate is an unverified gate.
+
+    Strict oldest-first resolution made role='signal' unauditable: the
+    due-but-unresolved backlog reached 297,569 with its oldest entry 9.9 days
+    past due, so every newly sealed signal sat behind ~300,000 older rows in a
+    queue growing 12,171/day. 67 of 75 signal outcomes were still pending and
+    the 8 that ever resolved all belonged to ONE pool -- no signal-versus-
+    control comparison had ever been possible.
+
+    Ordering by arm changes only WHICH due outcome is measured first. It is
+    not a threshold, an eligibility rule or an execution path.
+    """
+
+    NOW = 500_000.0
+
+    def _store(self, directory):
+        return rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+
+    def _observation(self, store, obs_id, role, target_offsets, *, verified=1):
+        with store.connection() as connection:
+            connection.execute(
+                """INSERT INTO flow_observations
+                     (observation_id,policy_version,pool_id,token_address,
+                      observation_head,observation_head_lag_blocks,observed_at,
+                      observed_at_epoch,window_start_block,window_end_block,
+                      transaction_set_hash,transaction_count,features_json,
+                      quote_json,quote_block,quote_verified,sealed_at,
+                      cohort_id,role,qualification_gap_count)
+                   VALUES (?,?,?,?,1,0,?,?,0,1,'h',1,'{}','{}',1,?,?,?,?,0)""",
+                (obs_id, rh.FLOW_EVIDENCE_POLICY_VERSION, "0x" + "11" * 32,
+                 TOKEN, rh._utc_now(), self.NOW, verified, rh._utc_now(),
+                 "c", role))
+            connection.executemany(
+                """INSERT INTO flow_observation_outcomes
+                     (observation_id,horizon_label,horizon_seconds,target_at,
+                      status)
+                   VALUES (?,?,?,?,'pending')""",
+                [(obs_id, f"h{i}", 60, self.NOW + off)
+                 for i, off in enumerate(target_offsets)])
+
+    def test_a_due_signal_outcome_outranks_an_older_due_control(self):
+        """The exact production shape: the control is older and would win on
+        target_at alone."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._observation(store, "control-old", "matched_control",
+                              [-100_000.0])
+            self._observation(store, "signal-new", "signal", [-1.0])
+            due = store.due_flow_observation_outcomes(self.NOW, limit=10)
+            self.assertEqual(len(due), 2)
+            self.assertEqual(due[0]["observation_id"], "signal-new",
+                             "the signal arm must be measured first")
+
+    def test_controls_still_resolve_in_oldest_first_order(self):
+        """Priority reorders the arms; it must not disorder within them."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._observation(store, "c-older", "matched_control", [-500.0])
+            self._observation(store, "c-newer", "matched_control", [-10.0])
+            due = store.due_flow_observation_outcomes(self.NOW, limit=10)
+            self.assertEqual([r["observation_id"] for r in due],
+                             ["c-older", "c-newer"])
+
+    def test_nothing_is_skipped_only_reordered(self):
+        """A deferred control is deferred by exactly what a signal advances."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._observation(store, "s", "signal", [-5.0])
+            self._observation(store, "c1", "matched_control", [-50.0])
+            self._observation(store, "c2", "matched_control", [-40.0])
+            due = store.due_flow_observation_outcomes(self.NOW, limit=10)
+            self.assertEqual(
+                sorted(r["observation_id"] for r in due), ["c1", "c2", "s"])
+
+    def test_the_limit_is_still_respected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._observation(store, "s", "signal", [-5.0, -4.0, -3.0])
+            self._observation(store, "c", "matched_control", [-50.0, -49.0])
+            self.assertEqual(
+                len(store.due_flow_observation_outcomes(self.NOW, limit=2)), 2)
+            self.assertEqual(
+                len(store.due_flow_observation_outcomes(self.NOW, limit=0)), 0)
+
+    def test_an_unverified_signal_quote_is_still_refused(self):
+        """Priority must not smuggle an observation past quote verification --
+        that would be gate-loosening, which the policy forbids."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._observation(store, "s-unverified", "signal", [-5.0],
+                              verified=0)
+            self._observation(store, "c", "matched_control", [-50.0])
+            due = store.due_flow_observation_outcomes(self.NOW, limit=10)
+            self.assertEqual([r["observation_id"] for r in due], ["c"])
+
+    def test_outcomes_not_yet_due_are_untouched(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._observation(store, "s-future", "signal", [+5_000.0])
+            self.assertEqual(
+                store.due_flow_observation_outcomes(self.NOW, limit=10), [])
+
+    def test_the_selection_never_materialises_a_global_sort(self):
+        """Guards the regression that made this fix cost 22.5s: expressing
+        the priority as an ORDER BY key drove the planner through ~297,000
+        due rows inside a lane already failing 25% of its runs on deadline."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        body = source.split("def due_flow_observation_outcomes", 1)[1].split(
+            "def record_flow_observation_outcome", 1)[0]
+        self.assertNotIn("CASE WHEN obs.role", body,
+                         "the priority is a sort key again")
+        self.assertIn("role='signal'", body)
