@@ -663,6 +663,11 @@ FLOW_DECISION_DRIFT_THRESHOLD_BPS = None   # unset until the cohort measures it
 # that are research-only whatever the price says. So a quote is taken only
 # where it could change the verdict, and even then bounded per cycle.
 FLOW_DECISION_QUOTE_LIMIT = 20
+#: What an outcome that could not be priced at its horizon is worth to the
+#: evaluation. The store already records these as total losses -- a strategy
+#: that cannot exit has lost the notional -- and comparisons must use the same
+#: number, or an arm with heavy attrition scores itself on its survivors.
+FLOW_UNEXITABLE_RETURN = -1.0
 # Can the position be exited at all? The entry quote already answers it: buy
 # and sell at the SAME block, before any time passes. Measured over 65 sealed
 # observations that round trip loses a median 22.5%, a minimum of 100% (pools
@@ -3624,6 +3629,7 @@ class RobinhoodLearningStore:
                 return None
             # Outcomes scheduled in the SAME transaction, so an observation
             # can never exist without the future it promised to measure.
+
             connection.executemany(
                 """
                 INSERT OR IGNORE INTO flow_observation_outcomes (
@@ -3903,33 +3909,63 @@ class RobinhoodLearningStore:
         """
         cohort = cohort_id or FLOW_EVIDENCE_COHORT_ID
         with self.connection() as connection:
+            # non_exitable is INCLUDED. Filtering to status='resolved' drops
+            # every outcome that could not be priced at its horizon, and the
+            # arms lose them at very different rates: measured 2026-08-27, the
+            # signal arm was 81% non-exitable against 31% for controls. On
+            # survivors alone the signal arm read +0.04% to +0.54% against
+            # -1.50% to -1.71% for controls, i.e. it looked like the first
+            # edge this project had ever found. Counting the unexitable at
+            # the -1.0 the store already records for them, the same data says
+            # signal -81.2% against control -40.2%: twice as bad, not better.
+            #
+            # The gate checks exitability once, at seal. These pools pass it
+            # then and die before the horizon, so the filter was selecting
+            # exactly the observations that make the arm look good.
             rows = [dict(r) for r in connection.execute(
                 """
-                SELECT o.role, o.token_address, x.net_return
+                SELECT o.role, o.token_address, x.net_return, x.status
                 FROM flow_observations o
                 JOIN flow_observation_outcomes x USING(observation_id)
-                WHERE o.cohort_id=? AND x.horizon_label=? AND x.status='resolved'
+                WHERE o.cohort_id=? AND x.horizon_label=?
+                  AND x.status IN ('resolved','non_exitable')
                 """, (cohort, FLOW_PRIMARY_HORIZON_LABEL),
             )]
         arms: dict[str, dict] = {}
         for row in rows:
             arm = arms.setdefault(
-                str(row["role"]), {"returns": [], "by_token": {}}
+                str(row["role"]),
+                {"returns": [], "by_token": {}, "survivors": [],
+                 "survivors_by_token": {}, "unexitable": 0},
             )
-            value = safe_float(row["net_return"], None)
+            unexitable = str(row["status"]) == "non_exitable"
+            value = (
+                FLOW_UNEXITABLE_RETURN if unexitable
+                else safe_float(row["net_return"], None)
+            )
             if value is None:
                 continue
             arm["returns"].append(value)
             # One observation per token, earliest wins, so a single dying
             # token cannot dominate the mean the way one supplied 20 of 41.
             arm["by_token"].setdefault(row["token_address"], value)
+            if unexitable:
+                arm["unexitable"] += 1
+            else:
+                arm["survivors"].append(value)
+                arm["survivors_by_token"].setdefault(
+                    row["token_address"], value)
         report = {}
         for name, arm in arms.items():
             raw = arm["returns"]
             deduped = sorted(arm["by_token"].values())
+            survivors = sorted(arm["survivors_by_token"].values())
             report[name] = {
                 "n_raw": len(raw),
                 "n_tokens": len(deduped),
+                # The headline INCLUDES unexitable outcomes. A mean that
+                # silently drops them is a mean over the survivors of a
+                # selection the arms do not share.
                 "mean_net_return": (
                     round(sum(deduped) / len(deduped), 6) if deduped else None
                 ),
@@ -3937,6 +3973,18 @@ class RobinhoodLearningStore:
                     round(deduped[len(deduped) // 2], 6) if deduped else None
                 ),
                 "positive": sum(1 for v in deduped if v > 0),
+                # Published beside it so the gap is visible rather than
+                # discoverable. These two differing by 80 points IS the
+                # finding, and it is invisible if only one is reported.
+                "unexitable_outcomes": arm["unexitable"],
+                "exit_attrition_rate": (
+                    round(arm["unexitable"] / len(raw), 4) if raw else None
+                ),
+                "mean_net_return_survivors_only": (
+                    round(sum(survivors) / len(survivors), 6)
+                    if survivors else None
+                ),
+                "n_tokens_survivors_only": len(survivors),
             }
         signal = (report.get("signal") or {}).get("mean_net_return")
         control = (report.get("matched_control") or {}).get("mean_net_return")

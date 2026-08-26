@@ -8896,3 +8896,69 @@ class EvidenceOutcomeItemReserveTests(unittest.TestCase):
         body = source.split(
             "def observe_flow_observation_outcomes", 1)[1][:2000]
         self.assertIn("deferred = len(due_rows) - index", body)
+
+
+class ExitAttritionIsPublishedTests(unittest.TestCase):
+    """A mean over survivors is a mean over a selection the arms don't share.
+
+    Measured 2026-08-27, once signal-first resolution made the arm
+    measurable: signal 81.25% non-exitable against 41.09% for controls. On
+    survivors alone the signal arm read +0.0076 against -0.7318 -- it looked
+    like the first edge this project had ever found. Counting the unexitable
+    at the -1.0 the store already records, the same data says -0.8857 against
+    -0.8960: indistinguishable. A 74-point illusion produced entirely by a
+    `status='resolved'` filter.
+    """
+
+    def _seal(self, store, obs_id, role, token, status, net):
+        with store.connection() as connection:
+            connection.execute(
+                "INSERT INTO flow_observations"
+                " (observation_id,policy_version,pool_id,token_address,"
+                "  observation_head,observation_head_lag_blocks,observed_at,"
+                "  observed_at_epoch,window_start_block,window_end_block,"
+                "  transaction_set_hash,transaction_count,features_json,"
+                "  quote_json,quote_block,quote_verified,sealed_at,"
+                "  cohort_id,role,qualification_gap_count)"
+                " VALUES (?,?,?,?,1,0,?,1.0,0,1,'h',1,'{}','{}',1,1,?,?,?,0)",
+                (obs_id, rh.FLOW_EVIDENCE_POLICY_VERSION, "0x" + "22" * 32,
+                 token, rh._utc_now(), rh._utc_now(),
+                 rh.FLOW_EVIDENCE_COHORT_ID, role))
+            connection.execute(
+                "INSERT INTO flow_observation_outcomes"
+                " (observation_id,horizon_label,horizon_seconds,target_at,"
+                "  status,net_return) VALUES (?,?,60,1.0,?,?)",
+                (obs_id, rh.FLOW_PRIMARY_HORIZON_LABEL, status, net))
+
+    def test_unexitable_outcomes_are_counted_not_dropped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._seal(store, "s1", "signal", "0xA", "resolved", 0.01)
+            self._seal(store, "s2", "signal", "0xB", "non_exitable", None)
+            arm = store.signal_versus_control()["arms"]["signal"]
+            self.assertEqual(arm["unexitable_outcomes"], 1)
+            self.assertEqual(arm["exit_attrition_rate"], 0.5)
+            self.assertAlmostEqual(arm["mean_net_return"], -0.495, places=3)
+            self.assertAlmostEqual(
+                arm["mean_net_return_survivors_only"], 0.01, places=6)
+
+    def test_the_headline_is_the_all_outcomes_figure(self):
+        """The survivors-only number must never be the one a reader meets
+        first -- that is the exact shape of the error being prevented."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._seal(store, "s1", "signal", "0xA", "resolved", 0.5)
+            self._seal(store, "s2", "signal", "0xB", "non_exitable", None)
+            arm = store.signal_versus_control()["arms"]["signal"]
+            self.assertLess(arm["mean_net_return"],
+                            arm["mean_net_return_survivors_only"])
+
+    def test_attrition_is_reported_per_arm(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._seal(store, "s1", "signal", "0xA", "non_exitable", None)
+            self._seal(store, "c1", "matched_control", "0xC", "resolved", -0.1)
+            arms = store.signal_versus_control()["arms"]
+            self.assertEqual(arms["signal"]["exit_attrition_rate"], 1.0)
+            self.assertEqual(
+                arms["matched_control"]["exit_attrition_rate"], 0.0)
