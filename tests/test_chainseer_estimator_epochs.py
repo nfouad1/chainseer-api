@@ -98,6 +98,29 @@ class StallSeparationTests(unittest.TestCase):
         self.assertEqual(
             stored["fixed_observation_samples"][0]["status"], "stalled")
 
+    def test_queue_settlement_stall_is_preserved_but_cannot_starve_live(self):
+        """A slow DB settlement is a stall, not a permanent tail reserve."""
+        for _ in range(10):
+            self.engine._blend_seal_model({"queue_settlement_p95": 0.2})
+        baseline = self.engine.seal_cost_model()["queue_settlement_p95"]
+        self.engine._blend_seal_model({"queue_settlement_p95": 12.7})
+        model = self.engine.seal_cost_model()
+        stored = self.store.scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY)
+
+        self.assertEqual(model["queue_settlement_p95"], baseline)
+        self.assertEqual(model["queue_settlement_stall_count"], 1)
+        self.assertEqual(model["seal_stall_count"], 1)
+        self.assertEqual(
+            stored["queue_settlement_samples"][-1]["status"], "stalled")
+
+    def test_queue_settlement_stalls_participate_in_tighten_only_guard(self):
+        for _ in range(rh.SEAL_STALL_GUARD_MIN_SAMPLES):
+            self.engine._blend_seal_model({"queue_settlement_p95": 0.2})
+        self.engine._blend_seal_model({"queue_settlement_p95": 12.7})
+        model = self.engine.seal_cost_model()
+        self.assertTrue(model["stall_guard_active"])
+        self.assertGreater(model["seal_stall_rate"], rh.SEAL_STALL_RATE_MAX)
+
     def test_excessive_stall_rate_activates_tighten_only_guard(self):
         for _ in range(rh.SEAL_STALL_GUARD_MIN_SAMPLES):
             self.engine._blend_seal_model(

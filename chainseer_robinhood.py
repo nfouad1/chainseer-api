@@ -231,7 +231,7 @@ SEAL_QUEUE_STALE_SECONDS = 3 * 3600.0
 #: distribution from an older code revision cannot leak into new estimates.
 #: Samples carry the epoch they were recorded under; only current-epoch
 #: samples drive admission.
-SEAL_COST_MODEL_EPOCH = 3
+SEAL_COST_MODEL_EPOCH = 4
 #: Code revision stamped onto every timing sample for provenance. Set from
 #: the environment the runner exports; "unknown" in tests/ad-hoc use.
 CODE_REVISION = os.environ.get("CHAINSEER_CODE_REVISION", "unknown")
@@ -260,6 +260,16 @@ SEAL_COST_SAMPLE_FIELDS = {
     "queue_settlement_p95": "queue_settlement_samples",
     "per_window_cost_p95": "per_window_samples",
     "downstream_reserve_p95": "downstream_samples",
+}
+
+# Selection/prefetch and queue settlement are both once-per-cycle costs. A
+# lock/provider stall in either component is reliability evidence, not the
+# normal price of one healthy cycle. Keeping those stalls out of the p95
+# prevents a single exceptional pass from starving all subsequent live work;
+# the combined stall guard still tightens admission when they recur.
+SEAL_ONCE_PER_CYCLE_STALL_COMPONENTS = {
+    "fixed_observation_cost_p95",
+    "queue_settlement_p95",
 }
 
 
@@ -350,18 +360,33 @@ def _seal_cost_model_from_state(stored: dict) -> dict:
         derived[field.replace("samples", "censored_count")] = len(censored)
 
     fixed = component_records["fixed_observation_samples"]
+    settlement = component_records["queue_settlement_samples"]
     fixed_success = sum(record["status"] == "success" for record in fixed)
     fixed_stalls = sum(record["status"] == "stalled" for record in fixed)
     fixed_population = fixed_success + fixed_stalls
-    stall_rate = (
+    fixed_stall_rate = (
         fixed_stalls / fixed_population if fixed_population else 0.0)
+    settlement_success = sum(
+        record["status"] == "success" for record in settlement)
+    settlement_stalls = sum(
+        record["status"] == "stalled" for record in settlement)
+    settlement_population = settlement_success + settlement_stalls
+    seal_stalls = fixed_stalls + settlement_stalls
+    seal_stall_population = fixed_population + settlement_population
+    seal_stall_rate = (
+        seal_stalls / seal_stall_population if seal_stall_population else 0.0)
     derived.update({
         "fixed_stall_count": fixed_stalls,
         "fixed_stall_population": fixed_population,
-        "fixed_stall_rate": round(stall_rate, 6),
+        "fixed_stall_rate": round(fixed_stall_rate, 6),
+        "queue_settlement_stall_count": settlement_stalls,
+        "queue_settlement_stall_population": settlement_population,
+        "seal_stall_count": seal_stalls,
+        "seal_stall_population": seal_stall_population,
+        "seal_stall_rate": round(seal_stall_rate, 6),
         "stall_guard_active": bool(
-            fixed_population >= SEAL_STALL_GUARD_MIN_SAMPLES
-            and stall_rate > SEAL_STALL_RATE_MAX),
+            seal_stall_population >= SEAL_STALL_GUARD_MIN_SAMPLES
+            and seal_stall_rate > SEAL_STALL_RATE_MAX),
         "stall_rate_limit": SEAL_STALL_RATE_MAX,
     })
     # Compatibility names used by existing dashboards/tests.
@@ -414,7 +439,8 @@ def _append_seal_cost_records(
         )
         for value in clean:
             record_status = status
-            if status == "success" and scalar == "fixed_observation_cost_p95":
+            if (status == "success"
+                    and scalar in SEAL_ONCE_PER_CYCLE_STALL_COMPONENTS):
                 if value > stall_threshold:
                     record_status = "stalled"
                     stalls_added += 1
@@ -5899,12 +5925,17 @@ class RobinhoodLearningStore:
         seal_model = _seal_cost_model_from_state(
             self.scheduler_state(SEAL_COST_MODEL_STATE_KEY))
         if cohort_id:
-            fixed_records = _valid_seal_sample_records(
-                self.scheduler_state(SEAL_COST_MODEL_STATE_KEY).get(
-                    "fixed_observation_samples"))
+            cohort_model_state = self.scheduler_state(
+                SEAL_COST_MODEL_STATE_KEY)
+            once_per_cycle_records = []
+            for field in (
+                "fixed_observation_samples", "queue_settlement_samples",
+            ):
+                once_per_cycle_records.extend(
+                    _valid_seal_sample_records(cohort_model_state.get(field)))
             cohort_started = _timestamp(cohort.get("started_at")) or 0.0
             cohort_fixed = [
-                record for record in fixed_records
+                record for record in once_per_cycle_records
                 if safe_int(record.get("epoch"), -1) == SEAL_COST_MODEL_EPOCH
                 and str(record.get("revision") or "") == cohort_revision
                 and safe_float(record.get("at"), 0.0) >= cohort_started
@@ -11582,6 +11613,10 @@ class RobinhoodLearningEngine:
                     model.get("fixed_stall_rate"), 0.0),
                 "fixed_stall_population": safe_int(
                     model.get("fixed_stall_population"), 0),
+                "seal_stall_rate": safe_float(
+                    model.get("seal_stall_rate"), 0.0),
+                "seal_stall_population": safe_int(
+                    model.get("seal_stall_population"), 0),
                 "stall_rate_limit": SEAL_STALL_RATE_MAX,
                 "windows_preclaimed": int(prequeued_now),
             },
@@ -14651,6 +14686,14 @@ def live_lane_reliability_snapshot(
                 model.get("fixed_stall_population"), 0),
             "fixed_stall_rate": safe_float(
                 model.get("fixed_stall_rate"), 0.0),
+            "queue_settlement_stall_count": safe_int(
+                model.get("queue_settlement_stall_count"), 0),
+            "seal_stall_count": safe_int(
+                model.get("seal_stall_count"), 0),
+            "seal_stall_population": safe_int(
+                model.get("seal_stall_population"), 0),
+            "seal_stall_rate": safe_float(
+                model.get("seal_stall_rate"), 0.0),
             "stall_guard_active": bool(
                 model.get("stall_guard_active")),
             "stall_rate_limit": SEAL_STALL_RATE_MAX,
