@@ -14407,12 +14407,6 @@ def dashboard_operational_snapshot(
             position for position in positions if position.get("status") == "closed"
         ][:12],
         "closed_performance":store.closed_performance(),
-        # A bounded audit feed includes every decision class. The browser keeps
-        # it collapsed, time-filtered and paged so rejected-token growth cannot
-        # dominate either the snapshot or the dashboard.
-        "analyzed_tokens":store.recent_analyzed_tokens(
-            limit=100, include_rejected=True,
-        ),
         "last_cycle":summary.get("cycle") or {},
         "lanes": {
             "state": store.lane_states(),
@@ -14475,7 +14469,6 @@ def dashboard_historical_snapshot(
         "pool_discovery": store.pool_discovery_latency(),
         "flow_evidence_events": store.recent_flow_evidence_events(limit=16),
         "flow_origin_queue": store.pending_transaction_origin_counts(),
-        "v4_custody": store.v4_custody_summary(),
     }
 
 
@@ -14946,8 +14939,8 @@ def serve_dashboard(
             self.end_headers(); self.wfile.write(content)
         def log_message(self, *_args):
             return
-    # The historical snapshot costs minutes: flow_summary, v4_custody_summary and
-    # pending_transaction_origin_counts each range-join 487k swap rows against
+    # The historical snapshot costs minutes: flow_summary and
+    # pending_transaction_origin_counts range-join 487k swap rows against
     # 2,176 signal windows on a BETWEEN, which no index serves. Computing that
     # on the request path made /api/status time out in the browser, so it is
     # computed off the request path instead and every request is served the

@@ -2353,12 +2353,14 @@ class RobinhoodLearningTests(unittest.TestCase):
             self.assertIn(renderer, html)
         self.assertIn("All-time net P&amp;L", html)
         self.assertIn("closed_performance", html)
-        self.assertIn("Detection activity", html)
-        self.assertIn("activitywindow", html)
-        self.assertIn("activitysearch", html)
-        self.assertIn("renderAnalyzed", html)
-        self.assertIn("V4 custody lab", html)
-        self.assertIn("renderCustody", html)
+        self.assertNotIn("Detection activity", html)
+        self.assertNotIn("activitywindow", html)
+        self.assertNotIn("renderAnalyzed", html)
+        self.assertNotIn("V4 custody lab", html)
+        self.assertNotIn("renderCustody", html)
+        self.assertIn("Latest checkpoint reflection", html)
+        self.assertIn("Checkpoint-based, not every lane cycle", html)
+        self.assertIn("refreshed by the dedicated marks lane", html)
         self.assertIn("Only immutable qualified signals and their matched controls", html)
         self.assertNotIn("Rejected by safety", html)
 
@@ -2751,15 +2753,15 @@ class PipelineListingTests(unittest.TestCase):
                 "rejections must stay available to the counterfactual audit",
             )
 
-    def test_dashboard_detection_feed_includes_excluded_tokens(self):
+    def test_dashboard_omits_detection_feed_but_preserves_audit_query(self):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "learning.sqlite3")
             token = "0x" + "e5" * 20
             self._analysed(store, token, "v4_shadow_only", False)
             snapshot = rh.dashboard_snapshot(directory)
-            self.assertEqual(snapshot["analyzed_tokens"][0]["token_address"], token)
+            self.assertNotIn("analyzed_tokens", snapshot)
             self.assertEqual(
-                snapshot["analyzed_tokens"][0]["paper_decision"],
+                store.recent_analyzed_tokens(include_rejected=True)[0]["paper_decision"],
                 "v4_shadow_only",
             )
 
