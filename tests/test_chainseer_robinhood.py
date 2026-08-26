@@ -8855,3 +8855,44 @@ class SignalArmResolutionPriorityTests(unittest.TestCase):
         self.assertNotIn("CASE WHEN obs.role", body,
                          "the priority is a sort key again")
         self.assertIn("role='signal'", body)
+
+
+class EvidenceOutcomeItemReserveTests(unittest.TestCase):
+    """A killed run discards the work it already finished.
+
+    90 of 98 evidence-lane failures terminated inside observation_outcomes,
+    whose p95 is 69.6s against a 90s budget at 12 items -- about 5.8s per
+    outcome, each one a remote block-pinned exit quote. The loop checked
+    `deadline.expired()`, which is only true once the budget is already
+    spent, so the item it admitted was precisely the one that overran. The
+    supervisor then killed the run and every resolution it had completed went
+    with it, holding effective throughput near three quarters of nominal
+    while the outcome backlog diverged at +12,171/day.
+    """
+
+    def test_the_loop_reserves_headroom_instead_of_waiting_for_expiry(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        body = source.split(
+            "def observe_flow_observation_outcomes", 1)[1][:2000]
+        self.assertIn("EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS", body)
+        self.assertNotIn(
+            "deadline.expired()", body,
+            "expiry admits the item that overruns; the reserve refuses it")
+
+    def test_the_reserve_covers_a_measured_outcome(self):
+        """Sized from the attribution: ~5.8s per outcome at p95."""
+        self.assertGreaterEqual(rh.EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS, 5.8)
+        self.assertLess(
+            rh.EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS,
+            rh.EVIDENCE_LANE_BUDGET_SECONDS / 4,
+            "a reserve this large would starve the stage rather than bound it")
+
+    def test_deferral_is_counted_not_silent(self):
+        """A deferred outcome must remain pending and be reported, so the
+        backlog stays visible rather than quietly shrinking."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        body = source.split(
+            "def observe_flow_observation_outcomes", 1)[1][:2000]
+        self.assertIn("deferred = len(due_rows) - index", body)

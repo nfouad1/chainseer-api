@@ -168,6 +168,16 @@ EVIDENCE_LANE_CADENCE_SECONDS = 60.0
 EVIDENCE_ENTRY_QUOTE_LIMIT = 8
 EVIDENCE_EVENT_OUTCOME_LIMIT = 12
 EVIDENCE_OBSERVATION_OUTCOME_LIMIT = 12
+#: Headroom one outcome needs to finish once started. Each resolution takes a
+#: block-pinned exit quote -- a remote call -- so an item begun with less than
+#: this left runs past the lane deadline and is killed by the supervisor,
+#: discarding every resolution the run had already completed. Measured: 90 of
+#: 98 evidence-lane failures terminated inside observation_outcomes, whose p95
+#: is 69.6s against a 90s budget at 12 items, i.e. ~5.8s per outcome.
+#: Deferring the next item instead costs one outcome; overrunning costs all of
+#: them, which is why the effective resolution rate sat near three quarters of
+#: nominal while the backlog diverged.
+EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS = 8.0
 # The live lane is for a fresh decision, not historical queue throughput.
 # The first clean 100-attempt cohort completed 100/100, but only 81 decisions
 # landed within 120 blocks because the quote stage handled eight windows. A
@@ -12038,7 +12048,13 @@ class RobinhoodLearningEngine:
         resolved = non_exitable = failures = 0
         deferred = 0
         for index, due in enumerate(due_rows):
-            if deadline is not None and deadline.expired():
+            # Reserve, not expiry. `expired()` is only true once the budget is
+            # already spent, so the item it admits is the one that overruns --
+            # and a killed run discards the resolutions it had finished, not
+            # just the one in flight.
+            if (deadline is not None
+                    and deadline.remaining()
+                    < EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
                 deferred = len(due_rows) - index
                 break
             try:
