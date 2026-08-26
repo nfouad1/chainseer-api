@@ -901,3 +901,66 @@ class ReliabilityTelemetryTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class EstimatorRecoveryProbeTests(unittest.TestCase):
+    """Admission at zero must always leave itself a way back.
+
+    Measured live 2026-08-26: per_window_cost_p95 inflated to ~3.27s and
+    admission collapsed. Admitting zero seals nothing, sealing nothing
+    measures nothing, and an estimate with no new samples never falls --
+    measured_cost_seconds was 0.0 across 39 of 77 recent cycles. Fresh
+    sealing fell from 13,283/day to 494/day and signal production stopped
+    entirely on 25-26 August, because a window can only qualify while it is
+    fresh: 15 of 15 signals ever produced came from windows within 1,350
+    blocks, and zero of 24,453 staler ones have ever qualified.
+
+    Of 62 sampled zero-admission cycles, 60 had usable budget remaining --
+    the budget was there, the probe simply was not reachable because it was
+    ANDed with `not epoch_model_initialized`, covering bootstrap but not
+    recovery. Recovery is the case that recurs in production.
+
+    These tests assert the shipped predicate rather than re-deriving the
+    admission arithmetic: an earlier draft reimplemented the formula, got a
+    different answer from production on production's own numbers, and would
+    have passed while the policy it claimed to check was broken.
+    """
+
+    def _source(self):
+        return Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+
+    def test_the_probe_is_not_gated_on_epoch_initialisation(self):
+        """The regression, stated directly. The old predicate ANDed
+        `not epoch_model_initialized` into the probe condition, which is
+        what made recovery unreachable."""
+        block = self._source().split("cold_start_probe = bool(", 1)[1][:200]
+        self.assertIn("admitted == 0", block)
+        self.assertIn("usable > 0", block)
+        self.assertNotIn(
+            "epoch_model_initialized", block,
+            "the probe is gated on epoch state again -- an inflated estimate "
+            "would once more be unable to measure its way back down")
+
+    def test_the_probe_still_requires_real_budget(self):
+        """It must not manufacture budget: `usable > 0` remains a condition,
+        and usable is what survives every reserve."""
+        block = self._source().split("cold_start_probe = bool(", 1)[1][:200]
+        self.assertIn("usable > 0", block)
+        self.assertIn("static_limit > 0", block)
+
+    def test_the_probe_reports_which_case_it_served(self):
+        """Bootstrap resolves itself; recovery means an estimate was stuck.
+        They are indistinguishable in a count and need opposite follow-up."""
+        source = self._source()
+        self.assertIn('"probe_kind": probe_kind', source)
+        self.assertIn('"estimator_recovery"', source)
+        self.assertIn('"cold_start"', source)
+
+    def test_the_stall_guard_still_caps_throughput_at_one(self):
+        """Tighten-only recovery: a probe may measure, it may not resume
+        normal throughput while the stall rate is out of policy."""
+        source = self._source()
+        block = source.split("stall_guard_active and admitted > 1", 1)[1][:400]
+        self.assertIn("admitted = 1", block)
+        self.assertIn("cap_one_recovery_probe", block)

@@ -11397,17 +11397,41 @@ class RobinhoodLearningEngine:
                 admitted = min(
                     static_limit,
                     int(usable // max(cost, 0.05)))
+            # A probe is owed whenever admission has collapsed to zero with
+            # budget still on the table -- not only before the model exists.
+            #
+            # Restricting it to an uninitialised epoch left a closed loop: an
+            # inflated p95 admits nothing, admitting nothing measures nothing,
+            # and an estimate with no new samples never falls. Measured live:
+            # per_window_cost_p95 3.266s against 10.468s of headroom, with
+            # measured_cost_seconds 0.0 and 39 of 77 recent cycles admitting
+            # zero windows. Fresh sealing fell from 13,283/day to 494/day and
+            # signal production stopped entirely on 25-26 August, because a
+            # window can only qualify while it is fresh.
+            #
+            # The p95 inflates from the stall tail (231 stalls, 2.16%), so the
+            # typical window still costs ~0.34s -- the estimate is not wrong
+            # about its tail, it is simply unable to notice the tail passing.
+            # One window is already the established safe floor: it is exactly
+            # what the stall guard permits, and it fits inside the reserve by
+            # construction because `usable` is what remains after every
+            # reserve is subtracted.
+            uninitialised = not bool(model.get("epoch_model_initialized"))
             cold_start_probe = bool(
-                admitted == 0 and static_limit > 0 and usable > 0
-                and not bool(model.get("epoch_model_initialized")))
+                admitted == 0 and static_limit > 0 and usable > 0)
+            probe_kind = (
+                None if not cold_start_probe
+                else "cold_start" if uninitialised else "estimator_recovery")
             if cold_start_probe:
-                # An epoch reset has no normative timing distribution yet.
-                # One bounded probe is necessary to learn it; admitting the
-                # entire batch would weaken policy, while admitting zero
-                # forever would make the estimator impossible to bootstrap.
+                # An epoch reset has no normative timing distribution yet, and
+                # a collapsed one has no way to earn a better distribution.
+                # One bounded probe answers both; admitting the entire batch
+                # would weaken policy, while admitting zero forever makes the
+                # estimator impossible to bootstrap OR to recover.
                 admitted = 1
         else:
             cold_start_probe = False
+            probe_kind = None
         stall_guard_active = bool(model.get("stall_guard_active"))
         stall_guard_action = "normal"
         if stall_guard_active and admitted > 1:
@@ -11653,6 +11677,10 @@ class RobinhoodLearningEngine:
                 "stall_guard_active": stall_guard_active,
                 "stall_guard_action": stall_guard_action,
                 "cold_start_probe": cold_start_probe,
+                # WHICH probe: bootstrapping a new epoch, or recovering an
+                # estimate that had locked admission at zero. They look
+                # identical in the count and need opposite follow-up.
+                "probe_kind": probe_kind,
                 "fixed_stall_rate": safe_float(
                     model.get("fixed_stall_rate"), 0.0),
                 "fixed_stall_population": safe_int(
