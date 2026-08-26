@@ -840,6 +840,35 @@ class RobinhoodLearningTests(unittest.TestCase):
                 45,
             )
 
+    def test_project_reflection_cannot_autogrow_shared_faculty_registry(self):
+        class Result:
+            stdout = "ok"
+
+        captured = {}
+
+        def command_runner(arguments, **kwargs):
+            captured["arguments"] = arguments
+            captured.update(kwargs)
+            return Result()
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            coordinator = RobinhoodReflectionCoordinator(
+                root,
+                SimpleNamespace(),
+                todo_path=root / "TODO.md",
+                skill_root=root / "skill",
+                command_runner=command_runner,
+            )
+            original_autogrow = os.environ.get("CT_AUTOGROW")
+            original_automaint = os.environ.get("CT_AUTOMAINT")
+            self.assertEqual(coordinator._run(["python", "reflection"]), "ok")
+
+            self.assertEqual(captured["env"]["CT_AUTOGROW"], "0")
+            self.assertEqual(captured["env"]["CT_AUTOMAINT"], "0")
+            self.assertEqual(os.environ.get("CT_AUTOGROW"), original_autogrow)
+            self.assertEqual(os.environ.get("CT_AUTOMAINT"), original_automaint)
+
     def test_counterfactual_audit_requires_realizable_gain_and_keeps_hard_stops(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

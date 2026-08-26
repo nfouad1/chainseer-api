@@ -674,12 +674,21 @@ class RobinhoodReflectionCoordinator:
         ]
 
     def _run(self, arguments: list[str]) -> str:
+        # Project reflections may use the shared Cypher Tempre senses and
+        # modalities, but they must not silently mutate the shared faculty
+        # registry.  Registry growth belongs to an explicit, epoch-sealed
+        # identity operation; otherwise a project checkpoint can invalidate
+        # the identity Timechain's registry covenant.
+        environment = os.environ.copy()
+        environment["CT_AUTOGROW"] = "0"
+        environment["CT_AUTOMAINT"] = "0"
         result = self.command_runner(
             arguments,
             check=True,
             capture_output=True,
             text=True,
             encoding="utf-8",
+            env=environment,
         )
         return result.stdout
 
