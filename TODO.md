@@ -52,20 +52,32 @@
 
 Generated from sealed 15-candidate or 15-signal checkpoints. Completion state is preserved on refresh.
 
+- [ ] `RH-FLOW-CONTROL-EDGE` — Require a positive paired control advantage
+  - Recommendation: Keep Flow shadow-only until the lower confidence bound of paired net expectancy is above zero.
+  - Evidence: Checkpoint 135: paired 15m evidence is {'qualified': {'n': 131, 'mean_net_return': -0.36253771788046923, 'catastrophic_rate': 0.3435114503816794}, 'matched_control': {'n': 78, 'mean_net_return': -0.4772070605967427, 'catastrophic_rate': 0.44871794871794873}, 'incremental_expectancy': 0.11466934271627349, 'paired_n': 78, 'paired_incremental_expectancy': 0.10055278346096017, 'paired_incremental_ci_95': [-0.06255228350496694, 0.25612210791336243]}.
+  - Checkpoints: first 15, latest 135
+- [ ] `RH-FLOW-EXIT-TAIL-RISK` — Reduce non-exitable and catastrophic Flow outcomes
+  - Recommendation: Investigate identity concentration, adverse direction, liquidity and quote failures before promotion.
+  - Evidence: Checkpoint 135: non-exit=0.19083969465648856, catastrophic=0.3435114503816794.
+  - Checkpoints: first 15, latest 135
+- [ ] `RH-FLOW-PROSPECTIVE-SAMPLE` — Continue the frozen prospective Flow cohort
+  - Recommendation: Do not tune Flow thresholds before the pre-registered evidence window is complete.
+  - Evidence: Checkpoint 90: 89 completed 15m qualified outcomes.
+  - Checkpoints: first 15, latest 90
 - [x] `RH-REFLECT-MARKET-COVERAGE` — Improve Robinhood outcome-market coverage
   - Recommendation: Add a fallback price/market-cap source and retain source-specific failure telemetry before using checkpoint returns for calibration.
-  - Evidence: Checkpoint 615: market observation failure ratio was 50.0%.
-  - Checkpoints: first 45, latest 615
+  - Evidence: Checkpoint 2415: market observation failure ratio was 33.3%.
+  - Checkpoints: first 45, latest 2415
 - [ ] `RH-REFLECT-METADATA` — Backfill missing Robinhood token identity metadata
   - Recommendation: Retry name/symbol reads from a current block and add an explorer fallback so analyzed-token evidence remains attributable.
-  - Evidence: Checkpoint 1095: 15 of 15 analyzed candidates lacked a name or symbol.
-  - Checkpoints: first 120, latest 1095
+  - Evidence: Checkpoint 3300: 15 of 15 analyzed candidates lacked a name or symbol.
+  - Checkpoints: first 120, latest 3300
 - [ ] `RH-REFLECT-SCORE-NON-PREDICTIVE` — A higher legitimacy score is not buying a better outcome
   - Recommendation: Do not raise the entry floor on this evidence. The floor is a safety control only if score predicts outcome; measure the safety sub-signals (holder concentration, liquidity custody) against outcomes before changing any threshold.
-  - Evidence: Checkpoint 1095: score-outcome correlation -0.2696 over 47 observed closes; worst bucket 80-85 averages 0.6348x over 4 closes
-  - Checkpoints: first 420, latest 1095
+  - Evidence: Checkpoint 3300: score-outcome correlation -0.1756 over 80 observed closes; worst bucket 75-80 averages 0.7881x over 32 closes
+  - Checkpoints: first 420, latest 3300
 - [ ] `RH-REFLECT-V4-CATCHUP` — Keep Robinhood V4 discovery continuously caught up
   - Recommendation: Use adaptive bounded block windows and explicit backlog telemetry; never advance the cursor across a failed window.
-  - Evidence: Checkpoint 1095: V4 discovery reported 309675 blocks behind.
-  - Checkpoints: first 120, latest 1095
+  - Evidence: Checkpoint 3300: V4 discovery reported 2142410 blocks behind.
+  - Checkpoints: first 120, latest 3300
 <!-- robinhood-reflection:auto:end -->

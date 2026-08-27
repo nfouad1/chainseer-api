@@ -252,7 +252,39 @@ SEAL_COST_MODEL_EPOCH = 4
 #: Code revision stamped onto every timing sample for provenance. Set from
 #: the environment the runner exports; "unknown" in tests/ad-hoc use.
 CODE_REVISION = os.environ.get("CHAINSEER_CODE_REVISION", "unknown")
-ACCEPTANCE_COHORT_SCHEMA_VERSION = 1
+
+
+def _worktree_source_digest() -> str:
+    """Hash of the source actually on disk, not the revision it claims to be.
+
+    A revision pin cannot see uncommitted edits. A cohort can therefore sit at
+    `revision_mismatches: 0` while every attempt runs modified code -- the pin
+    records what git was last told, and the process runs the working tree.
+    That is the same class of error as the 1,777/1,786 contaminated cohort,
+    but invisible to the check built to catch it.
+
+    Digests the modules that decide behaviour. Missing files are recorded as
+    absent rather than skipped, so deleting one changes the digest instead of
+    quietly preserving it.
+    """
+    digest = hashlib.sha256()
+    root = Path(__file__).resolve().parent
+    for name in sorted(SOURCE_DIGEST_MODULES):
+        digest.update(name.encode("utf-8"))
+        try:
+            digest.update((root / name).read_bytes())
+        except OSError:
+            digest.update(b"<absent>")
+    return digest.hexdigest()[:16]
+#: Modules whose content defines live-lane behaviour for acceptance purposes.
+SOURCE_DIGEST_MODULES = (
+    "chainseer_robinhood.py",
+    "chainseer_robinhood_commitments.py",
+    "chainseer_robinhood_gate.py",
+    "chainseer.py",
+    "chainseer_core.py",
+)
+ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
 ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v2"
 
 
@@ -2141,6 +2173,7 @@ class RobinhoodLearningStore:
                     schema_version INTEGER NOT NULL,
                     started_at TEXT NOT NULL,
                     revision TEXT NOT NULL,
+                    source_digest TEXT,
                     sample_target INTEGER NOT NULL,
                     policy_json TEXT NOT NULL,
                     policy_hash TEXT NOT NULL,
@@ -2739,6 +2772,14 @@ class RobinhoodLearningStore:
                 connection.execute(
                     "ALTER TABLE lane_state ADD COLUMN stage_detail_json"
                     " TEXT NOT NULL DEFAULT '{}'")
+            cohort_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(acceptance_cohorts)")
+            }
+            if cohort_columns and "source_digest" not in cohort_columns:
+                connection.execute(
+                    "ALTER TABLE acceptance_cohorts ADD COLUMN"
+                    " source_digest TEXT")
             run_columns = {
                 row[1] for row in connection.execute("PRAGMA table_info(runs)")
             }
@@ -2756,6 +2797,9 @@ class RobinhoodLearningStore:
                 "deadline_seconds": "REAL",
                 "lane": "TEXT NOT NULL DEFAULT 'legacy'",
                 "revision": "TEXT",
+                # What the process actually executed, as opposed to what the
+                # revision claims. Uncommitted edits move this and not that.
+                "source_digest": "TEXT",
                 "acceptance_cohort_id": "TEXT",
             }.items():
                 if name not in run_columns:
@@ -5163,11 +5207,15 @@ class RobinhoodLearningStore:
                               COALESCE(SUM(status='complete'),0) complete_attempts,
                               COALESCE(SUM(status='deadline_exceeded'),0) timeouts,
                               COALESCE(SUM(status='failed'),0) failures,
-                              COALESCE(SUM(revision!=?),0) revision_mismatches
+                              COALESCE(SUM(revision!=?),0) revision_mismatches,
+                              COALESCE(SUM(COALESCE(source_digest,'')!=?),0)
+                                  source_mismatches
                        FROM runs
                        WHERE acceptance_cohort_id=? AND lane='live'
                          AND status!='running'""",
-                    (result["revision"], result["cohort_id"]),
+                    (result["revision"],
+                     result.get("source_digest") or "",
+                     result["cohort_id"]),
                 ).fetchone()
         except sqlite3.OperationalError as error:
             # A read-only dashboard may start before the first writer has
@@ -5184,7 +5232,7 @@ class RobinhoodLearningStore:
         result.update({
             key: int(counts[key] or 0) for key in (
                 "terminal_attempts", "complete_attempts", "timeouts",
-                "failures", "revision_mismatches",
+                "failures", "revision_mismatches", "source_mismatches",
             )
         })
         target = max(1, safe_int(result.get("sample_target"), 100))
@@ -5229,11 +5277,12 @@ class RobinhoodLearningStore:
             )
             connection.execute(
                 """INSERT INTO acceptance_cohorts
-                   (cohort_id,schema_version,started_at,revision,sample_target,
-                    policy_json,policy_hash,status)
-                   VALUES (?,?,?,?,?,?,?,'collecting')""",
+                   (cohort_id,schema_version,started_at,revision,source_digest,
+                    sample_target,policy_json,policy_hash,status)
+                   VALUES (?,?,?,?,?,?,?,?,'collecting')""",
                 (str(cohort_id), ACCEPTANCE_COHORT_SCHEMA_VERSION, started_at,
-                 revision, target, _canonical(policy), policy_hash),
+                 revision, _worktree_source_digest(), target,
+                 _canonical(policy), policy_hash),
             )
         return self.acceptance_cohort()
 
@@ -5435,11 +5484,11 @@ class RobinhoodLearningStore:
             row_id = connection.execute(
                 """INSERT INTO runs(started_at,status,run_id,pid,host,
                        heartbeat_at,deadline_seconds,lane,revision,
-                       acceptance_cohort_id)
-                   VALUES (?,'running',?,?,?,?,?,?,?,?)""",
+                       source_digest,acceptance_cohort_id)
+                   VALUES (?,'running',?,?,?,?,?,?,?,?,?)""",
                 (_utc_now(), run_id, _os.getpid(), _socket.gethostname(),
                  now, float(deadline_seconds), str(lane), CODE_REVISION,
-                 cohort_id),
+                 _worktree_source_digest(), cohort_id),
             ).lastrowid
             if lane != "legacy":
                 connection.execute(
@@ -6306,7 +6355,10 @@ class RobinhoodLearningStore:
             ).hexdigest()
             provenance_ok = bool(
                 cohort.get("policy_hash") == expected_policy_hash
-                and safe_int(cohort.get("revision_mismatches"), 0) == 0)
+                and safe_int(cohort.get("revision_mismatches"), 0) == 0
+                # Both, not either. A clean revision with a moved worktree is
+                # exactly as contaminated and far harder to notice.
+                and safe_int(cohort.get("source_mismatches"), 0) == 0)
             criteria["cohort_provenance"] = {
                 "pass": provenance_ok,
                 "value": {
@@ -6314,6 +6366,8 @@ class RobinhoodLearningStore:
                     "revision": cohort_revision,
                     "revision_mismatches": safe_int(
                         cohort.get("revision_mismatches"), 0),
+                    "source_mismatches": safe_int(
+                        cohort.get("source_mismatches"), 0),
                     "policy_hash": cohort.get("policy_hash"),
                 },
                 "target": "pinned revision / unchanged policy",

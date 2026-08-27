@@ -9325,3 +9325,78 @@ class ControlledDeferralClassificationTests(unittest.TestCase):
         healthy lane, and one far above it would never bind."""
         self.assertGreater(rh.LIVE_DEFERRAL_RATE_MAX, 0.11)
         self.assertLessEqual(rh.LIVE_DEFERRAL_RATE_MAX, 0.5)
+
+
+class WorktreeSourceDigestTests(unittest.TestCase):
+    """A revision pin cannot see uncommitted edits.
+
+    A cohort can sit at revision_mismatches: 0 while every attempt runs
+    modified code -- the pin records what git was last told, the process runs
+    the working tree. That is the same contamination as the 1,777-of-1,786
+    cohort, but invisible to the check built to catch it.
+    """
+
+    def test_the_digest_reflects_content_not_revision(self):
+        first = rh._worktree_source_digest()
+        self.assertEqual(first, rh._worktree_source_digest(),
+                         "the digest must be stable for unchanged content")
+        self.assertEqual(len(first), 16)
+
+    def test_every_behaviour_defining_module_is_covered(self):
+        """A module that decides live-lane behaviour but is not digested is a
+        hole exactly the size of that module."""
+        for name in ("chainseer_robinhood.py",
+                     "chainseer_robinhood_commitments.py",
+                     "chainseer_robinhood_gate.py"):
+            self.assertIn(name, rh.SOURCE_DIGEST_MODULES)
+
+    def test_a_missing_module_changes_the_digest(self):
+        """Absence is recorded, not skipped: deleting a file must not quietly
+        preserve the digest."""
+        original = rh.SOURCE_DIGEST_MODULES
+        try:
+            rh.SOURCE_DIGEST_MODULES = original + ("does_not_exist.py",)
+            with_absent = rh._worktree_source_digest()
+        finally:
+            rh.SOURCE_DIGEST_MODULES = original
+        self.assertNotEqual(with_absent, rh._worktree_source_digest())
+
+    def test_a_cohort_records_the_digest_it_was_pinned_to(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            cohort = store.start_acceptance_cohort(
+                revision="deadbeef", sample_target=5)
+            self.assertEqual(cohort["source_digest"],
+                             rh._worktree_source_digest())
+            self.assertEqual(cohort["revision_mismatches"], 0)
+            self.assertEqual(cohort["source_mismatches"], 0)
+
+    def test_a_moved_worktree_is_counted_as_a_mismatch(self):
+        """The case a revision pin misses entirely: same commit, edited file."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            cohort = store.start_acceptance_cohort(
+                revision="deadbeef", sample_target=5)
+            with store.connection() as connection:
+                connection.execute(
+                    "INSERT INTO runs(started_at,status,lane,revision,"
+                    " source_digest,acceptance_cohort_id)"
+                    " VALUES (?,'complete','live','deadbeef',?,?)",
+                    (rh._utc_now(), "0000edited0000", cohort["cohort_id"]))
+            after = store.acceptance_cohort()
+            self.assertEqual(after["revision_mismatches"], 0,
+                             "the revision genuinely did not move")
+            self.assertEqual(after["source_mismatches"], 1,
+                             "but the source did, and only this catches it")
+
+    def test_the_acceptance_gate_refuses_on_either_mismatch(self):
+        """Both, not either: a clean revision with a moved worktree is exactly
+        as contaminated and far harder to notice."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        block = source.split('cohort.get("revision_mismatches")', 1)[1][:400]
+        self.assertIn("source_mismatches", block)
+
+    def test_the_schema_version_was_raised(self):
+        """Provenance shape changed; a reader must be able to tell."""
+        self.assertGreaterEqual(rh.ACCEPTANCE_COHORT_SCHEMA_VERSION, 2)
