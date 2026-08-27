@@ -254,8 +254,21 @@ SEAL_COST_MODEL_EPOCH = 4
 CODE_REVISION = os.environ.get("CHAINSEER_CODE_REVISION", "unknown")
 
 
+_SOURCE_DIGEST_CACHE: str | None = None
+
+
 def _worktree_source_digest() -> str:
     """Hash of the source actually on disk, not the revision it claims to be.
+
+    Computed once per process. A running process cannot change the modules it
+    already imported, so re-hashing 1.1MB on every begin_run bought nothing
+    the import-time value does not already carry -- measured at 7.3ms median,
+    26ms p95, 41ms max on the decision-critical path.
+
+    That cost turned out NOT to explain the decision-lag drop it was suspected
+    of causing (0.15 blocks median at the planning rate, against a 14-point
+    conformance change). It is cached because the work is pointless, not
+    because it was the culprit.
 
     A revision pin cannot see uncommitted edits. A cohort can therefore sit at
     `revision_mismatches: 0` while every attempt runs modified code -- the pin
@@ -267,6 +280,9 @@ def _worktree_source_digest() -> str:
     absent rather than skipped, so deleting one changes the digest instead of
     quietly preserving it.
     """
+    global _SOURCE_DIGEST_CACHE
+    if _SOURCE_DIGEST_CACHE is not None:
+        return _SOURCE_DIGEST_CACHE
     digest = hashlib.sha256()
     root = Path(__file__).resolve().parent
     for name in sorted(SOURCE_DIGEST_MODULES):
@@ -275,7 +291,8 @@ def _worktree_source_digest() -> str:
             digest.update((root / name).read_bytes())
         except OSError:
             digest.update(b"<absent>")
-    return digest.hexdigest()[:16]
+    _SOURCE_DIGEST_CACHE = digest.hexdigest()[:16]
+    return _SOURCE_DIGEST_CACHE
 #: Modules whose content defines live-lane behaviour for acceptance purposes.
 SOURCE_DIGEST_MODULES = (
     "chainseer_robinhood.py",

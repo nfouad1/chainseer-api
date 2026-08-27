@@ -9356,9 +9356,14 @@ class WorktreeSourceDigestTests(unittest.TestCase):
         original = rh.SOURCE_DIGEST_MODULES
         try:
             rh.SOURCE_DIGEST_MODULES = original + ("does_not_exist.py",)
+            # The digest is cached per process, so a test that changes what
+            # is digested must invalidate it -- otherwise this asserts the
+            # cache works, not that absence is recorded.
+            rh._SOURCE_DIGEST_CACHE = None
             with_absent = rh._worktree_source_digest()
         finally:
             rh.SOURCE_DIGEST_MODULES = original
+            rh._SOURCE_DIGEST_CACHE = None
         self.assertNotEqual(with_absent, rh._worktree_source_digest())
 
     def test_a_cohort_records_the_digest_it_was_pinned_to(self):
@@ -9400,3 +9405,40 @@ class WorktreeSourceDigestTests(unittest.TestCase):
     def test_the_schema_version_was_raised(self):
         """Provenance shape changed; a reader must be able to tell."""
         self.assertGreaterEqual(rh.ACCEPTANCE_COHORT_SCHEMA_VERSION, 2)
+
+
+class SourceDigestCachingTests(unittest.TestCase):
+    """Re-hashing 1.1MB on every begin_run bought nothing.
+
+    A running process cannot change the modules it already imported, so the
+    import-time value is as correct as a per-call one. Measured on the
+    decision-critical path at 7.3ms median, 26ms p95, 41ms max; cached it is
+    0.6us.
+
+    Recorded because the suspicion was wrong: this cost was proposed as the
+    cause of a 14-point decision-lag conformance drop and could not have been
+    -- 7.3ms is 0.15 blocks at the planning rate. It is cached because the
+    work is pointless, not because it was the culprit.
+    """
+
+    def test_the_digest_is_computed_once_per_process(self):
+        first = rh._worktree_source_digest()
+        import time as _t
+        start = _t.perf_counter()
+        for _ in range(50):
+            rh._worktree_source_digest()
+        elapsed = _t.perf_counter() - start
+        self.assertLess(elapsed, 0.05,
+                        "50 calls should be free if the value is cached")
+        self.assertEqual(first, rh._worktree_source_digest())
+
+    def test_the_cached_value_still_reflects_real_content(self):
+        """Caching must not turn the digest into a constant."""
+        rh._SOURCE_DIGEST_CACHE = None
+        try:
+            live = rh._worktree_source_digest()
+        finally:
+            rh._SOURCE_DIGEST_CACHE = None
+        recomputed = rh._worktree_source_digest()
+        self.assertEqual(live, recomputed)
+        self.assertEqual(len(live), 16)
