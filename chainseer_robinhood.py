@@ -553,6 +553,10 @@ LIVE_LANE_INGESTION_MARGIN_SECONDS = 0.5
 INGESTION_COST_MODEL_STATE_KEY = "live_ingestion_cost_v1"
 INGESTION_COST_SAMPLE_WINDOW = 128
 LANE_HEARTBEAT_SECONDS = 5.0
+#: How often the supervisor re-runs orphan recovery inside its scheduling
+#: loop. The startup-only sweep left rows stale for as long as a supervisor
+#: session lasted; one was measured at 90 minutes.
+ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
 LANE_TERMINATION_GRACE_SECONDS = 3.0
 ANALYSIS_START_RESERVE_SECONDS = 45.0
 OUTCOME_STAGE_BUDGET_SECONDS = 60.0
@@ -14410,6 +14414,7 @@ def supervise_lanes(
     status_path = root / "scheduler_status.json"
     supervisor_store = RobinhoodLearningStore(root / "learning.sqlite3")
     recovered_dead_lanes = _reconcile_dead_lane_state(supervisor_store)
+    last_orphan_sweep = time.monotonic()
     lane_job = _WindowsLaneJob()
     worker_python = str(getattr(sys, "_base_executable", None) or sys.executable)
     worker_environment = os.environ.copy()
@@ -14467,6 +14472,25 @@ def supervise_lanes(
     try:
         while time.monotonic() < stop_at:
             now_mono = time.monotonic()
+            # The startup sweep cannot reclaim a run that dies AFTER it. A
+            # supervisor session outlives many lane runs, so a worker killed
+            # mid-session held its `running` row until the next supervisor
+            # restart -- measured at 90 minutes on an analysis row whose
+            # heartbeat had stopped, while run_ownership is a critical-tier
+            # audit criterion that forces DEGRADED on a single stale row.
+            #
+            # The sweep is conservative and idempotent: it closes only rows
+            # whose owner is dead, whose heartbeat exceeded its own deadline
+            # plus grace, or which the lane has already superseded. Running it
+            # on a cadence costs one indexed query and removes the dependency
+            # on restart timing.
+            if now_mono - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS:
+                last_orphan_sweep = now_mono
+                try:
+                    _reconcile_dead_lane_state(supervisor_store)
+                except Exception:
+                    # Recovery is housekeeping; never let it stop scheduling.
+                    pass
             for lane, item in list(active.items()):
                 process = item["process"]
                 code = process.poll()

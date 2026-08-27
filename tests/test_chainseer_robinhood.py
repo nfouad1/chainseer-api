@@ -9180,3 +9180,73 @@ class StaleObservationSchedulingTests(unittest.TestCase):
                 end_block=1_000_000 - rh.FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS - 1)
             self.assertEqual(
                 store.due_flow_observation_outcomes(1e12, limit=50), [])
+
+
+class PeriodicOrphanSweepTests(unittest.TestCase):
+    """A run that dies mid-session must not wait for the next restart.
+
+    _reconcile_dead_lane_state ran once, at supervisor startup, before the
+    scheduling loop. A supervisor session outlives many lane runs, so a worker
+    killed mid-session held its `running` row until the supervisor itself
+    restarted -- measured at 90 minutes on an analysis row whose heartbeat had
+    stopped. run_ownership is critical-tier: one stale row forces DEGRADED.
+    """
+
+    def test_the_sweep_runs_inside_the_loop_not_only_at_startup(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        loop = source.split("while time.monotonic() < stop_at:", 1)[1][:1600]
+        self.assertIn("_reconcile_dead_lane_state", loop,
+                      "recovery is startup-only again")
+        self.assertIn("ORPHAN_SWEEP_INTERVAL_SECONDS", loop)
+
+    def test_the_interval_is_shorter_than_a_supervisor_session(self):
+        """A cadence longer than the session it runs in is startup-only with
+        extra steps."""
+        self.assertGreater(rh.ORPHAN_SWEEP_INTERVAL_SECONDS, 0)
+        self.assertLessEqual(rh.ORPHAN_SWEEP_INTERVAL_SECONDS, 300.0)
+
+    def test_sweep_failure_never_stops_scheduling(self):
+        """Recovery is housekeeping. A supervisor that dies because its
+        housekeeping raised would strand every lane, which is far worse than
+        the stale row it was cleaning up."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        loop = source.split("while time.monotonic() < stop_at:", 1)[1][:1600]
+        block = loop.split("_reconcile_dead_lane_state", 1)[1][:200]
+        self.assertIn("except Exception", block)
+
+    def test_a_stale_heartbeat_is_actually_recovered(self):
+        """The behaviour, not the wiring: a run whose heartbeat exceeded its
+        deadline plus grace is closed, and one still beating is untouched."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            now = time.time()
+            with store.connection() as connection:
+                connection.execute(
+                    "INSERT INTO runs(started_at,status,run_id,pid,host,"
+                    " heartbeat_at,deadline_seconds,lane)"
+                    " VALUES (?,'running','stale-run',?,?,?,?,'analysis')",
+                    (rh._utc_now(), 999_999, "nonexistent-host",
+                     now - 5400, 120.0))
+                connection.execute(
+                    "INSERT INTO runs(started_at,status,run_id,pid,host,"
+                    " heartbeat_at,deadline_seconds,lane)"
+                    " VALUES (?,'running','live-run',?,?,?,?,'live')",
+                    (rh._utc_now(), 999_998, "nonexistent-host",
+                     now, 25.0))
+                # lane_state must claim it, or the sweep correctly treats an
+                # unowned run as superseded -- which is the production rule,
+                # not an exception to it.
+                connection.execute(
+                    "INSERT INTO lane_state(lane,run_id,pid,status,"
+                    " started_at,heartbeat_at,deadline_seconds)"
+                    " VALUES ('live','live-run',?,'running',?,?,25.0)",
+                    (999_998, now, now))
+            store.recover_abandoned_runs(lambda pid: True)
+            with store.connection() as connection:
+                states = dict(connection.execute(
+                    "SELECT run_id, status FROM runs").fetchall())
+            self.assertEqual(states["stale-run"], "abandoned_recovered")
+            self.assertEqual(states["live-run"], "running",
+                             "a beating heartbeat must never be reclaimed")
