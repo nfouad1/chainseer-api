@@ -9442,3 +9442,61 @@ class SourceDigestCachingTests(unittest.TestCase):
         recomputed = rh._worktree_source_digest()
         self.assertEqual(live, recomputed)
         self.assertEqual(len(live), 16)
+
+
+class SettlementLockRetryTests(unittest.TestCase):
+    """A lost write race must not discard work already done.
+
+    The backfill lane failed 3 of 20 runs at queue_settlement with
+    "database is locked" -- not on deadline (47.7s used of 120s, 76.5s left
+    at stage start) but by losing a race to the live lane, which holds
+    priority by design. Each loss recorded the whole run failed: one had
+    sealed 47 observations and deferred 68 first.
+
+    busy_timeout is already 10s, so the lock outlived it. A longer global
+    timeout makes every writer wait longer for the same outcome; retrying
+    only this write, only on a lock, only while the deadline allows, is the
+    bounded version.
+    """
+
+    def _body(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        return source.split("settle_attempts = 0", 1)[1][:1800]
+
+    def test_only_lock_contention_is_retried(self):
+        body = self._body()
+        self.assertIn("database is locked", body)
+        self.assertIn("if not contended", body)
+        self.assertIn("raise", body)
+
+    def test_retries_are_bounded_and_deadline_aware(self):
+        body = self._body()
+        self.assertIn("SETTLEMENT_LOCK_RETRY_ATTEMPTS", body)
+        self.assertIn("deadline.remaining()", body)
+        self.assertGreaterEqual(rh.SETTLEMENT_LOCK_RETRY_ATTEMPTS, 2)
+        self.assertLessEqual(rh.SETTLEMENT_LOCK_RETRY_ATTEMPTS, 5)
+
+    def test_the_backoff_fits_inside_a_lane_budget(self):
+        """Total retry wait must be small against the 120s backfill budget,
+        or the fix trades a lock failure for a deadline failure."""
+        worst = (rh.SETTLEMENT_LOCK_RETRY_ATTEMPTS
+                 * rh.SETTLEMENT_LOCK_RETRY_BACKOFF_SECONDS)
+        self.assertLess(worst, rh.BACKFILL_LANE_BUDGET_SECONDS / 10)
+
+    def test_the_retried_writes_are_idempotent(self):
+        """Retrying a partially-applied settlement must not double-count."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        complete = source.split("def complete_seal_queue", 1)[1][:700]
+        # 1,400 not 900: the INSERT sits at offset 1,064 behind a long
+        # explanatory comment, and a slice that stops short asserts nothing
+        # while looking like it asserts something.
+        enqueue = source.split("def enqueue_seal", 1)[1][:1400]
+        self.assertIn("completed_at IS NULL", complete)
+        self.assertIn("INSERT OR IGNORE", enqueue)
+
+    def test_a_retry_is_reported_not_silent(self):
+        """Contention that is absorbed must still be visible, or a degrading
+        lock situation looks identical to a healthy one."""
+        self.assertIn("queue_settle_retries", self._body())

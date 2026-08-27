@@ -606,6 +606,11 @@ LANE_HEARTBEAT_SECONDS = 5.0
 #: loop. The startup-only sweep left rows stale for as long as a supervisor
 #: session lasted; one was measured at 90 minutes.
 ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
+#: Bounded retry for the seal-queue settlement write when a higher-priority
+#: lane holds the database lock. busy_timeout is already 10s, so these are
+#: extra waits on top of it, spent only when the lane deadline can afford them.
+SETTLEMENT_LOCK_RETRY_ATTEMPTS = 3
+SETTLEMENT_LOCK_RETRY_BACKOFF_SECONDS = 0.5
 #: A controlled deferral is healthy, but a lane that defers most of its cycles
 #: is not producing decisions even though nothing crashed. Reliability counts
 #: deferrals as healthy only while they stay under this share.
@@ -11784,13 +11789,52 @@ class RobinhoodLearningEngine:
             settle_started = time.monotonic()
             persist_substage("queue_settlement",
                              sealed=len(sealed_windows), deferred=len(deferred))
-            self.store.complete_seal_queue(sealed_windows)
-            # Idempotent belt-and-suspenders write for callers that supplied a
-            # malformed row during preclaim.  enqueue_seal historically
-            # returns rows attempted (not rows inserted), so it must not be
-            # added to the preclaim count or telemetry double-counts every
-            # deferred window.
-            self.store.enqueue_seal(deferred, "live_lane_headroom")
+            # Retried on lock contention, not abandoned.
+            #
+            # The backfill lane failed 3 of 20 runs here with "database is
+            # locked" -- not on deadline (47.7s used of 120s, 76.5s left at
+            # stage start) but by losing a write race to the live lane, which
+            # holds priority by design. Each loss recorded the whole run
+            # `failed` and discarded work already done: one had sealed 47
+            # observations and deferred 68 before the settlement was refused.
+            #
+            # busy_timeout is already 10s, so the lock outlived it; a longer
+            # global timeout would make every writer wait longer for the same
+            # outcome. Retrying only this write, only on a lock, and only
+            # while the deadline allows, is the bounded version.
+            #
+            # Safe to repeat: complete_seal_queue guards on
+            # `completed_at IS NULL` and enqueue_seal is INSERT OR IGNORE, so
+            # a partially-applied settlement re-applies to the same state.
+            settle_attempts = 0
+            while True:
+                settle_attempts += 1
+                try:
+                    self.store.complete_seal_queue(sealed_windows)
+                    # Idempotent belt-and-suspenders write for callers that
+                    # supplied a malformed row during preclaim. enqueue_seal
+                    # historically returns rows attempted (not rows inserted),
+                    # so it must not be added to the preclaim count or
+                    # telemetry double-counts every deferred window.
+                    self.store.enqueue_seal(deferred, "live_lane_headroom")
+                    break
+                except sqlite3.OperationalError as error:
+                    contended = "database is locked" in str(error).lower()
+                    exhausted = (
+                        settle_attempts >= SETTLEMENT_LOCK_RETRY_ATTEMPTS)
+                    no_time = (
+                        deadline is not None
+                        and deadline.remaining()
+                        <= SETTLEMENT_LOCK_RETRY_BACKOFF_SECONDS)
+                    # A lock that never clears is a real problem and must
+                    # still fail the run; only transient contention is
+                    # absorbed, and only while there is budget to absorb it.
+                    if not contended or exhausted or no_time:
+                        raise
+                    time.sleep(SETTLEMENT_LOCK_RETRY_BACKOFF_SECONDS)
+            if settle_attempts > 1:
+                phase.setdefault("queue_settle_retries", []).append(
+                    float(settle_attempts - 1))
             phase.setdefault("queue_settle", []).append(
                 time.monotonic() - settle_started)
             per_window_cost = self.record_seal_cost(
