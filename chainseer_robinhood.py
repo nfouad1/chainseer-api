@@ -858,6 +858,30 @@ FLOW_EVIDENCE_HORIZONS = (
     ("1h", 60 * 60),
     ("6h", 6 * 60 * 60),
 )
+#: Horizons scheduled for OBSERVATIONS. Deliberately narrower than
+#: FLOW_EVIDENCE_HORIZONS, which still governs the event path.
+#:
+#: Nothing reads the other four. flow_observation_outcomes has exactly two
+#: consumers -- cohort_progress and signal_versus_control -- and both filter to
+#: FLOW_PRIMARY_HORIZON_LABEL. The promotion gates do not read this table at
+#: all; they read flow_signal_outcomes on the event path. So 1m, 5m, 1h and 6h
+#: were scheduled, resolved at real cost, and consumed by no decision.
+#:
+#: Five horizons meant 3,605 seals a day promised 18,025 outcome prices
+#: against ~3,072-4,008 of measured capacity: the backlog grew +16,438/day to
+#: 301,208, oldest 9.9 days past due, and worsened after two correct fixes
+#: because restoring fresh sealing raised the promise faster than repairing
+#: the evidence lane raised delivery. One horizon promises 3,605/day, which
+#: capacity covers.
+#:
+#: This changes no contract: every sealed observation still gets a measurable
+#: outcome. What is lost is the return CURVE across horizons -- diagnostic
+#: only, though genuinely useful once: returns being flat from 1m to 6h is
+#: what identified friction-dominance. Widen this tuple to recover it, at the
+#: cost of convergence, and knowing capacity must rise with it.
+FLOW_OBSERVATION_HORIZONS = (
+    (FLOW_PRIMARY_HORIZON_LABEL, 15 * 60),
+)
 FLOW_EVIDENCE_FRICTION_BPS = 100.0
 FLOW_EVIDENCE_MINIMUM_PROMOTION_SIGNALS = 100
 FLOW_EVIDENCE_MAXIMUM_NONEXIT_RATE = 0.10
@@ -2752,6 +2776,17 @@ class RobinhoodLearningStore:
                         "ALTER TABLE flow_observation_outcomes"
                         f" ADD COLUMN {name} {decl}"
                     )
+
+            # Horizons already scheduled that no consumer will ever read.
+            # Retired rather than deleted: the row still records that the
+            # horizon was promised and why it was withdrawn, so the backlog
+            # becomes honest instead of merely smaller. Excluded from the due
+            # queue and from every reader by status, and from cohort_progress
+            # by horizon_label as well.
+            connection.execute(
+                """UPDATE flow_observation_outcomes SET status='retired_horizon'
+                   WHERE status='pending' AND horizon_label<>?""",
+                (FLOW_PRIMARY_HORIZON_LABEL,))
             event_columns = {
                 row[1] for row in connection.execute(
                     "PRAGMA table_info(flow_signal_events)"
@@ -3638,7 +3673,7 @@ class RobinhoodLearningStore:
                 """,
                 [
                     (observation_id, label, seconds, float(now) + seconds)
-                    for label, seconds in FLOW_EVIDENCE_HORIZONS
+                    for label, seconds in FLOW_OBSERVATION_HORIZONS
                 ],
             )
         if timings is not None:

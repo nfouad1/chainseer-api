@@ -4634,7 +4634,15 @@ class ObservationLifecycleTests(unittest.TestCase):
                 scheduled = connection.execute(
                     "SELECT COUNT(*) FROM flow_observation_outcomes"
                 ).fetchone()[0]
-            self.assertGreaterEqual(scheduled, 100)
+            # Derived, not hardcoded: this once read `>= 100` from 20
+            # observations times five horizons, and broke when the
+            # observation path narrowed to the one horizon its consumers
+            # actually read. The subject of this test is the assertion
+            # below -- that scheduled outcomes are not evidence -- and it is
+            # indifferent to how many horizons exist.
+            self.assertEqual(
+                scheduled, 20 * len(rh.FLOW_OBSERVATION_HORIZONS))
+            self.assertGreater(scheduled, 0)
             progress = store.cohort_progress()
             self.assertEqual(
                 progress["completed_primary_observations"], 0,
@@ -8962,3 +8970,107 @@ class ExitAttritionIsPublishedTests(unittest.TestCase):
             self.assertEqual(arms["signal"]["exit_attrition_rate"], 1.0)
             self.assertEqual(
                 arms["matched_control"]["exit_attrition_rate"], 0.0)
+
+
+class ObservationHorizonReductionTests(unittest.TestCase):
+    """Do not promise prices no consumer will ever read.
+
+    flow_observation_outcomes has exactly two consumers -- cohort_progress and
+    signal_versus_control -- and both filter to FLOW_PRIMARY_HORIZON_LABEL.
+    The promotion gates do not read this table at all; they read
+    flow_signal_outcomes on the event path. So 1m, 5m, 1h and 6h were
+    scheduled, resolved at real cost, and consumed by no decision.
+
+    Five horizons meant 3,605 seals a day promised 18,025 outcome prices
+    against ~3,072-4,008 of capacity: the backlog grew +16,438/day to 301,208
+    and worsened after two correct fixes, because restoring fresh sealing
+    raised the promise faster than repairing the evidence lane raised
+    delivery.
+    """
+
+    def _seal(self, store, obs_id, role="matched_control"):
+        return store.seal_flow_observation(
+            pool_id="0x" + "33" * 32, token_address=TOKEN,
+            observation_head=10, window_start_block=1, window_end_block=2,
+            transaction_hashes=[obs_id], features={},
+            quote={"execution_quote": {"verified": True}},
+            quote_block=2, now=0.0, role=role, gap_count=1)
+
+    def test_only_the_horizon_a_consumer_reads_is_scheduled(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._seal(store, "obs-a")
+            with store.connection() as connection:
+                labels = [r[0] for r in connection.execute(
+                    "SELECT horizon_label FROM flow_observation_outcomes")]
+            self.assertEqual(labels, [rh.FLOW_PRIMARY_HORIZON_LABEL])
+
+    def test_the_seal_contract_is_unchanged(self):
+        """Every sealed observation still gets a measurable outcome -- one
+        instead of five. This is what distinguishes the change from the
+        seal-time sampling that was tried and reverted, which voided the
+        contract for 80% of controls and broke 13 tests."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._seal(store, "obs-b")
+            due = store.due_flow_observation_outcomes(1e12, limit=10)
+            self.assertEqual(len(due), 1)
+            self.assertEqual(due[0]["status"], "pending")
+
+    def test_the_event_path_keeps_its_full_curve(self):
+        """Only the diverging pipeline is narrowed. The event path feeds the
+        promotion gates and is a different, much smaller population."""
+        self.assertEqual(len(rh.FLOW_OBSERVATION_HORIZONS), 1)
+        self.assertGreater(len(rh.FLOW_EVIDENCE_HORIZONS), 1)
+        self.assertIn(rh.FLOW_PRIMARY_HORIZON_LABEL,
+                      [label for label, _ in rh.FLOW_EVIDENCE_HORIZONS])
+
+    def test_the_scheduled_horizon_is_the_one_consumers_filter_on(self):
+        """If these ever diverge, both readers silently return nothing."""
+        self.assertEqual(
+            [label for label, _ in rh.FLOW_OBSERVATION_HORIZONS],
+            [rh.FLOW_PRIMARY_HORIZON_LABEL])
+
+    def test_already_scheduled_orphan_horizons_are_retired_not_deleted(self):
+        """The row still records that the horizon was promised and withdrawn,
+        so the backlog becomes honest rather than merely smaller."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "l.sqlite3"
+            store = rh.RobinhoodLearningStore(path)
+            observation_id = self._seal(store, "obs-c")
+            with store.connection() as connection:
+                connection.execute(
+                    "INSERT INTO flow_observation_outcomes"
+                    " (observation_id,horizon_label,horizon_seconds,target_at,"
+                    "  status) VALUES (?,'6h',21600,1.0,'pending')",
+                    (observation_id,))
+            # Re-open: migrations run on connect.
+            reopened = rh.RobinhoodLearningStore(path)
+            with reopened.connection() as connection:
+                rows = dict(connection.execute(
+                    "SELECT horizon_label, status FROM"
+                    " flow_observation_outcomes").fetchall())
+            self.assertEqual(rows["6h"], "retired_horizon")
+            self.assertEqual(rows[rh.FLOW_PRIMARY_HORIZON_LABEL], "pending")
+            self.assertEqual(
+                len(reopened.due_flow_observation_outcomes(1e12, limit=10)), 1,
+                "a retired horizon must never come due again")
+
+    def test_a_resolved_outcome_is_never_retired(self):
+        """Retirement must not rewrite measurements already taken."""
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "l.sqlite3"
+            store = rh.RobinhoodLearningStore(path)
+            observation_id = self._seal(store, "obs-d")
+            with store.connection() as connection:
+                connection.execute(
+                    "INSERT INTO flow_observation_outcomes"
+                    " (observation_id,horizon_label,horizon_seconds,target_at,"
+                    "  status,net_return) VALUES (?,'1m',60,1.0,'resolved',-0.2)",
+                    (observation_id,))
+            reopened = rh.RobinhoodLearningStore(path)
+            with reopened.connection() as connection:
+                status = connection.execute(
+                    "SELECT status FROM flow_observation_outcomes"
+                    " WHERE horizon_label='1m'").fetchone()[0]
+            self.assertEqual(status, "resolved")
