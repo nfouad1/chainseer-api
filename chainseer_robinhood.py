@@ -2536,6 +2536,10 @@ class RobinhoodLearningStore:
                 "qualification_gap_count": "INTEGER",
                 # Same-block buy-and-sell on the sealed quote: pure friction.
                 "round_trip_return": "REAL",
+                # Why this observation does or does not carry a scheduled
+                # outcome. An observation with no outcome must never be
+                # mistakable for one whose outcome was lost.
+                "outcome_schedule_state": "TEXT",
             }.items():
                 if name not in observation_columns:
                     connection.execute(
@@ -3663,19 +3667,49 @@ class RobinhoodLearningStore:
                         time.monotonic() - commit_started)
                 return None
             # Outcomes scheduled in the SAME transaction, so an observation
-            # can never exist without the future it promised to measure.
-
-            connection.executemany(
-                """
-                INSERT OR IGNORE INTO flow_observation_outcomes (
-                    observation_id,horizon_label,horizon_seconds,target_at
-                ) VALUES (?,?,?,?)
-                """,
-                [
-                    (observation_id, label, seconds, float(now) + seconds)
-                    for label, seconds in FLOW_OBSERVATION_HORIZONS
-                ],
+            # can never exist without the future it promised to measure --
+            # unless the window is too stale for that promise to mean
+            # anything, which is recorded rather than left implicit.
+            #
+            # Verified before narrowing: ZERO stale observations have ever
+            # produced a resolved outcome. At the primary horizon the resolved
+            # population is 3,844 fresh controls and 17 fresh signals, and 0
+            # stale of either arm. They scheduled work that never completed
+            # and fed no consumer, at 10,718 of the 12,698 observations sealed
+            # per day -- 85% of a load that resolution capacity (~2,793-4,008)
+            # could not absorb, while the backlog grew +9,905/day.
+            #
+            # It is also corrective. Neither consumer filters on staleness, so
+            # a stale outcome that DID resolve would enter the control arm and
+            # produce fresh signals compared against stale controls -- not a
+            # matched comparison. And 0 of 24,453 observations beyond this
+            # bound have ever qualified, so the population cannot contribute a
+            # signal in the first place.
+            #
+            # Deterministic in the observation, not a sampling coin flip: that
+            # is what separates this from the seal-time control sampling that
+            # was tried, voided the seal contract for a random 80% of
+            # controls, and was reverted.
+            schedules_outcome = lag <= FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS
+            connection.execute(
+                "UPDATE flow_observations SET outcome_schedule_state=?"
+                " WHERE observation_id=?",
+                ("scheduled" if schedules_outcome
+                 else "skipped_stale_window", observation_id),
             )
+
+            if schedules_outcome:
+                connection.executemany(
+                    """
+                    INSERT OR IGNORE INTO flow_observation_outcomes (
+                        observation_id,horizon_label,horizon_seconds,target_at
+                    ) VALUES (?,?,?,?)
+                    """,
+                    [
+                        (observation_id, label, seconds, float(now) + seconds)
+                        for label, seconds in FLOW_OBSERVATION_HORIZONS
+                    ],
+                )
         if timings is not None:
             timings["database_commit"] = time.monotonic() - commit_started
         return observation_id

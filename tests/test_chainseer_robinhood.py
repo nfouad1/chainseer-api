@@ -9074,3 +9074,109 @@ class ObservationHorizonReductionTests(unittest.TestCase):
                     "SELECT status FROM flow_observation_outcomes"
                     " WHERE horizon_label='1m'").fetchone()[0]
             self.assertEqual(status, "resolved")
+
+
+class StaleObservationSchedulingTests(unittest.TestCase):
+    """A promise to measure a window that can never resolve is not evidence.
+
+    Verified before narrowing: ZERO stale observations have ever produced a
+    resolved outcome. At the primary horizon the resolved population is 3,844
+    fresh controls and 17 fresh signals -- 0 stale of either arm. They
+    scheduled work that never completed and fed no consumer, at 10,718 of the
+    12,698 observations sealed per day: 85% of a load that resolution capacity
+    (~2,793-4,008/day) could not absorb, while the backlog grew +9,905/day.
+
+    It is corrective as well as economical. Neither consumer of
+    flow_observation_outcomes filters on staleness, so a stale outcome that
+    DID resolve would enter the control arm and produce fresh signals compared
+    against stale controls -- not a matched comparison. And 0 of 24,453
+    observations beyond this bound have ever qualified.
+    """
+
+    def _seal(self, store, obs_id, head, end_block, role="matched_control"):
+        return store.seal_flow_observation(
+            pool_id="0x" + "44" * 32, token_address=TOKEN,
+            observation_head=head, window_start_block=max(0, end_block - 100),
+            window_end_block=end_block, transaction_hashes=[obs_id],
+            features={}, quote={"execution_quote": {"verified": True}},
+            quote_block=end_block, now=0.0, role=role, gap_count=1)
+
+    def _state(self, store, observation_id):
+        with store.connection() as connection:
+            return connection.execute(
+                "SELECT outcome_schedule_state FROM flow_observations"
+                " WHERE observation_id=?", (observation_id,)).fetchone()[0]
+
+    def _outcomes(self, store, observation_id):
+        with store.connection() as connection:
+            return connection.execute(
+                "SELECT COUNT(*) FROM flow_observation_outcomes"
+                " WHERE observation_id=?", (observation_id,)).fetchone()[0]
+
+    def test_a_fresh_window_still_schedules_its_outcome(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            obs = self._seal(store, "fresh", head=1_000_000,
+                             end_block=1_000_000 - 10)
+            self.assertEqual(self._state(store, obs), "scheduled")
+            self.assertEqual(
+                self._outcomes(store, obs), len(rh.FLOW_OBSERVATION_HORIZONS))
+
+    def test_a_stale_window_schedules_nothing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            obs = self._seal(
+                store, "stale", head=1_000_000,
+                end_block=1_000_000 - rh.FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS - 1)
+            self.assertEqual(self._outcomes(store, obs), 0)
+
+    def test_the_absence_is_recorded_not_implicit(self):
+        """An observation with no outcome must never be mistakable for one
+        whose outcome was lost. Same discipline as retired_horizon."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            obs = self._seal(
+                store, "stale", head=1_000_000,
+                end_block=1_000_000 - rh.FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS - 1)
+            self.assertEqual(self._state(store, obs), "skipped_stale_window")
+
+    def test_the_boundary_matches_the_observability_bound(self):
+        """Exactly at the bound is still observable; one past it is not.
+        A different constant here would silently disagree with the window
+        the seal stage itself uses."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            head = 2_000_000
+            at_bound = self._seal(
+                store, "at-bound", head=head,
+                end_block=head - rh.FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS)
+            past = self._seal(
+                store, "past-bound", head=head,
+                end_block=head - rh.FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS - 1)
+            self.assertEqual(self._state(store, at_bound), "scheduled")
+            self.assertEqual(self._state(store, past), "skipped_stale_window")
+
+    def test_a_stale_signal_is_still_sealed_as_evidence(self):
+        """Skipping the outcome must not skip the observation. The claim is
+        still recorded; only the promise to price it is withheld."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            obs = self._seal(
+                store, "stale-signal", head=1_000_000,
+                end_block=1_000_000 - rh.FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS - 5,
+                role="signal")
+            self.assertIsNotNone(obs)
+            with store.connection() as connection:
+                role = connection.execute(
+                    "SELECT role FROM flow_observations WHERE observation_id=?",
+                    (obs,)).fetchone()[0]
+            self.assertEqual(role, "signal")
+
+    def test_skipped_observations_never_reach_the_resolver(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._seal(
+                store, "stale", head=1_000_000,
+                end_block=1_000_000 - rh.FLOW_ORIGIN_TARGET_HEAD_LAG_BLOCKS - 1)
+            self.assertEqual(
+                store.due_flow_observation_outcomes(1e12, limit=50), [])
