@@ -9250,3 +9250,78 @@ class PeriodicOrphanSweepTests(unittest.TestCase):
             self.assertEqual(states["stale-run"], "abandoned_recovered")
             self.assertEqual(states["live-run"], "running",
                              "a beating heartbeat must never be reclaimed")
+
+
+class ControlledDeferralClassificationTests(unittest.TestCase):
+    """Declining safely is not breaking.
+
+    controlled_deferral is set only on designed yields -- the ingestion
+    child-deadline preemption. A lane-deadline breach becomes
+    deadline_exceeded and an unexpected exception becomes failed, both on
+    separate paths. Counting deferrals as unreliability made correct
+    behaviour score as breakage: 117 complete of 127 terminal read 92.1% and
+    FAILED, where 117 of 118 non-deferred is 99.2%.
+
+    Worse, it made the measure fight its own remedy: tightening the
+    decision-head headroom converts stale completions into clean deferrals,
+    so the honest fix for decision lag would have LOWERED this score.
+    """
+
+    def _statuses(self, store, statuses):
+        with store.connection() as connection:
+            for index, status in enumerate(statuses):
+                connection.execute(
+                    "INSERT INTO runs(started_at,status,run_id,lane,"
+                    " heartbeat_at,deadline_seconds)"
+                    " VALUES (?,?,?,'live',?,25.0)",
+                    (rh._utc_now(), status, "r%d" % index, time.time()))
+
+    def _criterion(self, store):
+        return store.stabilization_summary(
+            sample_target=10)["criteria"]["live_reliability"]
+
+    def test_controlled_deferrals_count_as_healthy(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._statuses(store, ["complete"] * 9 + ["deferred"])
+            c = self._criterion(store)
+            self.assertTrue(c["pass"], "a safe decline scored as breakage")
+            self.assertEqual(c["controlled_deferrals"], 1)
+            self.assertEqual(c["completed"], 9)
+
+    def test_a_real_failure_still_fails(self):
+        """The change must not launder deadline_exceeded or failed."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._statuses(store, ["complete"] * 9 + ["deadline_exceeded"])
+            self.assertFalse(self._criterion(store)["pass"])
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._statuses(store, ["complete"] * 9 + ["failed"])
+            self.assertFalse(self._criterion(store)["pass"])
+
+    def test_a_lane_cannot_defer_its_way_to_a_pass(self):
+        """Nine deferrals in ten is not health, however little crashed."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._statuses(store, ["deferred"] * 9 + ["complete"])
+            c = self._criterion(store)
+            self.assertFalse(c["pass"])
+            self.assertGreater(c["controlled_deferral_rate"],
+                               rh.LIVE_DEFERRAL_RATE_MAX)
+
+    def test_the_deferral_rate_is_published_beside_the_verdict(self):
+        """A rising deferral rate must stay visible, not fold into a pass."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._statuses(store, ["complete"] * 8 + ["deferred"] * 2)
+            c = self._criterion(store)
+            self.assertEqual(c["controlled_deferral_rate"], 0.2)
+            self.assertEqual(c["controlled_deferral_rate_limit"],
+                             rh.LIVE_DEFERRAL_RATE_MAX)
+
+    def test_the_limit_admits_the_measured_rate(self):
+        """Live deferral rate measured at 11%; a limit below that would fail a
+        healthy lane, and one far above it would never bind."""
+        self.assertGreater(rh.LIVE_DEFERRAL_RATE_MAX, 0.11)
+        self.assertLessEqual(rh.LIVE_DEFERRAL_RATE_MAX, 0.5)

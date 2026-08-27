@@ -557,6 +557,10 @@ LANE_HEARTBEAT_SECONDS = 5.0
 #: loop. The startup-only sweep left rows stale for as long as a supervisor
 #: session lasted; one was measured at 90 minutes.
 ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
+#: A controlled deferral is healthy, but a lane that defers most of its cycles
+#: is not producing decisions even though nothing crashed. Reliability counts
+#: deferrals as healthy only while they stay under this share.
+LIVE_DEFERRAL_RATE_MAX = 0.20
 LANE_TERMINATION_GRACE_SECONDS = 3.0
 ANALYSIS_START_RESERVE_SECONDS = 45.0
 OUTCOME_STAGE_BUDGET_SECONDS = 60.0
@@ -6107,9 +6111,34 @@ class RobinhoodLearningStore:
         mark_samples = len(mark_rows) if cohort_id else completed
         mark_rate = marks_complete / mark_samples if mark_samples else None
         live_perf = performance.get("live") or {}
+        # A controlled deferral is the lane declining to act without adequate
+        # headroom -- exactly the fail-closed behaviour policy asks for -- and
+        # it is set only on designed yields: the ingestion child-deadline
+        # preemption. A lane-deadline breach becomes deadline_exceeded and an
+        # unexpected exception becomes failed, both on separate paths.
+        #
+        # Counting it as unreliability made correct behaviour score as
+        # breakage: 117 complete of 127 terminal read 92.1% and FAILED, where
+        # 117 of 118 non-deferred is 99.2%. Worse, it made the measure fight
+        # its own remedy -- tightening the decision-head headroom converts
+        # completions into controlled deferrals, so the honest fix for
+        # decision lag would have LOWERED this score.
+        #
+        # The deferral rate still needs its own bound. A lane deferring nine
+        # cycles in ten is not healthy merely because none of them crashed,
+        # so it is reported and capped rather than folded silently into a pass.
+        healthy = {"complete", "deferred"}
+        deferred_count = sum(
+            row["status"] == "deferred" for row in recent_live_statuses)
+        deferral_rate = (
+            deferred_count / len(recent_live_statuses)
+            if recent_live_statuses else None
+        )
         reliability_pass = bool(
             len(recent_live_statuses) >= target
-            and all(row["status"] == "complete" for row in recent_live_statuses)
+            and all(row["status"] in healthy for row in recent_live_statuses)
+            and deferral_rate is not None
+            and deferral_rate <= LIVE_DEFERRAL_RATE_MAX
         )
         decision_opportunities = 0
         useful_decisions = 0
@@ -6220,9 +6249,18 @@ class RobinhoodLearningStore:
             },
             "live_reliability": {
                 "pass": reliability_pass,
-                "value": (sum(row["status"] == "complete"
+                "value": (sum(row["status"] in healthy
                               for row in recent_live_statuses)),
-                "samples": len(recent_live_statuses), "target": f"{target}/{target}",
+                "samples": len(recent_live_statuses),
+                "target": f"{target}/{target}",
+                # Published separately so a lane that defers its way to a
+                # passing score is visible rather than merely compliant.
+                "completed": sum(row["status"] == "complete"
+                                 for row in recent_live_statuses),
+                "controlled_deferrals": deferred_count,
+                "controlled_deferral_rate": (
+                    None if deferral_rate is None else round(deferral_rate, 4)),
+                "controlled_deferral_rate_limit": LIVE_DEFERRAL_RATE_MAX,
                 "label": "Live-cycle reliability",
             },
             "decision_usefulness": {
