@@ -9500,3 +9500,52 @@ class SettlementLockRetryTests(unittest.TestCase):
         """Contention that is absorbed must still be visible, or a degrading
         lock situation looks identical to a healthy one."""
         self.assertIn("queue_settle_retries", self._body())
+
+
+class AnalysisLaneDeadlineTests(unittest.TestCase):
+    """76 of 200 analysis runs died on deadline with no attributable stage.
+
+    Two defects, one shape each seen before. The outcomes loop checked
+    expiry -- true only when the budget is already spent -- so the item it
+    admitted was the one that overran, and a killed run discards every
+    outcome it had already observed. And outcomes was handed the WHOLE lane
+    deadline, so a slow pass consumed all 120s and the stages after it were
+    killed rather than run.
+
+    Measured p95 on successful runs: outcomes 78.9s, analyses 71.1s (median
+    0.13s -- rare but very long tail), certificate_refresh 18.9s, rechecks
+    3.9s. Those cannot all fit in 120s, so the ordering decided who died.
+    """
+
+    def _body(self):
+        return Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+
+    def test_the_outcome_loop_reserves_instead_of_waiting_for_expiry(self):
+        body = self._body().split("def observe_outcomes", 1)[1][:6000]
+        self.assertIn("ANALYSIS_OUTCOME_ITEM_RESERVE_SECONDS", body)
+
+    def test_outcomes_leaves_budget_for_the_stages_after_it(self):
+        body = self._body().split("def run_analysis_lane", 1)[1][:5000]
+        self.assertIn("ANALYSIS_DOWNSTREAM_RESERVE_SECONDS", body)
+        self.assertNotIn(
+            "deadline_monotonic=time.monotonic() + deadline.remaining()",
+            body, "outcomes may not claim the whole lane budget again")
+
+    def test_the_lane_records_which_stage_it_is_in(self):
+        """Every one of the 76 failures reported failure_stage None. A lane
+        that cannot say where it died cannot be fixed from its own record."""
+        body = self._body().split("def run_analysis_lane", 1)[1][:5000]
+        self.assertIn("_mark_analysis_stage", body)
+        self.assertIn('_mark_analysis_stage("outcomes")', body)
+        self.assertIn('_mark_analysis_stage("certificate_refresh")', body)
+        # Telemetry must not become a new way to die: a store without the
+        # method goes unattributed rather than raising.
+        self.assertIn('getattr(self.store, "mark_lane_stage", None)', body)
+
+    def test_the_reserves_fit_the_lane_budget(self):
+        """Reserves larger than the budget would defer every cycle."""
+        total = (rh.ANALYSIS_OUTCOME_ITEM_RESERVE_SECONDS
+                 + rh.ANALYSIS_DOWNSTREAM_RESERVE_SECONDS)
+        self.assertLess(total, rh.ANALYSIS_LANE_BUDGET_SECONDS / 2)
+        self.assertGreater(rh.ANALYSIS_DOWNSTREAM_RESERVE_SECONDS, 0)

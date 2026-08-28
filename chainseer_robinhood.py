@@ -609,6 +609,17 @@ ORPHAN_SWEEP_INTERVAL_SECONDS = 60.0
 #: Bounded retry for the seal-queue settlement write when a higher-priority
 #: lane holds the database lock. busy_timeout is already 10s, so these are
 #: extra waits on top of it, spent only when the lane deadline can afford them.
+#: Headroom one outcome observation needs once started. The loop previously
+#: checked expiry -- true only when the budget is already gone -- so the item
+#: it admitted was the one that overran, and a killed run discards every
+#: observation it had already recorded.
+ANALYSIS_OUTCOME_ITEM_RESERVE_SECONDS = 6.0
+#: Left for the stages AFTER outcomes. Outcomes was handed the whole lane
+#: deadline, so on a slow pass it consumed all 120s and `analyses`,
+#: `market_rechecks` and `deferred_seals` were killed rather than run.
+#: Measured p95: outcomes 78.9s, analyses 71.1s (median 0.13s -- a rare but
+#: very long tail), certificate_refresh 18.9s, rechecks 3.9s.
+ANALYSIS_DOWNSTREAM_RESERVE_SECONDS = 20.0
 SETTLEMENT_LOCK_RETRY_ATTEMPTS = 3
 SETTLEMENT_LOCK_RETRY_BACKOFF_SECONDS = 0.5
 #: A controlled deferral is healthy, but a lane that defers most of its cycles
@@ -12618,7 +12629,12 @@ class RobinhoodLearningEngine:
         observation_seconds: list[float] = []
         for index, due in enumerate(due_outcomes):
             observation_started = time.monotonic()
-            if deadline_monotonic is not None and time.monotonic() >= deadline_monotonic:
+            # Reserve, not expiry. Stopping when the budget has already gone
+            # admits the item that overruns it, and the whole run is then
+            # killed -- discarding every outcome it had already observed.
+            if (deadline_monotonic is not None
+                    and time.monotonic()
+                    >= deadline_monotonic - ANALYSIS_OUTCOME_ITEM_RESERVE_SECONDS):
                 deferred = len(due_outcomes) - index
                 break
             v4_state_responded = False
@@ -13596,6 +13612,26 @@ class RobinhoodLearningEngine:
 
         def work(deadline: CycleDeadline) -> dict:
             timings: dict[str, float] = {}
+
+            def _mark_analysis_stage(name: str) -> None:
+                """Attribution is telemetry: it may never break the lane.
+
+                Every one of 76 deadline failures reported failure_stage
+                None, so this lane could not say where it died. Recording it
+                must not become a new way to die -- a store without the
+                method simply goes unattributed, exactly as before.
+                """
+                marker = getattr(self.store, "mark_lane_stage", None)
+                if marker is None:
+                    return
+                try:
+                    marker("analysis", name,
+                           run_id=getattr(self, "cycle_run_uuid", None),
+                           remaining=deadline.remaining(),
+                           completed=dict(timings))
+                except Exception:
+                    pass
+
             # Integrity refresh owns the first reservation in this lane.
             # Entry-capable rechecks and analyses must never run ahead of a
             # due certificate refresh and consume the budget it requires.
@@ -13612,6 +13648,7 @@ class RobinhoodLearningEngine:
                 or cert_age > max(0.0, cert_max_age * 0.5))
             if self.timechain_recorder is not None and needs_refresh:
                 stage = time.monotonic()
+                _mark_analysis_stage("certificate_refresh")
                 try:
                     certificate_refresh = self.publish_integrity_certificate()
                 except Exception as exc:
@@ -13624,9 +13661,19 @@ class RobinhoodLearningEngine:
                 deadline.raise_if_expired("certificate_refresh")
             stage = time.monotonic()
             with self._rpc_deadline(deadline):
+                # Bounded by what outcomes may spend, not by the whole lane
+                # budget. Handing it deadline.remaining() let a slow pass
+                # consume everything and leave the following stages to be
+                # killed instead of run -- 76 of the last 200 analysis runs
+                # ended deadline_exceeded, none of them with an attributable
+                # stage because this lane recorded none.
+                _mark_analysis_stage("outcomes")
                 outcomes = self.observe_outcomes(
                     observed_at, outcome_limit, outcome_recovery_limit,
-                    deadline_monotonic=time.monotonic() + deadline.remaining(),
+                    deadline_monotonic=(
+                        time.monotonic()
+                        + max(0.0, deadline.remaining()
+                              - ANALYSIS_DOWNSTREAM_RESERVE_SECONDS)),
                 )
             timings["outcomes"] = round(time.monotonic() - stage, 3)
             deadline.raise_if_expired("outcomes")
