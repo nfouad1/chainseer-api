@@ -11137,6 +11137,32 @@ class RobinhoodLearningEngine:
         the window would make freshness self-certifying, which is the error
         the telemetry already had to be corrected for once.
         """
+        def _ingest_substage(name: str) -> None:
+            """WHERE inside ingestion are we?
+
+            Four of five cohort failures terminated in `ingestion` with no
+            finer detail, and their causes were three different things --
+            supervisor_hard_deadline_exceeded, live_completion, and a
+            `database is locked`. A stage name covering head read, log fetch,
+            decode, enrichment and cursor commit cannot separate them, so any
+            fix sized against it would be a guess.
+
+            Telemetry only: a store without the method, or a failure writing
+            one, must never break ingestion.
+            """
+            marker = getattr(self.store, "mark_lane_stage", None)
+            if marker is None:
+                return
+            try:
+                marker("live", f"ingestion/{name}",
+                       run_id=getattr(self, "cycle_run_uuid", None),
+                       remaining=(
+                           None if deadline is None else deadline.remaining()),
+                       completed={})
+            except Exception:
+                pass
+
+        _ingest_substage("head_read")
         started = time.monotonic()
         try:
             head = int(self.rpc.get_block_number())
@@ -11173,11 +11199,13 @@ class RobinhoodLearningEngine:
         # stale (a long outage), so one pass cannot try to read a million
         # blocks. Being capped is recorded, because a capped pass DOES leave a
         # hole and the next reader must be able to see that it did.
+        _ingest_substage("cursor_read")
         cursor_path = self.root / cursor_name
         cursor = read_json(cursor_path, {}) or {}
         last_scanned = safe_int(cursor.get("last_scanned_block"), 0)
         max_scan_blocks = max(1, int(max_scan_blocks))
         window_floor = max(0, head - max_scan_blocks + 1)
+        _ingest_substage("log_fetch")
         incremental = bool(last_scanned)
         from_block = last_scanned + 1 if last_scanned else window_floor
         scan_capped = bool(from_block < window_floor)

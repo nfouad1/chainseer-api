@@ -54,12 +54,12 @@ Generated from sealed 15-candidate or 15-signal checkpoints. Completion state is
 
 - [ ] `RH-FLOW-CONTROL-EDGE` — Require a positive paired control advantage
   - Recommendation: Keep Flow shadow-only until the lower confidence bound of paired net expectancy is above zero.
-  - Evidence: Checkpoint 135: paired 15m evidence is {'qualified': {'n': 131, 'mean_net_return': -0.36253771788046923, 'catastrophic_rate': 0.3435114503816794}, 'matched_control': {'n': 78, 'mean_net_return': -0.4772070605967427, 'catastrophic_rate': 0.44871794871794873}, 'incremental_expectancy': 0.11466934271627349, 'paired_n': 78, 'paired_incremental_expectancy': 0.10055278346096017, 'paired_incremental_ci_95': [-0.06255228350496694, 0.25612210791336243]}.
-  - Checkpoints: first 15, latest 135
+  - Evidence: Checkpoint 165: paired 15m evidence is {'qualified': {'n': 163, 'mean_net_return': -0.3555772204337114, 'catastrophic_rate': 0.3312883435582822}, 'matched_control': {'n': 100, 'mean_net_return': -0.4363601278210417, 'catastrophic_rate': 0.41}, 'incremental_expectancy': 0.0807829073873303, 'paired_n': 100, 'paired_incremental_expectancy': 0.0704570378316384, 'paired_incremental_ci_95': [-0.06116188828919956, 0.21286553178929737]}.
+  - Checkpoints: first 15, latest 165
 - [ ] `RH-FLOW-EXIT-TAIL-RISK` — Reduce non-exitable and catastrophic Flow outcomes
   - Recommendation: Investigate identity concentration, adverse direction, liquidity and quote failures before promotion.
-  - Evidence: Checkpoint 135: non-exit=0.19083969465648856, catastrophic=0.3435114503816794.
-  - Checkpoints: first 15, latest 135
+  - Evidence: Checkpoint 165: non-exit=0.17791411042944785, catastrophic=0.3312883435582822.
+  - Checkpoints: first 15, latest 165
 - [ ] `RH-FLOW-PROSPECTIVE-SAMPLE` — Continue the frozen prospective Flow cohort
   - Recommendation: Do not tune Flow thresholds before the pre-registered evidence window is complete.
   - Evidence: Checkpoint 90: 89 completed 15m qualified outcomes.
@@ -70,14 +70,14 @@ Generated from sealed 15-candidate or 15-signal checkpoints. Completion state is
   - Checkpoints: first 45, latest 2415
 - [ ] `RH-REFLECT-METADATA` — Backfill missing Robinhood token identity metadata
   - Recommendation: Retry name/symbol reads from a current block and add an explorer fallback so analyzed-token evidence remains attributable.
-  - Evidence: Checkpoint 3300: 15 of 15 analyzed candidates lacked a name or symbol.
-  - Checkpoints: first 120, latest 3300
+  - Evidence: Checkpoint 3495: 15 of 15 analyzed candidates lacked a name or symbol.
+  - Checkpoints: first 120, latest 3495
 - [ ] `RH-REFLECT-SCORE-NON-PREDICTIVE` — A higher legitimacy score is not buying a better outcome
   - Recommendation: Do not raise the entry floor on this evidence. The floor is a safety control only if score predicts outcome; measure the safety sub-signals (holder concentration, liquidity custody) against outcomes before changing any threshold.
-  - Evidence: Checkpoint 3300: score-outcome correlation -0.1756 over 80 observed closes; worst bucket 75-80 averages 0.7881x over 32 closes
-  - Checkpoints: first 420, latest 3300
+  - Evidence: Checkpoint 3495: score-outcome correlation -0.1752 over 81 observed closes; worst bucket 75-80 averages 0.7881x over 32 closes
+  - Checkpoints: first 420, latest 3495
 - [ ] `RH-REFLECT-V4-CATCHUP` — Keep Robinhood V4 discovery continuously caught up
   - Recommendation: Use adaptive bounded block windows and explicit backlog telemetry; never advance the cursor across a failed window.
-  - Evidence: Checkpoint 3300: V4 discovery reported 2142410 blocks behind.
-  - Checkpoints: first 120, latest 3300
+  - Evidence: Checkpoint 3495: V4 discovery reported 2142410 blocks behind.
+  - Checkpoints: first 120, latest 3495
 <!-- robinhood-reflection:auto:end -->
