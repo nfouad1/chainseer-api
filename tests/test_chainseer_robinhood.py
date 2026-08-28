@@ -9770,3 +9770,58 @@ class IngestionFreshnessBudgetTests(unittest.TestCase):
         configuration can meet."""
         self.assertNotEqual(rh.FLOW_OBSERVED_BLOCKS_PER_SECOND,
                             rh.FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND)
+
+
+class DecisionTailAdmissionTests(unittest.TestCase):
+    """Observation count is reduced in blocks before a stale decision."""
+
+    def _engine(self, directory):
+        engine = rh.RobinhoodLearningEngine.__new__(
+            rh.RobinhoodLearningEngine)
+        engine.store = rh.RobinhoodLearningStore(
+            Path(directory) / "learning.sqlite3")
+        engine.cycle_run_uuid = "decision-tail-test"
+        return engine
+
+    def test_full_batch_fits_with_measured_p99_reserve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self._engine(directory).observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_061,
+                requested=2)
+        self.assertEqual(plan["admitted"], 2)
+        self.assertEqual(plan["tail_reserve_blocks"], 59)
+
+    def test_tight_headroom_reduces_two_observations_to_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self._engine(directory).observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_082,
+                requested=2)
+        self.assertEqual(plan["admitted"], 1)
+        self.assertEqual(plan["reason"], "batch_reduced_for_freshness")
+        self.assertEqual(plan["tail_reserve_blocks"], 36)
+
+    def test_exhausted_headroom_admits_no_remote_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self._engine(directory).observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_085,
+                requested=2)
+        self.assertEqual(plan["admitted"], 0)
+        self.assertEqual(plan["reason"], "decision_tail_headroom_exhausted")
+
+    def test_block_tail_model_is_tighten_only(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._engine(directory)
+            engine.record_decision_tail_blocks(1, 50)
+            plan = engine.observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_071,
+                requested=2)
+        self.assertEqual(plan["model"]["reserves"][1], 50)
+        self.assertEqual(plan["admitted"], 0)
+
+    def test_decision_head_uses_actual_downstream_work_not_flat_five_seconds(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._engine(directory)
+            engine.classification_cost_estimate = lambda: 0.05
+            plan = engine.decision_head_admission(2, 4.0)
+        self.assertTrue(plan["admitted"])
+        self.assertEqual(plan["required_seconds"], 3.6)

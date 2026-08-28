@@ -405,6 +405,18 @@ def _nearest_rank_p95(values: list[float], fallback: float = 0.0) -> float:
     return round(ordered[index], 4)
 
 
+def _nearest_rank_p99(values: list[float], fallback: float = 0.0) -> float:
+    """Deterministic nearest-rank p99 for the 99% decision-lag SLO."""
+    if not values:
+        return round(float(fallback), 4)
+    ordered = sorted(float(value) for value in values)
+    index = min(
+        len(ordered) - 1,
+        max(0, math.ceil(0.99 * len(ordered)) - 1),
+    )
+    return round(ordered[index], 4)
+
+
 def _valid_seal_sample_records(raw: object) -> list[dict]:
     """Return validated provenance records; legacy scalars never drive v2."""
     if not isinstance(raw, list):
@@ -803,6 +815,19 @@ FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS = (
     FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
     - FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS
 )
+# Final observation admission is also block-budgeted. The first clean v2
+# cohort measured the complete post-ingestion tail at p99/max: 36 blocks for
+# one observation and 59 for two. A single 67-block reserve for both would
+# have pushed controlled deferrals above their frozen 20% limit. These
+# baselines are tighten-only; a bounded live p99 can raise, never lower, them.
+DECISION_TAIL_BLOCK_MODEL_STATE_KEY = "live_decision_tail_blocks_v1"
+DECISION_TAIL_BLOCK_MODEL_EPOCH = 1
+DECISION_TAIL_BLOCK_SAMPLE_WINDOW = 128
+DECISION_TAIL_BLOCK_DEFAULTS = {0: 25, 1: 36, 2: 59}
+# The old blanket five-second pre-head cutoff duplicated downstream reserves
+# and discarded three finishable decisions. Head retrieval receives its own
+# bounded allowance; classification and ledger completion are sized below.
+DECISION_HEAD_RPC_RESERVE_SECONDS = 0.5
 # A rate floor prevents a quiet first few seconds from making the plan
 # optimistic. Cohort 5's enrichment-rate LOWER BOUND was 18.51 blocks/s at
 # p95 and 20.11 at max (using the admitted budget as the denominator, which
@@ -1240,6 +1265,8 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "seal_stall_rate_maximum": SEAL_STALL_RATE_MAX,
         "seal_stall_minimum_samples": SEAL_STALL_GUARD_MIN_SAMPLES,
         "seal_cost_model_epoch": SEAL_COST_MODEL_EPOCH,
+        "decision_tail_block_model_epoch":
+            DECISION_TAIL_BLOCK_MODEL_EPOCH,
         "live_observation_limit": LIVE_LANE_OBSERVATION_LIMIT,
         "live_decision_reserve_seconds":
             LIVE_LANE_DECISION_RESERVE_SECONDS,
@@ -11602,6 +11629,142 @@ class RobinhoodLearningEngine:
             "downstream_reserve_p95": max(0.0, float(seconds))})
         return model["downstream_reserve_p95"]
 
+    def decision_tail_block_model(self) -> dict:
+        """Return a tighten-only p99 block reserve by observation count."""
+        stored = self.store.scheduler_state(
+            DECISION_TAIL_BLOCK_MODEL_STATE_KEY)
+        epoch_matches = safe_int(stored.get("epoch"), 0) == (
+            DECISION_TAIL_BLOCK_MODEL_EPOCH)
+        raw = stored.get("samples") if epoch_matches else []
+        records: list[dict] = []
+        if isinstance(raw, list):
+            for item in raw:
+                if not isinstance(item, dict):
+                    continue
+                count = safe_int(item.get("observations"), -1)
+                blocks = safe_int(item.get("blocks"), -1)
+                if count < 0 or blocks < 0:
+                    continue
+                records.append({
+                    **item, "observations": count, "blocks": blocks})
+        records = records[-DECISION_TAIL_BLOCK_SAMPLE_WINDOW:]
+        reserves: dict[int, int] = {}
+        sample_counts: dict[int, int] = {}
+        for count in range(0, LIVE_LANE_OBSERVATION_LIMIT + 1):
+            values = [
+                record["blocks"] for record in records
+                if record["observations"] == count
+            ]
+            baseline = DECISION_TAIL_BLOCK_DEFAULTS.get(
+                count, FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS)
+            reserves[count] = int(max(
+                baseline, _nearest_rank_p99(values, baseline)))
+            sample_counts[count] = len(values)
+        return {
+            "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
+            "quantile": "nearest_rank_p99",
+            "reserves": reserves,
+            "sample_counts": sample_counts,
+            "samples": records,
+        }
+
+    def record_decision_tail_blocks(
+        self, observations: int, blocks: int,
+    ) -> dict:
+        """Append one successful decision-tail measurement."""
+        model = self.decision_tail_block_model()
+        samples = list(model["samples"])
+        samples.append({
+            "observations": max(0, int(observations)),
+            "blocks": max(0, int(blocks)),
+            "run_id": str(getattr(self, "cycle_run_uuid", "") or ""),
+            "revision": CODE_REVISION,
+            "at": time.time(),
+            "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
+        })
+        self.store.set_scheduler_state(
+            DECISION_TAIL_BLOCK_MODEL_STATE_KEY, {
+                "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
+                "revision": CODE_REVISION,
+                "samples": samples[-DECISION_TAIL_BLOCK_SAMPLE_WINDOW:],
+            })
+        return self.decision_tail_block_model()
+
+    def observation_freshness_admission(
+        self, *, observation_head: int, post_ingest_head: int | None,
+        requested: int,
+    ) -> dict:
+        """Admit the largest observation batch whose p99 tail still fits."""
+        requested = max(0, min(
+            int(requested), LIVE_LANE_OBSERVATION_LIMIT))
+        model = self.decision_tail_block_model()
+        model_report = {
+            "epoch": model["epoch"], "quantile": model["quantile"],
+            "reserves": model["reserves"],
+            "sample_counts": model["sample_counts"],
+        }
+        if post_ingest_head is None:
+            return {
+                "requested": requested, "admitted": 0,
+                "reason": "post_ingest_head_unavailable",
+                "observation_head": int(observation_head),
+                "post_ingest_head": None, "post_ingest_lag_blocks": None,
+                "tail_reserve_blocks": None,
+                "prospective_bound_blocks":
+                    FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
+                "model": model_report,
+            }
+        lag = max(0, int(post_ingest_head) - int(observation_head))
+        admitted = 0
+        reserve = int(model["reserves"].get(0, 0))
+        for count in range(requested, 0, -1):
+            candidate_reserve = int(model["reserves"].get(
+                count, FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS))
+            if lag + candidate_reserve <= (
+                FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+            ):
+                admitted = count
+                reserve = candidate_reserve
+                break
+        return {
+            "requested": requested, "admitted": admitted,
+            "reason": (
+                "requested_batch_fits" if admitted == requested
+                else "batch_reduced_for_freshness" if admitted > 0
+                else "decision_tail_headroom_exhausted"),
+            "observation_head": int(observation_head),
+            "post_ingest_head": int(post_ingest_head),
+            "post_ingest_lag_blocks": lag,
+            "tail_reserve_blocks": reserve,
+            "prospective_bound_blocks":
+                FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
+            "model": model_report,
+        }
+
+    def decision_head_admission(
+        self, observations: int, remaining_seconds: float,
+    ) -> dict:
+        """Reserve actual downstream work instead of a flat five seconds."""
+        observations = max(0, int(observations))
+        classification_seconds = (
+            self.classification_cost_estimate() * observations)
+        downstream = (
+            CLASSIFICATION_COMPLETION_RESERVE_SECONDS
+            + classification_seconds)
+        required = downstream + DECISION_HEAD_RPC_RESERVE_SECONDS
+        return {
+            "observations": observations,
+            "remaining_seconds": round(max(0.0, remaining_seconds), 3),
+            "classification_estimate_seconds": round(
+                classification_seconds, 3),
+            "completion_reserve_seconds":
+                CLASSIFICATION_COMPLETION_RESERVE_SECONDS,
+            "head_rpc_reserve_seconds":
+                DECISION_HEAD_RPC_RESERVE_SECONDS,
+            "required_seconds": round(required, 3),
+            "admitted": bool(remaining_seconds > required),
+        }
+
     def classification_cost_estimate(self) -> float:
         """Measured seconds per classified observation (EWMA p95), or a
         conservative cold-start default.
@@ -13583,6 +13746,15 @@ class RobinhoodLearningEngine:
             stage = time.monotonic()
             touched = list(near_head.get("touched_pool_ids") or [])
             observation_model = self.live_planning_seal_cost_model()
+            observation_head = int(near_head.get("to_block") or 0)
+            post_ingest_head = (
+                int(near_head["head_block_after"])
+                if near_head.get("head_block_after") is not None else None)
+            freshness_admission = self.observation_freshness_admission(
+                observation_head=observation_head,
+                post_ingest_head=post_ingest_head,
+                requested=LIVE_LANE_OBSERVATION_LIMIT,
+            )
             observation_minimum = (
                 max(LIVE_LANE_DECISION_RESERVE_SECONDS,
                     observation_model["downstream_reserve_p95"])
@@ -13609,9 +13781,9 @@ class RobinhoodLearningEngine:
                 try:
                     with self._rpc_deadline(deadline):
                         observation = self.seal_near_head_observations(
-                            int(near_head.get("to_block") or 0), observed_at,
+                            observation_head, observed_at,
                             pool_ids=touched, deadline=deadline,
-                            limit=LIVE_LANE_OBSERVATION_LIMIT,
+                            limit=freshness_admission["admitted"],
                             reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS,
                             # Historical durable work must not consume the
                             # freshness budget. It is drained by backfill.
@@ -13626,6 +13798,7 @@ class RobinhoodLearningEngine:
                     # admission learning from failures instead of successes only.
                     self.record_seal_cost_censored(time.monotonic() - stage)
                     raise
+            observation["freshness_admission"] = freshness_admission
             timings["fresh_quote_and_observation_seconds"] = round(
                 time.monotonic() - stage, 3)
             stage = time.monotonic()
@@ -13664,7 +13837,12 @@ class RobinhoodLearningEngine:
                 }
 
             decision_head_remaining = deadline.remaining()
-            if decision_head_remaining <= LIVE_LANE_DECISION_RESERVE_SECONDS:
+            decision_admission = self.decision_head_admission(
+                len(observation.get("observation_ids") or []),
+                decision_head_remaining,
+            )
+            observation["decision_head_admission"] = decision_admission
+            if not decision_admission["admitted"]:
                 return defer_decision_head(
                     "insufficient_decision_head_headroom")
             try:
@@ -13679,6 +13857,20 @@ class RobinhoodLearningEngine:
                     infrastructure_indeterminate=True, error=str(exc))
             timings["decision_head_seconds"] = round(
                 time.monotonic() - stage, 3)
+            post_ingest_tail_blocks = max(
+                0, decision_head - int(post_ingest_head or observation_head))
+            observation["decision_tail_blocks"] = post_ingest_tail_blocks
+            if observation.get("observation_ids"):
+                decision_tail_model = self.record_decision_tail_blocks(
+                    len(observation["observation_ids"]),
+                    post_ingest_tail_blocks,
+                )
+                observation["decision_tail_model_after"] = {
+                    "epoch": decision_tail_model["epoch"],
+                    "quantile": decision_tail_model["quantile"],
+                    "reserves": decision_tail_model["reserves"],
+                    "sample_counts": decision_tail_model["sample_counts"],
+                }
             stage = time.monotonic()
             self.store.mark_lane_stage(
                 "live", "flow_evidence_capture",
