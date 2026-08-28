@@ -150,6 +150,21 @@ EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
+# Keep enough of the lane budget after durable gap recovery to commit its
+# summary/cursor and release SQLite cleanly.  Gap recovery receives a child
+# deadline ending this many seconds before the lane deadline, so a final slow
+# RPC cannot consume the completion reserve merely because it started while
+# one second technically remained.
+BACKFILL_COMPLETION_RESERVE_SECONDS = 10.0
+# Durable skipped ranges are cursor-committed at this quantum regardless of a
+# wider secondary-discovery batch setting. Smaller caller limits remain valid
+# for tests/maintenance, but no gap transaction spans more than 1,000 blocks.
+BACKFILL_GAP_CHUNK_BLOCKS = 1_000
+# A corrupt/no-progress provider response must not turn a fast loop into an
+# unbounded one.  Normal cycles stop on the child deadline; this is a second,
+# deliberately generous structural bound (100,000 blocks at the standard
+# 1,000-block chunk size).
+BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 100
 # The supervised live cadence is 30 seconds and this chain has recently
 # produced roughly ten blocks/second. Scan a bounded newest-head slice on the
 # decision path; any older prefix is durably re-anchored into backfill.
@@ -241,8 +256,10 @@ SEAL_STALL_RATE_MAX = 0.01
 SEAL_STALL_GUARD_MIN_SAMPLES = 20
 #: Queue entries older than this are irrecoverably stale: the window can
 #: never again overlap the near-head region, so sealing one would pin a
-#: quote to an observation head that no longer exists. They are marked
-#: expired_stale (preserved for research) and excluded from live admission.
+#: quote to an observation head that no longer exists. They first become
+#: expired_stale and are then retired terminally as expired_unsealed.  Their
+#: immutable snapshot stays in the queue for audit, but no evidence/cohort
+#: record is fabricated after the fact.
 SEAL_QUEUE_STALE_SECONDS = 3 * 3600.0
 #: Estimator epoch: bumping this starts a fresh sample window so a poisoned
 #: distribution from an older code revision cannot leak into new estimates.
@@ -412,6 +429,14 @@ def _seal_cost_model_from_state(stored: dict) -> dict:
             record["value"] for record in current
             if record["status"] == "censored"
         ][-SEAL_COST_SAMPLE_WINDOW:]
+        successful_at = [
+            safe_float(record.get("at"), 0.0) for record in current
+            if record["status"] == "success"
+        ]
+        censored_at = [
+            safe_float(record.get("at"), 0.0) for record in current
+            if record["status"] == "censored"
+        ]
         # Scalar-only current-epoch fixtures and migrations remain readable,
         # but once provenance records exist the records are authoritative.
         fallback = defaults_for(scalar)
@@ -422,6 +447,10 @@ def _seal_cost_model_from_state(stored: dict) -> dict:
         derived[scalar] = round(max(successful_p95, censored_floor), 4)
         derived[f"{scalar}_successful_p95"] = successful_p95
         derived[f"{scalar}_censored_floor"] = censored_floor
+        derived[f"{scalar}_latest_success_at"] = max(
+            successful_at, default=0.0)
+        derived[f"{scalar}_latest_censored_at"] = max(
+            censored_at, default=0.0)
         derived[field.replace("samples", "sample_count")] = len(successful)
         derived[field.replace("samples", "censored_count")] = len(censored)
 
@@ -465,6 +494,51 @@ def _seal_cost_model_from_state(stored: dict) -> dict:
     derived["downstream_sample_count"] = derived.get(
         "downstream_sample_count", 0)
     return derived
+
+
+def _seal_live_planning_model(effective: dict) -> dict:
+    """Build live admission costs without erasing censored evidence.
+
+    Censored lower bounds remain authoritative for reliability telemetry, but
+    using them literally as a recurring reservation can permanently starve a
+    25-second lane. Planning uses successful current-epoch p95s and turns a
+    newer censored sample into a tighten-only, one-window recovery guard.
+    """
+    planning = dict(effective)
+    quarantined: dict[str, dict] = {}
+    guarded: list[str] = []
+    raw_effective: dict[str, float] = {}
+    for scalar in SEAL_COST_SAMPLE_FIELDS:
+        successful = max(0.0, safe_float(
+            effective.get(
+                f"{scalar}_successful_p95", effective.get(scalar)),
+            defaults_for(scalar),
+        ))
+        raw = max(0.0, safe_float(effective.get(scalar), successful))
+        censored_floor = max(0.0, safe_float(
+            effective.get(f"{scalar}_censored_floor"), 0.0))
+        latest_success = safe_float(
+            effective.get(f"{scalar}_latest_success_at"), 0.0)
+        latest_censored = safe_float(
+            effective.get(f"{scalar}_latest_censored_at"), 0.0)
+        planning[scalar] = round(successful, 4)
+        raw_effective[scalar] = round(raw, 4)
+        if censored_floor > successful:
+            quarantined[scalar] = {
+                "successful_p95": round(successful, 4),
+                "censored_floor": round(censored_floor, 4),
+                "raw_effective": round(raw, 4),
+            }
+        if latest_censored > latest_success:
+            guarded.append(scalar)
+    planning.update({
+        "planning_view": "successful_p95_with_censored_recovery_guard",
+        "raw_effective_costs": raw_effective,
+        "quarantined_censored_components": quarantined,
+        "censored_guard_active": bool(guarded),
+        "censored_guard_components": guarded,
+    })
+    return planning
 
 
 def _append_seal_cost_records(
@@ -564,11 +638,12 @@ CLASSIFICATION_COST_SMOOTHING = 0.3
 #: Ceiling on how many queued windows one live cycle may pull ahead of fresh
 #: ones. The queue must drain, but a deep backlog must never starve the head.
 SEAL_QUEUE_DRAIN_LIMIT = 4
-# Five-minute backfill cadence needs a materially larger bounded batch than
-# the 30-second live cadence. The same cohort produced about 23 new durable
-# windows/minute; 120 per backfill pass provides convergence headroom while
-# the two-part cost model and shared deadline still cap actual admission.
-BACKFILL_SEAL_QUEUE_DRAIN_LIMIT = 120
+# Retirement performs no quote, hash, observation or classification work; its
+# cost is one bounded SQLite update after the writer lock is acquired.  The old
+# value (120) was sized for remote sealing and merely held a 17k-row terminal
+# backlog flat.  A 1,000-row batch amortizes the same lock acquisition while
+# remaining short and independently bounded.
+BACKFILL_STALE_RETIRE_LIMIT = 1_000
 #: Hard ceiling on unclassified rows one classify pass may materialize when
 #: no admission limit is supplied (legacy callers). The full backlog is never
 #: loaded into Python on any path.
@@ -5365,10 +5440,11 @@ class RobinhoodLearningStore:
 
         Live freshness is a BLOCK invariant, not a wall-clock guess.  When a
         head is supplied (the production path), every window below the exact
-        120-block floor is completed as research-only queue debt.  The time
+        120-block floor is marked as research-only queue debt.  The time
         fallback exists only for offline maintenance callers that have no RPC
-        head. Entries are never deleted or represented as sealed: the live
-        lane excludes ``expired_stale`` while backfill can still consume it.
+        head. Entries are never deleted or represented as sealed. A separate
+        terminal transition preserves their snapshots as ``expired_unsealed``;
+        neither the live lane nor backfill is allowed to seal them afterward.
         """
         now = time.time()
         with self.connection() as connection:
@@ -5394,28 +5470,59 @@ class RobinhoodLearningStore:
                     (cutoff,))
             return cursor.rowcount or 0
 
-    def pending_seal_windows(
-        self, limit: int = 25, *, include_expired_stale: bool = False,
-    ) -> list[dict]:
+    def retire_expired_seal_queue(self, limit: int = 500) -> int:
+        """Terminally retire stale snapshots without creating observations.
+
+        Expiry is an evidence fact, not an invitation to reconstruct a late
+        observation. The original snapshot, enqueue time and reason remain in
+        ``flow_seal_queue`` for audit; only the lifecycle fields change.  A
+        bounded batch keeps this housekeeping write short beside the live
+        lane's higher-priority SQLite work.
+        """
+        batch_limit = max(0, int(limit))
+        if batch_limit <= 0:
+            return 0
+        now = time.time()
+        with self.connection() as connection:
+            cursor = connection.execute(
+                """UPDATE flow_seal_queue
+                   SET completed_at=?, queue_state='expired_unsealed',
+                       reason=CASE
+                         WHEN reason LIKE '%|retired_without_observation%'
+                           THEN reason
+                         ELSE reason || '|retired_without_observation'
+                       END
+                   WHERE rowid IN (
+                     SELECT rowid FROM flow_seal_queue
+                     WHERE completed_at IS NULL
+                       AND queue_state='expired_stale'
+                     ORDER BY enqueued_at LIMIT ?
+                   )""",
+                (now, batch_limit),
+            )
+            return cursor.rowcount or 0
+
+    def pending_seal_windows(self, limit: int = 25) -> list[dict]:
         """Queued windows, oldest first, ready to seal without a lookup.
 
         Each row is shaped like the flow_signals row it came from, because
         flow_signals cannot supply it a second time: that table is keyed by
         pool_id alone and is overwritten whenever the pool trades again.
 
+        Only ``pending`` rows are eligible.  Expired rows intentionally have
+        no opt-in escape hatch here: making a stale record observable through
+        the sealing API is how the backfill lane accidentally fabricated
+        active-cohort observations from terminal history.
+
         The join against flow_observations is what keeps the queue honest: a
         window sealed by any other path (a wider batch pass, a later cycle
         that reached it) leaves an entry behind, and returning it would spend
         the live lane's scarcest seconds re-quoting settled evidence.
         """
-        state_clause = (
-            "q.queue_state IN ('pending','expired_stale')"
-            if include_expired_stale else "q.queue_state='pending'"
-        )
         with self.connection() as connection:
             return [dict(row) for row in connection.execute(
                 """SELECT q.* FROM flow_seal_queue q
-                   WHERE q.completed_at IS NULL AND """ + state_clause + """
+                   WHERE q.completed_at IS NULL AND q.queue_state='pending'
                      AND NOT EXISTS (
                      SELECT 1 FROM flow_observations o
                      WHERE o.pool_id=q.pool_id
@@ -5446,10 +5553,16 @@ class RobinhoodLearningStore:
         """Depth AND age. A queue that only grows is a leak, not a buffer."""
         with self.connection() as connection:
             row = connection.execute(
-                """SELECT COUNT(*) windows, MIN(q.enqueued_at) oldest,
+                """SELECT
+                          SUM(CASE WHEN q.queue_state='pending'
+                                   THEN 1 ELSE 0 END) pending_windows,
+                          SUM(CASE WHEN q.queue_state='expired_stale'
+                                   THEN 1 ELSE 0 END) expired_stale_windows,
+                          MIN(q.enqueued_at) oldest,
                           MAX(q.attempts) attempts
                    FROM flow_seal_queue q
-                   WHERE q.completed_at IS NULL AND q.queue_state='pending'
+                   WHERE q.completed_at IS NULL
+                     AND q.queue_state IN ('pending','expired_stale')
                      AND NOT EXISTS (
                      SELECT 1 FROM flow_observations o
                      WHERE o.pool_id=q.pool_id
@@ -5459,7 +5572,9 @@ class RobinhoodLearningStore:
             ).fetchone()
         oldest = row["oldest"]
         return {
-            "pending_windows": int(row["windows"] or 0),
+            "pending_windows": int(row["pending_windows"] or 0),
+            "expired_stale_windows": int(
+                row["expired_stale_windows"] or 0),
             "max_attempts": int(row["attempts"] or 0),
             "oldest_age_seconds": (
                 round(time.time() - oldest, 1) if oldest else None),
@@ -5542,7 +5657,10 @@ class RobinhoodLearningStore:
                        run_id=excluded.run_id,pid=excluded.pid,
                        status='running',started_at=excluded.started_at,
                        heartbeat_at=excluded.heartbeat_at,completed_at=NULL,
-                       deadline_seconds=excluded.deadline_seconds,last_error=NULL""",
+                       deadline_seconds=excluded.deadline_seconds,last_error=NULL,
+                       current_stage=NULL,stage_started_at=NULL,
+                       deadline_remaining_at_stage_start=NULL,
+                       completed_stage_seconds_json='{}',stage_detail_json='{}'""",
                     (str(lane), run_id, _os.getpid(), now, now,
                      float(deadline_seconds)),
                 )
@@ -5854,6 +5972,7 @@ class RobinhoodLearningStore:
         with self.connection() as connection:
             row = connection.execute(
                 """SELECT run_id, current_stage, stage_started_at,
+                          deadline_seconds,
                           deadline_remaining_at_stage_start,
                           completed_stage_seconds_json,
                           COALESCE(stage_detail_json, '{}') AS stage_detail_json
@@ -5888,8 +6007,9 @@ class RobinhoodLearningStore:
                 # that the operation was fast.
                 stage = str(row["current_stage"] or "")
                 elapsed = safe_float(failure["stage_elapsed_seconds"], 0.0)
-                if elapsed > 0 and stage.startswith(
-                        "fresh_quote_and_observation"):
+                if (str(lane) == "live" and elapsed > 0
+                        and stage.startswith(
+                            "fresh_quote_and_observation")):
                     state_row = connection.execute(
                         "SELECT value_json FROM flow_scheduler_state WHERE key=?",
                         (SEAL_COST_MODEL_STATE_KEY,),
@@ -5909,14 +6029,28 @@ class RobinhoodLearningStore:
                         targets = ("fixed_observation_cost_p95",)
                     else:
                         targets = ("per_window_cost_p95",)
+                    censor_cap = max(
+                        0.05,
+                        safe_float(row["deadline_seconds"],
+                                   LIVE_LANE_BUDGET_SECONDS)
+                        + LANE_TERMINATION_GRACE_SECONDS,
+                    )
+                    bounded_elapsed = min(elapsed, censor_cap)
                     model_state = _append_seal_cost_records(
                         model_state,
-                        {target: elapsed for target in targets},
+                        {target: bounded_elapsed for target in targets},
                         status="censored", run_id=str(row["run_id"]),
                         revision=CODE_REVISION, recorded_at=now,
                     )
                     model_state["last_censored_stage"] = stage
-                    model_state["last_censored_seconds"] = round(elapsed, 4)
+                    model_state["last_censored_seconds"] = round(
+                        bounded_elapsed, 4)
+                    model_state["last_censored_raw_seconds"] = round(
+                        elapsed, 4)
+                    model_state["last_censored_cap_seconds"] = round(
+                        censor_cap, 4)
+                    model_state["last_censored_quarantined"] = bool(
+                        elapsed > censor_cap)
                     connection.execute(
                         """INSERT INTO flow_scheduler_state(key,value_json,updated_at)
                            VALUES (?,?,?)
@@ -11242,7 +11376,7 @@ class RobinhoodLearningEngine:
 
     def ingestion_tail_reserve(self) -> float:
         """Headroom ingestion must leave for observation and completion."""
-        model = self.seal_cost_model()
+        model = self.live_planning_seal_cost_model()
         return round(
             max(LIVE_LANE_DECISION_RESERVE_SECONDS,
                 model["downstream_reserve_p95"])
@@ -11266,6 +11400,10 @@ class RobinhoodLearningEngine:
         """
         stored = self.store.scheduler_state(SEAL_COST_MODEL_STATE_KEY)
         return _seal_cost_model_from_state(stored)
+
+    def live_planning_seal_cost_model(self) -> dict:
+        """Admission model isolated from censored reliability lower bounds."""
+        return _seal_live_planning_model(self.seal_cost_model())
 
     def seal_cost_estimate(self) -> float:
         """Per-window cost from the two-part model (compatibility shim)."""
@@ -11599,8 +11737,7 @@ class RobinhoodLearningEngine:
         # every recompute, so the window a queued row named no longer existed.
         queued_rows = (
             [dict(entry) for entry in self.store.pending_seal_windows(
-                max(0, int(queue_drain_limit)),
-                include_expired_stale=(stage_lane == "backfill"))]
+                max(0, int(queue_drain_limit)))]
             if queue_drain_limit > 0 else []
         )
         with self.store.connection() as connection:
@@ -11698,7 +11835,7 @@ class RobinhoodLearningEngine:
         # cycles. usable = remaining - downstream_reserve - fixed cost; what
         # is left must buy whole windows at per_window_cost_p95.
         static_limit = len(windows) if limit is None else max(0, int(limit))
-        model = self.seal_cost_model()
+        model = self.live_planning_seal_cost_model()
         fixed_cost = model["fixed_observation_cost_p95"]
         settlement_reserve = model["queue_settlement_p95"]
         cost = model["per_window_cost_p95"]
@@ -11766,6 +11903,13 @@ class RobinhoodLearningEngine:
             stall_guard_action = "cap_one_recovery_probe"
         elif stall_guard_active:
             stall_guard_action = "already_within_probe_cap"
+        censored_guard_active = bool(model.get("censored_guard_active"))
+        censored_guard_action = "normal"
+        if censored_guard_active and admitted > 1:
+            admitted = 1
+            censored_guard_action = "cap_one_censored_recovery_probe"
+        elif censored_guard_active:
+            censored_guard_action = "already_within_probe_cap"
         admitted = min(admitted, static_limit)
         deferred = windows[admitted:]
         windows = windows[:admitted]
@@ -12037,6 +12181,14 @@ class RobinhoodLearningEngine:
                 "queue_drained": len(queued_rows),
                 "model_censored_samples": safe_int(
                     model.get("censored_samples"), 0),
+                "censored_guard_active": censored_guard_active,
+                "censored_guard_action": censored_guard_action,
+                "censored_guard_components": list(
+                    model.get("censored_guard_components") or []),
+                "quarantined_censored_components": dict(
+                    model.get("quarantined_censored_components") or {}),
+                "raw_effective_costs": dict(
+                    model.get("raw_effective_costs") or {}),
                 "stall_guard_active": stall_guard_active,
                 "stall_guard_action": stall_guard_action,
                 "cold_start_probe": cold_start_probe,
@@ -13204,7 +13356,10 @@ class RobinhoodLearningEngine:
                 FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
                 / max(1.0, FLOW_OBSERVED_BLOCKS_PER_SECOND))
             downstream_observed = max(
-                0.0, self.seal_cost_model()["downstream_reserve_p95"])
+                0.0,
+                self.live_planning_seal_cost_model()[
+                    "downstream_reserve_p95"],
+            )
             # The floor guards the FRESHNESS term only. Applying it to the
             # whole expression let a cycle with no time left still claim 3s
             # of ingestion, which removed the deadline's ability to force a
@@ -13344,7 +13499,7 @@ class RobinhoodLearningEngine:
 
             stage = time.monotonic()
             touched = list(near_head.get("touched_pool_ids") or [])
-            observation_model = self.seal_cost_model()
+            observation_model = self.live_planning_seal_cost_model()
             observation_minimum = (
                 max(LIVE_LANE_DECISION_RESERVE_SECONDS,
                     observation_model["downstream_reserve_p95"])
@@ -13814,6 +13969,87 @@ class RobinhoodLearningEngine:
                 error=str(exc)[:500])
             raise
 
+    def drain_flow_backfill_until_reserve(
+        self, deadline: CycleDeadline, *, block_limit: int,
+        reserve_seconds: float = BACKFILL_COMPLETION_RESERVE_SECONDS,
+    ) -> dict:
+        """Commit consecutive durable chunks until only reserve remains.
+
+        ``drain_flow_backfill`` is intentionally one atomic chunk: its cursor
+        advances immediately after a successful scan.  This coordinator may
+        run many such chunks, but gives them a child deadline that ends before
+        the lane deadline.  A killed/failed later chunk therefore cannot erase
+        earlier cursor commits and cannot consume summary/lock-release time.
+        """
+        before = self.store.backfill_backlog()
+        chunk_limit = min(
+            BACKFILL_GAP_CHUNK_BLOCKS, max(1, int(block_limit)))
+        available = max(0.0, deadline.remaining() - max(0.0, reserve_seconds))
+        if available <= 0:
+            return {
+                "ranges_selected": 0, "chunks_processed": 0,
+                "cursor_commits": 0, "blocks_scanned": 0,
+                "candidates_added": 0, "completed_ranges": 0,
+                "chunk_limit_blocks": chunk_limit,
+                "completion_reserve_seconds": float(reserve_seconds),
+                "stopped_reason": "completion_reserve_reached",
+                "backlog_before": before, "backlog": before,
+                "pending_blocks_delta": 0, "backlog_shrinking": False,
+            }
+
+        recovery_deadline = CycleDeadline(available)
+        chunks: list[dict] = []
+        stopped_reason = "no_pending_ranges"
+        for _ in range(BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE):
+            if recovery_deadline.expired():
+                stopped_reason = "completion_reserve_reached"
+                break
+            with self._rpc_deadline(recovery_deadline):
+                chunk = self.drain_flow_backfill(
+                    recovery_deadline, block_limit=chunk_limit)
+            if safe_int(chunk.get("ranges_selected"), 0) <= 0:
+                stopped_reason = "no_pending_ranges"
+                break
+            chunks.append(dict(chunk))
+            progressed = (
+                safe_int(chunk.get("blocks_scanned"), 0) > 0
+                or bool(chunk.get("completed"))
+            )
+            if not progressed:
+                # A provider/store response claiming selection without cursor
+                # progress would otherwise spin until the wall-clock bound.
+                stopped_reason = "selected_without_progress"
+                break
+        else:
+            stopped_reason = "maximum_chunks_reached"
+
+        after = self.store.backfill_backlog()
+        before_blocks = safe_int(before.get("pending_blocks"), 0)
+        after_blocks = safe_int(after.get("pending_blocks"), 0)
+        first = chunks[0] if chunks else {}
+        last = chunks[-1] if chunks else {}
+        return {
+            "ranges_selected": sum(
+                safe_int(row.get("ranges_selected"), 0) for row in chunks),
+            "chunks_processed": len(chunks),
+            # advance_backfill is committed inside every successful chunk.
+            "cursor_commits": len(chunks),
+            "blocks_scanned": sum(
+                safe_int(row.get("blocks_scanned"), 0) for row in chunks),
+            "candidates_added": sum(
+                safe_int(row.get("candidates_added"), 0) for row in chunks),
+            "completed_ranges": sum(
+                1 for row in chunks if bool(row.get("completed"))),
+            "first_from_block": first.get("from_block"),
+            "last_to_block": last.get("to_block"),
+            "chunk_limit_blocks": chunk_limit,
+            "completion_reserve_seconds": float(reserve_seconds),
+            "stopped_reason": stopped_reason,
+            "backlog_before": before, "backlog": after,
+            "pending_blocks_delta": after_blocks - before_blocks,
+            "backlog_shrinking": after_blocks < before_blocks,
+        }
+
     def run_backfill_lane(
         self, *, budget_seconds: float = BACKFILL_LANE_BUDGET_SECONDS,
         discovery_block_limit: int = DEFAULT_DISCOVERY_BLOCK_LIMIT,
@@ -13822,34 +14058,69 @@ class RobinhoodLearningEngine:
         now: float | None = None,
     ) -> dict:
         """Historical discovery, enrichment and durable gap recovery lane."""
-        observed_at = time.time() if now is None else float(now)
+        _ = time.time() if now is None else float(now)
 
         def work(deadline: CycleDeadline) -> dict:
             timings: dict[str, float] = {}
-            # Drain historical observation work outside the decision path.
-            # These rows are durable snapshots, so moving them does not lose
-            # evidence; it only stops old quote RPCs consuming live freshness.
+            # Retire expired observation debt WITHOUT reconstructing a quote
+            # or observation.  The old backfill path passed expired_stale into
+            # seal_near_head_observations: the last measured pass spent ~67s
+            # on 120 guaranteed quote failures and then assigned those stale
+            # reconstructions to the active v3 cohort.  The queue snapshot is
+            # the audit record; expiry is terminal, not another admission lane.
             stage = time.monotonic()
-            seal_queue = {}
-            if self.store.seal_queue_backlog().get("pending_windows", 0):
+            queue_before = self.store.seal_queue_backlog()
+            retirement_limit = BACKFILL_STALE_RETIRE_LIMIT
+            retired_existing = self.store.retire_expired_seal_queue(
+                retirement_limit)
+            remaining_retirement = max(0, retirement_limit - retired_existing)
+            expired_this_cycle = 0
+            queue_head = None
+            after_existing = self.store.seal_queue_backlog()
+            if after_existing.get("pending_windows", 0):
                 with self._rpc_deadline(deadline):
                     queue_head = int(self.rpc.get_block_number())
-                    seal_queue = self.seal_near_head_observations(
-                        queue_head, observed_at,
-                        pool_ids=[], deadline=deadline,
-                        limit=BACKFILL_SEAL_QUEUE_DRAIN_LIMIT,
-                        reserve_seconds=10.0,
-                        queue_drain_limit=BACKFILL_SEAL_QUEUE_DRAIN_LIMIT,
-                        include_fresh=False,
-                        stage_lane="backfill",
-                    )
+                expired_this_cycle = self.store.expire_stale_seal_queue(
+                    head_block=queue_head,
+                    freshness_blocks=
+                        FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
+                )
+            retired_new = self.store.retire_expired_seal_queue(
+                remaining_retirement)
+            retired_total = retired_existing + retired_new
+            queue_after = self.store.seal_queue_backlog()
+            # Rows may transition pending -> expired_stale ->
+            # expired_unsealed inside this single pass. Comparing only the
+            # two endpoint expired_stale counts reports 0 -> 0 and falsely
+            # claims no convergence. Retirements are the exact durable debt
+            # reduction committed by this stage.
+            stale_delta = -int(retired_total)
+            seal_queue = {
+                "terminal_state": "expired_unsealed",
+                "queue_head_block": queue_head,
+                "expired_this_cycle": expired_this_cycle,
+                "stale_retired_this_cycle": retired_total,
+                "quote_calls_avoided": retired_total,
+                "observations_created": 0,
+                "active_cohort_observations_created": 0,
+                "classifications_created": 0,
+                "outcomes_scheduled": 0,
+                "paper_entries_created": 0,
+                "snapshots_preserved_for_audit": retired_total,
+                "retirement_limit": retirement_limit,
+                "expired_stale_backlog_delta": stale_delta,
+                "stale_backlog_shrinking": retired_total > 0,
+                "backlog_before": queue_before,
+                "backlog_after": queue_after,
+            }
             timings["durable_observation_queue"] = round(
                 time.monotonic() - stage, 3)
             deadline.raise_if_expired("durable_observation_queue")
             stage = time.monotonic()
-            with self._rpc_deadline(deadline):
-                gap_recovery = self.drain_flow_backfill(
-                    deadline, block_limit=discovery_block_limit)
+            gap_recovery = self.drain_flow_backfill_until_reserve(
+                deadline, block_limit=discovery_block_limit,
+                reserve_seconds=BACKFILL_COMPLETION_RESERVE_SECONDS,
+            )
             timings["durable_gap_recovery"] = round(
                 time.monotonic() - stage, 3)
             deadline.raise_if_expired("durable_gap_recovery")

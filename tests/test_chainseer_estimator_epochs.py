@@ -89,6 +89,68 @@ class StallSeparationTests(unittest.TestCase):
         self.assertEqual(model["per_window_cost_p95_successful_p95"], 0.4)
         self.assertGreaterEqual(model["per_window_cost_p95"], 9.0)
 
+    def test_live_planning_quarantines_poisoned_censored_floor(self):
+        for _ in range(10):
+            self.engine._blend_seal_model({
+                "fixed_observation_cost_p95": 5.797,
+                "queue_settlement_p95": 0.141,
+                "per_window_cost_p95": 0.812,
+                "downstream_reserve_p95": 3.5,
+            })
+        self.engine._blend_seal_model(
+            {"fixed_observation_cost_p95": 11_508.832}, censored=True)
+
+        effective = self.engine.seal_cost_model()
+        planning = self.engine.live_planning_seal_cost_model()
+        self.assertGreater(effective["fixed_observation_cost_p95"], 11_000)
+        self.assertAlmostEqual(
+            planning["fixed_observation_cost_p95"], 5.797, places=3)
+        self.assertTrue(planning["censored_guard_active"])
+        self.assertIn(
+            "fixed_observation_cost_p95",
+            planning["quarantined_censored_components"],
+        )
+        self.assertLess(
+            self.engine.ingestion_tail_reserve(),
+            rh.LIVE_LANE_BUDGET_SECONDS,
+        )
+
+    def test_new_success_clears_censored_recovery_guard(self):
+        self.engine._blend_seal_model({"per_window_cost_p95": 0.4})
+        self.engine._blend_seal_model(
+            {"per_window_cost_p95": 9.0}, censored=True)
+        self.assertTrue(
+            self.engine.live_planning_seal_cost_model()[
+                "censored_guard_active"])
+        time.sleep(0.002)
+        self.engine._blend_seal_model({"per_window_cost_p95": 0.45})
+        self.assertFalse(
+            self.engine.live_planning_seal_cost_model()[
+                "censored_guard_active"])
+
+    def test_censored_guard_caps_admission_to_one_probe(self):
+        for _ in range(10):
+            self.engine._blend_seal_model({
+                "fixed_observation_cost_p95": 0.4,
+                "queue_settlement_p95": 0.1,
+                "per_window_cost_p95": 0.4,
+                "downstream_reserve_p95": 1.0,
+            })
+        self.engine._blend_seal_model(
+            {"per_window_cost_p95": 9.0}, censored=True)
+        seed_windows(self.store, 4)
+        result = self.engine.seal_near_head_observations(
+            HEAD, time.time(), pool_ids=[POOL_ID],
+            deadline=rh.CycleDeadline(20.0), limit=4,
+            reserve_seconds=0.5)
+        admission = result["admission"]
+        self.assertTrue(admission["censored_guard_active"])
+        self.assertEqual(
+            admission["censored_guard_action"],
+            "cap_one_censored_recovery_probe",
+        )
+        self.assertEqual(result["windows_admitted"], 1)
+
     def test_cold_start_stall_cannot_become_the_epoch_baseline(self):
         self.engine._blend_seal_model({"fixed_observation_cost_p95": 60.0})
         model = self.engine.seal_cost_model()
@@ -171,6 +233,67 @@ class StallSeparationTests(unittest.TestCase):
         self.assertGreaterEqual(
             self.engine.seal_cost_model()["per_window_cost_p95"], 0.4)
 
+    def test_begin_run_clears_stale_stage_ownership(self):
+        self.store.begin_run("old", 120.0, lane="backfill")
+        self.store.mark_lane_stage(
+            "backfill", "fresh_quote_and_observation/observation_selection",
+            run_id="old", remaining=100.0,
+            completed={"historical": 10.0}, detail={"old": True})
+        self.store.finish_run("old", "complete")
+
+        self.store.begin_run("new", 120.0, lane="backfill")
+        with self.store.connection() as connection:
+            row = connection.execute(
+                "SELECT current_stage,stage_started_at,"
+                " deadline_remaining_at_stage_start,"
+                " completed_stage_seconds_json,stage_detail_json"
+                " FROM lane_state WHERE lane='backfill'"
+            ).fetchone()
+        self.assertIsNone(row["current_stage"])
+        self.assertIsNone(row["stage_started_at"])
+        self.assertIsNone(row["deadline_remaining_at_stage_start"])
+        self.assertEqual(json.loads(row["completed_stage_seconds_json"]), {})
+        self.assertEqual(json.loads(row["stage_detail_json"]), {})
+
+    def test_backfill_termination_cannot_contaminate_live_seal_model(self):
+        run_id = "backfill-no-live-estimator-write"
+        fake_pid = 876543
+        self.store.begin_run(run_id, 120.0, lane="backfill")
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE runs SET pid=? WHERE run_id=?", (fake_pid, run_id))
+            connection.execute(
+                "UPDATE lane_state SET pid=? WHERE lane='backfill'",
+                (fake_pid,))
+        self.store.mark_lane_stage(
+            "backfill", "fresh_quote_and_observation/observation_selection",
+            run_id=run_id, remaining=1.0)
+        self.store.terminate_lane("backfill", fake_pid, "deadline")
+        self.assertEqual(
+            self.store.scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY), {})
+
+    def test_live_termination_clamps_impossible_censored_duration(self):
+        run_id = "bounded-live-censor"
+        fake_pid = 765432
+        self.store.begin_run(run_id, 25.0, lane="live")
+        with self.store.connection() as connection:
+            connection.execute(
+                "UPDATE runs SET pid=? WHERE run_id=?", (fake_pid, run_id))
+            connection.execute(
+                "UPDATE lane_state SET pid=?,current_stage=?,"
+                " stage_started_at=? WHERE lane='live'",
+                (fake_pid,
+                 "fresh_quote_and_observation/observation_selection",
+                 time.time() - 11_508.832))
+        self.store.terminate_lane("live", fake_pid, "deadline")
+        state = self.store.scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY)
+        expected_cap = 25.0 + rh.LANE_TERMINATION_GRACE_SECONDS
+        self.assertEqual(state["last_censored_seconds"], expected_cap)
+        self.assertGreater(state["last_censored_raw_seconds"], 11_000)
+        self.assertTrue(state["last_censored_quarantined"])
+        self.assertLessEqual(
+            state["fixed_observation_samples"][-1]["value"], expected_cap)
+
 
 class StaleQueueExpiryTests(unittest.TestCase):
     def setUp(self):
@@ -200,7 +323,7 @@ class StaleQueueExpiryTests(unittest.TestCase):
         self._enqueue("0002", same_time, HEAD - 120)
         expired = self.store.expire_stale_seal_queue(head_block=HEAD)
         self.assertEqual(expired, 1)
-        # Preserved for research in an explicit non-live state.
+        # Preserved for audit in an explicit non-live state.
         with self.store.connection() as c:
             row = dict(list(c.execute(
                 "SELECT * FROM flow_seal_queue"
@@ -210,10 +333,15 @@ class StaleQueueExpiryTests(unittest.TestCase):
         # Live admission no longer sees it.
         pending = self.store.pending_seal_windows(25)
         self.assertEqual([p["pool_id"][-4:] for p in pending], ["0002"])
-        research = self.store.pending_seal_windows(
-            25, include_expired_stale=True)
-        self.assertEqual(
-            sorted(p["pool_id"][-4:] for p in research), ["0001", "0002"])
+        retired = self.store.retire_expired_seal_queue(25)
+        self.assertEqual(retired, 1)
+        with self.store.connection() as c:
+            terminal = dict(c.execute(
+                "SELECT * FROM flow_seal_queue"
+                " WHERE queue_state='expired_unsealed'").fetchone())
+        self.assertEqual(terminal["pool_id"][-4:], "0001")
+        self.assertIsNotNone(terminal["completed_at"])
+        self.assertIn("retired_without_observation", terminal["reason"])
 
     def test_expiry_runs_inside_seal_stage(self):
         """The seal stage expires stale entries before draining the queue."""

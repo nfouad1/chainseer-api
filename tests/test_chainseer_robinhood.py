@@ -7522,16 +7522,22 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(engine.store.backfill_backlog()["pending_ranges"], 0)
             self.assertFalse((root / "live_lane_cursor.json").exists())
 
-    def test_committed_gap_chunk_ends_the_backfill_cycle_successfully(self):
+    def test_committed_gap_chunks_end_the_backfill_cycle_successfully(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = rh.RobinhoodLearningEngine(
                 directory, rpc=FakeRPC([], latest=100),
                 analyzer=FakeAnalyzer(), market=FakeMarket())
-            engine.drain_flow_backfill = lambda deadline, **kwargs: {
-                "ranges_selected": 1, "blocks_scanned": 500,
-                "candidates_added": 3, "completed": False,
-                "backlog": {"pending_ranges": 1, "pending_blocks": 500},
-            }
+            chunks = iter([
+                {"ranges_selected": 1, "blocks_scanned": 500,
+                 "candidates_added": 3, "completed": False,
+                 "from_block": 1, "to_block": 500},
+                {"ranges_selected": 1, "blocks_scanned": 500,
+                 "candidates_added": 2, "completed": True,
+                 "from_block": 501, "to_block": 1000},
+                {"ranges_selected": 0, "blocks_scanned": 0,
+                 "candidates_added": 0},
+            ])
+            engine.drain_flow_backfill = lambda deadline, **kwargs: next(chunks)
             engine.observer.sync = lambda **kwargs: self.fail(
                 "secondary discovery ran after a committed gap chunk")
             engine.v4_observer.sync = lambda **kwargs: self.fail(
@@ -7543,7 +7549,130 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(result["status"], "complete")
             self.assertEqual(result["priority_mode"], "oldest_durable_gap_first")
             self.assertTrue(result["v2_discovery"]["deferred"])
-            self.assertEqual(result["new_candidates"], 3)
+            self.assertEqual(result["new_candidates"], 5)
+            recovery = result["durable_gap_recovery"]
+            self.assertEqual(recovery["chunks_processed"], 2)
+            self.assertEqual(recovery["cursor_commits"], 2)
+            self.assertEqual(recovery["blocks_scanned"], 1000)
+
+    def test_gap_recovery_refuses_to_spend_completion_reserve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine.drain_flow_backfill = lambda *args, **kwargs: self.fail(
+                "no chunk may start inside the completion reserve")
+            result = engine.drain_flow_backfill_until_reserve(
+                rh.CycleDeadline(0.01), block_limit=1000,
+                reserve_seconds=0.02,
+            )
+            self.assertEqual(result["chunks_processed"], 0)
+            self.assertEqual(
+                result["stopped_reason"], "completion_reserve_reached")
+
+    def test_gap_recovery_chunks_are_hard_bounded_at_one_thousand_blocks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            limits = []
+
+            def drain(deadline, *, block_limit):
+                limits.append(block_limit)
+                if len(limits) == 1:
+                    return {
+                        "ranges_selected": 1, "blocks_scanned": block_limit,
+                        "candidates_added": 0, "completed": False,
+                        "from_block": 1, "to_block": block_limit,
+                    }
+                return {"ranges_selected": 0, "blocks_scanned": 0,
+                        "candidates_added": 0}
+
+            engine.drain_flow_backfill = drain
+            result = engine.drain_flow_backfill_until_reserve(
+                rh.CycleDeadline(5.0), block_limit=5_000,
+                reserve_seconds=0.1,
+            )
+            self.assertEqual(limits, [1_000, 1_000])
+            self.assertEqual(result["chunk_limit_blocks"], 1_000)
+            self.assertEqual(result["blocks_scanned"], 1_000)
+
+    def test_backfill_retires_expired_snapshot_without_quote_or_cohort(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=10_000),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            snapshot = {
+                "pool_id": "0x" + "ab" * 32,
+                "token_address": TOKEN,
+                "window_start_block": 1,
+                "window_end_block": 100,
+                "features_json": json.dumps({"immutable": "snapshot"}),
+            }
+            engine.store.enqueue_seal([snapshot], "live_lane_headroom")
+            engine.seal_near_head_observations = lambda *args, **kwargs: (
+                self.fail("expired backfill debt must never enter sealing"))
+            engine.drain_flow_backfill_until_reserve = lambda *args, **kwargs: {
+                "ranges_selected": 1, "chunks_processed": 1,
+                "cursor_commits": 1, "blocks_scanned": 1000,
+                "candidates_added": 0,
+            }
+
+            result = engine.run_backfill_lane(
+                budget_seconds=30.0, discovery_block_limit=1000)
+            queue = result["durable_observation_queue"]
+            self.assertEqual(queue["stale_retired_this_cycle"], 1)
+            self.assertEqual(queue["quote_calls_avoided"], 1)
+            self.assertEqual(queue["active_cohort_observations_created"], 0)
+            self.assertEqual(queue["outcomes_scheduled"], 0)
+            self.assertTrue(queue["stale_backlog_shrinking"])
+            self.assertEqual(queue["expired_stale_backlog_delta"], -1)
+            with engine.store.connection() as connection:
+                row = dict(connection.execute(
+                    "SELECT * FROM flow_seal_queue").fetchone())
+                observations = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observations").fetchone()[0]
+                classifications = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observation_classifications"
+                ).fetchone()[0]
+                outcomes = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observation_outcomes"
+                ).fetchone()[0]
+            self.assertEqual(row["queue_state"], "expired_unsealed")
+            self.assertIsNotNone(row["completed_at"])
+            self.assertEqual(
+                json.loads(row["features_json"]), {"immutable": "snapshot"})
+            self.assertIn("live_lane_headroom", row["reason"])
+            self.assertIn("expired_stale:block_lag", row["reason"])
+            self.assertIn("retired_without_observation", row["reason"])
+            self.assertEqual(engine.store.retire_expired_seal_queue(10), 0)
+            self.assertEqual(row["reason"].count("retired_without_observation"), 1)
+            self.assertEqual((observations, classifications, outcomes), (0, 0, 0))
+
+    def test_backfill_leaves_fresh_queue_entry_for_normal_live_sealing(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=10_000),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine.store.enqueue_seal([{
+                "pool_id": "0x" + "cd" * 32,
+                "token_address": TOKEN,
+                "window_start_block": 8_640,
+                "window_end_block": 9_990,
+                "features_json": "{}",
+            }], "live_lane_headroom")
+            engine.drain_flow_backfill_until_reserve = lambda *args, **kwargs: {
+                "ranges_selected": 1, "chunks_processed": 1,
+                "cursor_commits": 1, "blocks_scanned": 1000,
+                "candidates_added": 0,
+            }
+            result = engine.run_backfill_lane(
+                budget_seconds=30.0, discovery_block_limit=1000)
+            queue = result["durable_observation_queue"]
+            self.assertEqual(queue["stale_retired_this_cycle"], 0)
+            pending = engine.store.pending_seal_windows(10)
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["queue_state"], "pending")
 
     def test_only_analysis_lane_is_constructed_with_the_producer_chain(self):
         source = inspect.getsource(rh.main)
@@ -8138,18 +8267,21 @@ class SealStageBudgetTests(unittest.TestCase):
                     " AND completed_at IS NULL").fetchone()[0]
             self.assertEqual(expired, 3, "research debt must be preserved")
 
-            # The non-live consumer can still seal the preserved evidence.
-            background = engine.seal_near_head_observations(
-                later, self.NOW + 60, deadline=rh.CycleDeadline(25.0),
-                limit=4, reserve_seconds=5.0, include_fresh=False,
-                stage_lane="backfill",
-            )
-            self.assertEqual(background["admission"]["queue_drained"], 3)
-            self.assertEqual(background["sealed_this_cycle"], 3)
+            # Expiry is terminal evidence, not permission for a background
+            # consumer to quote history and fabricate a prospective record.
+            retired = store.retire_expired_seal_queue(10)
+            self.assertEqual(retired, 3)
             with store.connection() as connection:
                 total = connection.execute(
                     "SELECT COUNT(*) FROM flow_observations").fetchone()[0]
-            self.assertEqual(total, 4, "every window was eventually sealed")
+                terminal = connection.execute(
+                    "SELECT COUNT(*) FROM flow_seal_queue"
+                    " WHERE queue_state='expired_unsealed'"
+                    " AND completed_at IS NOT NULL"
+                    " AND reason LIKE '%retired_without_observation%'"
+                ).fetchone()[0]
+            self.assertEqual(total, 1, "stale windows must never be sealed")
+            self.assertEqual(terminal, 3, "queue history stays auditable")
 
     def test_a_sealed_window_leaves_the_queue(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8219,8 +8351,8 @@ class SealStageBudgetTests(unittest.TestCase):
             self.assertIsNone(historical["completed_at"])
             self.assertEqual(fresh, 1)
 
-    def test_background_mode_drains_only_the_historical_queue(self):
-        """The queue has an explicit non-live consumer; nothing is dropped."""
+    def test_background_mode_never_reconstructs_expired_observations(self):
+        """Terminal history stays auditable but never becomes prospective."""
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
             self._windows(store, 1)
@@ -8239,15 +8371,22 @@ class SealStageBudgetTests(unittest.TestCase):
                 limit=2, reserve_seconds=5.0, queue_drain_limit=2,
                 include_fresh=False, stage_lane="backfill",
             )
-            self.assertEqual(result["sealed_this_cycle"], 2)
-            self.assertEqual(result["admission"]["queue_drained"], 2)
-            self.assertEqual(store.seal_queue_backlog()["pending_windows"], 0)
+            self.assertEqual(result["sealed_this_cycle"], 0)
+            self.assertEqual(result["admission"]["queue_drained"], 0)
+            backlog = store.seal_queue_backlog()
+            self.assertEqual(backlog["pending_windows"], 0)
+            self.assertEqual(backlog["expired_stale_windows"], 2)
             with store.connection() as connection:
                 fresh = connection.execute(
                     "SELECT COUNT(*) FROM flow_observations"
                     " WHERE window_end_block>=?", (self.HEAD - 100,)
                 ).fetchone()[0]
+                late = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observations"
+                    " WHERE window_end_block<?", (self.HEAD - 100,)
+                ).fetchone()[0]
             self.assertEqual(fresh, 0)
+            self.assertEqual(late, 0)
 
     # --- (5) the reserve --------------------------------------------------
 
