@@ -9549,3 +9549,56 @@ class AnalysisLaneDeadlineTests(unittest.TestCase):
                  + rh.ANALYSIS_DOWNSTREAM_RESERVE_SECONDS)
         self.assertLess(total, rh.ANALYSIS_LANE_BUDGET_SECONDS / 2)
         self.assertGreater(rh.ANALYSIS_DOWNSTREAM_RESERVE_SECONDS, 0)
+
+
+class IngestionFreshnessBudgetTests(unittest.TestCase):
+    """The cycle deadline was never the binding limit on decision lag.
+
+    All 12 lag breaches in 338 cycles were ingestion-dominated: ingestion
+    8.3-14.2s while sealing was 0.03-4.8s and classification 1.6-5.0s.
+    Median ingestion on passing cycles is 5.4s. A pass can finish well
+    inside the 25s cycle deadline and still be far too stale to act on.
+
+    An earlier attempt subtracted the full 8.73s tail RESERVE from a 5.85s
+    budget computed at the 20.5/s planning minimum, got zero, and would have
+    deferred every cycle forever. The reserve is what the lane sets aside,
+    not what it spends (observed downstream: 2.6-3.2s), and the planning
+    rate is a deliberate minimum for capacity sizing, not the real rate.
+    """
+
+    def _body(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        return source.split("def run_live_lane", 1)[1][:6000]
+
+    def test_ingestion_is_bounded_by_freshness_not_only_the_deadline(self):
+        body = self._body()
+        self.assertIn("freshness_seconds", body)
+        self.assertIn("FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS", body)
+
+    def test_the_budget_uses_observed_cost_not_the_reserve(self):
+        """Subtracting the reserve is what made the first attempt compute
+        zero and stop the lane."""
+        body = self._body()
+        self.assertIn("downstream_observed", body)
+        self.assertIn("downstream_reserve_p95", body)
+
+    def test_there_is_a_floor_so_the_lane_can_never_stop(self):
+        body = self._body()
+        self.assertIn("LIVE_LANE_MINIMUM_INGESTION_SECONDS", body)
+        self.assertGreater(rh.LIVE_LANE_MINIMUM_INGESTION_SECONDS, 0)
+
+    def test_the_budget_admits_a_typical_cycle(self):
+        """A bound that squeezes the median would trade lag failures for
+        universal deferral -- fewer decisions, not fresher ones."""
+        freshness = (rh.FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                     / rh.FLOW_OBSERVED_BLOCKS_PER_SECOND)
+        self.assertGreater(freshness - 3.2, 5.4,
+                           "median ingestion must still fit")
+
+    def test_the_observed_rate_is_not_the_planning_minimum(self):
+        """They serve opposite purposes: the planning rate is deliberately
+        conservative for capacity, and using it here yields a budget no
+        configuration can meet."""
+        self.assertNotEqual(rh.FLOW_OBSERVED_BLOCKS_PER_SECOND,
+                            rh.FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND)

@@ -620,6 +620,15 @@ ANALYSIS_OUTCOME_ITEM_RESERVE_SECONDS = 6.0
 #: Measured p95: outcomes 78.9s, analyses 71.1s (median 0.13s -- a rare but
 #: very long tail), certificate_refresh 18.9s, rechecks 3.9s.
 ANALYSIS_DOWNSTREAM_RESERVE_SECONDS = 20.0
+#: Blocks per second used to convert the freshness bound into a time budget.
+#: The planning rate (20.5) is a deliberate MINIMUM for capacity sizing; using
+#: it here yields a 5.85s budget that no configuration can meet. Observed lag
+#: against observed stage times puts the real rate near 10/s.
+FLOW_OBSERVED_BLOCKS_PER_SECOND = 10.0
+#: Ingestion may be squeezed by the freshness budget but never to nothing. A
+#: bad estimate must degrade scan width, not stop the lane -- an earlier
+#: version without this floor computed zero and would have deferred forever.
+LIVE_LANE_MINIMUM_INGESTION_SECONDS = 3.0
 SETTLEMENT_LOCK_RETRY_ATTEMPTS = 3
 SETTLEMENT_LOCK_RETRY_BACKOFF_SECONDS = 0.5
 #: A controlled deferral is healthy, but a lane that defers most of its cycles
@@ -13173,8 +13182,41 @@ class RobinhoodLearningEngine:
             stage = time.monotonic()
             ingestion_model = self.ingestion_cost_model()
             ingestion_tail_reserve = self.ingestion_tail_reserve()
+            # Also bounded by FRESHNESS, with a floor.
+            #
+            # Every decision-lag breach is ingestion-dominated: measured on
+            # the 12 breaches in 338 cycles, ingestion ran 8.3-14.2s while
+            # sealing was 0.03-4.8s and classification 1.6-5.0s. Median
+            # ingestion on passing cycles is 5.4s. The cycle deadline is 25s,
+            # so a pass can finish comfortably inside it and still be far too
+            # stale to act on -- the deadline was never the binding limit.
+            #
+            # Derived from the OBSERVED downstream cost (3.2s median), not
+            # from the reserve. An earlier attempt subtracted the full 8.73s
+            # tail reserve from a 5.85s budget, got zero, and would have
+            # deferred every cycle forever -- the reserve is what the lane
+            # sets aside, not what it spends.
+            #
+            # The floor is what makes this safe: ingestion can be squeezed
+            # but never to nothing, so a bad estimate degrades scan width
+            # instead of stopping the lane.
+            freshness_seconds = (
+                FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                / max(1.0, FLOW_OBSERVED_BLOCKS_PER_SECOND))
+            downstream_observed = max(
+                0.0, self.seal_cost_model()["downstream_reserve_p95"])
+            # The floor guards the FRESHNESS term only. Applying it to the
+            # whole expression let a cycle with no time left still claim 3s
+            # of ingestion, which removed the deadline's ability to force a
+            # deferral -- the lane must still be able to decline when it is
+            # genuinely out of budget, not merely out of freshness.
+            freshness_allowance = max(
+                LIVE_LANE_MINIMUM_INGESTION_SECONDS,
+                freshness_seconds - downstream_observed)
             ingestion_available = max(
-                0.0, deadline.remaining() - ingestion_tail_reserve)
+                0.0,
+                min(deadline.remaining() - ingestion_tail_reserve,
+                    freshness_allowance))
             predicted_ingestion = max(
                 0.05, ingestion_model["p95_seconds"])
             scan_fraction = min(
