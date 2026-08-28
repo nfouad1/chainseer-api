@@ -7162,7 +7162,7 @@ class LaneSplitTests(unittest.TestCase):
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
             cohort = store.start_acceptance_cohort(
                 revision="abc123", sample_target=3,
-                cohort_id="acceptance-test-1")
+                cohort_id="acceptance-test-1", checkout_revision="abc123")
             self.assertEqual(cohort["cohort_id"], "acceptance-test-1")
             self.assertEqual(cohort["revision"], "abc123")
             self.assertEqual(cohort["policy"]["sample_target"], 3)
@@ -7216,7 +7216,8 @@ class LaneSplitTests(unittest.TestCase):
                     )
             store.start_acceptance_cohort(
                 revision="frozen-revision", sample_target=2,
-                cohort_id="frozen-two")
+                cohort_id="frozen-two",
+                checkout_revision="frozen-revision")
             useful = {
                 "duration_seconds": 1.0,
                 "observation_seal": {
@@ -7250,7 +7251,8 @@ class LaneSplitTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
             store.start_acceptance_cohort(
-                revision="expected", sample_target=1, cohort_id="revision-test")
+                revision="expected", sample_target=1,
+                cohort_id="revision-test", checkout_revision="expected")
             with patch.object(rh, "CODE_REVISION", "unexpected"):
                 store.begin_run("wrong-revision", 25.0, lane="live")
                 store.finish_run(
@@ -7267,7 +7269,8 @@ class LaneSplitTests(unittest.TestCase):
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
             store.start_acceptance_cohort(
                 revision="useful-revision", sample_target=2,
-                cohort_id="useful-two")
+                cohort_id="useful-two",
+                checkout_revision="useful-revision")
             useful = {
                 "duration_seconds": 1.0,
                 "observation_seal": {"sealed_this_cycle": 1},
@@ -7295,7 +7298,7 @@ class LaneSplitTests(unittest.TestCase):
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
             store.start_acceptance_cohort(
                 revision="stall-revision", sample_target=1,
-                cohort_id="stall-one")
+                cohort_id="stall-one", checkout_revision="stall-revision")
             with patch.object(rh, "CODE_REVISION", "stall-revision"):
                 store.begin_run("live-first", 25.0, lane="live")
                 store.finish_run(
@@ -9481,6 +9484,30 @@ class WorktreeSourceDigestTests(unittest.TestCase):
                          "the digest must be stable for unchanged content")
         self.assertEqual(len(first), 16)
 
+    def test_cohort_start_rejects_a_stale_requested_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            with self.assertRaisesRegex(
+                    ValueError, "does not match checkout HEAD"):
+                store.start_acceptance_cohort(
+                    revision="one-behind", sample_target=5,
+                    checkout_revision="actual-head")
+
+    def test_cohort_status_exposes_checkout_drift(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="frozen-head", sample_target=5,
+                checkout_revision="frozen-head")
+            with patch.object(
+                    rh, "_workspace_revision", return_value="new-head"):
+                cohort = store.acceptance_cohort()
+                result = store.stabilization_summary(integrity={"ok": True})
+            self.assertEqual(cohort["checkout_revision"], "new-head")
+            self.assertTrue(cohort["checkout_revision_mismatch"])
+            self.assertFalse(
+                result["criteria"]["cohort_provenance"]["pass"])
+
     def test_every_behaviour_defining_module_is_covered(self):
         """A module that decides live-lane behaviour but is not digested is a
         hole exactly the size of that module."""
@@ -9509,7 +9536,8 @@ class WorktreeSourceDigestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
             cohort = store.start_acceptance_cohort(
-                revision="deadbeef", sample_target=5)
+                revision="deadbeef", sample_target=5,
+                checkout_revision="deadbeef")
             self.assertEqual(cohort["source_digest"],
                              rh._worktree_source_digest())
             self.assertEqual(cohort["revision_mismatches"], 0)
@@ -9520,7 +9548,8 @@ class WorktreeSourceDigestTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
             cohort = store.start_acceptance_cohort(
-                revision="deadbeef", sample_target=5)
+                revision="deadbeef", sample_target=5,
+                checkout_revision="deadbeef")
             with store.connection() as connection:
                 connection.execute(
                     "INSERT INTO runs(started_at,status,lane,revision,"

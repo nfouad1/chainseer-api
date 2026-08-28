@@ -266,9 +266,46 @@ SEAL_QUEUE_STALE_SECONDS = 3 * 3600.0
 #: Samples carry the epoch they were recorded under; only current-epoch
 #: samples drive admission.
 SEAL_COST_MODEL_EPOCH = 4
-#: Code revision stamped onto every timing sample for provenance. Set from
-#: the environment the runner exports; "unknown" in tests/ad-hoc use.
-CODE_REVISION = os.environ.get("CHAINSEER_CODE_REVISION", "unknown")
+def _workspace_revision(root: Path | None = None) -> str:
+    """Read the checkout HEAD without spawning Git or trusting process env."""
+    workspace = (root or Path(__file__).resolve().parent).resolve()
+    git_dir = workspace / ".git"
+    try:
+        if git_dir.is_file():
+            marker = git_dir.read_text(encoding="utf-8").strip()
+            if not marker.lower().startswith("gitdir:"):
+                return "unknown"
+            git_dir = (workspace / marker.split(":", 1)[1].strip()).resolve()
+        head = (git_dir / "HEAD").read_text(encoding="ascii").strip()
+        if not head.startswith("ref:"):
+            return head[:12] if head else "unknown"
+        ref = head.split(":", 1)[1].strip()
+        ref_path = git_dir / ref
+        if ref_path.exists():
+            value = ref_path.read_text(encoding="ascii").strip()
+            return value[:12] if value else "unknown"
+        packed = git_dir / "packed-refs"
+        if packed.exists():
+            for line in packed.read_text(encoding="ascii").splitlines():
+                if not line or line.startswith(("#", "^")):
+                    continue
+                value, name = line.split(" ", 1)
+                if name.strip() == ref:
+                    return value[:12]
+    except (OSError, ValueError):
+        return "unknown"
+    return "unknown"
+
+
+#: Code revision stamped onto every timing sample for provenance. The runner
+#: exports it so a process keeps naming the code it imported even if the
+#: checkout moves underneath it. Ad-hoc processes fall back to actual HEAD.
+_CONFIGURED_CODE_REVISION = os.environ.get("CHAINSEER_CODE_REVISION", "")
+CODE_REVISION = (
+    _CONFIGURED_CODE_REVISION
+    if _CONFIGURED_CODE_REVISION not in {"", "unknown"}
+    else _workspace_revision()
+)
 
 
 _SOURCE_DIGEST_CACHE: str | None = None
@@ -5352,6 +5389,12 @@ class RobinhoodLearningStore:
                 "failures", "revision_mismatches", "source_mismatches",
             )
         })
+        checkout_revision = _workspace_revision()
+        result["checkout_revision"] = checkout_revision
+        result["checkout_revision_mismatch"] = bool(
+            checkout_revision not in {"", "unknown"}
+            and str(result.get("revision") or "") != checkout_revision
+        )
         target = max(1, safe_int(result.get("sample_target"), 100))
         result["collection_complete"] = (
             result["terminal_attempts"] >= target)
@@ -5362,6 +5405,7 @@ class RobinhoodLearningStore:
     def start_acceptance_cohort(
         self, *, revision: str, sample_target: int = 100,
         cohort_id: str | None = None,
+        checkout_revision: str | None = None,
     ) -> dict:
         """Open a frozen revision/policy cohort while no lane owns a run.
 
@@ -5372,6 +5416,13 @@ class RobinhoodLearningStore:
         revision = str(revision or "").strip()
         if not revision or revision == "unknown":
             raise ValueError("a concrete code revision is required")
+        actual_checkout = str(
+            checkout_revision or _workspace_revision() or "unknown").strip()
+        if (actual_checkout not in {"", "unknown"}
+                and revision != actual_checkout):
+            raise ValueError(
+                "acceptance cohort revision does not match checkout HEAD: "
+                f"requested={revision} checkout={actual_checkout}")
         ownership = self.running_run_audit()
         if ownership["active"] or ownership["stale"]:
             raise RuntimeError(
@@ -6534,7 +6585,8 @@ class RobinhoodLearningStore:
                 and safe_int(cohort.get("revision_mismatches"), 0) == 0
                 # Both, not either. A clean revision with a moved worktree is
                 # exactly as contaminated and far harder to notice.
-                and safe_int(cohort.get("source_mismatches"), 0) == 0)
+                and safe_int(cohort.get("source_mismatches"), 0) == 0
+                and not bool(cohort.get("checkout_revision_mismatch")))
             criteria["cohort_provenance"] = {
                 "pass": provenance_ok,
                 "value": {
@@ -6544,6 +6596,9 @@ class RobinhoodLearningStore:
                         cohort.get("revision_mismatches"), 0),
                     "source_mismatches": safe_int(
                         cohort.get("source_mismatches"), 0),
+                    "checkout_revision": cohort.get("checkout_revision"),
+                    "checkout_revision_mismatch": bool(
+                        cohort.get("checkout_revision_mismatch")),
                     "policy_hash": cohort.get("policy_hash"),
                 },
                 "target": "pinned revision / unchanged policy",
