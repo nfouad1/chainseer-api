@@ -11228,6 +11228,17 @@ class RobinhoodLearningEngine:
         the window would make freshness self-certifying, which is the error
         the telemetry already had to be corrected for once.
         """
+        ingest_phase: dict[str, float] = {}
+        ingest_mark = [time.monotonic(), "start"]
+
+        def _close_ingest_phase() -> dict:
+            """Charge the final open sub-stage, then hand back the totals."""
+            now = time.monotonic()
+            ingest_phase[ingest_mark[1]] = round(
+                ingest_phase.get(ingest_mark[1], 0.0) + now - ingest_mark[0], 3)
+            ingest_mark[0] = now
+            return dict(ingest_phase)
+
         def _ingest_substage(name: str) -> None:
             """WHERE inside ingestion are we?
 
@@ -11241,6 +11252,15 @@ class RobinhoodLearningEngine:
             Telemetry only: a store without the method, or a failure writing
             one, must never break ingestion.
             """
+            # Close the previous sub-stage before opening this one. Marking
+            # position alone could not separate a slow RPC from a contended
+            # write: deferred cycles ingested 9.92s against 5.95s on identical
+            # work (53 vs 55 swaps, same 66-block scan), and nothing recorded
+            # WHICH part took the extra four seconds.
+            now = time.monotonic()
+            ingest_phase[ingest_mark[1]] = round(
+                ingest_phase.get(ingest_mark[1], 0.0) + now - ingest_mark[0], 3)
+            ingest_mark[0], ingest_mark[1] = now, name
             marker = getattr(self.store, "mark_lane_stage", None)
             if marker is None:
                 return
@@ -11395,8 +11415,10 @@ class RobinhoodLearningEngine:
                 "block_number": int(str(log.get("blockNumber") or "0x0"), 16),
             })
         if born:
+            _ingest_substage("apply_pool_events")
             self.store.apply_v4_events(born)
             known = self.store.known_v4_pool_ids()
+        _ingest_substage("decode_swaps")
         events = []
         for log in logs:
             topics = log.get("topics") or []
@@ -11421,6 +11443,7 @@ class RobinhoodLearningEngine:
                 "tick": _signed_word(log.get("data"), 4, 24),
             })
         if events:
+            _ingest_substage("apply_swap_events")
             self.store.apply_v4_events(events)
         # The scan and its raw events are durable at this point. Advance the
         # cursor BEFORE optional origin enrichment so an expensive identity
@@ -11469,6 +11492,12 @@ class RobinhoodLearningEngine:
                 max(0, window_floor - (last_scanned + 1)) if scan_capped else 0
             ),
             "scan_blocks": max(0, head - from_block + 1),
+            # Seconds per ingestion sub-stage. Published, not merely recorded:
+            # a timer nothing reads is the defect this project keeps finding,
+            # and the question it exists to answer -- why deferred cycles
+            # ingest 9.92s against 5.95s on identical work -- can only be
+            # settled from the persisted summary.
+            "ingest_phase_seconds": _close_ingest_phase(),
             "logs_seen": len(logs), "swaps_ingested": len(events),
             "initialize_logs_seen": len(init_logs),
             "pools_admitted_on_sight": len(born),

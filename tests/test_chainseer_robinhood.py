@@ -9825,3 +9825,50 @@ class DecisionTailAdmissionTests(unittest.TestCase):
             plan = engine.decision_head_admission(2, 4.0)
         self.assertTrue(plan["admitted"])
         self.assertEqual(plan["required_seconds"], 3.6)
+
+
+class IngestionPhaseTimingTests(unittest.TestCase):
+    """Position markers could not separate a slow RPC from a contended write.
+
+    Deferred cycles ingested 9.92s against 5.95s on identical work -- 53 vs
+    55 swaps, the same 66-block scan -- and every one deferred at
+    near_head_commit, the first checkpoint after ingestion. The sub-stages
+    recorded WHERE the pass was (head_read, cursor_read, log_fetch) but not
+    how long each took, and not the database writes at all, so the four
+    missing seconds had no candidate.
+    """
+
+    def _body(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        return source.split("def near_head_flow_pass", 1)[1][:24000]
+
+    def test_the_database_writes_are_timed(self):
+        body = self._body()
+        self.assertIn("apply_pool_events", body)
+        self.assertIn("apply_swap_events", body)
+        self.assertIn("decode_swaps", body)
+
+    def test_each_substage_closes_the_previous_one(self):
+        """Marking a position records where, not how long. Durations need the
+        previous sub-stage charged when the next opens."""
+        body = self._body()
+        self.assertIn("ingest_phase[ingest_mark[1]]", body)
+        self.assertIn("ingest_mark[0], ingest_mark[1] = now, name", body)
+
+    def test_the_totals_reach_the_persisted_summary(self):
+        """A timer nothing reads is the defect this project keeps finding."""
+        body = self._body()
+        self.assertIn('"ingest_phase_seconds": _close_ingest_phase()', body)
+
+    def test_the_final_substage_is_charged(self):
+        """Without a close, the last and often longest sub-stage records
+        zero and the totals silently understate the pass."""
+        body = self._body()
+        self.assertIn("def _close_ingest_phase", body)
+
+    def test_timing_never_breaks_ingestion(self):
+        """Telemetry must not become a new way to die."""
+        body = self._body()
+        self.assertIn('getattr(self.store, "mark_lane_stage", None)', body)
+        self.assertIn("except Exception", body)
