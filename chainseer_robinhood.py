@@ -417,6 +417,26 @@ def _nearest_rank_p99(values: list[float], fallback: float = 0.0) -> float:
     return round(ordered[index], 4)
 
 
+def _nearest_rank(values: list[float], quantile: float,
+                  fallback: float = 0.0) -> float:
+    """Deterministic nearest-rank quantile at an arbitrary level.
+
+    _nearest_rank_p99 stays as-is for the decision-lag SLO, which genuinely
+    wants the 99th percentile. The block-tail reserve does not: at every
+    sample count its window can hold, nearest-rank p99 lands on the maximum
+    or the value beside it (n=82 -> max, n=128 -> second largest), so it
+    reserves the worst case ever seen rather than a percentile.
+    """
+    if not values:
+        return round(float(fallback), 4)
+    ordered = sorted(float(value) for value in values)
+    index = min(
+        len(ordered) - 1,
+        max(0, math.ceil(float(quantile) * len(ordered)) - 1),
+    )
+    return round(ordered[index], 4)
+
+
 def _valid_seal_sample_records(raw: object) -> list[dict]:
     """Return validated provenance records; legacy scalars never drive v2."""
     if not isinstance(raw, list):
@@ -829,6 +849,18 @@ DECISION_TAIL_BLOCK_MODEL_STATE_KEY = "live_decision_tail_blocks_v1"
 DECISION_TAIL_BLOCK_MODEL_EPOCH = 1
 DECISION_TAIL_BLOCK_SAMPLE_WINDOW = 128
 DECISION_TAIL_BLOCK_DEFAULTS = {0: 25, 1: 36, 2: 59}
+#: Quantile for the block-tail reserve. LOWERED from p99 on explicit operator
+#: approval, 2026-08-29, after measuring that nearest-rank p99 cannot behave
+#: as a percentile on this window: at n=82 it selects the maximum and at the
+#: full n=128 the second largest. The reserve had ratcheted to 118 blocks
+#: against a 120-block bound on a median cost of 20 -- set by exactly one
+#: sample -- so at most one observation was ever admissible and usually none.
+#: Measured across 82 and 33 samples: p90 gives 71 and 96, p95 gives 82 and
+#: 113, p99 gives 118 and 157.
+#:
+#: This LOOSENS an admission gate. The max(baseline, ...) floor below keeps it
+#: from ever falling under the author's static defaults.
+DECISION_TAIL_BLOCK_QUANTILE = 0.90
 # The old blanket five-second pre-head cutoff duplicated downstream reserves
 # and discarded three finishable decisions. Head retrieval receives its own
 # bounded allowance; classification and ledger completion are sized below.
@@ -11689,12 +11721,17 @@ class RobinhoodLearningEngine:
             ]
             baseline = DECISION_TAIL_BLOCK_DEFAULTS.get(
                 count, FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS)
+            # max(baseline, ...) keeps this tighten-only: a single slow
+            # sample still raises the reserve immediately, and the measured
+            # value can never fall below the author's static default.
             reserves[count] = int(max(
-                baseline, _nearest_rank_p99(values, baseline)))
+                baseline,
+                _nearest_rank(values, DECISION_TAIL_BLOCK_QUANTILE,
+                              baseline)))
             sample_counts[count] = len(values)
         return {
             "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
-            "quantile": "nearest_rank_p99",
+            "quantile": f"nearest_rank_p{int(DECISION_TAIL_BLOCK_QUANTILE*100)}",
             "reserves": reserves,
             "sample_counts": sample_counts,
             "samples": records,
