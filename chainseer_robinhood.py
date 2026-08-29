@@ -753,6 +753,11 @@ FLOW_OBSERVED_BLOCKS_PER_SECOND = 10.0
 #: bad estimate must degrade scan width, not stop the lane -- an earlier
 #: version without this floor computed zero and would have deferred forever.
 LIVE_LANE_MINIMUM_INGESTION_SECONDS = 3.0
+#: Ingestion's bulk event write competes with every other lane for the single
+#: SQLite writer. busy_timeout is already 10s and the lock still outlived it
+#: twice in one 728-attempt cohort, on the decision-critical path.
+INGEST_LOCK_RETRY_ATTEMPTS = 3
+INGEST_LOCK_RETRY_BACKOFF_SECONDS = 0.4
 SETTLEMENT_LOCK_RETRY_ATTEMPTS = 3
 SETTLEMENT_LOCK_RETRY_BACKOFF_SECONDS = 0.5
 #: A controlled deferral is healthy, but a lane that defers most of its cycles
@@ -3328,6 +3333,33 @@ class RobinhoodLearningStore:
         120-block freshness bound. That needs a head-relative condition in the
         selector, not fewer windows here.
         """
+
+        # Retried on lock contention, not abandoned.
+        #
+        # Every failure in the 728-attempt cohort at ac55e69 attributed to
+        # ingestion/log_fetch, and two of the five were `database is locked`
+        # -- the same contention fixed for the backfill settlement write in
+        # 11d73ed. That fix was scoped to one call site, which is why this
+        # one recurred somewhere else; the retry belongs where the write is,
+        # so every caller inherits it.
+        #
+        # Safe to repeat: swaps are INSERT OR IGNORE and pools are an upsert
+        # (ON CONFLICT DO UPDATE) whose values come from the same event, so a
+        # partially-applied batch re-applies to the same state.
+        #
+        # A lock that never clears must still surface: only contention is
+        # absorbed, and only a bounded number of times.
+        for _attempt in range(1, INGEST_LOCK_RETRY_ATTEMPTS + 1):
+            try:
+                return self._apply_v4_events(events)
+            except sqlite3.OperationalError as error:
+                if ("database is locked" not in str(error).lower()
+                        or _attempt >= INGEST_LOCK_RETRY_ATTEMPTS):
+                    raise
+                time.sleep(INGEST_LOCK_RETRY_BACKOFF_SECONDS)
+
+    def _apply_v4_events(self, events: list[dict]) -> None:
+        """The write itself. Wrapped by apply_v4_events for lock retry."""
         with self.connection() as connection:
             affected_flow_pools = set()
             for event in events:
