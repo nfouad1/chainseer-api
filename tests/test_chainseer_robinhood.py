@@ -9872,3 +9872,36 @@ class IngestionPhaseTimingTests(unittest.TestCase):
         body = self._body()
         self.assertIn('getattr(self.store, "mark_lane_stage", None)', body)
         self.assertIn("except Exception", body)
+
+
+class IngestPhaseDashboardTests(unittest.TestCase):
+    """The timings must reach a human, not only the database.
+
+    A lane once ran for a session with no DOM element to render into and a
+    null textContent killed the whole page; a queue depth was published that
+    nothing read. Both halves have to exist.
+    """
+
+    def _html(self):
+        return Path("robinhood_dashboard.html").read_text(
+            encoding="utf-8", errors="replace")
+
+    def test_the_page_has_an_element_for_the_phase_row(self):
+        self.assertIn('id="ingest-phase"', self._html())
+
+    def test_the_renderer_reads_the_published_key(self):
+        html = self._html()
+        self.assertIn("renderIngestPhase", html)
+        self.assertIn("ingest_phase_seconds", html)
+
+    def test_the_unavailable_path_also_renders(self):
+        """When the snapshot is missing, every row must still be written or
+        the next render throws on a stale node."""
+        html = self._html()
+        self.assertIn("renderIngestPhase(null)", html)
+
+    def test_the_engine_publishes_what_the_page_reads(self):
+        """Guards the two halves drifting apart."""
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn('"ingest_phase_seconds"', source)
