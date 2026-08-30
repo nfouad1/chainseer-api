@@ -872,7 +872,24 @@ DECISION_HEAD_RPC_RESERVE_SECONDS = 0.5
 FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND = 20.5
 # A first origin batch has no local cost history. Cohort 4 observed a 2.156s
 # maximum batch, so a smaller allowance cannot honestly claim to bound it.
-FLOW_MINIMUM_FIRST_ORIGIN_BATCH_SECONDS = 2.25
+# LOWERED 2.25 -> 0.5 on operator approval, 2026-08-30, after measuring what
+# a batch actually costs. Live enrichment passes that completed: 60 origins
+# resolved in 0.203-0.250s with zero failures, five times out of six. At
+# FLOW_ORIGIN_BATCH_SIZE 25 that puts one batch near 0.08-0.10s, so the old
+# floor demanded roughly 20x a batch and 10x the whole 60-origin stage.
+#
+# The consequence was not a slow gate but a closed one. The budget is
+# (53 - lag) / 20.5 seconds, peaking at 2.585s with zero lag, so a 2.25s floor
+# admitted enrichment only below 7 blocks of head lag -- against an observed
+# median of 15. It ran 2 times in 187 cycles, and every window sealed in that
+# period carries no resolved participants, leaving the participant gate
+# evaluating absent evidence.
+#
+# 0.5s still refuses beyond ~42 blocks of lag, so a genuinely late cycle
+# starts nothing. The one slow pass observed (1.969s for 25 origins on a slow
+# provider) is what the old floor was sized for; the deadline and
+# deferred_for_deadline accounting bound that case rather than this floor.
+FLOW_MINIMUM_FIRST_ORIGIN_BATCH_SECONDS = 0.5
 # Enrichment targeting is a SEPARATE bound from decision freshness. Applying
 # the 120-block decision bound to a pool's last swap matched 1 of 1,895 pools,
 # because these pools trade a few times per 1,350 blocks -- so the prospective

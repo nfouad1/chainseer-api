@@ -3473,15 +3473,27 @@ class NearHeadFlowPassTests(unittest.TestCase):
         )
 
     def test_enrichment_admission_skips_an_unbounded_first_batch(self):
+        # Lag 45, not 40. The scenario moved because the premise was
+        # measured and found wrong: a 40-block lag leaves 0.634s, and a batch
+        # of 25 origins costs 0.08-0.10s (60 resolved in 0.203-0.250s across
+        # five live passes), so 0.634s fits roughly six batches. It was never
+        # an unbounded first batch. At 45 blocks the budget is 0.390s, under
+        # the 0.5s floor, which is a case that genuinely cannot start one.
         plan = rh.RobinhoodLearningEngine.near_head_enrichment_admission(
             observation_head=1_000,
-            current_head=1_040,
+            current_head=1_045,
             elapsed_seconds=6.0,
             configured_seconds=6.0,
         )
-        self.assertEqual(plan["raw_block_budget_seconds"], 0.634)
+        self.assertEqual(plan["raw_block_budget_seconds"], 0.39)
         self.assertEqual(plan["admitted_seconds"], 0.0)
         self.assertEqual(plan["reason"], "insufficient_first_batch_headroom")
+        # And the case that WAS being refused now runs, which is the point.
+        admitted = rh.RobinhoodLearningEngine.near_head_enrichment_admission(
+            observation_head=1_000, current_head=1_040,
+            elapsed_seconds=6.0, configured_seconds=6.0,
+        )
+        self.assertGreater(admitted["admitted_seconds"], 0.0)
 
     def test_enrichment_admission_fails_closed_without_a_current_head(self):
         plan = rh.RobinhoodLearningEngine.near_head_enrichment_admission(
