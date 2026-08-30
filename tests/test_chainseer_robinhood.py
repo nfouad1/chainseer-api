@@ -10162,6 +10162,8 @@ class ProductionHardeningTests(unittest.TestCase):
                 "ok": True,
                 "checked_at": datetime.fromtimestamp(
                     9_900, tz=timezone.utc).isoformat(),
+                "revision": rh.CODE_REVISION,
+                "source_digest": rh._worktree_source_digest(),
             })
             self.assertFalse(rh._full_verification_due(root, now=10_000))
             self.assertTrue(rh._full_verification_due(

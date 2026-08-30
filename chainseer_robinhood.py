@@ -15661,6 +15661,8 @@ class RobinhoodLearningEngine:
             "producer_timechain_ok": timechain_ok,
             "paper_only": True,
             "checked_at": _utc_now(),
+            "revision": CODE_REVISION,
+            "source_digest": _worktree_source_digest(),
         }
         atomic_json_write(self.root / "verification_status.json", result)
         return result
@@ -15812,6 +15814,9 @@ def _full_verification_due(
     current = time.time() if now is None else float(now)
     return bool(
         not status.get("ok") or checked is None
+        or str(status.get("revision") or "") != CODE_REVISION
+        or str(status.get("source_digest") or "")
+            != _worktree_source_digest()
         or current - checked >= FULL_VERIFICATION_REFRESH_SECONDS)
 
 
