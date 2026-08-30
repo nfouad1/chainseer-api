@@ -158,13 +158,14 @@ LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
 EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
-# Full SQLite integrity exceeded the first 20-minute production task boundary
-# on the 5.5 GB corpus.  It therefore runs under a dedicated 45-minute,
-# low-priority maintenance task, never under the 285-second live supervisor.
+# Full SQLite integrity exceeded both 20- and 45-minute production task
+# boundaries on the 5.5 GB corpus.  It therefore runs under a dedicated
+# 100-minute, low-priority nightly maintenance task, never under the
+# 285-second live supervisor.
 # Ledger and Timechain verification remain part of the same certificate; only
-# scheduling ownership changes.  The five-minute reserve lets the runner
+# scheduling ownership changes.  The ten-minute reserve lets the runner
 # publish its certificate and close SQLite cleanly before the OS kill boundary.
-VERIFICATION_LANE_BUDGET_SECONDS = 40 * 60.0
+VERIFICATION_LANE_BUDGET_SECONDS = 90 * 60.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
 # Keep enough of the lane budget after durable gap recovery to commit its
