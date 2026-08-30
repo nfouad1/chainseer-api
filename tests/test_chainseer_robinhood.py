@@ -7754,7 +7754,7 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         self.assertNotIn("verification", rh.SUPERVISED_LANE_NAMES)
         self.assertNotIn('"verification": {', source)
         self.assertGreaterEqual(
-            rh.VERIFICATION_LANE_BUDGET_SECONDS, 15 * 60)
+            rh.VERIFICATION_LANE_BUDGET_SECONDS, 40 * 60)
         runner = Path("run_chainseer_robinhood_learning.py").read_text(
             encoding="utf-8", errors="replace")
         self.assertIn('"--verification-only"', runner)

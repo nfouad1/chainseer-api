@@ -117,8 +117,11 @@ DASHBOARD_OPERATIONAL_REFRESH_SECONDS = 5.0
 DASHBOARD_SNAPSHOT_REFRESH_SECONDS = 30.0
 DASHBOARD_OPERATIONAL_STALE_SECONDS = 20.0
 DASHBOARD_HISTORICAL_STALE_SECONDS = 15 * 60.0
-DASHBOARD_INTEGRITY_MAX_AGE_SECONDS = 24 * 60 * 60
-FULL_VERIFICATION_REFRESH_SECONDS = 12 * 60 * 60
+# The full 5.5 GB check is deliberately daily, not per learner cycle.  A
+# two-hour display margin prevents a certificate from flickering red while
+# the next low-priority maintenance pass is still reading the database.
+DASHBOARD_INTEGRITY_MAX_AGE_SECONDS = 26 * 60 * 60
+FULL_VERIFICATION_REFRESH_SECONDS = 24 * 60 * 60
 DEFAULT_DISCOVERY_LOOKBACK_BLOCKS = 5_000
 DEFAULT_DISCOVERY_BLOCK_LIMIT = 5_000
 DEFAULT_ANALYSIS_LIMIT = 1
@@ -155,11 +158,13 @@ LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
 EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
-# Full SQLite integrity exceeds five minutes on the production corpus.  It is
-# run by a dedicated 20-minute maintenance task, never by the 285-second live
-# supervisor.  Ledger and Timechain verification remain part of the same
-# certificate; only scheduling ownership changes.
-VERIFICATION_LANE_BUDGET_SECONDS = 15 * 60.0
+# Full SQLite integrity exceeded the first 20-minute production task boundary
+# on the 5.5 GB corpus.  It therefore runs under a dedicated 45-minute,
+# low-priority maintenance task, never under the 285-second live supervisor.
+# Ledger and Timechain verification remain part of the same certificate; only
+# scheduling ownership changes.  The five-minute reserve lets the runner
+# publish its certificate and close SQLite cleanly before the OS kill boundary.
+VERIFICATION_LANE_BUDGET_SECONDS = 40 * 60.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
 # Keep enough of the lane budget after durable gap recovery to commit its
