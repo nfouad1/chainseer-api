@@ -166,9 +166,10 @@ def _atomic_json(path: Path, value: dict) -> None:
 
 
 def _runner_status(root: Path, *, status: str, started: float,
-                   error: str | None = None, result: dict | None = None) -> None:
+                   error: str | None = None, result: dict | None = None,
+                   filename: str = "runner_status.json") -> None:
     terminal = status != "running"
-    _atomic_json(root / "runner_status.json", {
+    _atomic_json(root / filename, {
         "schema_version": 2,
         "mode": "native_python_job_supervisor",
         "status": status,
@@ -210,6 +211,10 @@ def main() -> int:
     parser.add_argument("--outcome-limit", type=int, default=12)
     parser.add_argument("--outcome-recovery-limit", type=int, default=4)
     parser.add_argument("--market-recheck-limit", type=int, default=4)
+    parser.add_argument(
+        "--verification-only", action="store_true",
+        help="run the long full-integrity maintenance lane and exit",
+    )
     parser.add_argument("--job-object-probe", action="store_true")
     args = parser.parse_args()
     if args.job_object_probe:
@@ -217,9 +222,15 @@ def main() -> int:
 
     root = WORKSPACE / "robinhood_learning"
     started = time.time()
+    status_filename = (
+        "verification_runner_status.json"
+        if args.verification_only else "runner_status.json"
+    )
     try:
         own_process_tree()
-        _runner_status(root, status="initializing", started=started)
+        _runner_status(
+            root, status="initializing", started=started,
+            filename=status_filename)
         # Import only after ownership and status are authoritative. This module
         # is intentionally large; a scheduled startup must never disappear
         # into an unobservable import before the Job Object exists.
@@ -234,7 +245,21 @@ def main() -> int:
                 import chainseer_robinhood as robinhood
             finally:
                 faulthandler.cancel_dump_traceback_later()
-        _runner_status(root, status="running", started=started)
+        _runner_status(
+            root, status="running", started=started,
+            filename=status_filename)
+        if args.verification_only:
+            engine = robinhood.RobinhoodLearningEngine(
+                root,
+                chain_root="robinhood_learning_chain",
+                skill_root=str(robinhood.default_skill_root()),
+            )
+            result = engine.run_verification_lane(
+                budget_seconds=robinhood.VERIFICATION_LANE_BUDGET_SECONDS)
+            _runner_status(
+                root, status="complete", started=started, result=result,
+                filename=status_filename)
+            return 0
         result = robinhood.supervise_lanes(
             root,
             chain_root="robinhood_learning_chain",
@@ -248,12 +273,14 @@ def main() -> int:
         )
         _runner_status(
             root, status="complete", started=started, result=result,
+            filename=status_filename,
         )
         return 0
     except BaseException as exc:
         _runner_status(
             root, status="failed", started=started,
             error="".join(traceback.format_exception(exc))[-4_000:],
+            filename=status_filename,
         )
         raise
 

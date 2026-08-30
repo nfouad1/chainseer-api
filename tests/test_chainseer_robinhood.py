@@ -7739,14 +7739,26 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
     evidence the lane worked.
     """
 
-    def test_every_configured_lane_is_launched_by_the_loop(self):
+    def test_every_supervised_lane_is_launched_by_the_loop(self):
         source = inspect.getsource(rh.supervise_lanes)
         self.assertIn(
             "for lane, schedule in lanes.items()", source,
             "the launch loop must iterate the configuration, not a copy",
         )
-        for lane in rh.LANE_NAMES:
+        for lane in rh.SUPERVISED_LANE_NAMES:
             self.assertIn(f'"{lane}"', source, f"{lane} missing from config")
+
+    def test_full_verification_is_maintenance_only(self):
+        source = inspect.getsource(rh.supervise_lanes)
+        self.assertIn("verification", rh.LANE_NAMES)
+        self.assertNotIn("verification", rh.SUPERVISED_LANE_NAMES)
+        self.assertNotIn('"verification": {', source)
+        self.assertGreaterEqual(
+            rh.VERIFICATION_LANE_BUDGET_SECONDS, 15 * 60)
+        runner = Path("run_chainseer_robinhood_learning.py").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn('"--verification-only"', runner)
+        self.assertIn('"verification_runner_status.json"', runner)
 
     def test_no_module_keeps_its_own_lane_list(self):
         """Three separate tuples had already drifted from the config once."""

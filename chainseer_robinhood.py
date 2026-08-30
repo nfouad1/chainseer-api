@@ -143,8 +143,9 @@ MARKS_LANE_BUDGET_SECONDS = 90.0
 #: Every lane, in one place. Three separate hardcoded tuples had already
 #: drifted from the lane configuration once; anything iterating lanes reads
 #: this or the config dict, never its own copy.
-LANE_NAMES = (
-    "live", "marks", "evidence", "analysis", "backfill", "verification")
+SUPERVISED_LANE_NAMES = (
+    "live", "marks", "evidence", "analysis", "backfill")
+LANE_NAMES = (*SUPERVISED_LANE_NAMES, "verification")
 #: How long past its deadline the supervisor lets a lane run before killing
 #: it. A censored attempt is charged deadline + this, so a reliability failure
 #: stays a reliability failure without corrupting the latency SLO.
@@ -154,7 +155,11 @@ LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
 EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
-VERIFICATION_LANE_BUDGET_SECONDS = 240.0
+# Full SQLite integrity exceeds five minutes on the production corpus.  It is
+# run by a dedicated 20-minute maintenance task, never by the 285-second live
+# supervisor.  Ledger and Timechain verification remain part of the same
+# certificate; only scheduling ownership changes.
+VERIFICATION_LANE_BUDGET_SECONDS = 15 * 60.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
 # Keep enough of the lane budget after durable gap recovery to commit its
@@ -15872,13 +15877,6 @@ def supervise_lanes(
             "budget": BACKFILL_LANE_BUDGET_SECONDS, "next": started_mono + 6.0,
         },
     }
-    if _full_verification_due(root, now=started_wall):
-        lanes["verification"] = {
-            "command": "verification-once",
-            "cadence": FULL_VERIFICATION_REFRESH_SECONDS,
-            "budget": VERIFICATION_LANE_BUDGET_SECONDS,
-            "next": started_mono + 10.0,
-        }
     active: dict[str, dict] = {}
     launches = {lane: 0 for lane in lanes}
     timeouts = {lane: 0 for lane in lanes}
