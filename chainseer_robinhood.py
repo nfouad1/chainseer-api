@@ -6437,16 +6437,33 @@ class RobinhoodLearningStore:
             analysis_values = backlog_series("analysis", "pending_analysis")
 
         lags: list[float] = []
+        # Reported beside the rate: an exclusion nobody can see is
+        # indistinguishable from a population that was never contaminated.
+        lag_excluded_no_decision = 0
         marks_complete = 0
         for row in live_rows:
             try:
                 summary = json.loads(row.get("summary_json") or "{}")
             except (TypeError, ValueError, json.JSONDecodeError):
                 summary = {}
-            lag = (summary.get("observation_seal") or {}).get(
-                "decision_head_lag_blocks")
-            if lag is not None:
+            # Only cycles that actually produced a decision.
+            #
+            # decision_head_lag_blocks is recorded whenever the head is read,
+            # including on cycles that sealed nothing -- 266 of 1,309 entries
+            # in the cohort at 9a88bdc. A cycle with no sealed observation
+            # made no decision, so its lag measures how stale a decision
+            # WOULD have been had one existed. Counting it answers a
+            # counterfactual, not the SLO.
+            #
+            # It is not a large distortion: 97.33% combined against 97.60%
+            # scoped, and the rule still fails. The point is that the
+            # population now matches what the rule claims to measure.
+            seal = summary.get("observation_seal") or {}
+            lag = seal.get("decision_head_lag_blocks")
+            if lag is not None and safe_int(seal.get("sealed_this_cycle"), 0) > 0:
                 lags.append(safe_float(lag, float("inf")))
+            elif lag is not None:
+                lag_excluded_no_decision += 1
             if not cohort_id:
                 marks = summary.get("position_evaluations") or {}
                 if (
@@ -6614,6 +6631,10 @@ class RobinhoodLearningStore:
             "decision_lag": {
                 "pass": bool(lag_rate is not None and lag_rate >= 0.99),
                 "value": lag_rate, "samples": len(lags), "target": ">=99% <=120 blocks",
+                # Cycles that read a head but sealed nothing. They made no
+                # decision, so they are outside the SLO -- but the count is
+                # published, because a silent exclusion cannot be audited.
+                "excluded_no_decision": lag_excluded_no_decision,
                 "label": "Decision-lag SLO",
             },
             "position_marks": {

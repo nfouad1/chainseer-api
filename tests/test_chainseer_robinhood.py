@@ -9917,3 +9917,56 @@ class IngestPhaseDashboardTests(unittest.TestCase):
         source = Path("chainseer_robinhood.py").read_text(
             encoding="utf-8", errors="replace")
         self.assertIn('"ingest_phase_seconds"', source)
+
+
+class DecisionLagPopulationTests(unittest.TestCase):
+    """A cycle that sealed nothing made no decision.
+
+    decision_head_lag_blocks is recorded whenever the head is read, including
+    on cycles that sealed no observation -- 266 of 1,309 entries in the cohort
+    at 9a88bdc. Their lag measures how stale a decision WOULD have been had
+    one existed, which answers a counterfactual rather than the SLO.
+
+    The distortion is small (97.33% combined against 97.60% scoped, and the
+    rule fails either way). The point is that the population matches what the
+    rule claims to measure.
+    """
+
+    def _summary(self, lag, sealed):
+        return json.dumps({"observation_seal": {
+            "decision_head_lag_blocks": lag, "sealed_this_cycle": sealed}})
+
+    def _criterion(self, rows):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            with store.connection() as connection:
+                for lag, sealed in rows:
+                    connection.execute(
+                        "INSERT INTO runs(started_at,status,lane,summary_json,"
+                        " heartbeat_at,deadline_seconds)"
+                        " VALUES (?,'complete','live',?,?,25.0)",
+                        (rh._utc_now(), self._summary(lag, sealed), time.time()))
+            return store.stabilization_summary(
+                sample_target=2)["criteria"]["decision_lag"]
+
+    def test_cycles_that_sealed_nothing_are_excluded(self):
+        c = self._criterion([(50, 1), (500, 0)])
+        self.assertEqual(c["samples"], 1, "the no-decision cycle counted")
+        self.assertEqual(c["excluded_no_decision"], 1)
+
+    def test_the_exclusion_is_published_not_silent(self):
+        """An exclusion nobody can see is indistinguishable from a population
+        that was never contaminated."""
+        c = self._criterion([(50, 1), (500, 0), (600, 0)])
+        self.assertEqual(c["excluded_no_decision"], 2)
+
+    def test_a_real_breach_still_fails(self):
+        """Scoping must not launder genuine late decisions."""
+        c = self._criterion([(500, 1), (50, 1)])
+        self.assertFalse(c["pass"])
+        self.assertEqual(c["samples"], 2)
+
+    def test_sealed_cycles_are_kept(self):
+        c = self._criterion([(50, 1), (60, 3)])
+        self.assertEqual(c["samples"], 2)
+        self.assertEqual(c["excluded_no_decision"], 0)
