@@ -9,7 +9,7 @@ import tempfile
 import threading
 import time
 import unittest
-from datetime import datetime
+from datetime import datetime, timezone
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -4008,8 +4008,10 @@ class IdentityDeadlineTests(unittest.TestCase):
                 time.monotonic() + 0.3,
             )
             self.assertEqual(rpc.batches, 1)
-            self.assertEqual(result["attempted"], rh.FLOW_ORIGIN_BATCH_SIZE)
-            self.assertEqual(result["failures"], rh.FLOW_ORIGIN_BATCH_SIZE)
+            self.assertEqual(
+                result["attempted"], rh.FLOW_ORIGIN_COLD_BATCH_SIZE)
+            self.assertEqual(
+                result["failures"], rh.FLOW_ORIGIN_COLD_BATCH_SIZE)
             self.assertEqual(result["stopped_at_deadline"], 1)
             self.assertGreaterEqual(result["observed_batch_seconds"], 0.18)
 
@@ -4029,7 +4031,8 @@ class IdentityDeadlineTests(unittest.TestCase):
                 time.monotonic() + 0.3,
             )
             self.assertEqual(rpc.batches, 1)
-            self.assertEqual(result["attempted"], rh.FLOW_ORIGIN_BATCH_SIZE)
+            self.assertEqual(
+                result["attempted"], rh.FLOW_ORIGIN_COLD_BATCH_SIZE)
             self.assertEqual(result["stopped_at_deadline"], 1)
             self.assertGreaterEqual(result["observed_batch_seconds"], 0.20)
             self.assertGreaterEqual(result["observed_commit_seconds"], 0.18)
@@ -5152,11 +5155,15 @@ class NearHeadEnrichmentOrderingTests(unittest.TestCase):
 
         def get_transactions(self, hashes):
             self.transaction_calls.append(list(hashes))
+            known = {
+                str(log["transactionHash"]): index + 1
+                for index, log in enumerate(self.swaps)
+            }
             return [{"transaction_hash": h,
-                     "transaction": {"from": '0x' + format(index + 1, '040x'),
+                     "transaction": {"from": '0x' + format(known[h], '040x'),
                                      "to": "0x" + "9" * 40,
                                      "blockNumber": hex(self.head - 5)}}
-                    for index, h in enumerate(hashes)]
+                    for h in hashes]
 
     def _log(self, index, sender):
         return {
@@ -7257,7 +7264,14 @@ class LaneSplitTests(unittest.TestCase):
                 result["criteria"]["live_reliability"]["samples"], 2)
             self.assertFalse(result["criteria"]["live_reliability"]["pass"])
             self.assertEqual(
-                result["acceptance_cohort"]["terminal_attempts"], 3)
+                result["acceptance_cohort"]["terminal_attempts"], 2)
+            with store.connection() as connection:
+                third = connection.execute(
+                    "SELECT acceptance_cohort_id FROM runs"
+                    " WHERE run_id='third-complete'").fetchone()
+            self.assertIsNone(
+                third["acceptance_cohort_id"],
+                "runs after the exact sample target contaminated the cohort")
 
     def test_acceptance_cohort_fails_closed_on_revision_mismatch(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7291,14 +7305,26 @@ class LaneSplitTests(unittest.TestCase):
                     "scoped_rows_processed": 1,
                 },
             }
-            with patch.object(rh, "CODE_REVISION", "useful-revision"):
-                for run_id, summary in (
+            # Insert a historical collecting boundary directly: this test is
+            # about the selector scanning beyond the first N attempts. The
+            # normal writer now closes a cohort exactly at N terminal
+            # attempts and has a separate test above.
+            with store.connection() as connection:
+                for index, (run_id, summary) in enumerate((
                     ("idle-1", {"duration_seconds": 1.0}),
                     ("idle-2", {"duration_seconds": 1.0}),
                     ("useful-1", useful), ("useful-2", useful),
-                ):
-                    store.begin_run(run_id, 25.0, lane="live")
-                    store.finish_run(run_id, "complete", summary=summary)
+                )):
+                    connection.execute(
+                        """INSERT INTO runs (
+                               started_at,completed_at,status,summary_json,
+                               run_id,pid,host,heartbeat_at,deadline_seconds,
+                               lane,revision,acceptance_cohort_id)
+                           VALUES (?,?, 'complete', ?, ?,1,'test',?,25,'live',
+                                   'useful-revision','useful-two')""",
+                        (rh._utc_now(), rh._utc_now(), json.dumps(summary),
+                         run_id, float(index)),
+                    )
             criterion = store.stabilization_summary(
                 integrity={"ok": True})["criteria"]["decision_usefulness"]
             self.assertTrue(criterion["pass"])
@@ -7316,22 +7342,27 @@ class LaneSplitTests(unittest.TestCase):
                 store.finish_run(
                     "live-first", "complete",
                     summary={"duration_seconds": 1.0})
-            now = time.time() + 1.0
-            records = [{
-                "value": 0.4, "epoch": rh.SEAL_COST_MODEL_EPOCH,
-                "run_id": "live-first", "at": now + index / 1000,
-                "revision": "stall-revision", "status": "success",
-            } for index in range(rh.SEAL_STALL_GUARD_MIN_SAMPLES)]
-            records.extend({
-                "value": 50.0, "epoch": rh.SEAL_COST_MODEL_EPOCH,
-                "run_id": "backfill-later", "at": now + 2 + index / 1000,
-                "revision": "stall-revision", "status": "stalled",
-            } for index in range(40))
-            store.set_scheduler_state(rh.SEAL_COST_MODEL_STATE_KEY, {
-                "epoch": rh.SEAL_COST_MODEL_EPOCH,
-                "revision": "stall-revision",
-                "fixed_observation_samples": records,
-            })
+            with store.connection() as connection:
+                for index in range(rh.SEAL_STALL_GUARD_MIN_SAMPLES):
+                    connection.execute(
+                        """INSERT INTO seal_cost_samples (
+                               recorded_at,epoch,run_id,revision,
+                               acceptance_cohort_id,component,status,seconds,
+                               sample_count) VALUES (?,?,?,?,?,?,?,?,1)""",
+                        (time.time(), rh.SEAL_COST_MODEL_EPOCH,
+                         f"live-{index}", "stall-revision", "stall-one",
+                         "fixed_observation_cost", "success", 0.4),
+                    )
+                for index in range(40):
+                    connection.execute(
+                        """INSERT INTO seal_cost_samples (
+                               recorded_at,epoch,run_id,revision,
+                               acceptance_cohort_id,component,status,seconds,
+                               sample_count) VALUES (?,?,?,?,?,?,?,?,1)""",
+                        (time.time(), rh.SEAL_COST_MODEL_EPOCH,
+                         f"backfill-{index}", "stall-revision", None,
+                         "fixed_observation_cost", "stalled", 50.0),
+                    )
             criterion = store.stabilization_summary(
                 integrity={"ok": True})["criteria"]["seal_stall_guard"]
             self.assertTrue(criterion["pass"])
@@ -9933,8 +9964,19 @@ class DecisionLagPopulationTests(unittest.TestCase):
     """
 
     def _summary(self, lag, sealed):
-        return json.dumps({"observation_seal": {
-            "decision_head_lag_blocks": lag, "sealed_this_cycle": sealed}})
+        return json.dumps({
+            "observation_seal": {
+                "decision_head_lag_blocks": lag,
+                "sealed_this_cycle": sealed,
+            },
+            # A seal is a decision only when classification actually
+            # processed it. This is the production criterion's population,
+            # not merely a synthetically non-zero sealed counter.
+            "classification": {
+                "scoped_rows_selected": sealed,
+                "scoped_rows_processed": sealed,
+            },
+        })
 
     def _criterion(self, rows):
         with tempfile.TemporaryDirectory() as directory:
@@ -9970,3 +10012,157 @@ class DecisionLagPopulationTests(unittest.TestCase):
         c = self._criterion([(50, 1), (60, 3)])
         self.assertEqual(c["samples"], 2)
         self.assertEqual(c["excluded_no_decision"], 0)
+
+
+class ProductionHardeningTests(unittest.TestCase):
+    def test_evidence_lane_quotes_and_reclassifies_without_mutating_observation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            observation_id = store.seal_flow_observation(
+                pool_id="0x" + "ef" * 32, token_address=TOKEN,
+                observation_head=1_000, window_start_block=500,
+                window_end_block=990, transaction_hashes=["0xaa"],
+                features={"qualification_gaps": []},
+                quote={"verified": False,
+                       "quote_status": "deferred_to_evidence_lane"},
+                quote_block=990, now=1.0, role="signal", gap_count=0,
+            )
+            store.classify_flow_observation(
+                observation_id, decision_head=1_000,
+                identity_coverage=1.0, gates=[])
+
+            class RPC:
+                def get_block_number(self): return 1_010
+
+            class Market:
+                def snapshot(self, _candidate, quote_block=None):
+                    return {"execution_quote": {
+                        "verified": True, "anchor_in_raw": "1000",
+                        "anchor_out_raw": "990",
+                        "token_out_raw": "1000000000000000000",
+                        "quote_block": quote_block,
+                    }}
+
+            engine = rh.RobinhoodLearningEngine.__new__(
+                rh.RobinhoodLearningEngine)
+            engine.store, engine.rpc, engine.v4_market = store, RPC(), Market()
+            result = engine.quote_pending_flow_observations(limit=1)
+            self.assertEqual(result["quoted"], 1)
+            with store.connection() as connection:
+                observation = connection.execute(
+                    "SELECT quote_json,quote_verified FROM flow_observations"
+                    " WHERE observation_id=?", (observation_id,)).fetchone()
+                classification = connection.execute(
+                    "SELECT paper_eligible FROM flow_observation_classifications"
+                    " WHERE observation_id=?", (observation_id,)).fetchone()
+                quotes = connection.execute(
+                    "SELECT * FROM flow_observation_quotes"
+                    " WHERE observation_id=?", (observation_id,)).fetchone()
+            self.assertFalse(observation["quote_verified"])
+            self.assertIn("deferred_to_evidence_lane", observation["quote_json"])
+            self.assertTrue(quotes["entry_quote_verified"])
+            self.assertTrue(quotes["decision_quote_verified"])
+            self.assertTrue(classification["paper_eligible"])
+
+    def test_authoritative_missing_market_closes_after_three_marks(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            with store.connection() as connection:
+                connection.execute(
+                    """INSERT INTO positions (
+                           token_address,symbol,status,opened_at,
+                           entry_price_usd,entry_liquidity_usd,cost_usd,
+                           quantity,entry_friction_bps,realized_value_usd)
+                       VALUES (?,'X','open',?,1,10000,100,100,0,25)""",
+                    (TOKEN.lower(), time.time() - 60),
+                )
+            market = {
+                "current_state_verified": False,
+                "market_resolution": {
+                    "authoritative_no_liquidity": True,
+                    "confirmed_no_market": True,
+                },
+            }
+            self.assertFalse(store.mark_position(TOKEN, market, 1)["verified"])
+            self.assertFalse(store.mark_position(TOKEN, market, 2)["verified"])
+            final = store.mark_position(TOKEN, market, 3)
+            self.assertTrue(final["verified"])
+            self.assertEqual(final["reason"], "market_disappeared")
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT status,net_multiple FROM positions"
+                    " WHERE token_address=?", (TOKEN.lower(),)).fetchone()
+            self.assertEqual(row["status"], "closed")
+            self.assertAlmostEqual(row["net_multiple"], 0.25)
+
+    def test_provider_failure_alone_never_forces_terminal_close(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            with store.connection() as connection:
+                connection.execute(
+                    """INSERT INTO positions (
+                           token_address,symbol,status,opened_at,
+                           entry_price_usd,entry_liquidity_usd,cost_usd,
+                           quantity,entry_friction_bps)
+                       VALUES (?,'X','open',?,1,10000,100,100,0)""",
+                    (TOKEN.lower(), time.time() - 60),
+                )
+            for index in range(5):
+                store.mark_position(TOKEN, {
+                    "current_state_verified": False,
+                    "market_resolution": {
+                        "retryable_provider_failure": True},
+                }, index + 1)
+            with store.connection() as connection:
+                status = connection.execute(
+                    "SELECT status FROM positions WHERE token_address=?",
+                    (TOKEN.lower(),)).fetchone()[0]
+            self.assertEqual(status, "open")
+
+    def test_ingestion_deadline_prevents_a_new_chunk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            calls = []
+            original = store._apply_v4_events
+            try:
+                store._apply_v4_events = lambda rows, **_kwargs: calls.append(rows)
+                with self.assertRaises(rh.CycleDeadlineExceeded):
+                    store.apply_v4_events(
+                        [{"kind": "swap"}] * 3,
+                        deadline=rh.CycleDeadline(0), chunk_size=1)
+            finally:
+                store._apply_v4_events = original
+            self.assertEqual(calls, [])
+
+    def test_cohort_closes_exactly_at_target_and_future_runs_are_unstamped(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="fixed", checkout_revision="fixed",
+                sample_target=2, cohort_id="exact-two")
+            with patch.object(rh, "CODE_REVISION", "fixed"):
+                for run_id in ("one", "two", "three"):
+                    store.begin_run(run_id, 25, lane="live")
+                    store.finish_run(run_id, "complete", summary={})
+            cohort = store.acceptance_cohort()
+            self.assertEqual(cohort["status"], "complete")
+            self.assertEqual(cohort["terminal_attempts"], 2)
+            self.assertEqual(cohort["close_reason"], "sample_target_reached")
+            with store.connection() as connection:
+                third = connection.execute(
+                    "SELECT acceptance_cohort_id FROM runs WHERE run_id='three'"
+                ).fetchone()[0]
+            self.assertIsNone(third)
+
+    def test_full_verification_due_uses_cached_certificate_age(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            self.assertTrue(rh._full_verification_due(root, now=10_000))
+            rh.atomic_json_write(root / "verification_status.json", {
+                "ok": True,
+                "checked_at": datetime.fromtimestamp(
+                    9_900, tz=timezone.utc).isoformat(),
+            })
+            self.assertFalse(rh._full_verification_due(root, now=10_000))
+            self.assertTrue(rh._full_verification_due(
+                root, now=9_900 + rh.FULL_VERIFICATION_REFRESH_SECONDS + 1))

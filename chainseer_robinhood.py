@@ -92,6 +92,10 @@ V4_GET_SLOT0_SELECTOR = "c815641c"
 V4_QUOTE_EXACT_INPUT_SINGLE_SELECTOR = "aa9d21cb"
 V4_POSITION_INFO_SELECTOR = "89097a6a"
 V4_POSITION_LIQUIDITY_SELECTOR = "1efeed33"
+V3_SLOT0_SELECTOR = "3850c7bd"
+V3_LIQUIDITY_SELECTOR = "1a686502"
+V3_TOKEN0_SELECTOR = "0dfe1681"
+V3_TOKEN1_SELECTOR = "d21220a7"
 ERC721_OWNER_OF_SELECTOR = "6352211e"
 ERC721_GET_APPROVED_SELECTOR = "081812fc"
 SOURCE_V2 = "uniswap_v2"
@@ -114,6 +118,7 @@ DASHBOARD_SNAPSHOT_REFRESH_SECONDS = 30.0
 DASHBOARD_OPERATIONAL_STALE_SECONDS = 20.0
 DASHBOARD_HISTORICAL_STALE_SECONDS = 15 * 60.0
 DASHBOARD_INTEGRITY_MAX_AGE_SECONDS = 24 * 60 * 60
+FULL_VERIFICATION_REFRESH_SECONDS = 12 * 60 * 60
 DEFAULT_DISCOVERY_LOOKBACK_BLOCKS = 5_000
 DEFAULT_DISCOVERY_BLOCK_LIMIT = 5_000
 DEFAULT_ANALYSIS_LIMIT = 1
@@ -138,7 +143,8 @@ MARKS_LANE_BUDGET_SECONDS = 90.0
 #: Every lane, in one place. Three separate hardcoded tuples had already
 #: drifted from the lane configuration once; anything iterating lanes reads
 #: this or the config dict, never its own copy.
-LANE_NAMES = ("live", "marks", "evidence", "analysis", "backfill")
+LANE_NAMES = (
+    "live", "marks", "evidence", "analysis", "backfill", "verification")
 #: How long past its deadline the supervisor lets a lane run before killing
 #: it. A censored attempt is charged deadline + this, so a reliability failure
 #: stays a reliability failure without corrupting the latency SLO.
@@ -148,6 +154,7 @@ LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
 EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
+VERIFICATION_LANE_BUDGET_SECONDS = 240.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
 # Keep enough of the lane budget after durable gap recovery to commit its
@@ -183,6 +190,7 @@ EVIDENCE_LANE_CADENCE_SECONDS = 60.0
 EVIDENCE_ENTRY_QUOTE_LIMIT = 8
 EVIDENCE_EVENT_OUTCOME_LIMIT = 12
 EVIDENCE_OBSERVATION_OUTCOME_LIMIT = 12
+EVIDENCE_OBSERVATION_QUOTE_LIMIT = 8
 #: Headroom one outcome needs to finish once started. Each resolution takes a
 #: block-pinned exit quote -- a remote call -- so an item begun with less than
 #: this left runs past the lane deadline and is killed by the supervisor,
@@ -745,6 +753,7 @@ BACKGROUND_LANE_LAUNCH_SPACING_SECONDS = 2.0
 LIVE_LANE_INGESTION_MARGIN_SECONDS = 0.5
 INGESTION_COST_MODEL_STATE_KEY = "live_ingestion_cost_v1"
 INGESTION_COST_SAMPLE_WINDOW = 128
+INGEST_EVENT_CHUNK_SIZE = 100
 LANE_HEARTBEAT_SECONDS = 5.0
 #: How often the supervisor re-runs orphan recovery inside its scheduling
 #: loop. The startup-only sweep left rows stale for as long as a supervisor
@@ -778,6 +787,7 @@ LIVE_LANE_MINIMUM_INGESTION_SECONDS = 3.0
 #: twice in one 728-attempt cohort, on the decision-critical path.
 INGEST_LOCK_RETRY_ATTEMPTS = 3
 INGEST_LOCK_RETRY_BACKOFF_SECONDS = 0.4
+POSITION_TERMINAL_NO_MARKET_OBSERVATIONS = 3
 SETTLEMENT_LOCK_RETRY_ATTEMPTS = 3
 SETTLEMENT_LOCK_RETRY_BACKOFF_SECONDS = 0.5
 #: A controlled deferral is healthy, but a lane that defers most of its cycles
@@ -890,6 +900,12 @@ FLOW_MINIMUM_PLANNING_BLOCKS_PER_SECOND = 20.5
 # provider) is what the old floor was sized for; the deadline and
 # deferred_for_deadline accounting bound that case rather than this floor.
 FLOW_MINIMUM_FIRST_ORIGIN_BATCH_SECONDS = 0.5
+# Cold-start enrichment has no trustworthy cost sample.  A five-origin probe
+# bounds the first provider call; successful probes may then use the normal
+# batch size.  This keeps the live lane preemptible without turning a slow
+# first request into evidence loss -- results fetched after the child deadline
+# are discarded and remain unresolved for a later lane.
+FLOW_ORIGIN_COLD_BATCH_SIZE = 5
 # Enrichment targeting is a SEPARATE bound from decision freshness. Applying
 # the 120-block decision bound to a pool's last swap matched 1 of 1,895 pools,
 # because these pools trade a few times per 1,350 blocks -- so the prospective
@@ -2280,7 +2296,7 @@ class RobinhoodLearningStore:
             self.path.parent.mkdir(parents=True, exist_ok=True)
             self._initialize()
 
-    def _connect(self) -> sqlite3.Connection:
+    def _connect(self, busy_timeout_ms: int | None = None) -> sqlite3.Connection:
         if self.read_only:
             # A reader in WAL mode never blocks on a writer, so the dashboard
             # stays responsive mid-cycle instead of queueing behind it.
@@ -2290,12 +2306,14 @@ class RobinhoodLearningStore:
         else:
             connection = sqlite3.connect(self.path, timeout=10)
         connection.row_factory = sqlite3.Row
-        connection.execute("PRAGMA busy_timeout=10000")
+        timeout_ms = 10000 if busy_timeout_ms is None else max(
+            0, int(busy_timeout_ms))
+        connection.execute(f"PRAGMA busy_timeout={timeout_ms}")
         return connection
 
     @contextmanager
-    def connection(self):
-        connection = self._connect()
+    def connection(self, busy_timeout_ms: int | None = None):
+        connection = self._connect(busy_timeout_ms=busy_timeout_ms)
         try:
             if self.read_only:
                 # `with connection` opens a transaction that COMMITs on exit,
@@ -2592,6 +2610,25 @@ class RobinhoodLearningStore:
                     FOREIGN KEY(observation_id)
                         REFERENCES flow_observations(observation_id)
                 );
+                -- Remote execution quotes are evidence enrichment, not part
+                -- of observing the chain head.  Keeping them in a companion
+                -- table preserves the immutable observation while allowing
+                -- the evidence lane to attach block-pinned entry and
+                -- decision quotes asynchronously.
+                CREATE TABLE IF NOT EXISTS flow_observation_quotes (
+                    observation_id TEXT PRIMARY KEY,
+                    entry_quote_json TEXT NOT NULL,
+                    entry_quote_block INTEGER,
+                    entry_quote_verified INTEGER NOT NULL DEFAULT 0,
+                    decision_quote_json TEXT,
+                    decision_quote_block INTEGER,
+                    decision_quote_verified INTEGER NOT NULL DEFAULT 0,
+                    captured_at TEXT NOT NULL,
+                    FOREIGN KEY(observation_id)
+                        REFERENCES flow_observations(observation_id)
+                );
+                CREATE INDEX IF NOT EXISTS idx_flow_observation_quotes_entry
+                    ON flow_observation_quotes(entry_quote_verified,captured_at);
                 CREATE TABLE IF NOT EXISTS flow_observation_outcomes (
                     observation_id TEXT NOT NULL,
                     horizon_label TEXT NOT NULL,
@@ -2920,6 +2957,21 @@ class RobinhoodLearningStore:
                     value_json TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                 );
+                CREATE TABLE IF NOT EXISTS seal_cost_samples (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    recorded_at REAL NOT NULL,
+                    epoch INTEGER NOT NULL,
+                    run_id TEXT,
+                    revision TEXT,
+                    acceptance_cohort_id TEXT,
+                    component TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    seconds REAL,
+                    sample_count INTEGER NOT NULL DEFAULT 1
+                );
+                CREATE INDEX IF NOT EXISTS idx_seal_cost_cohort
+                    ON seal_cost_samples(
+                        acceptance_cohort_id,revision,run_id,component,status);
                 CREATE TABLE IF NOT EXISTS lane_state (
                     lane TEXT PRIMARY KEY,
                     run_id TEXT,
@@ -3370,7 +3422,10 @@ class RobinhoodLearningStore:
             )
             return connection.total_changes - before
 
-    def apply_v4_events(self, events: list[dict]) -> None:
+    def apply_v4_events(
+        self, events: list[dict], *, deadline: CycleDeadline | None = None,
+        chunk_size: int = INGEST_EVENT_CHUNK_SIZE,
+    ) -> None:
         """Persist V4 lifecycle evidence without creating analysis work yet.
 
         Windows are computed for every touched pool and kept: they are
@@ -3398,18 +3453,43 @@ class RobinhoodLearningStore:
         #
         # A lock that never clears must still surface: only contention is
         # absorbed, and only a bounded number of times.
-        for _attempt in range(1, INGEST_LOCK_RETRY_ATTEMPTS + 1):
-            try:
-                return self._apply_v4_events(events)
-            except sqlite3.OperationalError as error:
-                if ("database is locked" not in str(error).lower()
-                        or _attempt >= INGEST_LOCK_RETRY_ATTEMPTS):
-                    raise
-                time.sleep(INGEST_LOCK_RETRY_BACKOFF_SECONDS)
+        if not events:
+            return
+        chunk_size = max(1, int(chunk_size))
+        for offset in range(0, len(events), chunk_size):
+            if deadline is not None:
+                deadline.raise_if_expired("near_head_ingest_commit")
+            chunk = events[offset:offset + chunk_size]
+            for attempt in range(1, INGEST_LOCK_RETRY_ATTEMPTS + 1):
+                if deadline is not None:
+                    deadline.raise_if_expired("near_head_ingest_commit")
+                    # SQLite's lock wait must fit inside the shared lane
+                    # deadline.  A short retry is preferable to a ten-second
+                    # invisible hold that the supervisor can only hard-kill.
+                    busy_ms = max(1, min(
+                        1000, int(max(0.0, deadline.remaining() - 0.05) * 1000)))
+                else:
+                    busy_ms = None
+                try:
+                    self._apply_v4_events(chunk, busy_timeout_ms=busy_ms)
+                    break
+                except sqlite3.OperationalError as error:
+                    locked = "database is locked" in str(error).lower()
+                    if not locked or attempt >= INGEST_LOCK_RETRY_ATTEMPTS:
+                        raise
+                    backoff = INGEST_LOCK_RETRY_BACKOFF_SECONDS
+                    if deadline is not None:
+                        if deadline.remaining() <= backoff:
+                            raise CycleDeadlineExceeded(
+                                "near_head_ingest_commit") from error
+                        backoff = min(backoff, deadline.remaining())
+                    time.sleep(backoff)
 
-    def _apply_v4_events(self, events: list[dict]) -> None:
+    def _apply_v4_events(
+        self, events: list[dict], *, busy_timeout_ms: int | None = None,
+    ) -> None:
         """The write itself. Wrapped by apply_v4_events for lock retry."""
-        with self.connection() as connection:
+        with self.connection(busy_timeout_ms=busy_timeout_ms) as connection:
             affected_flow_pools = set()
             for event in events:
                 kind = event["kind"]
@@ -4028,6 +4108,56 @@ class RobinhoodLearningStore:
             timings["database_commit"] = time.monotonic() - commit_started
         return observation_id
 
+    def pending_flow_observation_quotes(self, limit: int = 8) -> list[dict]:
+        """Unquoted immutable observations, actionable candidates first."""
+        with self.connection() as connection:
+            return [dict(row) for row in connection.execute(
+                """SELECT o.observation_id,o.pool_id,o.token_address,
+                          o.window_end_block,c.decision_head,c.identity_coverage,
+                          c.identity_tier,c.gates_json
+                   FROM flow_observations o
+                   LEFT JOIN flow_observation_classifications c
+                     USING(observation_id)
+                   LEFT JOIN flow_observation_quotes q USING(observation_id)
+                   WHERE o.policy_version=? AND q.observation_id IS NULL
+                   ORDER BY CASE WHEN c.identity_tier='verified'
+                                      AND c.gates_json='[]' THEN 0 ELSE 1 END,
+                            o.sealed_at ASC LIMIT ?""",
+                (FLOW_EVIDENCE_POLICY_VERSION, max(0, int(limit))),
+            )]
+
+    def record_flow_observation_quotes(
+        self, observation_id: str, *, entry_quote: dict,
+        entry_quote_block: int, decision_quote: dict | None,
+        decision_quote_block: int | None,
+    ) -> None:
+        entry_execution = (entry_quote or {}).get("execution_quote") or (
+            entry_quote or {})
+        decision_execution = (decision_quote or {}).get(
+            "execution_quote") or (decision_quote or {})
+        with self.connection() as connection:
+            connection.execute(
+                """INSERT INTO flow_observation_quotes (
+                       observation_id,entry_quote_json,entry_quote_block,
+                       entry_quote_verified,decision_quote_json,
+                       decision_quote_block,decision_quote_verified,captured_at
+                   ) VALUES (?,?,?,?,?,?,?,?)
+                   ON CONFLICT(observation_id) DO UPDATE SET
+                       entry_quote_json=excluded.entry_quote_json,
+                       entry_quote_block=excluded.entry_quote_block,
+                       entry_quote_verified=excluded.entry_quote_verified,
+                       decision_quote_json=excluded.decision_quote_json,
+                       decision_quote_block=excluded.decision_quote_block,
+                       decision_quote_verified=excluded.decision_quote_verified,
+                       captured_at=excluded.captured_at""",
+                (observation_id, json.dumps(entry_quote or {}, sort_keys=True),
+                 int(entry_quote_block), bool(entry_execution.get("verified")),
+                 json.dumps(decision_quote or {}, sort_keys=True),
+                 None if decision_quote_block is None
+                 else int(decision_quote_block),
+                 bool(decision_execution.get("verified")), _utc_now()),
+            )
+
     def due_flow_observation_outcomes(self, now: float, limit: int = 50) -> list[dict]:
         """Scheduled outcomes whose horizon has arrived, signal arm first.
 
@@ -4061,17 +4191,24 @@ class RobinhoodLearningStore:
         # trivial, and the remainder still runs the original indexed path.
         budget = max(0, limit)
         columns = """
-                SELECT o.*, obs.pool_id, obs.token_address, obs.quote_json,
-                       obs.quote_verified, obs.cohort_id, obs.window_end_block
+                SELECT o.*, obs.pool_id, obs.token_address,
+                       COALESCE(q.entry_quote_json,obs.quote_json) quote_json,
+                       CASE WHEN q.observation_id IS NOT NULL
+                            THEN q.entry_quote_verified
+                            ELSE obs.quote_verified END quote_verified,
+                       obs.cohort_id, obs.window_end_block
                 FROM flow_observation_outcomes o
                 JOIN flow_observations obs USING(observation_id)
+                LEFT JOIN flow_observation_quotes q USING(observation_id)
                 WHERE o.status='pending' AND o.target_at<=?
-                  AND obs.quote_verified=1
+                  AND COALESCE(q.entry_quote_verified,obs.quote_verified)=1
                 """
         with self.connection() as connection:
             signal_ids = [row[0] for row in connection.execute(
-                "SELECT observation_id FROM flow_observations"
-                " WHERE role='signal' AND quote_verified=1")]
+                """SELECT obs.observation_id FROM flow_observations obs
+                   LEFT JOIN flow_observation_quotes q USING(observation_id)
+                   WHERE obs.role='signal'
+                     AND COALESCE(q.entry_quote_verified,obs.quote_verified)=1""")]
             rows: list[dict] = []
             if signal_ids and budget:
                 # Sorted in Python: the candidate set is bounded by the signal
@@ -4422,6 +4559,7 @@ class RobinhoodLearningStore:
         self, observation_id: str, *, decision_head: int,
         identity_coverage: float | None, gates: list, now: float | None = None,
         decision_quote: dict | None = None,
+        entry_quote: dict | None = None,
     ) -> dict:
         """Attach a verdict WITHOUT touching the sealed observation.
 
@@ -4453,8 +4591,9 @@ class RobinhoodLearningStore:
             execution = (decision_quote or {}).get("execution_quote") or (
                 decision_quote or {})
             decision_quote_verified = bool(execution.get("verified"))
-            entry_price = self._quote_price(
-                json.loads(row["quote_json"] or "{}"))
+            immutable_quote = json.loads(row["quote_json"] or "{}")
+            effective_entry_quote = entry_quote or immutable_quote
+            entry_price = self._quote_price(effective_entry_quote)
             decision_price = self._quote_price(decision_quote)
             drift_bps = (
                 abs(decision_price - entry_price) / entry_price * 10_000
@@ -4470,8 +4609,7 @@ class RobinhoodLearningStore:
             # is now, and fall back to the sealed one.
             round_trip = self._round_trip_return(decision_quote)
             if round_trip is None:
-                round_trip = self._round_trip_return(
-                    json.loads(row["quote_json"] or "{}"))
+                round_trip = self._round_trip_return(effective_entry_quote)
             exitable = bool(
                 round_trip is not None
                 and round_trip >= -FLOW_MAXIMUM_ROUND_TRIP_LOSS
@@ -5453,6 +5591,42 @@ class RobinhoodLearningStore:
                 (str(key), _canonical(value), _utc_now()),
             )
 
+    def record_seal_cost_samples(
+        self, updates: dict, *, status: str, run_id: str,
+        epoch: int, revision: str, sample_count: int = 1,
+    ) -> None:
+        """Append cohort-scoped seal samples beyond the rolling estimator."""
+        records: list[tuple] = []
+        with self.connection() as connection:
+            run = connection.execute(
+                """SELECT acceptance_cohort_id,revision FROM runs
+                   WHERE run_id=? ORDER BY id DESC LIMIT 1""",
+                (str(run_id),),
+            ).fetchone()
+            cohort_id = run["acceptance_cohort_id"] if run else None
+            run_revision = str(run["revision"] or revision) if run else revision
+            for component, raw in updates.items():
+                values = raw if isinstance(raw, list) else [raw]
+                for value in values:
+                    if not isinstance(value, (int, float)):
+                        continue
+                    measured = float(value)
+                    if not math.isfinite(measured) or measured < 0:
+                        continue
+                    records.append((
+                        time.time(), int(epoch), str(run_id), run_revision,
+                        cohort_id, str(component).removesuffix("_p95"),
+                        str(status), measured, max(1, int(sample_count or 1)),
+                    ))
+            if records:
+                connection.executemany(
+                    """INSERT INTO seal_cost_samples (
+                           recorded_at,epoch,run_id,revision,
+                           acceptance_cohort_id,component,status,seconds,
+                           sample_count) VALUES (?,?,?,?,?,?,?,?,?)""",
+                    records,
+                )
+
     def acceptance_cohort(self) -> dict:
         """Return the newest durable operational acceptance boundary."""
         try:
@@ -5842,6 +6016,27 @@ class RobinhoodLearningStore:
                 """UPDATE lane_state SET heartbeat_at=?
                    WHERE run_id=? AND status='running'""", (now, run_id))
 
+    @staticmethod
+    def _close_cohort_if_target(connection, cohort_id: str | None) -> None:
+        if not cohort_id:
+            return
+        cohort = connection.execute(
+            """SELECT sample_target,status FROM acceptance_cohorts
+               WHERE cohort_id=?""", (cohort_id,)).fetchone()
+        if not cohort or cohort["status"] != "collecting":
+            return
+        terminal = connection.execute(
+            """SELECT COUNT(*) FROM runs
+               WHERE acceptance_cohort_id=? AND lane='live'
+                 AND status!='running'""", (cohort_id,)).fetchone()[0]
+        if int(terminal) >= int(cohort["sample_target"]):
+            connection.execute(
+                """UPDATE acceptance_cohorts
+                   SET status='complete',closed_at=?,close_reason=?
+                   WHERE cohort_id=? AND status='collecting'""",
+                (_utc_now(), "sample_target_reached", cohort_id),
+            )
+
     def finish_run(
         self, run_id: str, status: str, *, summary: dict | None = None,
         error: str | None = None, cursor: dict | None = None,
@@ -5872,6 +6067,16 @@ class RobinhoodLearningStore:
                  _canonical(backlog) if backlog is not None else None,
                  run_id),
             )
+            run = connection.execute(
+                """SELECT lane,acceptance_cohort_id FROM runs
+                   WHERE run_id=? ORDER BY id DESC LIMIT 1""",
+                (run_id,),
+            ).fetchone()
+            if (run and run["lane"] == "live"
+                    and run["acceptance_cohort_id"]
+                    and status != "running"):
+                self._close_cohort_if_target(
+                    connection, run["acceptance_cohort_id"])
 
     def active_run(
         self, stale_seconds: float = 300.0, lane: str | None = None,
@@ -5983,6 +6188,9 @@ class RobinhoodLearningStore:
                            WHERE lane=? AND run_id=? AND status='running'""",
                         (now, now, _canonical(payload), reason, lane, run_id),
                     )
+                if lane == "live":
+                    self._close_cohort_if_target(
+                        connection, row.get("acceptance_cohort_id"))
                 recovered.append(payload)
         return recovered
 
@@ -6219,6 +6427,26 @@ class RobinhoodLearningStore:
                         (SEAL_COST_MODEL_STATE_KEY,
                          _canonical(model_state), _utc_now()),
                     )
+                    run_meta = connection.execute(
+                        """SELECT acceptance_cohort_id,revision FROM runs
+                           WHERE run_id=? ORDER BY id DESC LIMIT 1""",
+                        (str(row["run_id"]),),
+                    ).fetchone()
+                    for target in targets:
+                        connection.execute(
+                            """INSERT INTO seal_cost_samples (
+                                   recorded_at,epoch,run_id,revision,
+                                   acceptance_cohort_id,component,status,
+                                   seconds,sample_count)
+                               VALUES (?,?,?,?,?,?,?,?,1)""",
+                            (now, SEAL_COST_MODEL_EPOCH, str(row["run_id"]),
+                             str(run_meta["revision"] or CODE_REVISION)
+                             if run_meta else CODE_REVISION,
+                             run_meta["acceptance_cohort_id"]
+                             if run_meta else None,
+                             str(target).removesuffix("_p95"), "censored",
+                             bounded_elapsed),
+                        )
             if not row:
                 return
             connection.execute(
@@ -6233,6 +6461,16 @@ class RobinhoodLearningStore:
                 (now, now, _canonical(failure), str(reason),
                  str(lane), int(pid)),
             )
+            if str(lane) == "live":
+                cohort_row = connection.execute(
+                    """SELECT acceptance_cohort_id FROM runs
+                       WHERE run_id=? ORDER BY id DESC LIMIT 1""",
+                    (str(row["run_id"]),),
+                ).fetchone()
+                self._close_cohort_if_target(
+                    connection,
+                    cohort_row["acceptance_cohort_id"]
+                    if cohort_row else None)
 
     def lane_performance(
         self, limit: int = 100, *, cohort_id: str | None = None,
@@ -6458,12 +6696,6 @@ class RobinhoodLearningStore:
             # It is not a large distortion: 97.33% combined against 97.60%
             # scoped, and the rule still fails. The point is that the
             # population now matches what the rule claims to measure.
-            seal = summary.get("observation_seal") or {}
-            lag = seal.get("decision_head_lag_blocks")
-            if lag is not None and safe_int(seal.get("sealed_this_cycle"), 0) > 0:
-                lags.append(safe_float(lag, float("inf")))
-            elif lag is not None:
-                lag_excluded_no_decision += 1
             if not cohort_id:
                 marks = summary.get("position_evaluations") or {}
                 if (
@@ -6555,6 +6787,13 @@ class RobinhoodLearningStore:
             selected = safe_int(
                 classification.get("scoped_rows_selected"), 0)
             sealed = safe_int(observation.get("sealed_this_cycle"), 0)
+            lag = observation.get("decision_head_lag_blocks")
+            actual_decision = bool(
+                row["status"] == "complete" and processed > 0 and sealed > 0)
+            if lag is not None and actual_decision and len(lags) < target:
+                lags.append(safe_float(lag, float("inf")))
+            elif lag is not None and not actual_decision:
+                lag_excluded_no_decision += 1
             failure_stage = str(summary.get("failure_stage") or "")
             opportunity = bool(
                 selected > 0 or sealed > 0
@@ -6566,38 +6805,43 @@ class RobinhoodLearningStore:
             decision_opportunities += 1
             if row["status"] == "complete" and processed > 0:
                 useful_decisions += 1
-            if decision_opportunities >= target:
+            # The usefulness and lag criteria are intentionally sampled from
+            # the same ordered cohort scan, but they have distinct
+            # populations.  Do not stop after N opportunities while the lag
+            # criterion has only a handful of decisions -- that produced a
+            # statistically green 1/1 or 5/5 result labelled as 100 attempts.
+            if decision_opportunities >= target and len(lags) >= target:
                 break
         useful_decision_rate = (
             useful_decisions / decision_opportunities
             if decision_opportunities else None)
+        lag_rate = (
+            sum(value <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                for value in lags) / len(lags)
+            if lags else None
+        )
         seal_model = _seal_cost_model_from_state(
             self.scheduler_state(SEAL_COST_MODEL_STATE_KEY))
         if cohort_id:
-            cohort_model_state = self.scheduler_state(
-                SEAL_COST_MODEL_STATE_KEY)
-            once_per_cycle_records = []
-            for field in (
-                "fixed_observation_samples", "queue_settlement_samples",
-            ):
-                once_per_cycle_records.extend(
-                    _valid_seal_sample_records(cohort_model_state.get(field)))
-            cohort_started = _timestamp(cohort.get("started_at")) or 0.0
-            cohort_run_ids = {
-                str(row.get("run_id") or "") for row in attempt_rows
-                if row.get("run_id")
-            }
-            cohort_fixed = [
-                record for record in once_per_cycle_records
-                if safe_int(record.get("epoch"), -1) == SEAL_COST_MODEL_EPOCH
-                and str(record.get("revision") or "") == cohort_revision
-                and safe_float(record.get("at"), 0.0) >= cohort_started
-                and str(record.get("run_id") or "") in cohort_run_ids
-            ]
+            # The rolling estimator intentionally forgets old samples; an
+            # acceptance cohort must not.  Aggregate the append-only table by
+            # run so selection and settlement together count once per cycle.
+            with self.connection() as connection:
+                durable = [dict(row) for row in connection.execute(
+                    """SELECT run_id,
+                              MAX(status='stalled') AS stalled,
+                              MAX(status='success') AS succeeded
+                       FROM seal_cost_samples
+                       WHERE acceptance_cohort_id=? AND revision=?
+                         AND epoch=? AND component IN (
+                             'fixed_observation_cost','queue_settlement')
+                       GROUP BY run_id""",
+                    (cohort_id, cohort_revision, SEAL_COST_MODEL_EPOCH),
+                )]
+            fixed_stalls = sum(bool(row["stalled"]) for row in durable)
             fixed_success = sum(
-                record["status"] == "success" for record in cohort_fixed)
-            fixed_stalls = sum(
-                record["status"] == "stalled" for record in cohort_fixed)
+                bool(row["succeeded"]) and not bool(row["stalled"])
+                for row in durable)
             stall_population = fixed_success + fixed_stalls
             stall_rate = (
                 fixed_stalls / stall_population if stall_population else 0.0)
@@ -6629,8 +6873,12 @@ class RobinhoodLearningStore:
                 "label": "Live-lane p95",
             },
             "decision_lag": {
-                "pass": bool(lag_rate is not None and lag_rate >= 0.99),
-                "value": lag_rate, "samples": len(lags), "target": ">=99% <=120 blocks",
+                "pass": bool(
+                    len(lags) >= target
+                    and lag_rate is not None and lag_rate >= 0.99),
+                "value": lag_rate, "samples": len(lags),
+                "sample_target": target,
+                "target": f">=99% <=120 blocks across {target} decisions",
                 # Cycles that read a head but sealed nothing. They made no
                 # decision, so they are outside the SLO -- but the count is
                 # published, because a silent exclusion cannot be audited.
@@ -8088,6 +8336,13 @@ class RobinhoodLearningStore:
                 )
             )
             if not verified:
+                resolution = market.get("market_resolution") or {}
+                authoritative_no_market = bool(
+                    resolution.get("authoritative_no_liquidity")
+                    or resolution.get("confirmed_no_market")
+                    or market.get("confirmed_no_market"))
+                next_unverified = safe_int(
+                    position["consecutive_unverified_marks"], 0) + 1
                 connection.execute(
                     """
                     UPDATE positions SET unverified_marks=unverified_marks+1,
@@ -8097,6 +8352,39 @@ class RobinhoodLearningStore:
                     """,
                     (now, token.lower()),
                 )
+                if (authoritative_no_market
+                        and next_unverified
+                        >= POSITION_TERMINAL_NO_MARKET_OBSERVATIONS):
+                    realized = safe_float(
+                        position["realized_value_usd"], 0.0)
+                    multiple = realized / max(
+                        0.01, safe_float(position["cost_usd"], 0.0))
+                    reason = "market_disappeared"
+                    connection.execute(
+                        """UPDATE positions SET status='closed',quantity=0,
+                               last_price_usd=0,last_liquidity_usd=0,
+                               last_market_observed_at=?,last_mark_at=?,
+                               exit_price_usd=0,exit_value_usd=?,exit_reason=?,
+                               closed_at=?,net_multiple=?,
+                               consecutive_unverified_marks=0,
+                               last_verified_mark_at=?
+                           WHERE token_address=?""",
+                        (_utc_now(), now, realized, reason, now, multiple,
+                         now, token.lower()),
+                    )
+                    connection.execute(
+                        """UPDATE position_policy_states SET status='closed',
+                               exit_price_usd=0,exit_value_usd=?,exit_reason=?,
+                               closed_at=?,net_multiple=?,last_mark_at=?
+                           WHERE token_address=? AND status='open'""",
+                        (realized, reason, now, multiple, now, token.lower()),
+                    )
+                    return {
+                        "token_address": token.lower(), "verified": True,
+                        "observation_status": "terminal_confirmed",
+                        "reason": reason, "market_reason": reason,
+                        "net_multiple": multiple, "partial_exits": [],
+                    }
                 return {
                     "token_address": token.lower(),
                     "verified": False,
@@ -11016,25 +11304,50 @@ class RobinhoodLearningEngine:
         and is admitted on the raw deadline.
         """
         resolved = unavailable = failures = affected_pools = attempted = 0
+        discarded_after_deadline = 0
         deadline_stops = 0
         batch_seconds = 0.0
         remote_seconds = 0.0
         commit_seconds = 0.0
-        for offset in range(0, len(hashes), FLOW_ORIGIN_BATCH_SIZE):
+        offset = 0
+        first_batch = True
+        previous_batch_size = 0
+        while offset < len(hashes):
             if deadline_monotonic is not None:
                 remaining = deadline_monotonic - time.monotonic()
-                if remaining <= 0 or (batch_seconds and remaining < batch_seconds):
+                next_size = min(
+                    FLOW_ORIGIN_BATCH_SIZE, len(hashes) - offset)
+                estimated_next = (
+                    batch_seconds * next_size / previous_batch_size
+                    if batch_seconds and previous_batch_size else batch_seconds)
+                if remaining <= 0 or (
+                        estimated_next and remaining < estimated_next):
                     deadline_stops += 1
                     break
-            chunk = hashes[offset:offset + FLOW_ORIGIN_BATCH_SIZE]
+            batch_size = (
+                FLOW_ORIGIN_COLD_BATCH_SIZE
+                if first_batch and deadline_monotonic is not None
+                else FLOW_ORIGIN_BATCH_SIZE)
+            chunk = hashes[offset:offset + batch_size]
             attempted += len(chunk)
             batch_started = time.monotonic()
             try:
-                records = _remote_call(
-                    f"Robinhood transaction origins {offset + 1}-{offset + len(chunk)}",
-                    lambda chunk=chunk: self.rpc.get_transactions(chunk),
-                    attempts=1,
-                )
+                if deadline_monotonic is None:
+                    records = _remote_call(
+                        f"Robinhood transaction origins {offset + 1}-{offset + len(chunk)}",
+                        lambda chunk=chunk: self.rpc.get_transactions(chunk),
+                        attempts=1,
+                    )
+                else:
+                    child = CycleDeadline(
+                        max(0.0, deadline_monotonic - time.monotonic()),
+                        deadline_monotonic=deadline_monotonic)
+                    with self._rpc_deadline(child):
+                        records = _remote_call(
+                            f"Robinhood transaction origins {offset + 1}-{offset + len(chunk)}",
+                            lambda chunk=chunk: self.rpc.get_transactions(chunk),
+                            attempts=1,
+                        )
             except Exception:
                 # A failed remote batch consumed real freshness budget too.
                 # Previously only successful calls updated ``batch_seconds``;
@@ -11047,8 +11360,22 @@ class RobinhoodLearningEngine:
                 batch_seconds = max(observed, batch_seconds * 0.5)
                 remote_seconds = max(observed, remote_seconds * 0.5)
                 failures += len(chunk)
+                first_batch = False
+                previous_batch_size = len(chunk)
+                offset += len(chunk)
                 continue
             remote_observed = time.monotonic() - batch_started
+            # Never let a response that arrived after the observation budget
+            # mutate identity evidence.  The unresolved queue is the durable
+            # retry mechanism, so discarding is safe and scientifically
+            # preferable to publishing a decision with post-deadline facts.
+            if (deadline_monotonic is not None
+                    and time.monotonic() >= deadline_monotonic):
+                discarded_after_deadline += len(chunk)
+                deadline_stops += 1
+                batch_seconds = max(remote_observed, batch_seconds * 0.5)
+                remote_seconds = max(remote_observed, remote_seconds * 0.5)
+                break
             commit_started = time.monotonic()
             result = self.store.record_transaction_origins(records)
             commit_observed = time.monotonic() - commit_started
@@ -11066,11 +11393,15 @@ class RobinhoodLearningEngine:
             resolved += result["resolved"]
             unavailable += result["unavailable"]
             affected_pools += result["affected_pools"]
+            first_batch = False
+            previous_batch_size = len(chunk)
+            offset += len(chunk)
         return {
             "attempted": attempted, "resolved": resolved,
             "unavailable": unavailable, "failures": failures,
             "affected_pools": affected_pools,
             "stopped_at_deadline": deadline_stops,
+            "discarded_after_deadline": discarded_after_deadline,
             "observed_batch_seconds": round(batch_seconds, 3),
             "observed_remote_seconds": round(remote_seconds, 3),
             "observed_commit_seconds": round(commit_seconds, 3),
@@ -11165,12 +11496,15 @@ class RobinhoodLearningEngine:
             "failures": batch["failures"],
             "affected_pools": batch["affected_pools"],
             "stopped_at_deadline": batch["stopped_at_deadline"],
+            "discarded_after_deadline": batch.get(
+                "discarded_after_deadline", 0),
             "observed_batch_seconds": batch["observed_batch_seconds"],
             "observed_remote_seconds": batch["observed_remote_seconds"],
             "observed_commit_seconds": batch["observed_commit_seconds"],
             "window_fully_enriched": bool(
                 not truncated and batch["attempted"] == len(selected)
                 and not batch["failures"]
+                and not batch.get("discarded_after_deadline", 0)
             ),
         }
 
@@ -11454,7 +11788,7 @@ class RobinhoodLearningEngine:
             })
         if born:
             _ingest_substage("apply_pool_events")
-            self.store.apply_v4_events(born)
+            self.store.apply_v4_events(born, deadline=deadline)
             known = self.store.known_v4_pool_ids()
         _ingest_substage("decode_swaps")
         events = []
@@ -11482,7 +11816,7 @@ class RobinhoodLearningEngine:
             })
         if events:
             _ingest_substage("apply_swap_events")
-            self.store.apply_v4_events(events)
+            self.store.apply_v4_events(events, deadline=deadline)
         # The scan and its raw events are durable at this point. Advance the
         # cursor BEFORE optional origin enrichment so an expensive identity
         # lookup cannot make the next cycle ingest the same blocks again.
@@ -11682,6 +12016,19 @@ class RobinhoodLearningEngine:
             recorded_at=time.time(), sample_count=sample_count,
         )
         self.store.set_scheduler_state(SEAL_COST_MODEL_STATE_KEY, payload)
+        for scalar in updates:
+            field = SEAL_COST_SAMPLE_FIELDS[scalar]
+            for record in _valid_seal_sample_records(payload.get(field)):
+                if (str(record.get("run_id") or "") != run_id
+                        or abs(safe_float(record.get("at"), 0.0)
+                               - safe_float(payload.get("last_sample_at"), 0.0))
+                        > 0.001):
+                    continue
+                self.store.record_seal_cost_samples(
+                    {scalar: record["value"]}, status=record["status"],
+                    run_id=run_id, epoch=SEAL_COST_MODEL_EPOCH,
+                    revision=CODE_REVISION, sample_count=sample_count,
+                )
         return self.seal_cost_model()
 
     def record_seal_cost(
@@ -12060,6 +12407,7 @@ class RobinhoodLearningEngine:
         queue_drain_limit: int = SEAL_QUEUE_DRAIN_LIMIT,
         include_fresh: bool = True,
         stage_lane: str = "live",
+        defer_quotes: bool = False,
     ) -> dict:
         """Seal every near-head window, pinned to the OBSERVATION head.
 
@@ -12321,7 +12669,10 @@ class RobinhoodLearningEngine:
         # would otherwise look identical to a slow provider.
         primer = getattr(getattr(self, "v4_market", None),
                          "prime_window_quotes", None)
-        if primer is None:
+        if defer_quotes:
+            prime = {"supported": True, "deferred_to_evidence_lane": True,
+                     "batched": 0, "windows": len(windows)}
+        elif primer is None:
             prime = {"supported": False, "reason": "client_cannot_batch"}
         elif not windows:
             prime = {"supported": True, "batched": 0, "windows": 0}
@@ -12428,14 +12779,18 @@ class RobinhoodLearningEngine:
                     ]
                 phase.setdefault("transaction_hashes", []).append(
                     time.monotonic() - hashes_started)
-                persist_substage("window_quote_rpc", window_detail)
+                persist_substage("window_quote_rpc", window_detail,
+                                 deferred=bool(defer_quotes))
                 quote_started = time.monotonic()
                 try:
-                    market = self.v4_market.snapshot(
-                        {"pool_id": window["pool_id"],
-                         "token_address": window["token_address"]},
-                        quote_block=int(window["window_end_block"]),
-                    )
+                    market = (
+                        {"verified": False,
+                         "quote_status": "deferred_to_evidence_lane"}
+                        if defer_quotes else self.v4_market.snapshot(
+                            {"pool_id": window["pool_id"],
+                             "token_address": window["token_address"]},
+                            quote_block=int(window["window_end_block"]),
+                        ))
                 except CycleDeadlineExceeded:
                     # The deadline fired INSIDE the remote call. This is not
                     # a bad quote: every remaining window is over budget and
@@ -12492,7 +12847,7 @@ class RobinhoodLearningEngine:
                     round_trip is not None
                     and round_trip >= -FLOW_MAXIMUM_ROUND_TRIP_LOSS
                 )
-                if gap_count == 0 and not exitable:
+                if gap_count == 0 and not exitable and not defer_quotes:
                     gaps = list(gaps or []) + ["exitable_round_trip"]
                     gap_count = len(gaps)
                     features = dict(features)
@@ -12603,6 +12958,7 @@ class RobinhoodLearningEngine:
         self, decision_head: int, *, observation_ids: list[str] | None = None,
         deadline: CycleDeadline | None = None,
         admission_limit: int | None = None,
+        allow_remote_quotes: bool = True,
     ) -> dict:
         """Classify sealed observations after enrichment. Never mutates them.
 
@@ -12711,7 +13067,8 @@ class RobinhoodLearningEngine:
                 and safe_float(row.get("identity_coverage"), 0.0)
                     >= FLOW_MINIMUM_IDENTITY_COVERAGE
             )
-            if candidate and quotes_taken < FLOW_DECISION_QUOTE_LIMIT:
+            if (allow_remote_quotes and candidate
+                    and quotes_taken < FLOW_DECISION_QUOTE_LIMIT):
                 try:
                     decision_quote = self.v4_market.snapshot(
                         {"pool_id": row["pool_id"],
@@ -12852,6 +13209,75 @@ class RobinhoodLearningEngine:
             "quote_failures": quote_failures,
             "entry_quotes_deferred": deferred,
             "limit": max(0, int(limit)),
+        }
+
+    def quote_pending_flow_observations(
+        self, *, limit: int = EVIDENCE_OBSERVATION_QUOTE_LIMIT,
+        deadline: CycleDeadline | None = None,
+    ) -> dict:
+        """Attach block-pinned quotes outside the freshness-critical lane."""
+        selected = self.store.pending_flow_observation_quotes(
+            max(0, int(limit)))
+        quoted = failures = decision_quoted = deferred = 0
+        for index, row in enumerate(selected):
+            if deadline is not None and deadline.expired():
+                deferred = len(selected) - index
+                break
+            candidate = {
+                "pool_id": row["pool_id"],
+                "token_address": row["token_address"],
+            }
+            try:
+                entry_quote = self.v4_market.snapshot(
+                    candidate, quote_block=int(row["window_end_block"]))
+                entry_execution = (entry_quote or {}).get(
+                    "execution_quote") or (entry_quote or {})
+                if not entry_execution.get("verified"):
+                    failures += 1
+                    continue
+                if deadline is not None:
+                    deadline.raise_if_expired("observation_entry_quote")
+                try:
+                    gates = json.loads(row.get("gates_json") or "[]")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    gates = ["invalid_classification_gates"]
+                decision_quote = None
+                decision_head = safe_int(row.get("decision_head"), 0)
+                if row.get("identity_tier") == "verified" and not gates:
+                    decision_head = int(self.rpc.get_block_number())
+                    decision_quote = self.v4_market.snapshot(
+                        candidate, quote_block=decision_head)
+                    decision_quoted += 1
+                    if deadline is not None:
+                        deadline.raise_if_expired(
+                            "observation_decision_quote")
+                self.store.record_flow_observation_quotes(
+                    row["observation_id"], entry_quote=entry_quote,
+                    entry_quote_block=int(row["window_end_block"]),
+                    decision_quote=decision_quote,
+                    decision_quote_block=(
+                        decision_head if decision_quote is not None else None),
+                )
+                verdict = self.store.classify_flow_observation(
+                    row["observation_id"], decision_head=decision_head,
+                    identity_coverage=row.get("identity_coverage"),
+                    gates=gates, decision_quote=decision_quote,
+                    entry_quote=entry_quote,
+                )
+                if verdict.get("paper_eligible"):
+                    self._bump_classification_counters(
+                        {}, research_delta=0, paper_delta=1,
+                        total_delta=0)
+                quoted += 1
+            except CycleDeadlineExceeded:
+                deferred = len(selected) - index
+                break
+            except Exception:
+                failures += 1
+        return {
+            "selected": len(selected), "quoted": quoted,
+            "decision_quotes": decision_quoted,
+            "quote_failures": failures, "deferred": deferred,
         }
 
     def observe_flow_observation_outcomes(
@@ -13353,6 +13779,82 @@ class RobinhoodLearningEngine:
             "producer_observation_block": observation_block,
         }
 
+    def v3_market_snapshot(self, candidate: dict) -> dict:
+        """Authoritative V3 state fallback for paper-position marking."""
+        pair = str(candidate.get("pair_address") or "").lower()
+        token = str(candidate.get("token_address") or "").lower()
+        if len(pair.removeprefix("0x")) != 40:
+            return {}
+        slot0_raw = self.rpc.call(pair, "0x" + V3_SLOT0_SELECTOR)
+        liquidity_raw = self.rpc.call(pair, "0x" + V3_LIQUIDITY_SELECTOR)
+        sqrt_price, _tick = V4MarketClient._decode_slot0(slot0_raw)
+        liquidity = int(str(liquidity_raw or "0x0"), 16)
+        if sqrt_price <= 0 or liquidity <= 0:
+            return {
+                "source": "uniswap_v3_onchain",
+                "current_state_verified": False,
+                "confirmed_no_market": True,
+                "reason": "v3_zero_active_liquidity",
+                "market_resolution": {
+                    "winner": "uniswap_v3_onchain",
+                    "authoritative_no_liquidity": True,
+                    "confirmed_no_market": True,
+                    "retryable_provider_failure": False,
+                },
+            }
+
+        def address_result(raw: str) -> str:
+            return "0x" + str(raw or "").removeprefix("0x")[-40:].lower()
+
+        token0 = address_result(self.rpc.call(pair, "0x" + V3_TOKEN0_SELECTOR))
+        token1 = address_result(self.rpc.call(pair, "0x" + V3_TOKEN1_SELECTOR))
+        if token not in {token0, token1}:
+            return {}
+        anchor = token1 if token0 == token else token0
+        if anchor not in {USDG_ADDRESS.lower(), WETH_ADDRESS.lower()}:
+            return {}
+        token_decimals = self.rpc.erc20_decimals(token)
+        anchor_decimals = self.rpc.erc20_decimals(anchor)
+        total_supply = self.rpc.erc20_total_supply(token)
+        if anchor == USDG_ADDRESS.lower():
+            anchor_usd = 1.0
+        else:
+            anchor_usd, _source = self.market.wrapped_native_usd()
+        if anchor_usd <= 0:
+            return {}
+        raw_ratio = (sqrt_price / (1 << 96)) ** 2
+        # raw_ratio is raw token1 per raw token0. Convert it to human units,
+        # then invert when the learned token is token1.
+        human_token1_per_token0 = raw_ratio * (
+            10 ** (token_decimals - anchor_decimals)
+            if token0 == token else
+            10 ** (anchor_decimals - token_decimals))
+        token_usd = (
+            anchor_usd * human_token1_per_token0
+            if token0 == token else
+            anchor_usd / human_token1_per_token0
+            if human_token1_per_token0 else 0.0)
+        if token_usd <= 0:
+            return {}
+        token_scale = 10 ** token_decimals
+        anchor_scale = 10 ** anchor_decimals
+        liquidity_usd = (
+            2 * liquidity * (token_usd * anchor_usd) ** 0.5
+            / (token_scale * anchor_scale) ** 0.5)
+        supply = total_supply / token_scale
+        return {
+            "source": "uniswap_v3_onchain",
+            "current_state_verified": True,
+            "price_usd": token_usd,
+            "liquidity_usd": liquidity_usd,
+            "market_cap_usd": token_usd * supply,
+            "fdv_usd": token_usd * supply,
+            "market_resolution": {
+                "winner": "uniswap_v3_onchain",
+                "retryable_provider_failure": False,
+            },
+        }
+
     def evaluate_open_positions(
         self, now: float, *, deadline: CycleDeadline | None = None,
     ) -> dict:
@@ -13423,6 +13925,9 @@ class RobinhoodLearningEngine:
                     if market_batch_failed:
                         continue
                     market = resolved.get(candidate["token_address"].lower(), {})
+                    if (candidate.get("source_version") == SOURCE_V3
+                            and not market):
+                        market = self.v3_market_snapshot(candidate)
                 mark = self.store.mark_position(
                     candidate["token_address"], market, now
                 )
@@ -13644,6 +14149,18 @@ class RobinhoodLearningEngine:
 
             stage = time.monotonic()
             self.store.mark_lane_stage(
+                "evidence", "observation_quotes",
+                run_id=self.cycle_run_uuid,
+                remaining=deadline.remaining(), completed=dict(timings))
+            with self._rpc_deadline(deadline):
+                observation_quotes = self.quote_pending_flow_observations(
+                    limit=EVIDENCE_OBSERVATION_QUOTE_LIMIT,
+                    deadline=deadline)
+            timings["observation_quotes_seconds"] = round(
+                time.monotonic() - stage, 3)
+
+            stage = time.monotonic()
+            self.store.mark_lane_stage(
                 "evidence", "event_outcomes", run_id=self.cycle_run_uuid,
                 remaining=deadline.remaining(), completed=dict(timings))
             event_outcomes: dict
@@ -13679,6 +14196,7 @@ class RobinhoodLearningEngine:
                 time.monotonic() - stage, 3)
             return {
                 "entry_quotes": entry_quotes,
+                "observation_quotes": observation_quotes,
                 "event_outcomes": event_outcomes,
                 "observation_outcomes": observation_outcomes,
                 "stage_timings_seconds": timings,
@@ -13926,6 +14444,7 @@ class RobinhoodLearningEngine:
                             queue_drain_limit=0,
                             include_fresh=True,
                             stage_lane="live",
+                            defer_quotes=True,
                         )
                 except CycleDeadlineExceeded:
                     # CENSORED sample: this attempt was killed inside sealing.
@@ -14047,6 +14566,7 @@ class RobinhoodLearningEngine:
                 observation_ids=list(observation.get("observation_ids") or []),
                 deadline=deadline,
                 admission_limit=admission["admitted"],
+                allow_remote_quotes=False,
             )
             classification["admission_decision"] = admission
             timings["classification_seconds"] = round(
@@ -15145,6 +15665,16 @@ class RobinhoodLearningEngine:
         atomic_json_write(self.root / "verification_status.json", result)
         return result
 
+    def run_verification_lane(
+        self, *, budget_seconds: float = VERIFICATION_LANE_BUDGET_SECONDS,
+    ) -> dict:
+        """Refresh the full integrity certificate off every critical lane."""
+        def work(_deadline: CycleDeadline) -> dict:
+            result = self.verify()
+            return {"verification": result, "integrity_ok": bool(result["ok"])}
+
+        return self._execute_lane("verification", budget_seconds, work)
+
     def repair_outcome_integrity(self) -> dict:
         if self.timechain_recorder is None:
             raise RuntimeError("producer Timechain is disabled")
@@ -15256,7 +15786,7 @@ def _lane_creation_flags(lane: str) -> int:
     flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if lane == "live":
         flags |= int(getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0))
-    elif lane in {"analysis", "backfill"}:
+    elif lane in {"analysis", "backfill", "verification"}:
         flags |= int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     return flags
 
@@ -15272,6 +15802,17 @@ def _low_priority_launch_blocked(
         return True
     seconds_to_live = float(next_live) - float(now)
     return 0.0 <= seconds_to_live <= float(guard_seconds)
+
+
+def _full_verification_due(
+    root: str | Path, *, now: float | None = None,
+) -> bool:
+    status = read_json(Path(root) / "verification_status.json", {}) or {}
+    checked = _timestamp(status.get("checked_at"))
+    current = time.time() if now is None else float(now)
+    return bool(
+        not status.get("ok") or checked is None
+        or current - checked >= FULL_VERIFICATION_REFRESH_SECONDS)
 
 
 def supervise_lanes(
@@ -15326,6 +15867,13 @@ def supervise_lanes(
             "budget": BACKFILL_LANE_BUDGET_SECONDS, "next": started_mono + 6.0,
         },
     }
+    if _full_verification_due(root, now=started_wall):
+        lanes["verification"] = {
+            "command": "verification-once",
+            "cadence": FULL_VERIFICATION_REFRESH_SECONDS,
+            "budget": VERIFICATION_LANE_BUDGET_SECONDS,
+            "next": started_mono + 10.0,
+        }
     active: dict[str, dict] = {}
     launches = {lane: 0 for lane in lanes}
     timeouts = {lane: 0 for lane in lanes}
@@ -16297,7 +16845,7 @@ def main() -> None:
         "command",
         choices=(
             "learn-once", "marks-once", "live-once", "evidence-once",
-            "analysis-once", "backfill-once",
+            "analysis-once", "backfill-once", "verification-once",
             "lanes", "status", "dashboard", "verify", "reflect",
             "audit", "repair-outcomes", "cohort-start", "cohort-status",
         ),
@@ -16394,7 +16942,7 @@ def main() -> None:
         args.chain_root
         if args.command in {
             "learn-once", "analysis-once", "verify", "repair-outcomes",
-            "reflect", "audit",
+            "reflect", "audit", "verification-once",
         }
         else None
     )
@@ -16412,6 +16960,12 @@ def main() -> None:
     }
     if args.command=="verify":
         result=engine.verify(); print(json.dumps(result,indent=2)); raise SystemExit(0 if result["ok"] else 1)
+    if args.command=="verification-once":
+        summary = engine.run_verification_lane(
+            budget_seconds=max(
+                30.0, args.lane_budget_seconds
+                or VERIFICATION_LANE_BUDGET_SECONDS))
+        print(json.dumps(summary, indent=2)); return
     if args.command=="repair-outcomes":
         result = engine.repair_outcome_integrity()
         print(json.dumps(result, indent=2))
