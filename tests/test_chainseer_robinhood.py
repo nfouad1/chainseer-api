@@ -7226,6 +7226,8 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(
                 cohort["policy"]["backfill_successes_before_probe"],
                 rh.BACKFILL_RPC_SUCCESSES_BEFORE_PROBE)
+            self.assertTrue(
+                cohort["policy"]["backfill_state_revision_bound"])
             self.assertEqual(
                 cohort["policy"]["backfill_minimum_chunk_blocks"],
                 rh.BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS)
@@ -7962,6 +7964,37 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(failure["next_chunk_blocks"], 500)
             self.assertEqual(failure["success_streak"], 0)
             self.assertFalse(failure["probe_pending"])
+
+    def test_backfill_controller_refuses_state_from_another_revision(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine.store.set_scheduler_state(
+                rh.BACKFILL_RPC_CHUNK_STATE_KEY,
+                {
+                    "epoch": rh.BACKFILL_RPC_CHUNK_MODEL_EPOCH,
+                    "revision": "stale-revision",
+                    "next_chunk_blocks": 250,
+                    "stable_chunk_blocks": 250,
+                    "success_streak": 4,
+                    "previous_result": "success",
+                },
+            )
+            with patch.object(rh, "CODE_REVISION", "current-revision"):
+                plan = engine.backfill_rpc_chunk_plan(1_000)
+                self.assertEqual(
+                    plan["chunk_blocks"],
+                    rh.BACKFILL_GAP_INITIAL_CHUNK_BLOCKS)
+                self.assertEqual(plan["stable_chunk_blocks"], 0)
+                self.assertEqual(plan["success_streak"], 0)
+                self.assertFalse(plan["state_revision_matches"])
+                recorded = engine.record_backfill_rpc_chunk_result(
+                    rh.BACKFILL_GAP_INITIAL_CHUNK_BLOCKS, error=None)
+            self.assertEqual(recorded["revision"], "current-revision")
+            self.assertEqual(
+                recorded["stable_chunk_blocks"],
+                rh.BACKFILL_GAP_INITIAL_CHUNK_BLOCKS)
 
     def test_backfill_retires_expired_snapshot_without_quote_or_cohort(self):
         with tempfile.TemporaryDirectory() as directory:

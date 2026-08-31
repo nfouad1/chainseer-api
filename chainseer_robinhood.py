@@ -1395,6 +1395,7 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             BACKFILL_RPC_PROBE_STEP_BLOCKS,
         "backfill_successes_before_probe":
             BACKFILL_RPC_SUCCESSES_BEFORE_PROBE,
+        "backfill_state_revision_bound": True,
         "backfill_minimum_chunk_blocks":
             BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS,
         "live_observation_limit": LIVE_LANE_OBSERVATION_LIMIT,
@@ -15000,19 +15001,23 @@ class RobinhoodLearningEngine:
         state = self.store.scheduler_state(BACKFILL_RPC_CHUNK_STATE_KEY)
         epoch_matches = safe_int(state.get("epoch"), 0) == (
             BACKFILL_RPC_CHUNK_MODEL_EPOCH)
+        revision_matches = str(state.get("revision") or "") == CODE_REVISION
+        state_usable = epoch_matches and revision_matches
         initial = min(configured, BACKFILL_GAP_INITIAL_CHUNK_BLOCKS)
         stored = safe_int(
-            state.get("next_chunk_blocks") if epoch_matches else None,
+            state.get("next_chunk_blocks") if state_usable else None,
             initial,
         )
         minimum = min(configured, BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS)
         stable = safe_int(
-            state.get("stable_chunk_blocks") if epoch_matches else None, 0)
+            state.get("stable_chunk_blocks") if state_usable else None, 0)
         stable = max(0, min(configured, stable))
         success_streak = max(0, safe_int(
-            state.get("success_streak") if epoch_matches else None, 0))
+            state.get("success_streak") if state_usable else None, 0))
         return {
             "epoch": BACKFILL_RPC_CHUNK_MODEL_EPOCH,
+            "state_revision": state.get("revision") if epoch_matches else None,
+            "state_revision_matches": revision_matches,
             "configured_chunk_blocks": configured,
             "chunk_blocks": max(minimum, min(configured, stored)),
             "minimum_chunk_blocks": minimum,
@@ -15023,7 +15028,7 @@ class RobinhoodLearningEngine:
             "probe_step_blocks": BACKFILL_RPC_PROBE_STEP_BLOCKS,
             "probe_pending": bool(stable and stored > stable),
             "previous_result": state.get("previous_result")
-                if epoch_matches else None,
+                if state_usable else None,
         }
 
     def record_backfill_rpc_chunk_result(
@@ -15040,10 +15045,12 @@ class RobinhoodLearningEngine:
         state = self.store.scheduler_state(BACKFILL_RPC_CHUNK_STATE_KEY)
         epoch_matches = safe_int(state.get("epoch"), 0) == (
             BACKFILL_RPC_CHUNK_MODEL_EPOCH)
+        revision_matches = str(state.get("revision") or "") == CODE_REVISION
+        state_usable = epoch_matches and revision_matches
         stable = max(0, min(configured, safe_int(
-            state.get("stable_chunk_blocks") if epoch_matches else None, 0)))
+            state.get("stable_chunk_blocks") if state_usable else None, 0)))
         success_streak = max(0, safe_int(
-            state.get("success_streak") if epoch_matches else None, 0))
+            state.get("success_streak") if state_usable else None, 0))
         probe_pending = bool(stable and attempted > stable)
         if error is None:
             # A successful probe becomes the new stable size. Ordinary
