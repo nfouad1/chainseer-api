@@ -376,7 +376,9 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v2"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v3"
+ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
+ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
 
 def _seal_cost_defaults() -> dict:
@@ -1325,10 +1327,11 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
     underneath it.  This is deliberately operational policy; strategy
     promotion remains a separate fail-closed gate.
     """
+    target = max(1, int(sample_target))
     return {
         "schema_version": ACCEPTANCE_COHORT_SCHEMA_VERSION,
         "policy_version": ACCEPTANCE_COHORT_POLICY_VERSION,
-        "sample_target": max(1, int(sample_target)),
+        "sample_target": target,
         "paper_only": True,
         "live_execution_enabled": False,
         "live_lane_budget_seconds": LIVE_LANE_BUDGET_SECONDS,
@@ -1344,6 +1347,17 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
         "decision_lag_minimum_rate": 0.99,
         "decision_usefulness_minimum_rate": 0.99,
+        # The cohort boundary is exactly N terminal LIVE attempts. Decisions
+        # are conditional on a qualifying opportunity and marks have their
+        # own slower cadence, so requiring N of either inside N live attempts
+        # is impossible by construction. Freeze independent minimums instead
+        # of changing denominators after observing a cohort.
+        "decision_minimum_samples": max(
+            1, math.ceil(target * ACCEPTANCE_DECISION_SAMPLE_FRACTION)),
+        "position_mark_minimum_samples": max(
+            1, math.ceil(
+                target * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION)),
+        "position_mark_minimum_rate": 1.0,
         "seal_stall_rate_maximum": SEAL_STALL_RATE_MAX,
         "seal_stall_minimum_samples": SEAL_STALL_GUARD_MIN_SAMPLES,
         "seal_cost_model_epoch": SEAL_COST_MODEL_EPOCH,
@@ -6601,6 +6615,23 @@ class RobinhoodLearningStore:
         cohort_revision = str(cohort.get("revision") or "") or None
         target = max(1, int(
             cohort.get("sample_target") if cohort_id else sample_target))
+        cohort_policy = dict(cohort.get("policy") or {})
+        # Missing values mean the cohort predates independent denominators.
+        # Fall back to its original live-attempt target so a completed v2
+        # cohort is never retroactively relabelled by v3 code.
+        decision_sample_target = max(1, safe_int(
+            cohort_policy.get("decision_minimum_samples"), target))
+        mark_sample_target = max(1, safe_int(
+            cohort_policy.get("position_mark_minimum_samples"), target))
+        decision_lag_maximum = max(0, safe_int(
+            cohort_policy.get("decision_lag_maximum_blocks"),
+            FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS))
+        decision_lag_minimum_rate = safe_float(
+            cohort_policy.get("decision_lag_minimum_rate"), 0.99)
+        decision_usefulness_minimum_rate = safe_float(
+            cohort_policy.get("decision_usefulness_minimum_rate"), 0.99)
+        position_mark_minimum_rate = safe_float(
+            cohort_policy.get("position_mark_minimum_rate"), 1.0)
         performance = self.lane_performance(
             limit=target, cohort_id=cohort_id, revision=cohort_revision)
         ownership = self.running_run_audit()
@@ -6749,7 +6780,7 @@ class RobinhoodLearningStore:
         completed = len(live_rows)
         terminal_attempts = len(recent_live_statuses)
         lag_rate = (
-            sum(value <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+            sum(value <= decision_lag_maximum
                 for value in lags) / len(lags)
             if lags else None
         )
@@ -6828,7 +6859,7 @@ class RobinhoodLearningStore:
             useful_decisions / decision_opportunities
             if decision_opportunities else None)
         lag_rate = (
-            sum(value <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+            sum(value <= decision_lag_maximum
                 for value in lags) / len(lags)
             if lags else None
         )
@@ -6886,11 +6917,15 @@ class RobinhoodLearningStore:
             },
             "decision_lag": {
                 "pass": bool(
-                    len(lags) >= target
-                    and lag_rate is not None and lag_rate >= 0.99),
+                    len(lags) >= decision_sample_target
+                    and lag_rate is not None
+                    and lag_rate >= decision_lag_minimum_rate),
                 "value": lag_rate, "samples": len(lags),
-                "sample_target": target,
-                "target": f">=99% <=120 blocks across {target} decisions",
+                "sample_target": decision_sample_target,
+                "target": (
+                    f">={decision_lag_minimum_rate:.0%} "
+                    f"<={decision_lag_maximum} blocks across "
+                    f">={decision_sample_target} decisions"),
                 # Cycles that read a head but sealed nothing. They made no
                 # decision, so they are outside the SLO -- but the count is
                 # published, because a silent exclusion cannot be audited.
@@ -6899,11 +6934,15 @@ class RobinhoodLearningStore:
             },
             "position_marks": {
                 "pass": bool(
-                    mark_rate is not None and mark_rate >= 1.0
-                    and (not cohort_id or mark_samples >= target)),
+                    mark_rate is not None
+                    and mark_rate >= position_mark_minimum_rate
+                    and (not cohort_id
+                         or mark_samples >= mark_sample_target)),
                 "value": mark_rate, "samples": mark_samples,
+                "sample_target": mark_sample_target,
                 "target": (
-                    f"100% across {target} cohort marks"
+                    f">={position_mark_minimum_rate:.0%} across "
+                    f">={mark_sample_target} cohort marks"
                     if cohort_id else "100%"),
                 "label": "Complete position marks",
             },
@@ -6930,12 +6969,17 @@ class RobinhoodLearningStore:
             },
             "decision_usefulness": {
                 "pass": bool(
-                    decision_opportunities >= target
-                    and useful_decisions >= math.ceil(0.99 * target)),
+                    decision_opportunities >= decision_sample_target
+                    and useful_decision_rate is not None
+                    and useful_decision_rate
+                    >= decision_usefulness_minimum_rate),
                 "value": useful_decision_rate,
                 "samples": decision_opportunities,
                 "useful": useful_decisions,
-                "target": f">={math.ceil(0.99 * target)}/{target}",
+                "sample_target": decision_sample_target,
+                "target": (
+                    f">={decision_usefulness_minimum_rate:.0%} useful across "
+                    f">={decision_sample_target} opportunities"),
                 "label": "Decision-bearing usefulness",
             },
             "seal_stall_guard": {
@@ -13799,7 +13843,7 @@ class RobinhoodLearningEngine:
             return {}
         slot0_raw = self.rpc.call(pair, "0x" + V3_SLOT0_SELECTOR)
         liquidity_raw = self.rpc.call(pair, "0x" + V3_LIQUIDITY_SELECTOR)
-        sqrt_price, _tick = V4MarketClient._decode_slot0(slot0_raw)
+        sqrt_price, _tick = RobinhoodV4MarketClient._decode_slot0(slot0_raw)
         liquidity = int(str(liquidity_raw or "0x0"), 16)
         if sqrt_price <= 0 or liquidity <= 0:
             return {
@@ -13892,6 +13936,8 @@ class RobinhoodLearningEngine:
         resolved: dict[str, dict] = {}
         market_batch_requests = 0
         market_batch_failed = False
+        market_batch_error = None
+        failure_details: list[dict] = []
         if standard:
             try:
                 if deadline is not None:
@@ -13924,9 +13970,9 @@ class RobinhoodLearningEngine:
                         )
                 if deadline is not None:
                     deadline.raise_if_expired("position_market_batch")
-            except Exception:
+            except Exception as exc:
                 market_batch_failed = True
-                failures += len(standard)
+                market_batch_error = RobinhoodMarketClient._provider_error(exc)
         for candidate in candidates:
             if deadline is not None:
                 deadline.raise_if_expired("position_mark_commit")
@@ -13934,12 +13980,13 @@ class RobinhoodLearningEngine:
                 if candidate.get("source_version") == SOURCE_V4:
                     market = self.v4_market.snapshot(candidate)
                 else:
-                    if market_batch_failed:
-                        continue
                     market = resolved.get(candidate["token_address"].lower(), {})
                     if (candidate.get("source_version") == SOURCE_V3
                             and not market):
                         market = self.v3_market_snapshot(candidate)
+                    elif market_batch_failed and not market:
+                        raise RuntimeError(
+                            "batched position market provider failed")
                 mark = self.store.mark_position(
                     candidate["token_address"], market, now
                 )
@@ -13953,8 +14000,14 @@ class RobinhoodLearningEngine:
                 closed += bool(mark.get("reason"))
                 partial_exits += len(mark.get("partial_exits") or [])
                 self.ledger.append("robinhood_paper_mark", mark)
-            except Exception:
+            except Exception as exc:
                 failures += 1
+                if len(failure_details) < 10:
+                    failure_details.append({
+                        "token_address": candidate.get("token_address"),
+                        "source_version": candidate.get("source_version"),
+                        **RobinhoodMarketClient._provider_error(exc),
+                    })
         return {
             "checked": checked, "marked": marked, "unverified": unverified,
             "closed": closed,
@@ -13962,7 +14015,9 @@ class RobinhoodLearningEngine:
             "market_batch_candidates": len(standard),
             "market_batch_requests": market_batch_requests,
             "market_batch_failed": market_batch_failed,
+            "market_batch_error": market_batch_error,
             "individual_v4_quotes": len(v4),
+            "failure_details": failure_details,
             "cadence": "every_learning_cycle",
         }
 

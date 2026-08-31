@@ -7185,6 +7185,13 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["cohort_id"], "acceptance-test-1")
             self.assertEqual(cohort["revision"], "abc123")
             self.assertEqual(cohort["policy"]["sample_target"], 3)
+            self.assertEqual(
+                cohort["policy"]["policy_version"],
+                "robinhood-operational-v3")
+            self.assertEqual(
+                cohort["policy"]["decision_minimum_samples"], 2)
+            self.assertEqual(
+                cohort["policy"]["position_mark_minimum_samples"], 2)
             self.assertFalse(cohort["policy"]["live_execution_enabled"])
             expected_hash = hashlib.sha256(
                 rh._canonical(cohort["policy"]).encode("utf-8")
@@ -7201,6 +7208,103 @@ class LaneSplitTests(unittest.TestCase):
                        WHERE run_id='cohort-live-1'""").fetchone()
             self.assertEqual(row["revision"], "abc123")
             self.assertEqual(row["acceptance_cohort_id"], "acceptance-test-1")
+
+    def test_v3_cohort_uses_frozen_independent_sample_minimums(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="v3-revision", sample_target=4,
+                cohort_id="v3-independent-samples",
+                checkout_revision="v3-revision")
+            useful = {
+                "duration_seconds": 1.0,
+                "observation_seal": {
+                    "sealed_this_cycle": 1,
+                    "decision_head_lag_blocks": 20,
+                },
+                "classification": {
+                    "scoped_rows_selected": 1,
+                    "scoped_rows_processed": 1,
+                },
+            }
+            mark = {"position_evaluations": {
+                "checked": 1, "marked": 1, "failures": 0,
+                "unverified": 0,
+            }}
+            with patch.object(rh, "CODE_REVISION", "v3-revision"):
+                for index in range(2):
+                    store.begin_run(f"decision-{index}", 25.0, lane="live")
+                    store.finish_run(
+                        f"decision-{index}", "complete", summary=useful)
+                    store.begin_run(f"mark-{index}", 20.0, lane="marks")
+                    store.finish_run(
+                        f"mark-{index}", "complete", summary=mark)
+                for index in range(2):
+                    store.begin_run(f"idle-{index}", 25.0, lane="live")
+                    store.finish_run(
+                        f"idle-{index}", "complete",
+                        summary={"duration_seconds": 1.0})
+            result = store.stabilization_summary(integrity={"ok": True})
+            self.assertEqual(result["terminal_live_attempts"], 4)
+            for key in ("decision_lag", "decision_usefulness", "position_marks"):
+                criterion = result["criteria"][key]
+                self.assertTrue(criterion["pass"], (key, criterion))
+                self.assertEqual(criterion["sample_target"], 2)
+
+    def test_v2_cohort_is_not_retroactively_relabelled_by_v3_code(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            cohort = store.start_acceptance_cohort(
+                revision="v2-revision", sample_target=4,
+                cohort_id="v2-frozen-samples",
+                checkout_revision="v2-revision")
+            policy = dict(cohort["policy"])
+            policy["policy_version"] = "robinhood-operational-v2"
+            policy.pop("decision_minimum_samples")
+            policy.pop("position_mark_minimum_samples")
+            policy.pop("position_mark_minimum_rate")
+            policy_hash = hashlib.sha256(
+                rh._canonical(policy).encode("utf-8")).hexdigest()
+            with store.connection() as connection:
+                connection.execute(
+                    "UPDATE acceptance_cohorts SET policy_json=?,policy_hash=?"
+                    " WHERE cohort_id=?",
+                    (rh._canonical(policy), policy_hash,
+                     "v2-frozen-samples"),
+                )
+            useful = {
+                "duration_seconds": 1.0,
+                "observation_seal": {
+                    "sealed_this_cycle": 1,
+                    "decision_head_lag_blocks": 20,
+                },
+                "classification": {
+                    "scoped_rows_selected": 1,
+                    "scoped_rows_processed": 1,
+                },
+            }
+            mark = {"position_evaluations": {
+                "checked": 1, "marked": 1, "failures": 0,
+                "unverified": 0,
+            }}
+            with patch.object(rh, "CODE_REVISION", "v2-revision"):
+                for index in range(2):
+                    store.begin_run(f"decision-{index}", 25.0, lane="live")
+                    store.finish_run(
+                        f"decision-{index}", "complete", summary=useful)
+                    store.begin_run(f"mark-{index}", 20.0, lane="marks")
+                    store.finish_run(
+                        f"mark-{index}", "complete", summary=mark)
+                for index in range(2):
+                    store.begin_run(f"idle-{index}", 25.0, lane="live")
+                    store.finish_run(
+                        f"idle-{index}", "complete",
+                        summary={"duration_seconds": 1.0})
+            criteria = store.stabilization_summary(
+                integrity={"ok": True})["criteria"]
+            for key in ("decision_lag", "decision_usefulness", "position_marks"):
+                self.assertFalse(criteria[key]["pass"], key)
+                self.assertEqual(criteria[key]["sample_target"], 4)
 
     def test_read_only_legacy_database_reports_no_acceptance_cohort(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7459,6 +7563,103 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(result["failures"], 0)
             self.assertEqual(result["market_batch_requests"], 1)
             self.assertFalse(result["market_batch_failed"])
+
+    def test_v3_position_mark_falls_back_when_batch_provider_fails(self):
+        class BrokenBatchMarket:
+            timeout = 10.0
+            select_snapshot = staticmethod(
+                rh.RobinhoodMarketClient.select_snapshot)
+
+            def snapshots_many(self, _tokens):
+                raise RuntimeError("primary batch unavailable")
+
+        class V3RPC:
+            def call(self, _address, data, block=None):
+                del block
+                if data == "0x" + rh.V3_SLOT0_SELECTOR:
+                    return "0x" + word(1 << 95) + word(0)
+                if data == "0x" + rh.V3_LIQUIDITY_SELECTOR:
+                    return hex(10**24)
+                if data == "0x" + rh.V3_TOKEN0_SELECTOR:
+                    return "0x" + word(TOKEN)
+                if data == "0x" + rh.V3_TOKEN1_SELECTOR:
+                    return "0x" + word(rh.USDG_ADDRESS)
+                raise AssertionError(data)
+
+            def erc20_decimals(self, _token, block=None):
+                del block
+                return 18
+
+            def erc20_total_supply(self, _token, block=None):
+                del block
+                return 1_000_000 * 10**18
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(
+                Path(directory) / "learning.sqlite3")
+            candidate = RobinhoodLearningTests._candidate(rh.SOURCE_V3)
+            store.add_candidates([candidate])
+            entry = {
+                "price_usd": 0.25, "liquidity_usd": 50_000,
+                "market_cap_usd": 250_000, "fdv_usd": 300_000,
+            }
+            store.record_analysis(
+                TOKEN, FakeAnalyzer().analyze_token(
+                    TOKEN, False, True)["analysis"], entry)
+            self.assertTrue(store.open_position(store.candidate(TOKEN), entry))
+
+            engine = rh.RobinhoodLearningEngine.__new__(
+                rh.RobinhoodLearningEngine)
+            engine.store = store
+            engine.market = BrokenBatchMarket()
+            engine.rpc = V3RPC()
+            engine.ledger = SimpleNamespace(append=lambda *_args: None)
+            result = engine.evaluate_open_positions(
+                time.time() + 60, deadline=rh.CycleDeadline(10.0))
+
+            self.assertTrue(result["market_batch_failed"])
+            self.assertEqual(
+                result["market_batch_error"]["error_type"], "RuntimeError")
+            self.assertEqual(result["checked"], 1)
+            self.assertEqual(result["marked"], 1)
+            self.assertEqual(result["failures"], 0)
+            self.assertEqual(result["failure_details"], [])
+
+    def test_position_mark_failure_details_are_not_silently_discarded(self):
+        class BrokenBatchMarket:
+            timeout = 10.0
+            select_snapshot = staticmethod(
+                rh.RobinhoodMarketClient.select_snapshot)
+
+            def snapshots_many(self, _tokens):
+                raise RuntimeError("primary batch unavailable")
+
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(
+                Path(directory) / "learning.sqlite3")
+            candidate = RobinhoodLearningTests._candidate(rh.SOURCE_V2)
+            store.add_candidates([candidate])
+            entry = {
+                "price_usd": 0.25, "liquidity_usd": 50_000,
+                "market_cap_usd": 250_000, "fdv_usd": 300_000,
+            }
+            store.record_analysis(
+                TOKEN, FakeAnalyzer().analyze_token(
+                    TOKEN, False, True)["analysis"], entry)
+            self.assertTrue(store.open_position(store.candidate(TOKEN), entry))
+            engine = rh.RobinhoodLearningEngine.__new__(
+                rh.RobinhoodLearningEngine)
+            engine.store = store
+            engine.market = BrokenBatchMarket()
+            engine.ledger = SimpleNamespace(append=lambda *_args: None)
+            result = engine.evaluate_open_positions(
+                time.time() + 60, deadline=rh.CycleDeadline(10.0))
+            self.assertEqual(result["failures"], 1)
+            self.assertEqual(len(result["failure_details"]), 1)
+            self.assertEqual(
+                result["failure_details"][0]["token_address"], TOKEN)
+            self.assertEqual(
+                result["failure_details"][0]["error_type"], "RuntimeError")
 
     def test_supervisor_tail_guard_requires_budget_plus_grace(self):
         self.assertFalse(rh._lane_launch_fits(27.9, 25.0))
