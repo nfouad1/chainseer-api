@@ -7754,7 +7754,9 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         self.assertNotIn("verification", rh.SUPERVISED_LANE_NAMES)
         self.assertNotIn('"verification": {', source)
         self.assertGreaterEqual(
-            rh.VERIFICATION_LANE_BUDGET_SECONDS, 90 * 60)
+            rh.VERIFICATION_LANE_BUDGET_SECONDS, 30 * 60)
+        self.assertGreaterEqual(
+            rh.FULL_VERIFICATION_LANE_BUDGET_SECONDS, 3 * 60 * 60)
         runner = Path("run_chainseer_robinhood_learning.py").read_text(
             encoding="utf-8", errors="replace")
         self.assertIn('"--verification-only"', runner)
@@ -10180,3 +10182,56 @@ class ProductionHardeningTests(unittest.TestCase):
             self.assertFalse(rh._full_verification_due(root, now=10_000))
             self.assertTrue(rh._full_verification_due(
                 root, now=9_900 + rh.FULL_VERIFICATION_REFRESH_SECONDS + 1))
+
+    def test_dashboard_requires_operational_and_full_db_certificates(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            now = datetime.now(timezone.utc).isoformat()
+            rh.atomic_json_write(root / "verification_status.json", {
+                "ok": True, "checked_at": now,
+                "sqlite_quick_integrity": True,
+                "event_ledger_ok": True, "producer_timechain_ok": True,
+                "verification_level": "operational",
+            })
+            partial = rh._dashboard_integrity(root)
+            self.assertFalse(partial["ok"])
+            self.assertTrue(partial["sqlite_quick"])
+            self.assertFalse(partial["sqlite_full"])
+            rh.atomic_json_write(root / "full_verification_status.json", {
+                "ok": True, "checked_at": now,
+                "sqlite_integrity": True, "verification_level": "full",
+            })
+            complete = rh._dashboard_integrity(root)
+            self.assertTrue(complete["ok"])
+            self.assertTrue(complete["sqlite"])
+
+    def test_operational_verify_never_claims_full_sqlite_integrity(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(directory)
+            result = engine.verify_operational()
+            self.assertTrue(result["ok"])
+            self.assertTrue(result["sqlite_quick_integrity"])
+            self.assertIsNone(result["sqlite_integrity"])
+            self.assertEqual(result["verification_level"], "operational")
+            self.assertTrue(
+                (Path(directory) / "verification_status.json").exists())
+            self.assertFalse(
+                (Path(directory) / "full_verification_status.json").exists())
+
+    def test_operational_verify_preserves_legacy_full_certificate(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            legacy = {
+                "ok": True, "checked_at": datetime.now(timezone.utc).isoformat(),
+                "sqlite_integrity": True, "event_ledger_ok": True,
+                "producer_timechain_ok": True,
+            }
+            rh.atomic_json_write(root / "verification_status.json", legacy)
+            engine = rh.RobinhoodLearningEngine(root)
+            engine.verify_operational()
+            preserved = rh.read_json(
+                root / "full_verification_status.json", {})
+            self.assertTrue(preserved["sqlite_integrity"])
+            operational = rh.read_json(root / "verification_status.json", {})
+            self.assertTrue(operational["sqlite_quick_integrity"])
+            self.assertIsNone(operational["sqlite_integrity"])

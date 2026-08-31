@@ -121,6 +121,7 @@ DASHBOARD_HISTORICAL_STALE_SECONDS = 15 * 60.0
 # two-hour display margin prevents a certificate from flickering red while
 # the next low-priority maintenance pass is still reading the database.
 DASHBOARD_INTEGRITY_MAX_AGE_SECONDS = 26 * 60 * 60
+FULL_INTEGRITY_MAX_AGE_SECONDS = 8 * 24 * 60 * 60
 FULL_VERIFICATION_REFRESH_SECONDS = 24 * 60 * 60
 DEFAULT_DISCOVERY_LOOKBACK_BLOCKS = 5_000
 DEFAULT_DISCOVERY_BLOCK_LIMIT = 5_000
@@ -158,14 +159,13 @@ LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
 EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
-# Full SQLite integrity exceeded both 20- and 45-minute production task
-# boundaries on the 5.5 GB corpus.  It therefore runs under a dedicated
-# 100-minute, low-priority nightly maintenance task, never under the
-# 285-second live supervisor.
-# Ledger and Timechain verification remain part of the same certificate; only
-# scheduling ownership changes.  The ten-minute reserve lets the runner
-# publish its certificate and close SQLite cleanly before the OS kill boundary.
-VERIFICATION_LANE_BUDGET_SECONDS = 90 * 60.0
+# Operational verification uses SQLite quick_check plus complete ledger and
+# producer-Timechain verification.  Exhaustive integrity_check exceeded the
+# 100-minute production boundary on this 5.5 GB, low-memory corpus, so it has a
+# distinct weekly offline task and certificate.  Neither may run in the
+# 285-second live supervisor, and quick_check is never labelled as full.
+VERIFICATION_LANE_BUDGET_SECONDS = 30 * 60.0
+FULL_VERIFICATION_LANE_BUDGET_SECONDS = 3 * 60 * 60.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
 # Keep enough of the lane budget after durable gap recovery to commit its
@@ -15655,10 +15655,23 @@ class RobinhoodLearningEngine:
                     )
                 raise
 
-    def verify(self) -> dict:
+    def _verify(self, *, full: bool) -> dict:
+        if not full:
+            full_path = self.root / "full_verification_status.json"
+            legacy = read_json(self.root / "verification_status.json", {}) or {}
+            if (
+                not full_path.exists()
+                and legacy.get("sqlite_integrity") is not None
+                and legacy.get("sqlite_quick_integrity") is None
+            ):
+                # Preserve the last genuine pre-split full certificate before
+                # the operational certificate replaces its legacy filename.
+                atomic_json_write(full_path, legacy)
         ledger_ok,ledger_report=self.ledger.verify()
         with self.store.connection() as connection:
-            sqlite_ok=connection.execute("PRAGMA integrity_check").fetchone()[0]=="ok"
+            pragma = "integrity_check" if full else "quick_check"
+            sqlite_ok = connection.execute(
+                f"PRAGMA {pragma}").fetchone()[0] == "ok"
         timechain_ok = True
         timechain_report = "disabled"
         if self.timechain_recorder is not None:
@@ -15667,7 +15680,9 @@ class RobinhoodLearningEngine:
             "ok": ledger_ok and sqlite_ok and timechain_ok,
             "ledger": ledger_report,
             "event_ledger_ok": ledger_ok,
-            "sqlite_integrity": sqlite_ok,
+            "sqlite_integrity": sqlite_ok if full else None,
+            "sqlite_quick_integrity": sqlite_ok if not full else None,
+            "verification_level": "full" if full else "operational",
             "producer_timechain": timechain_report,
             "producer_timechain_ok": timechain_ok,
             "paper_only": True,
@@ -15675,18 +15690,41 @@ class RobinhoodLearningEngine:
             "revision": CODE_REVISION,
             "source_digest": _worktree_source_digest(),
         }
-        atomic_json_write(self.root / "verification_status.json", result)
+        atomic_json_write(
+            self.root / (
+                "full_verification_status.json"
+                if full else "verification_status.json"),
+            result,
+        )
         return result
+
+    def verify(self) -> dict:
+        """Run the exhaustive offline certificate (may take hours)."""
+        return self._verify(full=True)
+
+    def verify_operational(self) -> dict:
+        """Run the bounded daily certificate without claiming full DB proof."""
+        return self._verify(full=False)
 
     def run_verification_lane(
         self, *, budget_seconds: float = VERIFICATION_LANE_BUDGET_SECONDS,
     ) -> dict:
-        """Refresh the full integrity certificate off every critical lane."""
+        """Refresh the daily operational certificate off every critical lane."""
+        def work(_deadline: CycleDeadline) -> dict:
+            result = self.verify_operational()
+            return {"verification": result, "integrity_ok": bool(result["ok"])}
+
+        return self._execute_lane("verification", budget_seconds, work)
+
+    def run_full_verification_lane(
+        self, *, budget_seconds: float = FULL_VERIFICATION_LANE_BUDGET_SECONDS,
+    ) -> dict:
+        """Refresh the exhaustive weekly certificate in offline maintenance."""
         def work(_deadline: CycleDeadline) -> dict:
             result = self.verify()
             return {"verification": result, "integrity_ok": bool(result["ok"])}
 
-        return self._execute_lane("verification", budget_seconds, work)
+        return self._execute_lane("full_verification", budget_seconds, work)
 
     def repair_outcome_integrity(self) -> dict:
         if self.timechain_recorder is None:
@@ -16107,22 +16145,41 @@ def _dashboard_integrity(
     root: str | Path, *, chain_root: str | Path | None = None,
     skill_root: str | Path | None = None,
 ) -> dict:
-    """Read the latest full verification certificate without blocking UI."""
+    """Combine fresh operational and weekly full certificates without I/O."""
     root = Path(root)
     certificate = read_json(root / "verification_status.json", {}) or {}
+    full_certificate = read_json(
+        root / "full_verification_status.json", {}) or {}
+    # Compatibility for the last pre-split full certificate. It is accepted
+    # only as full evidence and only inside the explicit full-age window.
+    if not full_certificate and certificate.get("sqlite_integrity") is not None:
+        full_certificate = certificate
     checked_epoch = _timestamp(certificate.get("checked_at"))
     age = time.time() - checked_epoch if checked_epoch is not None else None
     fresh = bool(
         age is not None and 0 <= age <= DASHBOARD_INTEGRITY_MAX_AGE_SECONDS)
+    full_checked_epoch = _timestamp(full_certificate.get("checked_at"))
+    full_age = (
+        time.time() - full_checked_epoch
+        if full_checked_epoch is not None else None)
+    full_fresh = bool(
+        full_age is not None and 0 <= full_age <= FULL_INTEGRITY_MAX_AGE_SECONDS)
     result = {
-        "sqlite": False, "event_ledger": False, "producer_timechain": False,
+        "sqlite": False, "sqlite_quick": False, "sqlite_full": False,
+        "event_ledger": False, "producer_timechain": False,
         "checked_at": certificate.get("checked_at"),
         "age_seconds": round(age, 1) if age is not None else None,
         "maximum_age_seconds": DASHBOARD_INTEGRITY_MAX_AGE_SECONDS,
         "fresh": fresh,
+        "full_checked_at": full_certificate.get("checked_at"),
+        "full_age_seconds": (
+            round(full_age, 1) if full_age is not None else None),
+        "full_maximum_age_seconds": FULL_INTEGRITY_MAX_AGE_SECONDS,
+        "full_fresh": full_fresh,
     }
     if certificate:
-        result["sqlite"] = bool(certificate.get("sqlite_integrity"))
+        result["sqlite_quick"] = bool(
+            certificate.get("sqlite_quick_integrity"))
         result["event_ledger"] = bool(certificate.get("event_ledger_ok"))
         result["producer_timechain"] = bool(
             certificate.get("producer_timechain_ok"))
@@ -16131,6 +16188,11 @@ def _dashboard_integrity(
             "producer_timechain")
     else:
         result["status"] = "verification_required"
+    result["sqlite_full"] = bool(
+        full_certificate.get("sqlite_integrity"))
+    result["sqlite"] = bool(
+        fresh and full_fresh and result["sqlite_quick"]
+        and result["sqlite_full"])
     result["ok"] = bool(
         fresh and result["sqlite"] and result["event_ledger"]
         and result["producer_timechain"]
@@ -16855,6 +16917,7 @@ def main() -> None:
         choices=(
             "learn-once", "marks-once", "live-once", "evidence-once",
             "analysis-once", "backfill-once", "verification-once",
+            "full-verification-once",
             "lanes", "status", "dashboard", "verify", "reflect",
             "audit", "repair-outcomes", "cohort-start", "cohort-status",
         ),
@@ -16952,6 +17015,7 @@ def main() -> None:
         if args.command in {
             "learn-once", "analysis-once", "verify", "repair-outcomes",
             "reflect", "audit", "verification-once",
+            "full-verification-once",
         }
         else None
     )
@@ -16974,6 +17038,12 @@ def main() -> None:
             budget_seconds=max(
                 30.0, args.lane_budget_seconds
                 or VERIFICATION_LANE_BUDGET_SECONDS))
+        print(json.dumps(summary, indent=2)); return
+    if args.command=="full-verification-once":
+        summary = engine.run_full_verification_lane(
+            budget_seconds=max(
+                30.0, args.lane_budget_seconds
+                or FULL_VERIFICATION_LANE_BUDGET_SECONDS))
         print(json.dumps(summary, indent=2)); return
     if args.command=="repair-outcomes":
         result = engine.repair_outcome_integrity()
