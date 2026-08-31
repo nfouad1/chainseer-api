@@ -7754,7 +7754,7 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         self.assertNotIn("verification", rh.SUPERVISED_LANE_NAMES)
         self.assertNotIn('"verification": {', source)
         self.assertGreaterEqual(
-            rh.VERIFICATION_LANE_BUDGET_SECONDS, 15 * 60)
+            rh.VERIFICATION_LANE_BUDGET_SECONDS, 30 * 60)
         self.assertGreaterEqual(
             rh.FULL_VERIFICATION_LANE_BUDGET_SECONDS, 3 * 60 * 60)
         runner = Path("run_chainseer_robinhood_learning.py").read_text(
@@ -10204,6 +10204,12 @@ class ProductionHardeningTests(unittest.TestCase):
             complete = rh._dashboard_integrity(root)
             self.assertTrue(complete["ok"])
             self.assertTrue(complete["sqlite"])
+
+    def test_dashboard_labels_operational_and_full_db_integrity(self):
+        source = Path("robinhood_dashboard.html").read_text(
+            encoding="utf-8", errors="replace")
+        self.assertIn("DB op ${v?.sqlite_operational?'PASS':'WAIT'}", source)
+        self.assertIn("full ${v?.sqlite_full?'PASS':'WAIT'}", source)
 
     def test_operational_verify_never_claims_full_sqlite_integrity(self):
         with tempfile.TemporaryDirectory() as directory:
