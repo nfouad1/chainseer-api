@@ -179,11 +179,18 @@ BACKFILL_COMPLETION_RESERVE_SECONDS = 10.0
 # wider secondary-discovery batch setting. Smaller caller limits remain valid
 # for tests/maintenance, but no gap transaction spans more than 1,000 blocks.
 BACKFILL_GAP_CHUNK_BLOCKS = 1_000
-# A corrupt/no-progress provider response must not turn a fast loop into an
-# unbounded one.  Normal cycles stop on the child deadline; this is a second,
-# deliberately generous structural bound (100,000 blocks at the standard
-# 1,000-block chunk size).
-BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 100
+BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS = 125
+BACKFILL_RPC_CHUNK_STATE_KEY = "backfill_rpc_chunk_v1"
+BACKFILL_RPC_CHUNK_MODEL_EPOCH = 1
+# The production v3 cohort proved request COUNT, not range size, was binding.
+# Every one of 11 backfill runs retried into a provider throttle, while paced
+# probes from 25 through 1,000 blocks all succeeded in 1.2-2.25 seconds.  The
+# next burst request then returned 429. One 1,000-block request per 60-second
+# cadence supplies 60,000 blocks/hour against roughly 16,000 blocks/hour
+# of measured re-anchoring, and normally finishes before the next 30-second
+# live scan.  More chunks are provider pressure, not useful throughput.
+BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 1
+BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK = 1
 # The supervised live cadence is 30 seconds and this chain has recently
 # produced roughly ten blocks/second. Scan a bounded newest-head slice on the
 # decision path; any older prefix is durably re-anchored into backfill.
@@ -376,7 +383,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v3"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v4"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -742,11 +749,11 @@ CLASSIFICATION_BACKLOG_SCAN_LIMIT = 500
 CLASSIFICATION_COUNTERS_STATE_KEY = "classification_cumulative_counters"
 LIVE_LANE_CADENCE_SECONDS = 30.0
 ANALYSIS_LANE_CADENCE_SECONDS = 60.0
-# With the live lane deliberately observing only the newest ~100 blocks,
-# re-anchored history arrives faster. A three-minute cadence at the scheduled
-# 1,000-block quantum has ~20k blocks/hour of nominal recovery capacity,
-# above the ~16k/hour re-anchor rate measured in the failed v2 cohort.
-BACKFILL_LANE_CADENCE_SECONDS = 180.0
+# With one request per invocation, a one-minute cadence is rate SHAPING rather
+# than a burst: at most 60 requests/hour and 60k blocks/hour before background
+# scheduling contention. That leaves room for a timeout-driven half-window
+# fallback while exceeding the ~16k blocks/hour of measured re-anchoring.
+BACKFILL_LANE_CADENCE_SECONDS = 60.0
 # Do not start another worker while the latency-critical live worker is
 # starting/running or about to become due.  The failed acceptance cohort
 # measured a 21.95s live startup while the analysis lane was at its hard
@@ -885,6 +892,13 @@ DECISION_TAIL_BLOCK_DEFAULTS = {0: 25, 1: 36, 2: 59}
 #: This LOOSENS an admission gate. The max(baseline, ...) floor below keeps it
 #: from ever falling under the author's static defaults.
 DECISION_TAIL_BLOCK_QUANTILE = 0.90
+# Two v3 decisions breached the 120-block SLO at 125 and 190 blocks after a
+# two-observation batch was admitted at 60 + 59: one nominal block of slack.
+# Counterfactual replay shows a ten-block margin would have reduced 30 such
+# batches to one observation without creating any additional zero-admission
+# cycles.  Apply it only to multi-observation batches; the one-observation
+# reserve already covered the cohort maximum (36 reserved, 35 observed).
+DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS = 10
 # The old blanket five-second pre-head cutoff duplicated downstream reserves
 # and discarded three finishable decisions. Head retrieval receives its own
 # bounded allowance; classification and ledger completion are sized below.
@@ -1363,6 +1377,16 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "seal_cost_model_epoch": SEAL_COST_MODEL_EPOCH,
         "decision_tail_block_model_epoch":
             DECISION_TAIL_BLOCK_MODEL_EPOCH,
+        "decision_multi_observation_safety_blocks":
+            DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS,
+        "backfill_maximum_chunks_per_cycle":
+            BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE,
+        "backfill_remote_attempts_per_chunk":
+            BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK,
+        "backfill_rpc_chunk_model_epoch":
+            BACKFILL_RPC_CHUNK_MODEL_EPOCH,
+        "backfill_minimum_chunk_blocks":
+            BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS,
         "live_observation_limit": LIVE_LANE_OBSERVATION_LIMIT,
         "live_decision_reserve_seconds":
             LIVE_LANE_DECISION_RESERVE_SECONDS,
@@ -1428,14 +1452,45 @@ def _timestamp(value) -> float | None:
         return None
 
 
+def _rpc_rate_limited(error: BaseException | str) -> bool:
+    """Return whether retrying now would amplify provider pressure."""
+    text = str(error).lower()
+    return bool(
+        "rpc -429" in text
+        or "response failed (429)" in text
+        or "too many requests" in text
+    )
+
+
+def _transient_rpc_failure(error: BaseException | str) -> bool:
+    """Classify transport/provider failures without hiding deterministic bugs."""
+    text = str(error).lower()
+    return bool(
+        _rpc_rate_limited(error)
+        or "rpc -2" in text
+        or "timed out" in text
+        or "timeout" in text
+        or "cannot connect" in text
+        or "transport failed" in text
+        or "connection" in text
+    )
+
+
 def _remote_call(operation: str, callback, *, attempts: int = REMOTE_RETRY_ATTEMPTS):
     """Retry a bounded remote read without changing any durable cursor state."""
     last_error: Exception | None = None
+    attempts_made = 0
     for attempt in range(max(1, attempts)):
+        attempts_made = attempt + 1
         try:
             return callback()
         except Exception as exc:
             last_error = exc
+            # A 429 is an instruction to send LESS traffic. Immediate retries
+            # consumed the provider bucket and collided with authoritative
+            # live decision-head reads. The scheduled next cycle is the retry.
+            if _rpc_rate_limited(exc):
+                break
             # Retrying an oversized eth_getLogs window cannot change the
             # provider's deterministic result. Callers that support adaptive
             # windowing can split immediately after this error is wrapped.
@@ -1449,7 +1504,7 @@ def _remote_call(operation: str, callback, *, attempts: int = REMOTE_RETRY_ATTEM
             )
             time.sleep(ceiling + random.uniform(0.0, ceiling * 0.2))
     raise RuntimeError(
-        f"{operation} failed after {max(1, attempts)} attempts: {last_error}"
+        f"{operation} failed after {attempts_made} attempts: {last_error}"
     ) from last_error
 
 
@@ -9313,10 +9368,15 @@ class RobinhoodPairObserver:
 
 class RobinhoodV4Observer:
     """Observe V4 pools cheaply and activate only after liquidity and a swap."""
-    def __init__(self, rpc: RobinhoodRPC, store: RobinhoodLearningStore, state_path: str | Path):
+    def __init__(
+        self, rpc: RobinhoodRPC, store: RobinhoodLearningStore,
+        state_path: str | Path, *,
+        remote_attempts: int = REMOTE_RETRY_ATTEMPTS,
+    ):
         self.rpc = rpc
         self.store = store
         self.state_path = Path(state_path)
+        self.remote_attempts = max(1, int(remote_attempts))
 
     def _state(self) -> dict:
         return read_json(self.state_path, {}) or {}
@@ -9341,6 +9401,7 @@ class RobinhoodV4Observer:
                             V4_SWAP_TOPIC,
                         ]],
                     ),
+                    attempts=self.remote_attempts,
                 )
             except RuntimeError as exc:
                 if (
@@ -12164,7 +12225,7 @@ class RobinhoodLearningEngine:
         return model["downstream_reserve_p95"]
 
     def decision_tail_block_model(self) -> dict:
-        """Return a tighten-only p99 block reserve by observation count."""
+        """Return a tighten-only measured block reserve by observation count."""
         stored = self.store.scheduler_state(
             DECISION_TAIL_BLOCK_MODEL_STATE_KEY)
         epoch_matches = safe_int(stored.get("epoch"), 0) == (
@@ -12233,7 +12294,7 @@ class RobinhoodLearningEngine:
         self, *, observation_head: int, post_ingest_head: int | None,
         requested: int,
     ) -> dict:
-        """Admit the largest observation batch whose p99 tail still fits."""
+        """Admit the largest batch whose reserve and safety margin still fit."""
         requested = max(0, min(
             int(requested), LIVE_LANE_OBSERVATION_LIMIT))
         model = self.decision_tail_block_model()
@@ -12241,6 +12302,8 @@ class RobinhoodLearningEngine:
             "epoch": model["epoch"], "quantile": model["quantile"],
             "reserves": model["reserves"],
             "sample_counts": model["sample_counts"],
+            "multi_observation_safety_blocks":
+                DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS,
         }
         if post_ingest_head is None:
             return {
@@ -12249,6 +12312,7 @@ class RobinhoodLearningEngine:
                 "observation_head": int(observation_head),
                 "post_ingest_head": None, "post_ingest_lag_blocks": None,
                 "tail_reserve_blocks": None,
+                "safety_blocks": None,
                 "prospective_bound_blocks":
                     FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
                 "model": model_report,
@@ -12256,14 +12320,20 @@ class RobinhoodLearningEngine:
         lag = max(0, int(post_ingest_head) - int(observation_head))
         admitted = 0
         reserve = int(model["reserves"].get(0, 0))
+        safety_blocks = 0
         for count in range(requested, 0, -1):
             candidate_reserve = int(model["reserves"].get(
                 count, FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS))
-            if lag + candidate_reserve <= (
+            candidate_safety = (
+                DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS
+                if count > 1 else 0
+            )
+            if lag + candidate_reserve + candidate_safety <= (
                 FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
             ):
                 admitted = count
                 reserve = candidate_reserve
+                safety_blocks = candidate_safety
                 break
         return {
             "requested": requested, "admitted": admitted,
@@ -12275,6 +12345,7 @@ class RobinhoodLearningEngine:
             "post_ingest_head": int(post_ingest_head),
             "post_ingest_lag_blocks": lag,
             "tail_reserve_blocks": reserve,
+            "safety_blocks": safety_blocks,
             "prospective_bound_blocks":
                 FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
             "model": model_report,
@@ -14912,6 +14983,63 @@ class RobinhoodLearningEngine:
 
         return self._execute_lane("analysis", budget_seconds, work)
 
+    def backfill_rpc_chunk_plan(self, requested_limit: int) -> dict:
+        """Return the durable next-cycle range, bounded by policy."""
+        configured = min(
+            BACKFILL_GAP_CHUNK_BLOCKS, max(1, int(requested_limit)))
+        state = self.store.scheduler_state(BACKFILL_RPC_CHUNK_STATE_KEY)
+        epoch_matches = safe_int(state.get("epoch"), 0) == (
+            BACKFILL_RPC_CHUNK_MODEL_EPOCH)
+        stored = safe_int(
+            state.get("next_chunk_blocks") if epoch_matches else None,
+            configured,
+        )
+        minimum = min(configured, BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS)
+        return {
+            "epoch": BACKFILL_RPC_CHUNK_MODEL_EPOCH,
+            "configured_chunk_blocks": configured,
+            "chunk_blocks": max(minimum, min(configured, stored)),
+            "minimum_chunk_blocks": minimum,
+            "previous_result": state.get("previous_result")
+                if epoch_matches else None,
+        }
+
+    def record_backfill_rpc_chunk_result(
+        self, attempted_blocks: int, *, error: BaseException | str | None,
+    ) -> dict:
+        """Adapt the NEXT cycle; never split into more calls in this cycle."""
+        attempted = max(1, min(
+            BACKFILL_GAP_CHUNK_BLOCKS, int(attempted_blocks)))
+        minimum = min(
+            BACKFILL_GAP_CHUNK_BLOCKS,
+            BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS,
+        )
+        if error is None:
+            # Recover capacity cautiously after a smaller window succeeds.
+            next_blocks = min(BACKFILL_GAP_CHUNK_BLOCKS, attempted * 2)
+            result = "success"
+        elif _rpc_rate_limited(error):
+            # 429 is about request rate, not range size. Keep the range and
+            # let the scheduled cadence provide the cooldown.
+            next_blocks = attempted
+            result = "provider_rate_limited"
+        else:
+            # A log-query timeout may be range-density dependent. Halve only
+            # the next request; never fan out into more calls now.
+            next_blocks = max(minimum, attempted // 2)
+            result = "provider_timeout"
+        payload = {
+            "epoch": BACKFILL_RPC_CHUNK_MODEL_EPOCH,
+            "revision": CODE_REVISION,
+            "attempted_chunk_blocks": attempted,
+            "next_chunk_blocks": next_blocks,
+            "previous_result": result,
+            "updated_at": _utc_now(),
+        }
+        self.store.set_scheduler_state(
+            BACKFILL_RPC_CHUNK_STATE_KEY, payload)
+        return payload
+
     def drain_flow_backfill(
         self, deadline: CycleDeadline, *, block_limit: int,
     ) -> dict:
@@ -14935,7 +15063,10 @@ class RobinhoodLearningEngine:
             "next_block": start, "range_from": int(row["from_block"]),
             "range_to": upper_bound, "updated_at": _utc_now(),
         })
-        observer = RobinhoodV4Observer(self.rpc, self.store, cursor_path)
+        observer = RobinhoodV4Observer(
+            self.rpc, self.store, cursor_path,
+            remote_attempts=BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK,
+        )
         try:
             candidates, coverage = observer.sync(
                 block_limit=end - start + 1, lookback=1,
@@ -14974,14 +15105,14 @@ class RobinhoodLearningEngine:
         """Commit consecutive durable chunks until only reserve remains.
 
         ``drain_flow_backfill`` is intentionally one atomic chunk: its cursor
-        advances immediately after a successful scan.  This coordinator may
-        run many such chunks, but gives them a child deadline that ends before
-        the lane deadline.  A killed/failed later chunk therefore cannot erase
-        earlier cursor commits and cannot consume summary/lock-release time.
+        advances immediately after a successful scan. The coordinator retains
+        a child deadline, but production policy currently admits one provider
+        request per cycle so historical recovery cannot become an RPC burst or
+        overlap the next latency-critical live scan.
         """
         before = self.store.backfill_backlog()
-        chunk_limit = min(
-            BACKFILL_GAP_CHUNK_BLOCKS, max(1, int(block_limit)))
+        chunk_plan = self.backfill_rpc_chunk_plan(block_limit)
+        chunk_limit = int(chunk_plan["chunk_blocks"])
         available = max(0.0, deadline.remaining() - max(0.0, reserve_seconds))
         if available <= 0:
             return {
@@ -14998,17 +15129,48 @@ class RobinhoodLearningEngine:
         recovery_deadline = CycleDeadline(available)
         chunks: list[dict] = []
         stopped_reason = "no_pending_ranges"
+        provider_deferral: dict | None = None
+        next_chunk_state: dict | None = None
         for _ in range(BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE):
             if recovery_deadline.expired():
                 stopped_reason = "completion_reserve_reached"
                 break
-            with self._rpc_deadline(recovery_deadline):
-                chunk = self.drain_flow_backfill(
-                    recovery_deadline, block_limit=chunk_limit)
+            try:
+                with self._rpc_deadline(recovery_deadline):
+                    chunk = self.drain_flow_backfill(
+                        recovery_deadline, block_limit=chunk_limit)
+            except RuntimeError as exc:
+                if not _transient_rpc_failure(exc):
+                    raise
+                next_chunk_state = self.record_backfill_rpc_chunk_result(
+                    chunk_limit, error=exc)
+                # Cursor remains on the attempted block. A provider throttle
+                # is a controlled no-progress cycle, not evidence corruption
+                # and not permission to launch secondary RPC discovery.
+                provider_deferral = {
+                    "deferred": True,
+                    "reason": (
+                        "provider_rate_limited"
+                        if _rpc_rate_limited(exc)
+                        else "provider_temporarily_unavailable"
+                    ),
+                    "error_type": type(exc).__name__,
+                    "error": str(exc)[:500],
+                    "attempts_per_chunk":
+                        BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK,
+                    "attempted_chunk_blocks": chunk_limit,
+                    "next_chunk_blocks": next_chunk_state[
+                        "next_chunk_blocks"],
+                    "cursor_advanced": False,
+                }
+                stopped_reason = provider_deferral["reason"]
+                break
             if safe_int(chunk.get("ranges_selected"), 0) <= 0:
                 stopped_reason = "no_pending_ranges"
                 break
             chunks.append(dict(chunk))
+            next_chunk_state = self.record_backfill_rpc_chunk_result(
+                chunk_limit, error=None)
             progressed = (
                 safe_int(chunk.get("blocks_scanned"), 0) > 0
                 or bool(chunk.get("completed"))
@@ -15041,8 +15203,15 @@ class RobinhoodLearningEngine:
             "first_from_block": first.get("from_block"),
             "last_to_block": last.get("to_block"),
             "chunk_limit_blocks": chunk_limit,
+            "chunk_plan": chunk_plan,
+            "next_chunk_blocks": (
+                next_chunk_state.get("next_chunk_blocks")
+                if next_chunk_state else chunk_limit
+            ),
             "completion_reserve_seconds": float(reserve_seconds),
             "stopped_reason": stopped_reason,
+            "provider_deferred": bool(provider_deferral),
+            "provider_deferral": provider_deferral,
             "backlog_before": before, "backlog": after,
             "pending_blocks_delta": after_blocks - before_blocks,
             "backlog_shrinking": after_blocks < before_blocks,
@@ -15122,7 +15291,10 @@ class RobinhoodLearningEngine:
             timings["durable_gap_recovery"] = round(
                 time.monotonic() - stage, 3)
             deadline.raise_if_expired("durable_gap_recovery")
-            if safe_int(gap_recovery.get("ranges_selected"), 0) > 0:
+            if (
+                safe_int(gap_recovery.get("ranges_selected"), 0) > 0
+                or bool(gap_recovery.get("provider_deferred"))
+            ):
                 # A committed gap chunk is a complete unit of work. Continuing
                 # into two discovery cursors and historical identity made the
                 # process hit its deadline after useful progress, so every run
@@ -15135,17 +15307,29 @@ class RobinhoodLearningEngine:
                         gap_recovery.get("candidates_added"), 0),
                     "v2_discovery": {
                         "deferred": True,
-                        "reason": "durable_gap_recovery_priority",
+                        "reason": (
+                            "backfill_provider_deferred"
+                            if gap_recovery.get("provider_deferred")
+                            else "durable_gap_recovery_priority"
+                        ),
                     },
                     "v4_discovery": {
                         "deferred": True,
-                        "reason": "durable_gap_recovery_priority",
+                        "reason": (
+                            "backfill_provider_deferred"
+                            if gap_recovery.get("provider_deferred")
+                            else "durable_gap_recovery_priority"
+                        ),
                     },
                     "durable_gap_recovery": gap_recovery,
                     "durable_observation_queue": seal_queue,
                     "historical_identity_resolution": {
                         "deferred": True,
-                        "reason": "durable_gap_recovery_priority",
+                        "reason": (
+                            "backfill_provider_deferred"
+                            if gap_recovery.get("provider_deferred")
+                            else "durable_gap_recovery_priority"
+                        ),
                     },
                     "stage_timings_seconds": timings,
                     "cursor": {

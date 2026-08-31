@@ -1034,6 +1034,19 @@ class RobinhoodLearningTests(unittest.TestCase):
                     )
             self.assertEqual(json.loads(cursor.read_text())["next_block"], 77)
 
+    def test_remote_call_does_not_retry_provider_rate_limit_in_a_burst(self):
+        calls = []
+
+        def throttled():
+            calls.append(time.monotonic())
+            raise rh.RPCError("RPC HTTP response failed (429)", -429)
+
+        with patch.object(rh.time, "sleep") as sleeper:
+            with self.assertRaisesRegex(RuntimeError, "after 1 attempts"):
+                rh._remote_call("rate-limited probe", throttled, attempts=4)
+        self.assertEqual(len(calls), 1)
+        sleeper.assert_not_called()
+
     def test_failed_learning_cycle_is_not_left_running(self):
         class BrokenRPC(FakeRPC):
             def get_block_number(self):
@@ -7187,11 +7200,23 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v3")
+                "robinhood-operational-v4")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
                 cohort["policy"]["position_mark_minimum_samples"], 2)
+            self.assertEqual(
+                cohort["policy"]["decision_multi_observation_safety_blocks"],
+                rh.DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS)
+            self.assertEqual(
+                cohort["policy"]["backfill_maximum_chunks_per_cycle"], 1)
+            self.assertEqual(
+                cohort["policy"]["backfill_remote_attempts_per_chunk"], 1)
+            self.assertEqual(
+                cohort["policy"]["backfill_rpc_chunk_model_epoch"], 1)
+            self.assertEqual(
+                cohort["policy"]["backfill_minimum_chunk_blocks"],
+                rh.BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS)
             self.assertFalse(cohort["policy"]["live_execution_enabled"])
             expected_hash = hashlib.sha256(
                 rh._canonical(cohort["policy"]).encode("utf-8")
@@ -7796,11 +7821,13 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(result["status"], "complete")
             self.assertEqual(result["priority_mode"], "oldest_durable_gap_first")
             self.assertTrue(result["v2_discovery"]["deferred"])
-            self.assertEqual(result["new_candidates"], 5)
+            self.assertEqual(result["new_candidates"], 3)
             recovery = result["durable_gap_recovery"]
-            self.assertEqual(recovery["chunks_processed"], 2)
-            self.assertEqual(recovery["cursor_commits"], 2)
-            self.assertEqual(recovery["blocks_scanned"], 1000)
+            self.assertEqual(recovery["chunks_processed"], 1)
+            self.assertEqual(recovery["cursor_commits"], 1)
+            self.assertEqual(recovery["blocks_scanned"], 500)
+            self.assertEqual(
+                recovery["stopped_reason"], "maximum_chunks_reached")
 
     def test_gap_recovery_refuses_to_spend_completion_reserve(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7840,9 +7867,58 @@ class LaneSplitTests(unittest.TestCase):
                 rh.CycleDeadline(5.0), block_limit=5_000,
                 reserve_seconds=0.1,
             )
-            self.assertEqual(limits, [1_000, 1_000])
+            self.assertEqual(limits, [1_000])
             self.assertEqual(result["chunk_limit_blocks"], 1_000)
             self.assertEqual(result["blocks_scanned"], 1_000)
+
+    def test_backfill_rate_limit_is_one_attempt_and_a_controlled_deferral(self):
+        class RateLimitedRPC(FakeRPC):
+            def __init__(self):
+                super().__init__([], latest=100)
+                self.calls = 0
+
+            def get_logs(self, *args, **kwargs):
+                self.calls += 1
+                raise rh.RPCError("RPC HTTP response failed (429)", -429)
+
+        with tempfile.TemporaryDirectory() as directory:
+            rpc = RateLimitedRPC()
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=rpc, analyzer=FakeAnalyzer(),
+                market=FakeMarket())
+            engine.store.enqueue_backfill(10, 19, "live_lane_reanchor")
+            result = engine.run_backfill_lane(
+                budget_seconds=30.0, discovery_block_limit=1_000)
+            recovery = result["durable_gap_recovery"]
+            self.assertEqual(result["status"], "complete")
+            self.assertTrue(recovery["provider_deferred"])
+            self.assertEqual(
+                recovery["provider_deferral"]["reason"],
+                "provider_rate_limited")
+            self.assertEqual(rpc.calls, 1)
+            self.assertEqual(
+                engine.store.pending_backfill()[0]["next_block"], 10)
+            self.assertEqual(
+                result["v2_discovery"]["reason"],
+                "backfill_provider_deferred")
+            self.assertEqual(
+                recovery["next_chunk_blocks"],
+                rh.BACKFILL_GAP_CHUNK_BLOCKS,
+                "a 429 changes cadence, not query size")
+
+    def test_backfill_timeout_halves_only_the_next_scheduled_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            timeout = engine.record_backfill_rpc_chunk_result(
+                1_000, error="[RPC -32000] log query timed out")
+            self.assertEqual(timeout["next_chunk_blocks"], 500)
+            self.assertEqual(
+                engine.backfill_rpc_chunk_plan(1_000)["chunk_blocks"], 500)
+            success = engine.record_backfill_rpc_chunk_result(
+                500, error=None)
+            self.assertEqual(success["next_chunk_blocks"], 1_000)
 
     def test_backfill_retires_expired_snapshot_without_quote_or_cohort(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -10041,22 +10117,37 @@ class DecisionTailAdmissionTests(unittest.TestCase):
         engine.cycle_run_uuid = "decision-tail-test"
         return engine
 
-    def test_full_batch_fits_with_measured_p99_reserve(self):
+    def test_full_batch_fits_with_multi_observation_safety_margin(self):
         with tempfile.TemporaryDirectory() as directory:
             plan = self._engine(directory).observation_freshness_admission(
-                observation_head=1_000, post_ingest_head=1_061,
+                observation_head=1_000, post_ingest_head=1_050,
                 requested=2)
         self.assertEqual(plan["admitted"], 2)
         self.assertEqual(plan["tail_reserve_blocks"], 59)
+        self.assertEqual(
+            plan["safety_blocks"],
+            rh.DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS)
 
     def test_tight_headroom_reduces_two_observations_to_one(self):
         with tempfile.TemporaryDirectory() as directory:
             plan = self._engine(directory).observation_freshness_admission(
-                observation_head=1_000, post_ingest_head=1_082,
+                observation_head=1_000, post_ingest_head=1_060,
                 requested=2)
         self.assertEqual(plan["admitted"], 1)
         self.assertEqual(plan["reason"], "batch_reduced_for_freshness")
         self.assertEqual(plan["tail_reserve_blocks"], 36)
+        self.assertEqual(plan["safety_blocks"], 0)
+
+    def test_v3_lag_misses_are_reduced_without_extra_zero_admission(self):
+        """Both misses began at lag 60 with a two-observation request."""
+        with tempfile.TemporaryDirectory() as directory:
+            plan = self._engine(directory).observation_freshness_admission(
+                observation_head=50_000, post_ingest_head=50_060,
+                requested=2)
+        self.assertEqual(plan["admitted"], 1)
+        self.assertLessEqual(
+            60 + plan["tail_reserve_blocks"],
+            rh.FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS)
 
     def test_exhausted_headroom_admits_no_remote_observation(self):
         with tempfile.TemporaryDirectory() as directory:
