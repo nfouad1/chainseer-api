@@ -176,19 +176,23 @@ BACKFILL_V4_ACTIVATION_LIMIT = 25
 # one second technically remained.
 BACKFILL_COMPLETION_RESERVE_SECONDS = 10.0
 # Durable skipped ranges are cursor-committed at this quantum regardless of a
-# wider secondary-discovery batch setting. Smaller caller limits remain valid
-# for tests/maintenance, but no gap transaction spans more than 1,000 blocks.
-BACKFILL_GAP_CHUNK_BLOCKS = 1_000
+# wider secondary-discovery batch setting. The v4 acceptance trace disproved
+# 1,000 as a reliable operating point on the live provider: one of six calls
+# succeeded, while every 500-block fallback and a read-only 750-block probe
+# succeeded. Cap the v5 controller at the measured middle point instead of
+# repeatedly spending a scheduled opportunity rediscovering the same limit.
+BACKFILL_GAP_CHUNK_BLOCKS = 750
+BACKFILL_GAP_INITIAL_CHUNK_BLOCKS = 750
 BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS = 125
 BACKFILL_RPC_CHUNK_STATE_KEY = "backfill_rpc_chunk_v1"
-BACKFILL_RPC_CHUNK_MODEL_EPOCH = 1
-# The production v3 cohort proved request COUNT, not range size, was binding.
-# Every one of 11 backfill runs retried into a provider throttle, while paced
-# probes from 25 through 1,000 blocks all succeeded in 1.2-2.25 seconds.  The
-# next burst request then returned 429. One 1,000-block request per 60-second
-# cadence supplies 60,000 blocks/hour against roughly 16,000 blocks/hour
-# of measured re-anchoring, and normally finishes before the next 30-second
-# live scan.  More chunks are provider pressure, not useful throughput.
+BACKFILL_RPC_CHUNK_MODEL_EPOCH = 2
+BACKFILL_RPC_PROBE_STEP_BLOCKS = 125
+BACKFILL_RPC_SUCCESSES_BEFORE_PROBE = 5
+# The v3 cohort proved request COUNT was binding during a retry burst; v4 then
+# proved that range density also matters once request count is fixed at one.
+# Preserve one call per scheduled run, but require repeated success before an
+# additive upward probe. A failed probe falls back to the last proven size,
+# rather than oscillating 1,000 -> 500 -> 1,000 after every single success.
 BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 1
 BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK = 1
 # The supervised live cadence is 30 seconds and this chain has recently
@@ -383,7 +387,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v4"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v5"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -1355,7 +1359,7 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "live_enrichment_budget_seconds": (
             LIVE_LANE_ENRICHMENT_BUDGET_SECONDS),
         "backfill_lane_cadence_seconds": BACKFILL_LANE_CADENCE_SECONDS,
-        "scheduled_backfill_block_limit": 1000,
+        "scheduled_backfill_block_limit": BACKFILL_GAP_CHUNK_BLOCKS,
         "live_all_attempt_p95_target_seconds": 30.0,
         "decision_lag_maximum_blocks":
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
@@ -1385,6 +1389,12 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK,
         "backfill_rpc_chunk_model_epoch":
             BACKFILL_RPC_CHUNK_MODEL_EPOCH,
+        "backfill_initial_chunk_blocks":
+            BACKFILL_GAP_INITIAL_CHUNK_BLOCKS,
+        "backfill_probe_step_blocks":
+            BACKFILL_RPC_PROBE_STEP_BLOCKS,
+        "backfill_successes_before_probe":
+            BACKFILL_RPC_SUCCESSES_BEFORE_PROBE,
         "backfill_minimum_chunk_blocks":
             BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS,
         "live_observation_limit": LIVE_LANE_OBSERVATION_LIMIT,
@@ -14990,16 +15000,28 @@ class RobinhoodLearningEngine:
         state = self.store.scheduler_state(BACKFILL_RPC_CHUNK_STATE_KEY)
         epoch_matches = safe_int(state.get("epoch"), 0) == (
             BACKFILL_RPC_CHUNK_MODEL_EPOCH)
+        initial = min(configured, BACKFILL_GAP_INITIAL_CHUNK_BLOCKS)
         stored = safe_int(
             state.get("next_chunk_blocks") if epoch_matches else None,
-            configured,
+            initial,
         )
         minimum = min(configured, BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS)
+        stable = safe_int(
+            state.get("stable_chunk_blocks") if epoch_matches else None, 0)
+        stable = max(0, min(configured, stable))
+        success_streak = max(0, safe_int(
+            state.get("success_streak") if epoch_matches else None, 0))
         return {
             "epoch": BACKFILL_RPC_CHUNK_MODEL_EPOCH,
             "configured_chunk_blocks": configured,
             "chunk_blocks": max(minimum, min(configured, stored)),
             "minimum_chunk_blocks": minimum,
+            "stable_chunk_blocks": stable,
+            "success_streak": success_streak,
+            "successes_before_probe":
+                BACKFILL_RPC_SUCCESSES_BEFORE_PROBE,
+            "probe_step_blocks": BACKFILL_RPC_PROBE_STEP_BLOCKS,
+            "probe_pending": bool(stable and stored > stable),
             "previous_result": state.get("previous_result")
                 if epoch_matches else None,
         }
@@ -15007,32 +15029,73 @@ class RobinhoodLearningEngine:
     def record_backfill_rpc_chunk_result(
         self, attempted_blocks: int, *, error: BaseException | str | None,
     ) -> dict:
-        """Adapt the NEXT cycle; never split into more calls in this cycle."""
+        """Adapt the next cycle using a durable stable-size hysteresis."""
+        configured = BACKFILL_GAP_CHUNK_BLOCKS
         attempted = max(1, min(
-            BACKFILL_GAP_CHUNK_BLOCKS, int(attempted_blocks)))
+            configured, int(attempted_blocks)))
         minimum = min(
-            BACKFILL_GAP_CHUNK_BLOCKS,
+            configured,
             BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS,
         )
+        state = self.store.scheduler_state(BACKFILL_RPC_CHUNK_STATE_KEY)
+        epoch_matches = safe_int(state.get("epoch"), 0) == (
+            BACKFILL_RPC_CHUNK_MODEL_EPOCH)
+        stable = max(0, min(configured, safe_int(
+            state.get("stable_chunk_blocks") if epoch_matches else None, 0)))
+        success_streak = max(0, safe_int(
+            state.get("success_streak") if epoch_matches else None, 0))
+        probe_pending = bool(stable and attempted > stable)
         if error is None:
-            # Recover capacity cautiously after a smaller window succeeds.
-            next_blocks = min(BACKFILL_GAP_CHUNK_BLOCKS, attempted * 2)
-            result = "success"
+            # A successful probe becomes the new stable size. Ordinary
+            # successes stay at that size until a real streak earns exactly
+            # one additive probe; one sparse range can no longer double the
+            # next request back into a repeatedly failing operating point.
+            if attempted != stable:
+                stable = attempted
+                success_streak = 1
+                result = "probe_success" if probe_pending else "success"
+            else:
+                success_streak += 1
+                result = "success"
+            if (
+                stable < configured
+                and success_streak >= BACKFILL_RPC_SUCCESSES_BEFORE_PROBE
+            ):
+                next_blocks = min(
+                    configured, stable + BACKFILL_RPC_PROBE_STEP_BLOCKS)
+                success_streak = 0
+            else:
+                next_blocks = stable
         elif _rpc_rate_limited(error):
             # 429 is about request rate, not range size. Keep the range and
             # let the scheduled cadence provide the cooldown.
             next_blocks = attempted
             result = "provider_rate_limited"
         else:
-            # A log-query timeout may be range-density dependent. Halve only
-            # the next request; never fan out into more calls now.
-            next_blocks = max(minimum, attempted // 2)
+            # A log-query timeout may be range-density dependent. A failed
+            # upward probe returns to the last proven size. If the stable size
+            # itself fails on a denser range, step down additively and require
+            # new success evidence before probing upward again.
+            if 0 < stable < attempted:
+                next_blocks = stable
+            else:
+                next_blocks = max(
+                    minimum, attempted - BACKFILL_RPC_PROBE_STEP_BLOCKS * 2)
+                stable = 0
+            success_streak = 0
             result = "provider_timeout"
         payload = {
             "epoch": BACKFILL_RPC_CHUNK_MODEL_EPOCH,
             "revision": CODE_REVISION,
+            "configured_chunk_blocks": configured,
             "attempted_chunk_blocks": attempted,
             "next_chunk_blocks": next_blocks,
+            "stable_chunk_blocks": stable,
+            "success_streak": success_streak,
+            "successes_before_probe":
+                BACKFILL_RPC_SUCCESSES_BEFORE_PROBE,
+            "probe_step_blocks": BACKFILL_RPC_PROBE_STEP_BLOCKS,
+            "probe_pending": bool(stable and next_blocks > stable),
             "previous_result": result,
             "updated_at": _utc_now(),
         }

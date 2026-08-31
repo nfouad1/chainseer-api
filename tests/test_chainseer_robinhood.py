@@ -7200,7 +7200,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v4")
+                "robinhood-operational-v5")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7213,7 +7213,19 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(
                 cohort["policy"]["backfill_remote_attempts_per_chunk"], 1)
             self.assertEqual(
-                cohort["policy"]["backfill_rpc_chunk_model_epoch"], 1)
+                cohort["policy"]["backfill_rpc_chunk_model_epoch"], 2)
+            self.assertEqual(
+                cohort["policy"]["scheduled_backfill_block_limit"],
+                rh.BACKFILL_GAP_CHUNK_BLOCKS)
+            self.assertEqual(
+                cohort["policy"]["backfill_initial_chunk_blocks"],
+                rh.BACKFILL_GAP_INITIAL_CHUNK_BLOCKS)
+            self.assertEqual(
+                cohort["policy"]["backfill_probe_step_blocks"],
+                rh.BACKFILL_RPC_PROBE_STEP_BLOCKS)
+            self.assertEqual(
+                cohort["policy"]["backfill_successes_before_probe"],
+                rh.BACKFILL_RPC_SUCCESSES_BEFORE_PROBE)
             self.assertEqual(
                 cohort["policy"]["backfill_minimum_chunk_blocks"],
                 rh.BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS)
@@ -7844,7 +7856,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(
                 result["stopped_reason"], "completion_reserve_reached")
 
-    def test_gap_recovery_chunks_are_hard_bounded_at_one_thousand_blocks(self):
+    def test_gap_recovery_chunks_are_hard_bounded_at_provider_safe_cap(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = rh.RobinhoodLearningEngine(
                 directory, rpc=FakeRPC([], latest=100),
@@ -7867,9 +7879,13 @@ class LaneSplitTests(unittest.TestCase):
                 rh.CycleDeadline(5.0), block_limit=5_000,
                 reserve_seconds=0.1,
             )
-            self.assertEqual(limits, [1_000])
-            self.assertEqual(result["chunk_limit_blocks"], 1_000)
-            self.assertEqual(result["blocks_scanned"], 1_000)
+            self.assertEqual(limits, [rh.BACKFILL_GAP_CHUNK_BLOCKS])
+            self.assertEqual(
+                result["chunk_limit_blocks"],
+                rh.BACKFILL_GAP_CHUNK_BLOCKS)
+            self.assertEqual(
+                result["blocks_scanned"],
+                rh.BACKFILL_GAP_CHUNK_BLOCKS)
 
     def test_backfill_rate_limit_is_one_attempt_and_a_controlled_deferral(self):
         class RateLimitedRPC(FakeRPC):
@@ -7906,19 +7922,46 @@ class LaneSplitTests(unittest.TestCase):
                 rh.BACKFILL_GAP_CHUNK_BLOCKS,
                 "a 429 changes cadence, not query size")
 
-    def test_backfill_timeout_halves_only_the_next_scheduled_window(self):
+    def test_backfill_hysteresis_requires_a_success_streak_before_probe(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = rh.RobinhoodLearningEngine(
                 directory, rpc=FakeRPC([], latest=100),
                 analyzer=FakeAnalyzer(), market=FakeMarket())
             timeout = engine.record_backfill_rpc_chunk_result(
-                1_000, error="[RPC -32000] log query timed out")
+                750, error="[RPC -32000] log query timed out")
             self.assertEqual(timeout["next_chunk_blocks"], 500)
             self.assertEqual(
                 engine.backfill_rpc_chunk_plan(1_000)["chunk_blocks"], 500)
-            success = engine.record_backfill_rpc_chunk_result(
-                500, error=None)
-            self.assertEqual(success["next_chunk_blocks"], 1_000)
+            for success_number in range(
+                1, rh.BACKFILL_RPC_SUCCESSES_BEFORE_PROBE + 1
+            ):
+                success = engine.record_backfill_rpc_chunk_result(
+                    500, error=None)
+                expected = (
+                    625
+                    if success_number
+                        == rh.BACKFILL_RPC_SUCCESSES_BEFORE_PROBE
+                    else 500
+                )
+                self.assertEqual(success["next_chunk_blocks"], expected)
+            plan = engine.backfill_rpc_chunk_plan(1_000)
+            self.assertEqual(plan["chunk_blocks"], 625)
+            self.assertEqual(plan["stable_chunk_blocks"], 500)
+            self.assertTrue(plan["probe_pending"])
+
+    def test_failed_backfill_probe_returns_to_last_proven_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            for _ in range(rh.BACKFILL_RPC_SUCCESSES_BEFORE_PROBE):
+                engine.record_backfill_rpc_chunk_result(500, error=None)
+            failure = engine.record_backfill_rpc_chunk_result(
+                625, error="[RPC -32000] log query timed out")
+            self.assertEqual(failure["stable_chunk_blocks"], 500)
+            self.assertEqual(failure["next_chunk_blocks"], 500)
+            self.assertEqual(failure["success_streak"], 0)
+            self.assertFalse(failure["probe_pending"])
 
     def test_backfill_retires_expired_snapshot_without_quote_or_cohort(self):
         with tempfile.TemporaryDirectory() as directory:

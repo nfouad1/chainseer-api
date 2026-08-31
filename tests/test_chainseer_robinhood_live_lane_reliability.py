@@ -254,7 +254,9 @@ class IngestionAdmissionTests(unittest.TestCase):
         )
         self.assertEqual(policy["live_scan_blocks"], 100)
         self.assertEqual(policy["backfill_lane_cadence_seconds"], 60.0)
-        self.assertEqual(policy["scheduled_backfill_block_limit"], 1000)
+        self.assertEqual(
+            policy["scheduled_backfill_block_limit"],
+            rh.BACKFILL_GAP_CHUNK_BLOCKS)
         self.assertEqual(policy["backfill_maximum_chunks_per_cycle"], 1)
         self.assertEqual(policy["backfill_remote_attempts_per_chunk"], 1)
 
