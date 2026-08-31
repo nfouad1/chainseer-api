@@ -7754,7 +7754,7 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         self.assertNotIn("verification", rh.SUPERVISED_LANE_NAMES)
         self.assertNotIn('"verification": {', source)
         self.assertGreaterEqual(
-            rh.VERIFICATION_LANE_BUDGET_SECONDS, 75 * 60)
+            rh.VERIFICATION_LANE_BUDGET_SECONDS, 15 * 60)
         self.assertGreaterEqual(
             rh.FULL_VERIFICATION_LANE_BUDGET_SECONDS, 3 * 60 * 60)
         runner = Path("run_chainseer_robinhood_learning.py").read_text(
@@ -10189,13 +10189,13 @@ class ProductionHardeningTests(unittest.TestCase):
             now = datetime.now(timezone.utc).isoformat()
             rh.atomic_json_write(root / "verification_status.json", {
                 "ok": True, "checked_at": now,
-                "sqlite_quick_integrity": True,
+                "sqlite_operational_health": True,
                 "event_ledger_ok": True, "producer_timechain_ok": True,
                 "verification_level": "operational",
             })
             partial = rh._dashboard_integrity(root)
             self.assertFalse(partial["ok"])
-            self.assertTrue(partial["sqlite_quick"])
+            self.assertTrue(partial["sqlite_operational"])
             self.assertFalse(partial["sqlite_full"])
             rh.atomic_json_write(root / "full_verification_status.json", {
                 "ok": True, "checked_at": now,
@@ -10210,7 +10210,7 @@ class ProductionHardeningTests(unittest.TestCase):
             engine = rh.RobinhoodLearningEngine(directory)
             result = engine.verify_operational()
             self.assertTrue(result["ok"])
-            self.assertTrue(result["sqlite_quick_integrity"])
+            self.assertTrue(result["sqlite_operational_health"])
             self.assertIsNone(result["sqlite_integrity"])
             self.assertEqual(result["verification_level"], "operational")
             self.assertTrue(
@@ -10233,5 +10233,5 @@ class ProductionHardeningTests(unittest.TestCase):
                 root / "full_verification_status.json", {})
             self.assertTrue(preserved["sqlite_integrity"])
             operational = rh.read_json(root / "verification_status.json", {})
-            self.assertTrue(operational["sqlite_quick_integrity"])
+            self.assertTrue(operational["sqlite_operational_health"])
             self.assertIsNone(operational["sqlite_integrity"])

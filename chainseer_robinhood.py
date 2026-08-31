@@ -159,12 +159,13 @@ LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
 EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
-# Operational verification uses SQLite quick_check plus complete ledger and
-# producer-Timechain verification.  Exhaustive integrity_check exceeded the
-# 100-minute production boundary on this 5.5 GB, low-memory corpus, so it has a
-# distinct weekly offline task and certificate.  Neither may run in the
-# 285-second live supervisor, and quick_check is never labelled as full.
-VERIFICATION_LANE_BUDGET_SECONDS = 75 * 60.0
+# Operational verification performs bounded schema/readability/critical-table
+# health checks plus complete ledger and producer-Timechain verification.
+# Both SQLite quick_check and integrity_check exceeded practical maintenance
+# bounds on this 5.5 GB, low-memory corpus, so exhaustive proof has a distinct
+# weekly offline task and certificate. Neither may run in the 285-second live
+# supervisor, and operational health is never labelled full.
+VERIFICATION_LANE_BUDGET_SECONDS = 15 * 60.0
 FULL_VERIFICATION_LANE_BUDGET_SECONDS = 3 * 60 * 60.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
@@ -15662,16 +15663,54 @@ class RobinhoodLearningEngine:
             if (
                 not full_path.exists()
                 and legacy.get("sqlite_integrity") is not None
-                and legacy.get("sqlite_quick_integrity") is None
+                and legacy.get("sqlite_operational_health") is None
             ):
                 # Preserve the last genuine pre-split full certificate before
                 # the operational certificate replaces its legacy filename.
                 atomic_json_write(full_path, legacy)
         ledger_ok,ledger_report=self.ledger.verify()
         with self.store.connection() as connection:
-            pragma = "integrity_check" if full else "quick_check"
-            sqlite_ok = connection.execute(
-                f"PRAGMA {pragma}").fetchone()[0] == "ok"
+            if full:
+                sqlite_ok = (
+                    connection.execute(
+                        "PRAGMA integrity_check").fetchone()[0] == "ok")
+                sqlite_report = {"check": "integrity_check", "ok": sqlite_ok}
+            else:
+                required = {
+                    "runs", "candidates", "flow_observations", "positions",
+                }
+                present = {
+                    str(row[0]) for row in connection.execute(
+                        "SELECT name FROM sqlite_schema"
+                        " WHERE type='table' AND name IN (?,?,?,?)",
+                        tuple(sorted(required)),
+                    ).fetchall()
+                }
+                readable = {}
+                for table in sorted(required & present):
+                    connection.execute(
+                        f'SELECT * FROM "{table}" LIMIT 1').fetchone()
+                    readable[table] = True
+                schema_version = int(connection.execute(
+                    "PRAGMA schema_version").fetchone()[0])
+                page_count = int(connection.execute(
+                    "PRAGMA page_count").fetchone()[0])
+                journal_mode = str(connection.execute(
+                    "PRAGMA journal_mode").fetchone()[0]).lower()
+                sqlite_ok = bool(
+                    present == required and len(readable) == len(required)
+                    and schema_version >= 0 and page_count > 0
+                    and journal_mode in {"wal", "delete"})
+                sqlite_report = {
+                    "check": "bounded_operational_health",
+                    "ok": sqlite_ok,
+                    "required_tables": sorted(required),
+                    "present_tables": sorted(present),
+                    "readable_tables": sorted(readable),
+                    "schema_version": schema_version,
+                    "page_count": page_count,
+                    "journal_mode": journal_mode,
+                }
         timechain_ok = True
         timechain_report = "disabled"
         if self.timechain_recorder is not None:
@@ -15681,7 +15720,8 @@ class RobinhoodLearningEngine:
             "ledger": ledger_report,
             "event_ledger_ok": ledger_ok,
             "sqlite_integrity": sqlite_ok if full else None,
-            "sqlite_quick_integrity": sqlite_ok if not full else None,
+            "sqlite_operational_health": sqlite_ok if not full else None,
+            "sqlite_report": sqlite_report,
             "verification_level": "full" if full else "operational",
             "producer_timechain": timechain_report,
             "producer_timechain_ok": timechain_ok,
@@ -16165,7 +16205,7 @@ def _dashboard_integrity(
     full_fresh = bool(
         full_age is not None and 0 <= full_age <= FULL_INTEGRITY_MAX_AGE_SECONDS)
     result = {
-        "sqlite": False, "sqlite_quick": False, "sqlite_full": False,
+        "sqlite": False, "sqlite_operational": False, "sqlite_full": False,
         "event_ledger": False, "producer_timechain": False,
         "checked_at": certificate.get("checked_at"),
         "age_seconds": round(age, 1) if age is not None else None,
@@ -16178,8 +16218,8 @@ def _dashboard_integrity(
         "full_fresh": full_fresh,
     }
     if certificate:
-        result["sqlite_quick"] = bool(
-            certificate.get("sqlite_quick_integrity"))
+        result["sqlite_operational"] = bool(
+            certificate.get("sqlite_operational_health"))
         result["event_ledger"] = bool(certificate.get("event_ledger_ok"))
         result["producer_timechain"] = bool(
             certificate.get("producer_timechain_ok"))
@@ -16191,7 +16231,7 @@ def _dashboard_integrity(
     result["sqlite_full"] = bool(
         full_certificate.get("sqlite_integrity"))
     result["sqlite"] = bool(
-        fresh and full_fresh and result["sqlite_quick"]
+        fresh and full_fresh and result["sqlite_operational"]
         and result["sqlite_full"])
     result["ok"] = bool(
         fresh and result["sqlite"] and result["event_ledger"]
