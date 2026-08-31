@@ -165,7 +165,7 @@ BACKFILL_LANE_BUDGET_SECONDS = 120.0
 # bounds on this 5.5 GB, low-memory corpus, so exhaustive proof has a distinct
 # weekly offline task and certificate. Neither may run in the 285-second live
 # supervisor, and operational health is never labelled full.
-VERIFICATION_LANE_BUDGET_SECONDS = 45 * 60.0
+VERIFICATION_LANE_BUDGET_SECONDS = 75 * 60.0
 FULL_VERIFICATION_LANE_BUDGET_SECONDS = 3 * 60 * 60.0
 BACKFILL_LANE_IDENTITY_LIMIT = 25
 BACKFILL_V4_ACTIVATION_LIMIT = 25
