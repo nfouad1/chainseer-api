@@ -9879,6 +9879,43 @@ class ControlledDeferralClassificationTests(unittest.TestCase):
         self.assertLessEqual(rh.LIVE_DEFERRAL_RATE_MAX, 0.5)
 
 
+class BackfillConvergenceAttributionTests(unittest.TestCase):
+    def test_red_net_trend_still_reports_productive_recovery_and_arrivals(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            with store.connection() as connection:
+                for index, pending in enumerate((1_000, 1_100, 1_200)):
+                    summary = {
+                        "backlog": {"pending_blocks": pending},
+                        "durable_gap_recovery": {
+                            "blocks_scanned": 500,
+                            "provider_deferred": False,
+                        },
+                    }
+                    connection.execute(
+                        "INSERT INTO runs(started_at,status,run_id,lane,"
+                        " summary_json,heartbeat_at,deadline_seconds)"
+                        " VALUES (?,'complete',?,'backfill',?,?,120)",
+                        (rh._utc_now(), f"b{index}", json.dumps(summary),
+                         time.time()),
+                    )
+            item = store.stabilization_summary(
+                sample_target=3)["criteria"]["backfill_convergence"]
+            self.assertFalse(item["pass"])
+            self.assertEqual(item["value"]["net_change_blocks"], 200)
+            self.assertEqual(item["value"]["gross_recovered_blocks"], 1_000)
+            self.assertEqual(item["value"]["inferred_arrival_blocks"], 1_200)
+            self.assertEqual(item["value"]["productive_runs"], 2)
+            self.assertAlmostEqual(
+                item["value"]["recovery_to_arrival_ratio"], 0.8333)
+
+    def test_historical_dashboard_refresh_is_not_an_operational_poll(self):
+        self.assertGreaterEqual(
+            rh.DASHBOARD_SNAPSHOT_REFRESH_SECONDS,
+            rh.DASHBOARD_HISTORICAL_STALE_SECONDS,
+        )
+
+
 class WorktreeSourceDigestTests(unittest.TestCase):
     """A revision pin cannot see uncommitted edits.
 
@@ -10397,6 +10434,86 @@ class DecisionLagPopulationTests(unittest.TestCase):
 
 
 class ProductionHardeningTests(unittest.TestCase):
+    def test_near_head_pending_hash_filter_is_keyed_and_honors_exhaustion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            resolved = "0x" + "01" * 32
+            exhausted = "0x" + "02" * 32
+            retryable = "0x" + "03" * 32
+            missing = "0x" + "04" * 32
+            with store.connection() as connection:
+                connection.executemany(
+                    "INSERT INTO transaction_origins (transaction_hash,status,"
+                    " attempts,last_attempt_at) VALUES (?,?,?,?)",
+                    [
+                        (resolved, "resolved", 1, 1.0),
+                        (exhausted, "unavailable",
+                         rh.FLOW_ORIGIN_MAXIMUM_ATTEMPTS, 1.0),
+                        (retryable, "unavailable", 1, 1.0),
+                    ],
+                )
+                plan = " ".join(str(row[3]) for row in connection.execute(
+                    "EXPLAIN QUERY PLAN SELECT transaction_hash,status,attempts"
+                    " FROM transaction_origins WHERE transaction_hash IN"
+                    " (?,?,?,?)",
+                    (resolved, exhausted, retryable, missing),
+                )).lower()
+            self.assertIn("transaction_hash", plan)
+            self.assertNotIn("origin_status", plan)
+            self.assertEqual(
+                store.unresolved_transaction_hashes(
+                    [resolved, exhausted, retryable, missing]),
+                [retryable, missing],
+            )
+
+    def test_multi_pool_flow_refresh_receives_preloaded_batch_evidence(self):
+        """The live writer must not fall back to three SELECTs per pool."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            pools = ["0x" + "a1" * 32, "0x" + "b2" * 32]
+            tokens = ["0x" + "11" * 20, "0x" + "22" * 20]
+            events = []
+            for index, (pool, token) in enumerate(zip(pools, tokens)):
+                events.extend([{
+                    "kind": "initialize", "pool_id": pool,
+                    "currency0": token,
+                    "currency1": rh.USDG_ADDRESS.lower(),
+                    "token_address": token,
+                    "anchor_address": rh.USDG_ADDRESS.lower(),
+                    "fee_tier": 3000, "tick_spacing": 60,
+                    "hooks_address": rh.ZERO_ADDRESS,
+                    "block_number": 100 + index,
+                    "sqrt_price_x96": 1 << 96, "tick": 0,
+                }, {
+                    "kind": "swap", "pool_id": pool,
+                    "block_number": 110 + index,
+                    "transaction_hash": "0x" + f"{index + 1:064x}",
+                    "log_index": index, "sender_hint": tokens[index],
+                    "amount0_raw": -100, "amount1_raw": 10,
+                    "sqrt_price_x96": 1 << 96,
+                    "active_liquidity": 10**18, "tick": 0,
+                    "block_timestamp": None,
+                }])
+            original = store._refresh_v4_flow_signal
+            calls = []
+
+            def inspect(connection, pool_id, **kwargs):
+                calls.append((pool_id, kwargs))
+                return original(connection, pool_id, **kwargs)
+
+            with patch.object(store, "_refresh_v4_flow_signal", inspect):
+                store.apply_v4_events(events)
+            self.assertEqual({pool for pool, _ in calls}, set(pools))
+            self.assertTrue(all(
+                call["preloaded_pool"] is not None
+                and call["preloaded_latest"] is not None
+                and call["preloaded_rows"] is not None
+                for _, call in calls
+            ))
+            with store.connection() as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT COUNT(*) FROM flow_signals").fetchone()[0], 2)
+
     def test_evidence_lane_quotes_and_reclassifies_without_mutating_observation(self):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")

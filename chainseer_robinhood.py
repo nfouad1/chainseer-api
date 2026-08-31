@@ -114,7 +114,12 @@ DEFAULT_DASHBOARD_PORT = 8769
 # The dashboard has two deliberately independent freshness domains. Operational
 # state must stay useful while historical range joins are still running.
 DASHBOARD_OPERATIONAL_REFRESH_SECONDS = 5.0
-DASHBOARD_SNAPSHOT_REFRESH_SECONDS = 30.0
+# Historical aggregation scans millions of swap-origin rows.  Refreshing it
+# every 30 seconds meant the dashboard spent almost its entire lifetime in a
+# new full-corpus read, competing with the latency-critical live writer for
+# CPU and disk.  Historical research does not need operational cadence; the
+# independently cached operational payload still refreshes every five seconds.
+DASHBOARD_SNAPSHOT_REFRESH_SECONDS = 15 * 60.0
 DASHBOARD_OPERATIONAL_STALE_SECONDS = 20.0
 DASHBOARD_HISTORICAL_STALE_SECONDS = 15 * 60.0
 # The full 5.5 GB check is deliberately daily, not per learner cycle.  A
@@ -3583,6 +3588,18 @@ class RobinhoodLearningStore:
         """The write itself. Wrapped by apply_v4_events for lock retry."""
         with self.connection(busy_timeout_ms=busy_timeout_ms) as connection:
             affected_flow_pools = set()
+            event_pool_ids = sorted({
+                str(event.get("pool_id") or "") for event in events
+                if event.get("pool_id")
+            })
+            pool_cache: dict[str, sqlite3.Row | dict] = {}
+            if event_pool_ids:
+                placeholders = ",".join("?" for _ in event_pool_ids)
+                pool_cache = {
+                    row["pool_id"]: row for row in connection.execute(
+                        f"SELECT * FROM v4_pools WHERE pool_id IN "
+                        f"({placeholders})", event_pool_ids)
+                }
             for event in events:
                 kind = event["kind"]
                 if kind == "initialize":
@@ -3602,6 +3619,15 @@ class RobinhoodLearningStore:
                          event["tick_spacing"],event["hooks_address"],event["block_number"],
                          str(event["sqrt_price_x96"]),event["tick"],_utc_now()),
                     )
+                    # A mixed discovery batch may initialize and swap the
+                    # same pool.  Keep immutable identity fields available
+                    # without issuing one SELECT for every following swap.
+                    pool_cache[event["pool_id"]] = {
+                        "pool_id": event["pool_id"],
+                        "token_address": event["token_address"],
+                        "currency0": event["currency0"],
+                        "currency1": event["currency1"],
+                    }
                 elif kind == "modify":
                     connection.execute(
                         "UPDATE v4_pools SET modified_block=COALESCE(modified_block,?),updated_at=? WHERE pool_id=?",
@@ -3619,10 +3645,14 @@ class RobinhoodLearningStore:
                          event["log_index"],str(event["sqrt_price_x96"]),
                          str(event["active_liquidity"]),event["tick"],_utc_now(),event["pool_id"]),
                     )
-                    pool = connection.execute(
-                        "SELECT * FROM v4_pools WHERE pool_id=?",
-                        (event["pool_id"],),
-                    ).fetchone()
+                    pool = pool_cache.get(event["pool_id"])
+                    if pool is None:
+                        pool = connection.execute(
+                            "SELECT * FROM v4_pools WHERE pool_id=?",
+                            (event["pool_id"],),
+                        ).fetchone()
+                        if pool is not None:
+                            pool_cache[event["pool_id"]] = pool
                     if not pool:
                         continue
                     amount0 = int(event.get("amount0_raw") or 0)
@@ -3655,34 +3685,110 @@ class RobinhoodLearningStore:
                         ),
                     )
                     affected_flow_pools.add(event["pool_id"])
-            for pool_id in affected_flow_pools:
-                self._refresh_v4_flow_signal(connection, pool_id)
+            self._refresh_v4_flow_signals(connection, affected_flow_pools)
 
     @staticmethod
     def _bounded_fraction(value: float) -> float:
         return max(0.0, min(1.0, value))
 
-    def _refresh_v4_flow_signal(
-        self, connection: sqlite3.Connection, pool_id: str,
+    def _refresh_v4_flow_signals(
+        self, connection: sqlite3.Connection, pool_ids,
     ) -> None:
-        pool = connection.execute(
-            "SELECT * FROM v4_pools WHERE pool_id=?", (pool_id,)
-        ).fetchone()
-        latest = connection.execute(
-            "SELECT MAX(block_number) FROM swap_observations WHERE pool_id=?",
-            (pool_id,),
-        ).fetchone()[0]
+        """Refresh a touched pool set with three reads, not three per pool.
+
+        The live pass normally touches 20-30 pools.  The old loop performed a
+        pool lookup, MAX lookup and range read for each pool while holding the
+        writer transaction; production measured 5-7 seconds in this phase and
+        26 ``near_head_commit`` deferrals in 90 attempts.  The same indexed
+        evidence is loaded in batches here, then the existing projection code
+        is reused unchanged for every pool.
+        """
+        identifiers = sorted({str(value) for value in pool_ids if value})
+        if not identifiers:
+            return
+        placeholders = ",".join("?" for _ in identifiers)
+        pools = {
+            row["pool_id"]: row for row in connection.execute(
+                f"SELECT * FROM v4_pools WHERE pool_id IN ({placeholders})",
+                identifiers,
+            )
+        }
+        latest_by_pool = {
+            row["pool_id"]: int(row["latest_block"])
+            for row in connection.execute(
+                f"SELECT pool_id,MAX(block_number) latest_block "
+                f"FROM swap_observations WHERE pool_id IN ({placeholders}) "
+                "GROUP BY pool_id",
+                identifiers,
+            )
+            if row["latest_block"] is not None
+        }
+        starts = {
+            pool_id: max(
+                int(pools[pool_id]["swapped_block"] or latest),
+                int(latest) - FLOW_WINDOW_BLOCKS + 1,
+            )
+            for pool_id, latest in latest_by_pool.items()
+            if pool_id in pools
+        }
+        rows_by_pool: dict[str, list[sqlite3.Row]] = {
+            pool_id: [] for pool_id in starts
+        }
+        if starts:
+            minimum_start = min(starts.values())
+            for row in connection.execute(
+                f"SELECT * FROM swap_observations "
+                f"WHERE pool_id IN ({placeholders}) AND block_number>=? "
+                "ORDER BY pool_id,block_number,log_index",
+                (*identifiers, minimum_start),
+            ):
+                pool_id = row["pool_id"]
+                if (
+                    pool_id in starts
+                    and starts[pool_id] <= int(row["block_number"])
+                    <= latest_by_pool[pool_id]
+                ):
+                    rows_by_pool[pool_id].append(row)
+        for pool_id in identifiers:
+            if pool_id not in pools or pool_id not in latest_by_pool:
+                continue
+            self._refresh_v4_flow_signal(
+                connection, pool_id,
+                preloaded_pool=pools[pool_id],
+                preloaded_latest=latest_by_pool[pool_id],
+                preloaded_rows=rows_by_pool.get(pool_id, []),
+            )
+
+    def _refresh_v4_flow_signal(
+        self, connection: sqlite3.Connection, pool_id: str, *,
+        preloaded_pool: sqlite3.Row | dict | None = None,
+        preloaded_latest: int | None = None,
+        preloaded_rows: list[sqlite3.Row] | None = None,
+    ) -> None:
+        pool = preloaded_pool
+        if pool is None:
+            pool = connection.execute(
+                "SELECT * FROM v4_pools WHERE pool_id=?", (pool_id,)
+            ).fetchone()
+        latest = preloaded_latest
+        if latest is None:
+            latest = connection.execute(
+                "SELECT MAX(block_number) FROM swap_observations WHERE pool_id=?",
+                (pool_id,),
+            ).fetchone()[0]
         if not pool or latest is None:
             return
         start = max(int(pool["swapped_block"] or latest), int(latest) - FLOW_WINDOW_BLOCKS + 1)
-        rows = connection.execute(
-            """
-            SELECT * FROM swap_observations
-            WHERE pool_id=? AND block_number>=? AND block_number<=?
-            ORDER BY block_number,log_index
-            """,
-            (pool_id, start, latest),
-        ).fetchall()
+        rows = preloaded_rows
+        if rows is None:
+            rows = connection.execute(
+                """
+                SELECT * FROM swap_observations
+                WHERE pool_id=? AND block_number>=? AND block_number<=?
+                ORDER BY block_number,log_index
+                """,
+                (pool_id, start, latest),
+            ).fetchall()
         buys = [row for row in rows if row["side"] == "buy"]
         sells = [row for row in rows if row["side"] == "sell"]
         directional = len(buys) + len(sells)
@@ -3970,7 +4076,7 @@ class RobinhoodLearningStore:
             )
             return cursor.rowcount or 0
 
-    def flow_summary(self) -> dict:
+    def flow_summary(self, pending: dict | None = None) -> dict:
         with self.connection() as connection:
             row = connection.execute(
                 """
@@ -3991,27 +4097,21 @@ class RobinhoodLearningStore:
             resolved = connection.execute(
                 "SELECT COUNT(*) FROM swap_observations WHERE resolved_participant IS NOT NULL"
             ).fetchone()[0]
-            active = connection.execute(
-                """
-                SELECT COUNT(*) raw,
-                       COALESCE(SUM(CASE WHEN so.resolved_participant IS NOT NULL
-                                         THEN 1 ELSE 0 END),0) resolved
-                FROM swap_observations so
-                JOIN flow_signals fs ON fs.pool_id=so.pool_id
-                WHERE so.block_number BETWEEN fs.window_start_block
-                                          AND fs.window_end_block
-                """
-            ).fetchone()
-            pending = self.pending_transaction_origin_counts()
+            # pending_transaction_origin_counts already walks the current
+            # pool windows. Repeating the same multi-million-row range join
+            # here doubled dashboard I/O while adding no evidence.
+            pending = pending or self.pending_transaction_origin_counts()
         return {
             "raw_swaps": raw, "pools": row["pools"] or 0,
             "identity_resolved_swaps": resolved,
             "identity_coverage": resolved / raw if raw else 0.0,
             "active_identity_coverage": (
-                active["resolved"] / active["raw"] if active["raw"] else 0.0
+                pending["active_resolved_swaps"] / pending["active_swaps"]
+                if pending["active_swaps"] else 0.0
             ),
-            "active_identity_resolved_swaps": int(active["resolved"] or 0),
-            "active_identity_swaps": int(active["raw"] or 0),
+            "active_identity_resolved_swaps": int(
+                pending["active_resolved_swaps"] or 0),
+            "active_identity_swaps": int(pending["active_swaps"] or 0),
             "identity_pending_active": pending["active"],
             "identity_pending_historical": pending["historical"],
             "window_swaps": row["window_swaps"] or 0,
@@ -5619,32 +5719,85 @@ class RobinhoodLearningStore:
         }
 
     def pending_transaction_origin_counts(self) -> dict:
+        """Count origin debt without the unbounded window cross-product.
+
+        ``flow_signals`` is one row per pool.  Driving the active-window join
+        from that small table lets ``idx_swap_observation_pool_block`` seek
+        directly into each window.  The former query drove from every swap
+        and tested it against a BETWEEN join; the dashboard then ran it twice
+        per refresh.  On the production corpus the replacement was bounded by
+        the current windows instead of millions-of-swaps times all windows.
+        """
         with self.connection() as connection:
-            row = connection.execute(
+            distinct_hashes = int(connection.execute(
+                """SELECT COUNT(DISTINCT transaction_hash)
+                   FROM swap_observations WHERE transaction_hash<>''"""
+            ).fetchone()[0] or 0)
+            origin_status = connection.execute(
                 """
-                WITH pending AS (
-                    SELECT so.transaction_hash,
-                           MAX(CASE WHEN fs.pool_id IS NOT NULL
-                                    AND so.block_number BETWEEN
-                                        fs.window_start_block AND fs.window_end_block
-                               THEN 1 ELSE 0 END) active_window
-                    FROM swap_observations so
-                    LEFT JOIN flow_signals fs ON fs.pool_id=so.pool_id
-                    LEFT JOIN transaction_origins tx USING(transaction_hash)
-                    WHERE so.transaction_hash<>''
-                      AND (tx.transaction_hash IS NULL OR (
-                          tx.status<>'resolved' AND tx.attempts<?
-                      ))
-                    GROUP BY so.transaction_hash
-                )
-                SELECT COUNT(*) total,
-                       COALESCE(SUM(active_window),0) active,
-                       COALESCE(SUM(1-active_window),0) historical
-                FROM pending
+                SELECT COALESCE(SUM(status='resolved'),0) resolved,
+                       COALESCE(SUM(status<>'resolved' AND attempts>=?),0)
+                           exhausted
+                FROM transaction_origins
                 """,
                 (FLOW_ORIGIN_MAXIMUM_ATTEMPTS,),
             ).fetchone()
-        return {key: int(row[key] or 0) for key in ("total", "active", "historical")}
+            active = connection.execute(
+                """
+                SELECT COUNT(*) active_swaps,
+                       COALESCE(SUM(so.resolved_participant IS NOT NULL),0)
+                           active_resolved_swaps,
+                       COUNT(DISTINCT CASE WHEN so.transaction_hash<>''
+                                           THEN so.transaction_hash END)
+                           active_hashes,
+                       COUNT(DISTINCT CASE
+                           WHEN so.transaction_hash<>''
+                            AND so.resolved_participant IS NOT NULL
+                           THEN so.transaction_hash END) active_resolved_hashes
+                FROM flow_signals fs
+                CROSS JOIN swap_observations so
+                    INDEXED BY idx_swap_observation_pool_block
+                WHERE so.pool_id=fs.pool_id
+                  AND so.block_number BETWEEN fs.window_start_block
+                                          AND fs.window_end_block
+                """
+            ).fetchone()
+            # Exhausted/unavailable origins are intentionally not pending.
+            # They are normally empty, but count the active subset exactly
+            # when present instead of silently assuming success forever.
+            exhausted_hashes = [row[0] for row in connection.execute(
+                """SELECT transaction_hash FROM transaction_origins
+                   WHERE status<>'resolved' AND attempts>=?""",
+                (FLOW_ORIGIN_MAXIMUM_ATTEMPTS,),
+            )]
+            active_exhausted = 0
+            for digest in exhausted_hashes:
+                active_exhausted += int(bool(connection.execute(
+                    """
+                    SELECT 1 FROM swap_observations so
+                    JOIN flow_signals fs ON fs.pool_id=so.pool_id
+                    WHERE so.transaction_hash=?
+                      AND so.block_number BETWEEN fs.window_start_block
+                                              AND fs.window_end_block
+                    LIMIT 1
+                    """,
+                    (digest,),
+                ).fetchone()))
+        total = max(
+            0, distinct_hashes - int(origin_status["resolved"] or 0)
+            - int(origin_status["exhausted"] or 0))
+        active_pending = max(
+            0, int(active["active_hashes"] or 0)
+            - int(active["active_resolved_hashes"] or 0)
+            - active_exhausted)
+        return {
+            "total": total,
+            "active": active_pending,
+            "historical": max(0, total - active_pending),
+            "active_swaps": int(active["active_swaps"] or 0),
+            "active_resolved_swaps": int(
+                active["active_resolved_swaps"] or 0),
+        }
 
     def enqueue_backfill(self, from_block: int, to_block: int, reason: str) -> bool:
         """Record a range the live lane skipped, so it is deferred not lost."""
@@ -6782,6 +6935,27 @@ class RobinhoodLearningStore:
 
             backfill_values = backlog_series("backfill", "pending_blocks")
             analysis_values = backlog_series("analysis", "pending_analysis")
+            backfill_summary_filters = ["lane='backfill'", "status='complete'"]
+            backfill_summary_parameters: list[object] = []
+            if cohort_id:
+                backfill_summary_filters.extend([
+                    "acceptance_cohort_id=?", "revision=?"])
+                backfill_summary_parameters.extend([
+                    cohort_id, cohort_revision])
+            backfill_summary_parameters.append(10)
+            backfill_summary_rows = connection.execute(
+                "SELECT summary_json FROM runs WHERE "
+                + " AND ".join(backfill_summary_filters)
+                + " ORDER BY id DESC LIMIT ?",
+                backfill_summary_parameters,
+            ).fetchall()
+            backfill_summaries: list[dict] = []
+            for item in reversed(backfill_summary_rows):
+                try:
+                    backfill_summaries.append(json.loads(
+                        item["summary_json"] or "{}"))
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    backfill_summaries.append({})
 
         lags: list[float] = []
         # Reported beside the rate: an exclusion nobody can see is
@@ -6967,6 +7141,42 @@ class RobinhoodLearningStore:
             stall_population >= SEAL_STALL_GUARD_MIN_SAMPLES
             and not stall_guard_active)
         backfill_trend = trend(backfill_values)
+        # Net queue depth is the acceptance invariant, but it did not explain
+        # whether a red result meant a dead worker or incoming gaps outrunning
+        # useful recovery.  Decompose the SAME oldest->current interval into
+        # gross recovered blocks and inferred arrivals.  Exclude the first
+        # summary's recovery because ``oldest`` is its post-run backlog.
+        interval_backfill = backfill_summaries[1:]
+        recovered_blocks = sum(safe_int(
+            (summary.get("durable_gap_recovery") or {}).get(
+                "blocks_scanned"), 0)
+            for summary in interval_backfill)
+        productive_runs = sum(
+            safe_int((summary.get("durable_gap_recovery") or {}).get(
+                "blocks_scanned"), 0) > 0
+            for summary in interval_backfill)
+        provider_deferrals = sum(bool(
+            (summary.get("durable_gap_recovery") or {}).get(
+                "provider_deferred"))
+            for summary in interval_backfill)
+        net_backlog_change = (
+            backfill_trend["current"] - backfill_trend["oldest"]
+            if backfill_trend["current"] is not None
+            and backfill_trend["oldest"] is not None else None)
+        inferred_arrivals = (
+            max(0, net_backlog_change + recovered_blocks)
+            if net_backlog_change is not None else None)
+        backfill_trend.update({
+            "net_change_blocks": net_backlog_change,
+            "gross_recovered_blocks": recovered_blocks,
+            "inferred_arrival_blocks": inferred_arrivals,
+            "productive_runs": productive_runs,
+            "provider_deferrals": provider_deferrals,
+            "recovery_to_arrival_ratio": (
+                round(recovered_blocks / inferred_arrivals, 4)
+                if inferred_arrivals else (
+                    None if inferred_arrivals is None else 1.0)),
+        })
         analysis_trend = trend(analysis_values)
         integrity = dict(integrity or {})
         integrity_pass = bool(integrity.get("ok"))
@@ -7060,7 +7270,8 @@ class RobinhoodLearningStore:
             },
             "backfill_convergence": {
                 "pass": backfill_trend["decreasing"], "value": backfill_trend,
-                "target": "decreasing", "label": "Backfill backlog",
+                "target": "net decreasing (gross recovery shown separately)",
+                "label": "Backfill convergence",
             },
             "analysis_convergence": {
                 "pass": analysis_trend["decreasing"], "value": analysis_trend,
@@ -7187,13 +7398,29 @@ class RobinhoodLearningStore:
             return []
         placeholders = ",".join("?" * len(wanted))
         with self.connection() as connection:
-            resolved = {row[0] for row in connection.execute(
-                "SELECT transaction_hash FROM transaction_origins"
-                " WHERE status='resolved' AND transaction_hash IN"
-                " (" + placeholders + ")",
-                wanted,
-            )}
-        return [h for h in wanted if h not in resolved]
+            # Do not predicate on status here.  SQLite selected
+            # idx_transaction_origin_status and scanned every resolved origin
+            # before applying a 12-hash IN list: 7.7s inside a 9.2s freshness
+            # budget.  Starting from the PRIMARY KEY turns this into exactly
+            # N point lookups.  Status and attempts are then interpreted from
+            # that bounded result set in Python.
+            known = {
+                row["transaction_hash"]: row
+                for row in connection.execute(
+                    "SELECT transaction_hash,status,attempts"
+                    " FROM transaction_origins"
+                    " WHERE transaction_hash IN (" + placeholders + ")",
+                    wanted,
+                )
+            }
+        return [
+            digest for digest in wanted
+            if digest not in known or (
+                known[digest]["status"] != "resolved"
+                and safe_int(known[digest]["attempts"], 0)
+                    < FLOW_ORIGIN_MAXIMUM_ATTEMPTS
+            )
+        ]
 
     def record_transaction_origins(self, records: list[dict]) -> dict:
         resolved = unavailable = 0
@@ -16672,8 +16899,12 @@ def dashboard_historical_snapshot(
     """Build research aggregates that are allowed to finish asynchronously."""
     root = Path(root)
     store = store or RobinhoodLearningStore(root / "learning.sqlite3")
+    # This is the only full origin census in a historical refresh.  The old
+    # payload called it once here and again inside flow_summary, turning one
+    # expensive research query into permanent disk pressure on the live lane.
+    flow_origin_queue = store.pending_transaction_origin_counts()
     return {
-        "flow_shadow": store.flow_summary(),
+        "flow_shadow": store.flow_summary(pending=flow_origin_queue),
         "flow_signals": store.recent_flow_signals(limit=12),
         "flow_evidence": store.flow_evidence_summary(),
         # Friction is the largest component of every return recorded here.
@@ -16683,7 +16914,7 @@ def dashboard_historical_snapshot(
         # Distinct from discovery_coverage, which is the BACKFILL cursor.
         "pool_discovery": store.pool_discovery_latency(),
         "flow_evidence_events": store.recent_flow_evidence_events(limit=16),
-        "flow_origin_queue": store.pending_transaction_origin_counts(),
+        "flow_origin_queue": flow_origin_queue,
     }
 
 
