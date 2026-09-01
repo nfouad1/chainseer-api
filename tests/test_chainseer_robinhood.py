@@ -7200,7 +7200,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v7")
+                "robinhood-operational-v8")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7211,9 +7211,13 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(
                 cohort["policy"]["backfill_maximum_chunks_per_cycle"], 2)
             self.assertEqual(
-                cohort["policy"]["background_rpc_priority_gate_version"], 1)
+                cohort["policy"]["background_rpc_priority_gate_version"], 2)
             self.assertTrue(
                 cohort["policy"]["background_rpc_serialized"])
+            self.assertEqual(
+                cohort["policy"][
+                    "background_rpc_minimum_interval_seconds"],
+                rh.BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS)
             self.assertEqual(
                 cohort["policy"]["backfill_remote_attempts_per_chunk"], 1)
             self.assertEqual(
@@ -8019,6 +8023,8 @@ class LaneSplitTests(unittest.TestCase):
 
             with patch.dict(
                 os.environ, {"CHAINSEER_RPC_PRIORITY_REQUIRED": "1"}
+            ), patch.object(
+                rh, "BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS", 0.01
             ):
                 workers = [
                     threading.Thread(target=request, args=(engine,))
@@ -8030,6 +8036,42 @@ class LaneSplitTests(unittest.TestCase):
                     worker.join(timeout=3.0)
             self.assertTrue(all(not worker.is_alive() for worker in workers))
             self.assertEqual(maximum_active, 1)
+
+    def test_background_rpc_gate_paces_completed_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine._active_lane = "evidence"
+            engine._active_lane_deadline = rh.CycleDeadline(8.0)
+            now = time.monotonic()
+            rh.atomic_json_write(
+                Path(directory) / rh.BACKGROUND_RPC_PRIORITY_STATE_FILE,
+                {
+                    "published_monotonic": now,
+                    "next_live_monotonic": now + 20.0,
+                    "live_active": False,
+                },
+            )
+            with patch.dict(
+                os.environ, {"CHAINSEER_RPC_PRIORITY_REQUIRED": "1"}
+            ), patch.object(
+                rh, "BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS", 0.05
+            ):
+                with engine._rpc_request_guard():
+                    pass
+                first_completed = time.monotonic()
+                with engine._rpc_request_guard():
+                    second_started = time.monotonic()
+
+            self.assertGreaterEqual(
+                second_started - first_completed, 0.04)
+            self.assertGreater(
+                engine._rpc_priority_telemetry["rate_wait_seconds"], 0.0)
+            rate_state = rh.read_json(
+                Path(directory) / rh.BACKGROUND_RPC_RATE_STATE_FILE, {})
+            self.assertEqual(rate_state["lane"], "evidence")
+            self.assertFalse(rate_state["request_failed"])
 
     def test_rpc_priority_exhaustion_is_a_controlled_lane_deferral(self):
         with tempfile.TemporaryDirectory() as directory:

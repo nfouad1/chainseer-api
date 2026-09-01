@@ -405,7 +405,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v7"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v8"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -784,13 +784,22 @@ BACKFILL_LANE_CADENCE_SECONDS = 60.0
 LIVE_LANE_LAUNCH_GUARD_SECONDS = 8.0
 # Raw JSON-RPC requests from background lanes are serialized and admitted
 # only when the supervisor reports a safe window before the next live pass.
-# The socket timeout ends this far before the live reservation, so an in-flight
-# historical request cannot consume the decision-head provider slot.
-BACKGROUND_RPC_LIVE_GUARD_SECONDS = 2.0
+# The socket timeout ends this far before the live reservation, so both the
+# in-flight request and the provider's rolling rate bucket can drain before a
+# decision-head call.  A two-second guard serialized requests but still let
+# two live attempts receive HTTP 429 after back-to-back evidence workers.
+BACKGROUND_RPC_LIVE_GUARD_SECONDS = 8.0
 BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS = 5.0
+# Serialization is not rate limiting. Production measured 83 evidence
+# requests admitted in a 90-second lane, bunched into the short windows
+# between live passes; live then received two consecutive 429s. Pace all
+# background lanes through one shared completion-to-start interval while live
+# remains unpaced and preemptive.
+BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS = 1.0
 BACKGROUND_RPC_PRIORITY_POLL_SECONDS = 0.1
 BACKGROUND_RPC_PRIORITY_MAX_STATE_AGE_SECONDS = 3.0
 BACKGROUND_RPC_PRIORITY_STATE_FILE = "rpc_priority_state.json"
+BACKGROUND_RPC_RATE_STATE_FILE = "rpc_request_rate_state.json"
 BACKGROUND_RPC_SERIALIZED_LANES = frozenset({
     "analysis", "backfill", "evidence", "marks",
 })
@@ -1430,12 +1439,14 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             LIVE_LANE_ENRICHMENT_BUDGET_SECONDS),
         "backfill_lane_cadence_seconds": BACKFILL_LANE_CADENCE_SECONDS,
         "scheduled_backfill_block_limit": BACKFILL_GAP_CHUNK_BLOCKS,
-        "background_rpc_priority_gate_version": 1,
+        "background_rpc_priority_gate_version": 2,
         "background_rpc_serialized": True,
         "background_rpc_live_guard_seconds":
             BACKGROUND_RPC_LIVE_GUARD_SECONDS,
         "background_rpc_minimum_window_seconds":
             BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS,
+        "background_rpc_minimum_interval_seconds":
+            BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS,
         "live_all_attempt_p95_target_seconds": 30.0,
         "decision_lag_maximum_blocks":
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
@@ -11146,7 +11157,8 @@ class RobinhoodLearningEngine:
         self._rpc_gate_deadline: CycleDeadline | None = None
         self._rpc_priority_telemetry = {
             "admissions": 0, "deferrals": 0,
-            "wait_seconds": 0.0, "last_reason": None,
+            "wait_seconds": 0.0, "rate_wait_seconds": 0.0,
+            "last_reason": None,
         }
         # RobinhoodRPC invokes this context at the raw HTTP boundary for
         # _call AND _batch_call. Test doubles without a session deliberately
@@ -11623,6 +11635,7 @@ class RobinhoodLearningEngine:
 
         last_reason = "priority_state_unavailable"
         while deadline.remaining() > 0.1:
+            rate_sleep_seconds = 0.0
             state = read_json(
                 self.root / BACKGROUND_RPC_PRIORITY_STATE_FILE, {}) or {}
             window = _background_rpc_priority_window(state)
@@ -11651,7 +11664,28 @@ class RobinhoodLearningEngine:
                         deadline.remaining(),
                         safe_float(window.get("available_seconds"), 0.0),
                     )
-                    if window["admitted"] and maximum >= (
+                    rate_state = read_json(
+                        self.root / BACKGROUND_RPC_RATE_STATE_FILE, {}) or {}
+                    last_completed = safe_float(
+                        rate_state.get(
+                            "last_background_completed_monotonic"), 0.0)
+                    since_completed = (
+                        time.monotonic() - last_completed
+                        if last_completed > 0 else None)
+                    if since_completed is not None and since_completed < 0:
+                        # monotonic clocks reset across a machine reboot;
+                        # a persisted pre-reboot stamp must not defer forever.
+                        since_completed = None
+                    rate_sleep_seconds = max(
+                        0.0,
+                        BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS - (
+                            since_completed
+                            if since_completed is not None
+                            else BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS),
+                    )
+                    if rate_sleep_seconds > 0:
+                        last_reason = "background_rate_paced"
+                    elif window["admitted"] and maximum >= (
                             BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS):
                         waited = time.monotonic() - wait_started
                         self._rpc_priority_telemetry["admissions"] += 1
@@ -11659,10 +11693,38 @@ class RobinhoodLearningEngine:
                             "wait_seconds"] += waited
                         self._rpc_priority_telemetry["last_reason"] = (
                             "safe_background_window")
-                        yield maximum
+                        request_failed = True
+                        try:
+                            yield maximum
+                            request_failed = False
+                        finally:
+                            atomic_json_write(
+                                self.root / BACKGROUND_RPC_RATE_STATE_FILE,
+                                {
+                                    "schema_version": 1,
+                                    "last_background_completed_monotonic":
+                                        time.monotonic(),
+                                    "last_background_completed_at":
+                                        time.time(),
+                                    "lane": lane,
+                                    "request_failed": request_failed,
+                                    "minimum_interval_seconds":
+                                        BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS,
+                                },
+                            )
                         return
                 finally:
                     request_lock.__exit__(None, None, None)
+            if rate_sleep_seconds > 0:
+                sleep_for = min(
+                    rate_sleep_seconds,
+                    BACKGROUND_RPC_PRIORITY_POLL_SECONDS,
+                    max(0.0, deadline.remaining()),
+                )
+                self._rpc_priority_telemetry[
+                    "rate_wait_seconds"] += sleep_for
+                time.sleep(sleep_for)
+                continue
             time.sleep(min(
                 BACKGROUND_RPC_PRIORITY_POLL_SECONDS,
                 max(0.0, deadline.remaining())))
@@ -14597,7 +14659,8 @@ class RobinhoodLearningEngine:
         self._rpc_gate_deadline = None
         self._rpc_priority_telemetry = {
             "admissions": 0, "deferrals": 0,
-            "wait_seconds": 0.0, "last_reason": None,
+            "wait_seconds": 0.0, "rate_wait_seconds": 0.0,
+            "last_reason": None,
         }
         stop_heartbeat = threading.Event()
         with LearningRunLock(self.root / f".{lane}_once.lock"):
@@ -16822,7 +16885,7 @@ def supervise_lanes(
 
     def publish(status: str = "running") -> None:
         rpc_priority = {
-            "schema_version": 1,
+            "schema_version": 2,
             "status": status,
             "published_monotonic": time.monotonic(),
             "published_at": time.time(),
@@ -16835,6 +16898,8 @@ def supervise_lanes(
             "guard_seconds": BACKGROUND_RPC_LIVE_GUARD_SECONDS,
             "minimum_window_seconds":
                 BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS,
+            "minimum_interval_seconds":
+                BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS,
             "background_serialized": True,
         }
         atomic_json_write(rpc_priority_path, rpc_priority)

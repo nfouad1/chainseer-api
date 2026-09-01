@@ -219,6 +219,7 @@ class StageTimingBoundaryTests(unittest.TestCase):
         self.assertIn("CHAINSEER_LANE_DEADLINE_MONOTONIC", supervisor)
         self.assertIn("CHAINSEER_RPC_PRIORITY_REQUIRED", supervisor)
         self.assertIn("rpc_priority_state.json", source)
+        self.assertIn("rpc_request_rate_state.json", source)
 
     def test_shared_deadline_startup_is_partitioned_into_phases(self):
         with tempfile.TemporaryDirectory() as directory:
