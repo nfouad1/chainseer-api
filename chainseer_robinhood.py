@@ -224,6 +224,8 @@ BACKFILL_QUEUE_MAINTENANCE_MINIMUM_SECONDS = 8.0
 BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS = 20.0
 BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS = 12.0
 BACKFILL_RPC_URL_ENV = "CHAINSEER_ROBINHOOD_BACKFILL_RPC_URL"
+BACKFILL_RPC_LOG_RANGE_LIMIT_ENV = (
+    "CHAINSEER_ROBINHOOD_BACKFILL_LOG_RANGE_LIMIT")
 # The supervised live cadence is 30 seconds and this chain has recently
 # produced roughly ten blocks/second. Scan a bounded newest-head slice on the
 # decision path; any older prefix is durably re-anchored into backfill.
@@ -1541,6 +1543,7 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "backfill_launch_minimum_live_window_seconds":
             BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS,
         "backfill_rpc_isolation_supported": True,
+        "backfill_rpc_configured_log_range_supported": True,
         "backfill_rpc_chunk_model_epoch":
             BACKFILL_RPC_CHUNK_MODEL_EPOCH,
         "backfill_initial_chunk_blocks":
@@ -9947,7 +9950,17 @@ class RobinhoodV4Observer:
 
     def _adaptive_logs(self, start: int, end: int) -> tuple[list[dict], int]:
         """Split deterministic provider-limit failures without moving the cursor."""
-        pending = [(start, end)]
+        configured_limit = max(
+            0, safe_int(getattr(self.rpc, "maximum_log_range_blocks", 0), 0))
+        if configured_limit:
+            windows = [
+                (block, min(end, block + configured_limit - 1))
+                for block in range(start, end + 1, configured_limit)
+            ]
+            # LIFO stack: reverse so the earliest window executes next.
+            pending = list(reversed(windows))
+        else:
+            pending = [(start, end)]
         logs: list[dict] = []
         successful_windows = 0
         while pending:
@@ -18686,6 +18699,9 @@ def main() -> None:
         if args.command == "backfill-once" else "")
     lane_rpc = (
         RobinhoodRPC(backfill_rpc_url) if backfill_rpc_url else None)
+    if lane_rpc is not None:
+        lane_rpc.maximum_log_range_blocks = max(0, safe_int(
+            os.environ.get(BACKFILL_RPC_LOG_RANGE_LIMIT_ENV), 0))
     engine=RobinhoodLearningEngine(
         args.root, rpc=lane_rpc,
         chain_root=producer_chain, skill_root=args.skill_root,

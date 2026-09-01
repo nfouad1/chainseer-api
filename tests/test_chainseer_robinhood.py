@@ -1580,6 +1580,27 @@ class RobinhoodLearningTests(unittest.TestCase):
             self.assertEqual(coverage["rpc_windows"], 3)
             self.assertEqual(json.loads(cursor.read_text())["next_block"], 100)
 
+    def test_v4_starts_with_configured_provider_safe_windows(self):
+        class ConfiguredRPC(FakeRPC):
+            maximum_log_range_blocks = 2
+
+            def get_logs(self, start, end, address=None, topics=None):
+                self.calls.append((start, end, address, topics))
+                if end - start + 1 > self.maximum_log_range_blocks:
+                    raise AssertionError("oversized request must not be attempted")
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            cursor = Path(directory) / "v4.json"
+            store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+            rpc = ConfiguredRPC(latest=100)
+            _, coverage = rh.RobinhoodV4Observer(
+                rpc, store, cursor).sync(block_limit=5, lookback=5)
+            spans = [(start, end) for start, end, *_ in rpc.calls]
+            self.assertEqual(spans, [(95, 96), (97, 98), (99, 99)])
+            self.assertEqual(coverage["rpc_windows"], 3)
+            self.assertEqual(json.loads(cursor.read_text())["next_block"], 100)
+
     def test_v4_custody_maps_position_and_refuses_eoa_control_as_locked(self):
         token_id = 7
         lower, upper = -120, 120
@@ -8503,6 +8524,9 @@ class LaneSplitTests(unittest.TestCase):
         source = inspect.getsource(rh.supervise_lanes)
         self.assertIn("BACKFILL_RPC_URL_ENV", source)
         self.assertIn('"0" if lane == "backfill"', source)
+        main_source = inspect.getsource(rh.main)
+        self.assertIn("BACKFILL_RPC_LOG_RANGE_LIMIT_ENV", main_source)
+        self.assertIn("maximum_log_range_blocks", main_source)
 
 
 class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
