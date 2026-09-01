@@ -257,7 +257,7 @@ class IngestionAdmissionTests(unittest.TestCase):
         self.assertEqual(
             policy["scheduled_backfill_block_limit"],
             rh.BACKFILL_GAP_CHUNK_BLOCKS)
-        self.assertEqual(policy["backfill_maximum_chunks_per_cycle"], 1)
+        self.assertEqual(policy["backfill_maximum_chunks_per_cycle"], 2)
         self.assertEqual(policy["backfill_remote_attempts_per_chunk"], 1)
 
     def test_insufficient_ingestion_headroom_is_a_non_success_deferral(self):

@@ -195,10 +195,18 @@ BACKFILL_RPC_PROBE_STEP_BLOCKS = 125
 BACKFILL_RPC_SUCCESSES_BEFORE_PROBE = 5
 # The v3 cohort proved request COUNT was binding during a retry burst; v4 then
 # proved that range density also matters once request count is fixed at one.
-# Preserve one call per scheduled run, but require repeated success before an
-# additive upward probe. A failed probe falls back to the last proven size,
-# rather than oscillating 1,000 -> 500 -> 1,000 after every single success.
-BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 1
+# Preserve one attempt per atomic chunk and require repeated success before an
+# additive upward size probe. A failed probe falls back to the last proven
+# size, rather than oscillating 1,000 -> 500 -> 1,000 after every success.
+# The v5 cohort measured the whole scheduler, not merely an isolated RPC:
+# three backfill launches per five-minute supervisor window recovered 4,750
+# blocks while 9,754 new skipped blocks arrived.  The 750-block query shape
+# itself is proven (219 consecutive successes), so changing the range size or
+# retrying a failed request would attack the wrong constraint.  Permit one
+# additional independently committed chunk after a successful first chunk.
+# A throttle still stops the cycle immediately, and every completed chunk has
+# already advanced its durable cursor before the next provider call begins.
+BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 2
 BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK = 1
 # The supervised live cadence is 30 seconds and this chain has recently
 # produced roughly ten blocks/second. Scan a bounded newest-head slice on the
@@ -392,7 +400,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v5"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v6"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -15402,10 +15410,11 @@ class RobinhoodLearningEngine:
         """Commit consecutive durable chunks until only reserve remains.
 
         ``drain_flow_backfill`` is intentionally one atomic chunk: its cursor
-        advances immediately after a successful scan. The coordinator retains
-        a child deadline, but production policy currently admits one provider
-        request per cycle so historical recovery cannot become an RPC burst or
-        overlap the next latency-critical live scan.
+        advances immediately after a successful scan. The coordinator may run
+        a small bounded sequence of those commits. A failed/throttled request
+        stops the sequence without retry, while already committed chunks remain
+        useful progress. The independent low-priority lane and child deadline
+        keep this historical work away from the latency-critical live scan.
         """
         before = self.store.backfill_backlog()
         chunk_plan = self.backfill_rpc_chunk_plan(block_limit)

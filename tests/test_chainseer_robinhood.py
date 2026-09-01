@@ -7200,7 +7200,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v5")
+                "robinhood-operational-v6")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7209,7 +7209,7 @@ class LaneSplitTests(unittest.TestCase):
                 cohort["policy"]["decision_multi_observation_safety_blocks"],
                 rh.DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS)
             self.assertEqual(
-                cohort["policy"]["backfill_maximum_chunks_per_cycle"], 1)
+                cohort["policy"]["backfill_maximum_chunks_per_cycle"], 2)
             self.assertEqual(
                 cohort["policy"]["backfill_remote_attempts_per_chunk"], 1)
             self.assertEqual(
@@ -7835,11 +7835,11 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(result["status"], "complete")
             self.assertEqual(result["priority_mode"], "oldest_durable_gap_first")
             self.assertTrue(result["v2_discovery"]["deferred"])
-            self.assertEqual(result["new_candidates"], 3)
+            self.assertEqual(result["new_candidates"], 5)
             recovery = result["durable_gap_recovery"]
-            self.assertEqual(recovery["chunks_processed"], 1)
-            self.assertEqual(recovery["cursor_commits"], 1)
-            self.assertEqual(recovery["blocks_scanned"], 500)
+            self.assertEqual(recovery["chunks_processed"], 2)
+            self.assertEqual(recovery["cursor_commits"], 2)
+            self.assertEqual(recovery["blocks_scanned"], 1000)
             self.assertEqual(
                 recovery["stopped_reason"], "maximum_chunks_reached")
 
@@ -7881,13 +7881,53 @@ class LaneSplitTests(unittest.TestCase):
                 rh.CycleDeadline(5.0), block_limit=5_000,
                 reserve_seconds=0.1,
             )
-            self.assertEqual(limits, [rh.BACKFILL_GAP_CHUNK_BLOCKS])
+            self.assertEqual(limits, [
+                rh.BACKFILL_GAP_CHUNK_BLOCKS,
+                rh.BACKFILL_GAP_CHUNK_BLOCKS,
+            ])
             self.assertEqual(
                 result["chunk_limit_blocks"],
                 rh.BACKFILL_GAP_CHUNK_BLOCKS)
             self.assertEqual(
                 result["blocks_scanned"],
                 rh.BACKFILL_GAP_CHUNK_BLOCKS)
+
+    def test_second_backfill_throttle_preserves_first_committed_chunk(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            calls = []
+
+            def drain(deadline, *, block_limit):
+                calls.append(block_limit)
+                if len(calls) == 1:
+                    return {
+                        "ranges_selected": 1,
+                        "blocks_scanned": block_limit,
+                        "candidates_added": 2,
+                        "completed": False,
+                        "from_block": 1,
+                        "to_block": block_limit,
+                    }
+                # The RPC deadline boundary normalizes provider errors to the
+                # RuntimeError form consumed by the coordinator.
+                raise RuntimeError("[RPC -429] RPC HTTP response failed (429)")
+
+            engine.drain_flow_backfill = drain
+            result = engine.drain_flow_backfill_until_reserve(
+                rh.CycleDeadline(5.0), block_limit=5_000,
+                reserve_seconds=0.1,
+            )
+            self.assertEqual(len(calls), 2)
+            self.assertEqual(result["chunks_processed"], 1)
+            self.assertEqual(result["cursor_commits"], 1)
+            self.assertEqual(
+                result["blocks_scanned"], rh.BACKFILL_GAP_CHUNK_BLOCKS)
+            self.assertEqual(result["candidates_added"], 2)
+            self.assertTrue(result["provider_deferred"])
+            self.assertEqual(
+                result["stopped_reason"], "provider_rate_limited")
 
     def test_backfill_rate_limit_is_one_attempt_and_a_controlled_deferral(self):
         class RateLimitedRPC(FakeRPC):
