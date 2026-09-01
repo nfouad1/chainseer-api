@@ -11372,11 +11372,12 @@ class RobinhoodLearningEngine:
         market=None, chain_root: str | Path | None = None,
         skill_root: str | Path | None = None,
         timechain_recorder: RobinhoodLearningTimechainRecorder | None = None,
+        rpc_isolated: bool = False,
     ):
         self.root=Path(root)
         self.root.mkdir(parents=True,exist_ok=True)
         self.rpc=rpc or RobinhoodRPC(ROBINHOOD_NETWORK.rpc_url)
-        self.backfill_rpc_isolated = False
+        self.backfill_rpc_isolated = bool(rpc_isolated)
         self.store=RobinhoodLearningStore(self.root/"learning.sqlite3")
         self._active_lane: str | None = None
         self._active_lane_deadline: CycleDeadline | None = None
@@ -11391,7 +11392,8 @@ class RobinhoodLearningEngine:
         # RobinhoodRPC invokes this context at the raw HTTP boundary for
         # _call AND _batch_call. Test doubles without a session deliberately
         # retain their existing behavior.
-        self._bind_rpc_request_gate(self.rpc)
+        if not self.backfill_rpc_isolated:
+            self._bind_rpc_request_gate(self.rpc)
         self.ledger=HashEventLedger(self.root/"events.jsonl")
         self.observer=RobinhoodPairObserver(self.rpc,self.root/"discovery_cursor.json")
         self.v4_observer=RobinhoodV4Observer(self.rpc,self.store,self.root/"discovery_v4_cursor.json")
@@ -17715,7 +17717,10 @@ def supervise_lanes(
                 lane_environment = dict(worker_environment)
                 lane_environment[
                     "CHAINSEER_LANE_DEADLINE_MONOTONIC"] = repr(child_deadline)
-                lane_environment["CHAINSEER_RPC_PRIORITY_REQUIRED"] = "1"
+                lane_environment["CHAINSEER_RPC_PRIORITY_REQUIRED"] = (
+                    "0" if lane == "backfill" and str(
+                        lane_environment.get(BACKFILL_RPC_URL_ENV) or ""
+                    ).strip() else "1")
                 process = subprocess.Popen(
                     command_for(lane), cwd=str(Path(__file__).resolve().parent),
                     stdout=stdout, stderr=stderr, env=lane_environment,
@@ -18662,8 +18667,8 @@ def main() -> None:
     engine=RobinhoodLearningEngine(
         args.root, rpc=lane_rpc,
         chain_root=producer_chain, skill_root=args.skill_root,
+        rpc_isolated=bool(backfill_rpc_url),
     )
-    engine.backfill_rpc_isolated = bool(backfill_rpc_url)
     engine._startup_milestones = {
         "shared_deadline": bool(safe_float(
             os.environ.get("CHAINSEER_LANE_DEADLINE_MONOTONIC"), 0.0) > 0),

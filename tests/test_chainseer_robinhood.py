@@ -8456,6 +8456,32 @@ class LaneSplitTests(unittest.TestCase):
         self.assertIn("timechain_writer", inspect.getsource(
             rh.RobinhoodLearningEngine.run_analysis_lane))
 
+    def test_secondary_backfill_rpc_bypasses_the_live_provider_mutex(self):
+        class BindableRPC(FakeRPC):
+            def __init__(self):
+                super().__init__([], latest=100)
+                self._session = object()
+
+            def _call(self, *_args, **_kwargs):
+                return None
+
+        with tempfile.TemporaryDirectory() as directory:
+            shared = BindableRPC()
+            isolated = BindableRPC()
+            rh.RobinhoodLearningEngine(
+                Path(directory) / "shared", rpc=shared,
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine = rh.RobinhoodLearningEngine(
+                Path(directory) / "isolated", rpc=isolated,
+                analyzer=FakeAnalyzer(), market=FakeMarket(),
+                rpc_isolated=True)
+            self.assertTrue(callable(shared.request_gate))
+            self.assertFalse(hasattr(isolated, "request_gate"))
+            self.assertTrue(engine.backfill_rpc_isolated)
+        source = inspect.getsource(rh.supervise_lanes)
+        self.assertIn("BACKFILL_RPC_URL_ENV", source)
+        self.assertIn('"0" if lane == "backfill"', source)
+
 
 class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
     """A lane that is configured but never launched is worse than absent.
