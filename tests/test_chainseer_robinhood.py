@@ -9617,6 +9617,29 @@ class EvidenceOutcomeItemReserveTests(unittest.TestCase):
             rh.EVIDENCE_LANE_BUDGET_SECONDS / 4,
             "a reserve this large would starve the stage rather than bound it")
 
+    def test_both_outcome_streams_reserve_one_remote_item(self):
+        source = Path("chainseer_robinhood.py").read_text(
+            encoding="utf-8", errors="replace")
+        observation = source.split(
+            "def observe_flow_observation_outcomes", 1)[1].split(
+                "def observe_flow_evidence_outcomes", 1)[0]
+        event = source.split(
+            "def observe_flow_evidence_outcomes", 1)[1].split(
+                "def _best_executable_market", 1)[0]
+        for body in (observation, event):
+            self.assertIn("EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS", body)
+            self.assertNotIn("deadline.expired()", body)
+
+    def test_evidence_lane_reserves_time_to_commit_its_summary(self):
+        source = inspect.getsource(
+            rh.RobinhoodLearningEngine.run_evidence_lane)
+        self.assertIn("EVIDENCE_COMPLETION_RESERVE_SECONDS", source)
+        self.assertIn("execution_deadline", source)
+        self.assertGreaterEqual(
+            rh.EVIDENCE_COMPLETION_RESERVE_SECONDS,
+            rh.LANE_TERMINATION_GRACE_SECONDS,
+        )
+
     def test_deferral_is_counted_not_silent(self):
         """A deferred outcome must remain pending and be reported, so the
         backlog stays visible rather than quietly shrinking."""

@@ -163,6 +163,11 @@ MARKS_LANE_CADENCE_SECONDS = 45.0
 LIVE_LANE_BUDGET_SECONDS = 25.0
 ANALYSIS_LANE_BUDGET_SECONDS = 120.0
 EVIDENCE_LANE_BUDGET_SECONDS = 90.0
+# Remote evidence work must stop before the supervisor deadline so the child
+# can persist its summary and release SQLite cleanly. The RPC-priority soak
+# measured a worker entering ``observation_outcomes`` with exactly 0.0s left;
+# it was then killed even though the expensive work had already completed.
+EVIDENCE_COMPLETION_RESERVE_SECONDS = 3.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
 # Operational verification performs bounded schema/readability/critical-table
 # health checks plus complete ledger and producer-Timechain verification.
@@ -13921,7 +13926,11 @@ class RobinhoodLearningEngine:
         non_exitable = 0
         deferred = 0
         for index, due in enumerate(due_rows):
-            if deadline is not None and deadline.expired():
+            # Reserve one measured remote-item tail. Merely checking expiry
+            # admits the request that consumes the last seconds of the lane.
+            if (deadline is not None
+                    and deadline.remaining()
+                    < EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
                 deferred = len(due_rows) - index
                 break
             entry = json.loads(due.get("entry_quote_json") or "{}")
@@ -14743,14 +14752,23 @@ class RobinhoodLearningEngine:
         observed_at = time.time() if now is None else float(now)
 
         def work(deadline: CycleDeadline) -> dict:
+            # The parent deadline includes durable completion. Passing it to
+            # every remote stage let a final successful request consume the
+            # full lane budget, leaving no time to persist the result.
+            execution_deadline = CycleDeadline(max(
+                0.0,
+                deadline.remaining() - EVIDENCE_COMPLETION_RESERVE_SECONDS,
+            ))
             timings: dict[str, float] = {}
             stage = time.monotonic()
             self.store.mark_lane_stage(
                 "evidence", "entry_quotes", run_id=self.cycle_run_uuid,
-                remaining=deadline.remaining(), completed=dict(timings))
-            with self._rpc_deadline(deadline):
+                remaining=execution_deadline.remaining(),
+                completed=dict(timings))
+            with self._rpc_deadline(execution_deadline):
                 entry_quotes = self.quote_pending_flow_evidence(
-                    limit=max(0, int(entry_quote_limit)), deadline=deadline)
+                    limit=max(0, int(entry_quote_limit)),
+                    deadline=execution_deadline)
             timings["entry_quotes_seconds"] = round(
                 time.monotonic() - stage, 3)
 
@@ -14758,31 +14776,38 @@ class RobinhoodLearningEngine:
             self.store.mark_lane_stage(
                 "evidence", "observation_quotes",
                 run_id=self.cycle_run_uuid,
-                remaining=deadline.remaining(), completed=dict(timings))
-            with self._rpc_deadline(deadline):
+                remaining=execution_deadline.remaining(),
+                completed=dict(timings))
+            with self._rpc_deadline(execution_deadline):
                 observation_quotes = self.quote_pending_flow_observations(
                     limit=EVIDENCE_OBSERVATION_QUOTE_LIMIT,
-                    deadline=deadline)
+                    deadline=execution_deadline)
             timings["observation_quotes_seconds"] = round(
                 time.monotonic() - stage, 3)
 
             stage = time.monotonic()
             self.store.mark_lane_stage(
                 "evidence", "event_outcomes", run_id=self.cycle_run_uuid,
-                remaining=deadline.remaining(), completed=dict(timings))
+                remaining=execution_deadline.remaining(),
+                completed=dict(timings))
             event_outcomes: dict
-            if deadline.expired():
-                event_outcomes = {
-                    "selected": 0, "observed": 0, "non_exitable": 0,
-                    "deferred": 0, "reason": "deadline_exhausted",
-                }
+            if execution_deadline.remaining() < (
+                    EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
+                # The selector still counts the due rows; the item reserve
+                # prevents it from starting any remote request.
+                event_outcomes = self.observe_flow_evidence_outcomes(
+                    observed_at, 0,
+                    limit=max(0, int(event_outcome_limit)),
+                    deadline=execution_deadline,
+                )
+                event_outcomes["reason"] = "completion_reserve_reached"
             else:
-                with self._rpc_deadline(deadline):
+                with self._rpc_deadline(execution_deadline):
                     outcome_head = int(self.rpc.get_block_number())
                     event_outcomes = self.observe_flow_evidence_outcomes(
                         observed_at, outcome_head,
                         limit=max(0, int(event_outcome_limit)),
-                        deadline=deadline,
+                        deadline=execution_deadline,
                     )
                 event_outcomes["head_block"] = outcome_head
             timings["event_outcomes_seconds"] = round(
@@ -14792,12 +14817,13 @@ class RobinhoodLearningEngine:
             self.store.mark_lane_stage(
                 "evidence", "observation_outcomes",
                 run_id=self.cycle_run_uuid,
-                remaining=deadline.remaining(), completed=dict(timings))
-            with self._rpc_deadline(deadline):
+                remaining=execution_deadline.remaining(),
+                completed=dict(timings))
+            with self._rpc_deadline(execution_deadline):
                 observation_outcomes = self.observe_flow_observation_outcomes(
                     observed_at,
                     limit=max(0, int(observation_outcome_limit)),
-                    deadline=deadline,
+                    deadline=execution_deadline,
                 )
             timings["observation_outcomes_seconds"] = round(
                 time.monotonic() - stage, 3)
@@ -14807,6 +14833,8 @@ class RobinhoodLearningEngine:
                 "event_outcomes": event_outcomes,
                 "observation_outcomes": observation_outcomes,
                 "stage_timings_seconds": timings,
+                "completion_reserve_seconds":
+                    EVIDENCE_COMPLETION_RESERVE_SECONDS,
                 "paper_only": True,
                 "live_execution_enabled": False,
                 "timechain_writer": None,
