@@ -8555,6 +8555,19 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
             "other background RPC work must not run beside recovery",
         )
 
+    def test_backfill_launch_reserves_startup_plus_rpc_window(self):
+        self.assertTrue(rh._low_priority_launch_blocked(
+            "backfill", {}, now=100.0, next_live=111.0,
+            guard_seconds=rh.BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS,
+        ))
+        self.assertFalse(rh._low_priority_launch_blocked(
+            "backfill", {}, now=100.0, next_live=113.0,
+            guard_seconds=rh.BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS,
+        ))
+        source = inspect.getsource(rh.supervise_lanes)
+        self.assertIn(
+            "BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS", source)
+
     def test_full_verification_is_maintenance_only(self):
         source = inspect.getsource(rh.supervise_lanes)
         self.assertIn("verification", rh.LANE_NAMES)

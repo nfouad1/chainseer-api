@@ -222,6 +222,7 @@ BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK = 1
 BACKFILL_RECOVERY_TARGET_RATIO = 1.10
 BACKFILL_QUEUE_MAINTENANCE_MINIMUM_SECONDS = 8.0
 BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS = 20.0
+BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS = 12.0
 BACKFILL_RPC_URL_ENV = "CHAINSEER_ROBINHOOD_BACKFILL_RPC_URL"
 # The supervised live cadence is 30 seconds and this chain has recently
 # produced roughly ten blocks/second. Scan a bounded newest-head slice on the
@@ -1537,6 +1538,8 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             BACKFILL_RECOVERY_TARGET_RATIO,
         "backfill_rpc_attempt_budget_seconds":
             BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
+        "backfill_launch_minimum_live_window_seconds":
+            BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS,
         "backfill_rpc_isolation_supported": True,
         "backfill_rpc_chunk_model_epoch":
             BACKFILL_RPC_CHUNK_MODEL_EPOCH,
@@ -17688,6 +17691,10 @@ def supervise_lanes(
                 if _low_priority_launch_blocked(
                     lane, active, now=now_mono,
                     next_live=float(lanes["live"]["next"]),
+                    guard_seconds=(
+                        BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS
+                        if lane == "backfill"
+                        else LIVE_LANE_LAUNCH_GUARD_SECONDS),
                 ):
                     priority_deferrals[lane] += 1
                     continue
