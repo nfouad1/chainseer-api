@@ -1661,6 +1661,18 @@ def _transient_rpc_failure(error: BaseException | str) -> bool:
     )
 
 
+def _rpc_log_range_limit(error: BaseException | str) -> int | None:
+    """Extract a deterministic provider eth_getLogs block-range ceiling."""
+    text = str(error).lower()
+    match = re.search(r"up to (?:a )?([0-9][0-9,]*) block range", text)
+    if not match:
+        return None
+    try:
+        return max(1, int(match.group(1).replace(",", "")))
+    except ValueError:
+        return None
+
+
 def _remote_call(operation: str, callback, *, attempts: int = REMOTE_RETRY_ATTEMPTS):
     """Retry a bounded remote read without changing any durable cursor state."""
     last_error: Exception | None = None
@@ -1685,6 +1697,8 @@ def _remote_call(operation: str, callback, *, attempts: int = REMOTE_RETRY_ATTEM
             # provider's deterministic result. Callers that support adaptive
             # windowing can split immediately after this error is wrapped.
             if "exceeds limit of 10000" in str(exc).lower():
+                break
+            if _rpc_log_range_limit(exc) is not None:
                 break
             if attempt + 1 >= max(1, attempts):
                 break
@@ -9954,10 +9968,18 @@ class RobinhoodV4Observer:
                     attempts=self.remote_attempts,
                 )
             except RuntimeError as exc:
-                if (
-                    "exceeds limit of 10000" not in str(exc).lower()
-                    or window_start >= window_end
-                ):
+                range_limit = _rpc_log_range_limit(exc)
+                if range_limit is not None and window_start < window_end:
+                    windows = [
+                        (block, min(window_end, block + range_limit - 1))
+                        for block in range(
+                            window_start, window_end + 1, range_limit)
+                    ]
+                    # LIFO stack: reverse so the earliest window executes next.
+                    pending.extend(reversed(windows))
+                    continue
+                if ("exceeds limit of 10000" not in str(exc).lower()
+                        or window_start >= window_end):
                     raise
                 midpoint = (window_start + window_end) // 2
                 # LIFO order keeps requests and accumulated events chronological.

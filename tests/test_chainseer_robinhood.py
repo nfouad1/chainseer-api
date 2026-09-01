@@ -1558,6 +1558,28 @@ class RobinhoodLearningTests(unittest.TestCase):
             self.assertEqual(json.loads(cursor.read_text())["next_block"], 100)
             self.assertIn((95, 99, rh.UNISWAP_V4_POOL_MANAGER, unittest.mock.ANY), rpc.calls)
 
+    def test_v4_honors_provider_block_range_hint_exactly(self):
+        class AlchemyFreeRPC(FakeRPC):
+            def get_logs(self, start, end, address=None, topics=None):
+                self.calls.append((start, end, address, topics))
+                if end - start + 1 > 2:
+                    raise RuntimeError(
+                        "Under the Free tier plan, you can make eth_getLogs "
+                        "requests with up to a 2 block range")
+                return []
+
+        with tempfile.TemporaryDirectory() as directory:
+            cursor = Path(directory) / "v4.json"
+            store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+            rpc = AlchemyFreeRPC(latest=100)
+            _, coverage = rh.RobinhoodV4Observer(
+                rpc, store, cursor).sync(block_limit=5, lookback=5)
+            spans = [(start, end) for start, end, *_ in rpc.calls]
+            self.assertEqual(
+                spans, [(95, 99), (95, 96), (97, 98), (99, 99)])
+            self.assertEqual(coverage["rpc_windows"], 3)
+            self.assertEqual(json.loads(cursor.read_text())["next_block"], 100)
+
     def test_v4_custody_maps_position_and_refuses_eoa_control_as_locked(self):
         token_id = 7
         lower, upper = -120, 120
