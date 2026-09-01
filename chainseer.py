@@ -56,6 +56,7 @@ import shutil
 import sys
 import threading
 import time
+from contextlib import nullcontext
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -1504,6 +1505,22 @@ class RobinhoodRPC:
         self._session.headers.update({"Content-Type": "application/json"})
         self._req_id = 0
         self.context = None
+        # Optional per-request context factory installed by supervised
+        # consumers.  It may serialize callers and return a stricter socket
+        # timeout.  Keeping the hook at the raw HTTP boundary means a helper
+        # that performs several RPCs cannot accidentally bypass live-lane
+        # priority merely because its outer Python context began earlier.
+        self.request_gate = None
+
+    def _request_guard(self):
+        factory = self.request_gate
+        return factory() if callable(factory) else nullcontext(None)
+
+    def _guarded_timeout(self, maximum) -> float:
+        configured = max(0.1, float(self.timeout))
+        if maximum is None:
+            return configured
+        return max(0.1, min(configured, float(maximum)))
 
     def bind_context(self, context: ScanContext):
         self.context = context
@@ -1532,7 +1549,10 @@ class RobinhoodRPC:
         self._req_id += 1
         payload = {"jsonrpc": "2.0", "method": method, "params": call_params, "id": self._req_id}
         try:
-            resp = self._session.post(self.rpc_url, json=payload, timeout=self.timeout)
+            with self._request_guard() as maximum_timeout:
+                request_timeout = self._guarded_timeout(maximum_timeout)
+                resp = self._session.post(
+                    self.rpc_url, json=payload, timeout=request_timeout)
             resp.raise_for_status()
             data = resp.json()
             if self.context is not None:
@@ -1551,7 +1571,8 @@ class RobinhoodRPC:
         except requests.exceptions.ConnectionError:
             raise RPCError(f"Cannot connect to {self.rpc_url}", -1)
         except requests.exceptions.Timeout:
-            raise RPCError(f"RPC request timed out after {self.timeout}s", -2)
+            raise RPCError(
+                f"RPC request timed out after {request_timeout}s", -2)
         except requests.exceptions.HTTPError as exc:
             status = getattr(exc.response, "status_code", None)
             raise RPCError(
@@ -1613,11 +1634,13 @@ class RobinhoodRPC:
             return [item or {} for item in results]
 
         try:
-            response = self._session.post(
-                self.rpc_url,
-                json=payload,
-                timeout=self.timeout,
-            )
+            with self._request_guard() as maximum_timeout:
+                request_timeout = self._guarded_timeout(maximum_timeout)
+                response = self._session.post(
+                    self.rpc_url,
+                    json=payload,
+                    timeout=request_timeout,
+                )
             response.raise_for_status()
             body = response.json()
             if not isinstance(body, list):
@@ -1654,7 +1677,7 @@ class RobinhoodRPC:
             raise RPCError(f"Cannot connect to {self.rpc_url}", -1) from exc
         except requests.exceptions.Timeout as exc:
             raise RPCError(
-                f"RPC request timed out after {self.timeout}s", -2
+                f"RPC request timed out after {request_timeout}s", -2
             ) from exc
         except requests.exceptions.HTTPError as exc:
             status = getattr(exc.response, "status_code", None)

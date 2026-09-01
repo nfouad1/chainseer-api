@@ -400,7 +400,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v6"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v7"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -766,10 +766,10 @@ CLASSIFICATION_BACKLOG_SCAN_LIMIT = 500
 CLASSIFICATION_COUNTERS_STATE_KEY = "classification_cumulative_counters"
 LIVE_LANE_CADENCE_SECONDS = 30.0
 ANALYSIS_LANE_CADENCE_SECONDS = 60.0
-# With one request per invocation, a one-minute cadence is rate SHAPING rather
-# than a burst: at most 60 requests/hour and 60k blocks/hour before background
-# scheduling contention. That leaves room for a timeout-driven half-window
-# fallback while exceeding the ~16k blocks/hour of measured re-anchoring.
+# A one-minute worker cadence plus a two-chunk ceiling is rate shaping rather
+# than an unbounded drain. Raw requests are additionally serialized and yield
+# to the 30-second live reservation, so catch-up capacity cannot turn into a
+# provider burst on the decision path.
 BACKFILL_LANE_CADENCE_SECONDS = 60.0
 # Do not start another worker while the latency-critical live worker is
 # starting/running or about to become due.  The failed acceptance cohort
@@ -777,6 +777,18 @@ BACKFILL_LANE_CADENCE_SECONDS = 60.0
 # deadline; launching more interpreters in the same window makes that tail
 # worse and is never freshness-positive.
 LIVE_LANE_LAUNCH_GUARD_SECONDS = 8.0
+# Raw JSON-RPC requests from background lanes are serialized and admitted
+# only when the supervisor reports a safe window before the next live pass.
+# The socket timeout ends this far before the live reservation, so an in-flight
+# historical request cannot consume the decision-head provider slot.
+BACKGROUND_RPC_LIVE_GUARD_SECONDS = 2.0
+BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS = 5.0
+BACKGROUND_RPC_PRIORITY_POLL_SECONDS = 0.1
+BACKGROUND_RPC_PRIORITY_MAX_STATE_AGE_SECONDS = 3.0
+BACKGROUND_RPC_PRIORITY_STATE_FILE = "rpc_priority_state.json"
+BACKGROUND_RPC_SERIALIZED_LANES = frozenset({
+    "analysis", "backfill", "evidence", "marks",
+})
 # A low-priority hard kill can leave Windows closing handles and SQLite
 # releasing locks for a short interval.  Delay (not skip) a due live launch
 # through that cleanup window so it receives a fresh full budget.
@@ -1122,6 +1134,46 @@ class CycleDeadlineExceeded(RuntimeError):
     """A stage was interrupted because the cycle deadline passed."""
 
 
+class BackgroundRpcPriorityDeferred(RuntimeError):
+    """Background RPC work could not fit outside a live reservation."""
+
+
+def _background_rpc_priority_window(
+    state: dict, *, now_monotonic: float | None = None,
+) -> dict:
+    """Classify one supervisor-published background RPC window.
+
+    The state is deliberately tiny and monotonic-clock based. A stale or
+    missing publication fails closed for background traffic; live traffic
+    never consults it. ``available_seconds`` already excludes the guard that
+    belongs exclusively to the upcoming live request.
+    """
+    now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    published = safe_float(state.get("published_monotonic"), 0.0)
+    next_live = safe_float(state.get("next_live_monotonic"), 0.0)
+    age = now - published if published > 0 else None
+    available = (
+        next_live - now - BACKGROUND_RPC_LIVE_GUARD_SECONDS
+        if next_live > 0 else 0.0)
+    if age is None or age < -1.0 or age > (
+            BACKGROUND_RPC_PRIORITY_MAX_STATE_AGE_SECONDS):
+        reason = "priority_state_stale"
+    elif bool(state.get("live_active")):
+        reason = "live_lane_active"
+    elif available < BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS:
+        reason = "live_lane_imminent"
+    else:
+        reason = "safe_background_window"
+    return {
+        "admitted": reason == "safe_background_window",
+        "reason": reason,
+        "available_seconds": round(max(0.0, available), 6),
+        "state_age_seconds": (
+            round(age, 6) if age is not None else None),
+        "next_live_monotonic": next_live or None,
+    }
+
+
 FLOW_NEAR_HEAD_SCAN_BLOCKS = 25_000
 # One get_logs call cannot span the whole range. The endpoint rejects a query
 # whose RESULT SET is too large -- "[RPC -32000] logs matched by query exceeds
@@ -1373,6 +1425,12 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             LIVE_LANE_ENRICHMENT_BUDGET_SECONDS),
         "backfill_lane_cadence_seconds": BACKFILL_LANE_CADENCE_SECONDS,
         "scheduled_backfill_block_limit": BACKFILL_GAP_CHUNK_BLOCKS,
+        "background_rpc_priority_gate_version": 1,
+        "background_rpc_serialized": True,
+        "background_rpc_live_guard_seconds":
+            BACKGROUND_RPC_LIVE_GUARD_SECONDS,
+        "background_rpc_minimum_window_seconds":
+            BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS,
         "live_all_attempt_p95_target_seconds": 30.0,
         "decision_lag_maximum_blocks":
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
@@ -1508,6 +1566,11 @@ def _remote_call(operation: str, callback, *, attempts: int = REMOTE_RETRY_ATTEM
         attempts_made = attempt + 1
         try:
             return callback()
+        except BackgroundRpcPriorityDeferred:
+            # Scheduling policy is not a provider failure. Retrying inside the
+            # same live reservation would only burn the lane deadline and
+            # erase the controlled-deferral type used by the supervisor.
+            raise
         except Exception as exc:
             last_error = exc
             # A 429 is an instruction to send LESS traffic. Immediate retries
@@ -11073,6 +11136,17 @@ class RobinhoodLearningEngine:
         self.root.mkdir(parents=True,exist_ok=True)
         self.rpc=rpc or RobinhoodRPC(ROBINHOOD_NETWORK.rpc_url)
         self.store=RobinhoodLearningStore(self.root/"learning.sqlite3")
+        self._active_lane: str | None = None
+        self._active_lane_deadline: CycleDeadline | None = None
+        self._rpc_gate_deadline: CycleDeadline | None = None
+        self._rpc_priority_telemetry = {
+            "admissions": 0, "deferrals": 0,
+            "wait_seconds": 0.0, "last_reason": None,
+        }
+        # RobinhoodRPC invokes this context at the raw HTTP boundary for
+        # _call AND _batch_call. Test doubles without a session deliberately
+        # retain their existing behavior.
+        self._bind_rpc_request_gate(self.rpc)
         self.ledger=HashEventLedger(self.root/"events.jsonl")
         self.observer=RobinhoodPairObserver(self.rpc,self.root/"discovery_cursor.json")
         self.v4_observer=RobinhoodV4Observer(self.rpc,self.store,self.root/"discovery_v4_cursor.json")
@@ -11082,6 +11156,7 @@ class RobinhoodLearningEngine:
         self.market=market or RobinhoodMarketClient()
         self.v4_market=RobinhoodV4MarketClient(self.rpc,self.market,self.store)
         self.analyzer=analyzer
+        self._bind_rpc_request_gate(getattr(self.analyzer, "rpc", None))
         # A run id for cycles that act outside a lane context (standalone
         # market rechecks); lanes overwrite it with their own run uuid.
         self.cycle_run_uuid = "engine-" + uuid.uuid4().hex[:16]
@@ -11491,11 +11566,119 @@ class RobinhoodLearningEngine:
                     return f"genesis:{str(ring.get('ring_hash', ''))[:16]}"
         return "unknown-chain"
 
+    def _bind_rpc_request_gate(self, rpc) -> None:
+        if (rpc is not None and hasattr(rpc, "_session")
+                and hasattr(rpc, "_call")):
+            rpc.request_gate = self._rpc_request_guard
+
+    @contextmanager
+    def _rpc_request_guard(self):
+        """Serialize raw RPC requests and reserve the provider for live.
+
+        The supervisor is the authority for live activity and next cadence.
+        Background processes fail closed when that publication is stale.
+        Rechecking after the mutex is acquired closes the race where another
+        background process waited through a safe window and acquired the lock
+        only after live became due.
+        """
+        lane = str(self._active_lane or "")
+        deadline = self._rpc_gate_deadline or self._active_lane_deadline
+        required = os.environ.get(
+            "CHAINSEER_RPC_PRIORITY_REQUIRED", "") == "1"
+        if not required or not lane:
+            yield deadline.remaining() if deadline is not None else None
+            return
+        if deadline is None:
+            raise BackgroundRpcPriorityDeferred(
+                "RPC priority gate has no authoritative lane deadline")
+
+        lock_path = self.root / "rpc_request_priority.lock"
+        wait_started = time.monotonic()
+        if lane == "live":
+            try:
+                with _HashLedgerAppendLock(
+                    lock_path,
+                    timeout_seconds=max(0.1, deadline.remaining()),
+                ):
+                    waited = time.monotonic() - wait_started
+                    self._rpc_priority_telemetry["admissions"] += 1
+                    self._rpc_priority_telemetry["wait_seconds"] += waited
+                    self._rpc_priority_telemetry["last_reason"] = (
+                        "live_priority")
+                    yield max(0.1, deadline.remaining())
+                return
+            except TimeoutError as exc:
+                raise RPCError(
+                    "live RPC priority lock exceeded the lane deadline", -2
+                ) from exc
+
+        if lane not in BACKGROUND_RPC_SERIALIZED_LANES:
+            yield max(0.1, deadline.remaining())
+            return
+
+        last_reason = "priority_state_unavailable"
+        while deadline.remaining() > 0.1:
+            state = read_json(
+                self.root / BACKGROUND_RPC_PRIORITY_STATE_FILE, {}) or {}
+            window = _background_rpc_priority_window(state)
+            last_reason = str(window["reason"])
+            if window["admitted"]:
+                try:
+                    request_lock = _HashLedgerAppendLock(
+                        lock_path,
+                        timeout_seconds=min(
+                            0.25, max(0.1, deadline.remaining())),
+                    )
+                    request_lock.__enter__()
+                except TimeoutError:
+                    time.sleep(min(
+                        BACKGROUND_RPC_PRIORITY_POLL_SECONDS,
+                        max(0.0, deadline.remaining())))
+                    continue
+                try:
+                    # The lock wait may have crossed into the reservation.
+                    state = read_json(
+                        self.root / BACKGROUND_RPC_PRIORITY_STATE_FILE,
+                        {}) or {}
+                    window = _background_rpc_priority_window(state)
+                    last_reason = str(window["reason"])
+                    maximum = min(
+                        deadline.remaining(),
+                        safe_float(window.get("available_seconds"), 0.0),
+                    )
+                    if window["admitted"] and maximum >= (
+                            BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS):
+                        waited = time.monotonic() - wait_started
+                        self._rpc_priority_telemetry["admissions"] += 1
+                        self._rpc_priority_telemetry[
+                            "wait_seconds"] += waited
+                        self._rpc_priority_telemetry["last_reason"] = (
+                            "safe_background_window")
+                        yield maximum
+                        return
+                finally:
+                    request_lock.__exit__(None, None, None)
+            time.sleep(min(
+                BACKGROUND_RPC_PRIORITY_POLL_SECONDS,
+                max(0.0, deadline.remaining())))
+
+        waited = time.monotonic() - wait_started
+        self._rpc_priority_telemetry["deferrals"] += 1
+        self._rpc_priority_telemetry["wait_seconds"] += waited
+        self._rpc_priority_telemetry["last_reason"] = last_reason
+        raise BackgroundRpcPriorityDeferred(
+            f"background RPC deferred for live priority: {last_reason}")
+
     @contextmanager
     def _rpc_deadline(self, deadline: CycleDeadline):
         """Push the monotonic budget into this lane's blocking RPC socket."""
+        original_deadline = getattr(self, "_rpc_gate_deadline", None)
+        self._rpc_gate_deadline = deadline
         if not hasattr(self.rpc, "timeout"):
-            yield
+            try:
+                yield
+            finally:
+                self._rpc_gate_deadline = original_deadline
             return
         original = self.rpc.timeout
         remaining = max(0.5, deadline.remaining())
@@ -11508,6 +11691,7 @@ class RobinhoodLearningEngine:
             yield
         finally:
             self.rpc.timeout = original
+            self._rpc_gate_deadline = original_deadline
 
     @contextmanager
     def _market_deadline(self, deadline: CycleDeadline):
@@ -11532,6 +11716,8 @@ class RobinhoodLearningEngine:
                 chain_root=str(Path(DEFAULT_CHAIN_ROOT)),
                 network=ROBINHOOD_NETWORK,
             )
+            self._bind_rpc_request_gate(
+                getattr(self.analyzer, "rpc", None))
         return self.analyzer
 
     def seal_analysis_memory(
@@ -14397,6 +14583,13 @@ class RobinhoodLearningEngine:
         execute_entered = time.monotonic()
         run_uuid = uuid.uuid4().hex
         self.cycle_run_uuid = run_uuid
+        self._active_lane = lane
+        self._active_lane_deadline = deadline
+        self._rpc_gate_deadline = None
+        self._rpc_priority_telemetry = {
+            "admissions": 0, "deferrals": 0,
+            "wait_seconds": 0.0, "last_reason": None,
+        }
         stop_heartbeat = threading.Event()
         with LearningRunLock(self.root / f".{lane}_once.lock"):
             self.store.begin_run(run_uuid, budget_seconds, lane=lane)
@@ -14435,6 +14628,12 @@ class RobinhoodLearningEngine:
                     "startup_consumed_seconds": round(startup_consumed, 3),
                     "startup_phases": startup_phases,
                     "duration_seconds": round(time.monotonic() - started, 3),
+                    "rpc_priority": {
+                        **self._rpc_priority_telemetry,
+                        "wait_seconds": round(
+                            safe_float(self._rpc_priority_telemetry.get(
+                                "wait_seconds"), 0.0), 3),
+                    },
                     "paper_only": True,
                     "live_execution_enabled": False,
                     **payload,
@@ -14451,9 +14650,13 @@ class RobinhoodLearningEngine:
             except Exception as exc:
                 stop_heartbeat.set()
                 heartbeat.join(timeout=1.0)
+                priority_deferred = isinstance(
+                    exc, BackgroundRpcPriorityDeferred)
                 terminal_status = (
-                    "deadline_exceeded"
-                    if isinstance(exc, CycleDeadlineExceeded) else "failed")
+                    "deferred" if priority_deferred else (
+                        "deadline_exceeded"
+                        if isinstance(exc, CycleDeadlineExceeded)
+                        else "failed"))
                 failure = {
                     "schema_version": 1, "timestamp": _utc_now(),
                     "lane": lane, "run_id": run_uuid,
@@ -14467,13 +14670,33 @@ class RobinhoodLearningEngine:
                     "startup_consumed_seconds": round(startup_consumed, 3),
                     "startup_phases": startup_phases,
                     "duration_seconds": round(time.monotonic() - started, 3),
+                    "controlled_deferral": priority_deferred,
+                    "deferral_stage": (
+                        "background_rpc_priority"
+                        if priority_deferred else None),
+                    "deferral_reason": (
+                        "live_rpc_reservation"
+                        if priority_deferred else None),
+                    "rpc_priority": {
+                        **self._rpc_priority_telemetry,
+                        "wait_seconds": round(
+                            safe_float(self._rpc_priority_telemetry.get(
+                                "wait_seconds"), 0.0), 3),
+                    },
                     "paper_only": True, "live_execution_enabled": False,
                 }
                 self.store.finish_run(
                     run_uuid, terminal_status,
-                    summary=failure, error=failure["error"])
+                    summary=failure,
+                    error=None if priority_deferred else failure["error"])
                 atomic_json_write(self.root / f"{lane}_lane_summary.json", failure)
+                if priority_deferred:
+                    return failure
                 raise
+            finally:
+                self._active_lane = None
+                self._active_lane_deadline = None
+                self._rpc_gate_deadline = None
 
     def run_marks_lane(
         self, *, budget_seconds: float = MARKS_LANE_BUDGET_SECONDS,
@@ -16516,6 +16739,7 @@ def supervise_lanes(
     last_background_launch = started_mono - (
         BACKGROUND_LANE_LAUNCH_SPACING_SECONDS)
     status_path = root / "scheduler_status.json"
+    rpc_priority_path = root / BACKGROUND_RPC_PRIORITY_STATE_FILE
     supervisor_store = RobinhoodLearningStore(root / "learning.sqlite3")
     recovered_dead_lanes = _reconcile_dead_lane_state(supervisor_store)
     last_orphan_sweep = time.monotonic()
@@ -16553,6 +16777,23 @@ def supervise_lanes(
         return command
 
     def publish(status: str = "running") -> None:
+        rpc_priority = {
+            "schema_version": 1,
+            "status": status,
+            "published_monotonic": time.monotonic(),
+            "published_at": time.time(),
+            "next_live_monotonic": float(lanes["live"]["next"]),
+            "live_active": "live" in active,
+            "live_pid": (
+                active["live"]["process"].pid
+                if "live" in active else None),
+            "live_cadence_seconds": float(lanes["live"]["cadence"]),
+            "guard_seconds": BACKGROUND_RPC_LIVE_GUARD_SECONDS,
+            "minimum_window_seconds":
+                BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS,
+            "background_serialized": True,
+        }
+        atomic_json_write(rpc_priority_path, rpc_priority)
         atomic_json_write(status_path, {
             "schema_version": 2, "status": status,
             "mode": "lane_supervisor", "started_at": started_wall,
@@ -16570,6 +16811,7 @@ def supervise_lanes(
             "launches": launches, "timeouts": timeouts, "failures": failures,
             "tail_skips": tail_skips,
             "priority_deferrals": priority_deferrals,
+            "rpc_priority": rpc_priority,
             "paper_only": True, "live_execution_enabled": False,
         })
 
@@ -16674,6 +16916,7 @@ def supervise_lanes(
                 lane_environment = dict(worker_environment)
                 lane_environment[
                     "CHAINSEER_LANE_DEADLINE_MONOTONIC"] = repr(child_deadline)
+                lane_environment["CHAINSEER_RPC_PRIORITY_REQUIRED"] = "1"
                 process = subprocess.Popen(
                     command_for(lane), cwd=str(Path(__file__).resolve().parent),
                     stdout=stdout, stderr=stderr, env=lane_environment,

@@ -7200,7 +7200,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v6")
+                "robinhood-operational-v7")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7210,6 +7210,10 @@ class LaneSplitTests(unittest.TestCase):
                 rh.DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS)
             self.assertEqual(
                 cohort["policy"]["backfill_maximum_chunks_per_cycle"], 2)
+            self.assertEqual(
+                cohort["policy"]["background_rpc_priority_gate_version"], 1)
+            self.assertTrue(
+                cohort["policy"]["background_rpc_serialized"])
             self.assertEqual(
                 cohort["policy"]["backfill_remote_attempts_per_chunk"], 1)
             self.assertEqual(
@@ -7928,6 +7932,131 @@ class LaneSplitTests(unittest.TestCase):
             self.assertTrue(result["provider_deferred"])
             self.assertEqual(
                 result["stopped_reason"], "provider_rate_limited")
+
+    def test_background_rpc_gate_admits_only_fresh_safe_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine._active_lane = "backfill"
+            engine._active_lane_deadline = rh.CycleDeadline(8.0)
+            now = time.monotonic()
+            rh.atomic_json_write(
+                Path(directory) / rh.BACKGROUND_RPC_PRIORITY_STATE_FILE,
+                {
+                    "published_monotonic": now,
+                    "next_live_monotonic": now + 20.0,
+                    "live_active": False,
+                },
+            )
+            with patch.dict(
+                os.environ, {"CHAINSEER_RPC_PRIORITY_REQUIRED": "1"}
+            ):
+                with engine._rpc_request_guard() as maximum:
+                    self.assertGreater(maximum, 7.0)
+                    self.assertLessEqual(maximum, 8.0)
+            self.assertEqual(
+                engine._rpc_priority_telemetry["admissions"], 1)
+
+    def test_background_rpc_gate_defers_when_live_owns_short_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine._active_lane = "evidence"
+            engine._active_lane_deadline = rh.CycleDeadline(0.03)
+            now = time.monotonic()
+            rh.atomic_json_write(
+                Path(directory) / rh.BACKGROUND_RPC_PRIORITY_STATE_FILE,
+                {
+                    "published_monotonic": now,
+                    "next_live_monotonic": now + 30.0,
+                    "live_active": True,
+                },
+            )
+            with patch.dict(
+                os.environ, {"CHAINSEER_RPC_PRIORITY_REQUIRED": "1"}
+            ), patch.object(
+                rh, "BACKGROUND_RPC_PRIORITY_POLL_SECONDS", 0.001
+            ):
+                with self.assertRaises(rh.BackgroundRpcPriorityDeferred):
+                    with engine._rpc_request_guard():
+                        self.fail("live-owned window must not be admitted")
+
+    def test_background_rpc_gate_serializes_concurrent_requests(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engines = [
+                rh.RobinhoodLearningEngine(
+                    directory, rpc=FakeRPC([], latest=100),
+                    analyzer=FakeAnalyzer(), market=FakeMarket())
+                for _ in range(2)
+            ]
+            for engine in engines:
+                engine._active_lane = "backfill"
+                engine._active_lane_deadline = rh.CycleDeadline(8.0)
+            now = time.monotonic()
+            rh.atomic_json_write(
+                Path(directory) / rh.BACKGROUND_RPC_PRIORITY_STATE_FILE,
+                {
+                    "published_monotonic": now,
+                    "next_live_monotonic": now + 20.0,
+                    "live_active": False,
+                },
+            )
+            active = 0
+            maximum_active = 0
+            counter_lock = threading.Lock()
+
+            def request(engine):
+                nonlocal active, maximum_active
+                with engine._rpc_request_guard():
+                    with counter_lock:
+                        active += 1
+                        maximum_active = max(maximum_active, active)
+                    time.sleep(0.05)
+                    with counter_lock:
+                        active -= 1
+
+            with patch.dict(
+                os.environ, {"CHAINSEER_RPC_PRIORITY_REQUIRED": "1"}
+            ):
+                workers = [
+                    threading.Thread(target=request, args=(engine,))
+                    for engine in engines
+                ]
+                for worker in workers:
+                    worker.start()
+                for worker in workers:
+                    worker.join(timeout=3.0)
+            self.assertTrue(all(not worker.is_alive() for worker in workers))
+            self.assertEqual(maximum_active, 1)
+
+    def test_rpc_priority_exhaustion_is_a_controlled_lane_deferral(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+
+            def worker(_deadline):
+                raise rh.BackgroundRpcPriorityDeferred("synthetic live hold")
+
+            result = engine._execute_lane("backfill", 5.0, worker)
+            self.assertEqual(result["status"], "deferred")
+            self.assertTrue(result["controlled_deferral"])
+            self.assertEqual(
+                result["deferral_reason"], "live_rpc_reservation")
+
+    def test_remote_retry_preserves_rpc_priority_deferral(self):
+        attempts = 0
+
+        def callback():
+            nonlocal attempts
+            attempts += 1
+            raise rh.BackgroundRpcPriorityDeferred("live reservation")
+
+        with self.assertRaises(rh.BackgroundRpcPriorityDeferred):
+            rh._remote_call("priority-test", callback, attempts=4)
+        self.assertEqual(attempts, 1)
 
     def test_backfill_rate_limit_is_one_attempt_and_a_controlled_deferral(self):
         class RateLimitedRPC(FakeRPC):

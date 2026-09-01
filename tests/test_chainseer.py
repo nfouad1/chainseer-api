@@ -6,7 +6,7 @@ import tempfile
 import types
 import unittest
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import ExitStack, redirect_stdout
+from contextlib import ExitStack, contextmanager, redirect_stdout
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -405,6 +405,30 @@ class ImmuneLockdownReasonTests(unittest.TestCase):
 
 
 class ChainseerInfrastructureTests(unittest.TestCase):
+    def test_raw_single_and_batch_requests_honor_request_gate_timeout(self):
+        events = []
+
+        @contextmanager
+        def gate():
+            events.append("enter")
+            try:
+                yield 3.25
+            finally:
+                events.append("exit")
+
+        rpc = chainseer.RobinhoodRPC(
+            "https://rpc.example.invalid", timeout=30)
+        rpc.request_gate = gate
+        rpc._session = FakeSession({"result": hex(123)})
+        self.assertEqual(rpc.get_block_number(), 123)
+        self.assertEqual(rpc._session.calls[0][2], 3.25)
+
+        rpc._session = EchoBatchSession()
+        result = rpc._batch_call([("eth_blockNumber", [])])
+        self.assertEqual(result[0]["result"], hex(10))
+        self.assertEqual(rpc._session.calls[0][2], 3.25)
+        self.assertEqual(events, ["enter", "exit", "enter", "exit"])
+
     def test_per_block_calls_batch_into_one_request(self):
         """Evidence pinned per record cannot share one block tag.
 

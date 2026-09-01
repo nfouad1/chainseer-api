@@ -217,6 +217,8 @@ class StageTimingBoundaryTests(unittest.TestCase):
         supervisor = source.split("def supervise_lanes", 1)[1].split(
             "def dashboard_operational_snapshot", 1)[0]
         self.assertIn("CHAINSEER_LANE_DEADLINE_MONOTONIC", supervisor)
+        self.assertIn("CHAINSEER_RPC_PRIORITY_REQUIRED", supervisor)
+        self.assertIn("rpc_priority_state.json", source)
 
     def test_shared_deadline_startup_is_partitioned_into_phases(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -389,6 +391,34 @@ class IngestionAdmissionTests(unittest.TestCase):
 
 class SupervisorPriorityTests(unittest.TestCase):
     """Background startup must yield around the live cadence."""
+
+    def test_rpc_priority_window_fails_closed_for_stale_or_imminent_state(self):
+        now = 100.0
+        stale = rh._background_rpc_priority_window({
+            "published_monotonic": now - 10.0,
+            "next_live_monotonic": now + 30.0,
+            "live_active": False,
+        }, now_monotonic=now)
+        self.assertFalse(stale["admitted"])
+        self.assertEqual(stale["reason"], "priority_state_stale")
+
+        imminent = rh._background_rpc_priority_window({
+            "published_monotonic": now,
+            "next_live_monotonic": (
+                now + rh.BACKGROUND_RPC_LIVE_GUARD_SECONDS
+                + rh.BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS - 0.1),
+            "live_active": False,
+        }, now_monotonic=now)
+        self.assertFalse(imminent["admitted"])
+        self.assertEqual(imminent["reason"], "live_lane_imminent")
+
+        active = rh._background_rpc_priority_window({
+            "published_monotonic": now,
+            "next_live_monotonic": now + 30.0,
+            "live_active": True,
+        }, now_monotonic=now)
+        self.assertFalse(active["admitted"])
+        self.assertEqual(active["reason"], "live_lane_active")
 
     def test_background_launch_is_blocked_while_live_is_active_or_due(self):
         self.assertTrue(rh._low_priority_launch_blocked(
