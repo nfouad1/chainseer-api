@@ -411,7 +411,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v9"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v10"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -806,6 +806,15 @@ BACKGROUND_RPC_PRIORITY_POLL_SECONDS = 0.1
 BACKGROUND_RPC_PRIORITY_MAX_STATE_AGE_SECONDS = 3.0
 BACKGROUND_RPC_PRIORITY_STATE_FILE = "rpc_priority_state.json"
 BACKGROUND_RPC_RATE_STATE_FILE = "rpc_request_rate_state.json"
+PROVIDER_RPC_THROTTLE_STATE_FILE = "rpc_provider_throttle_state.json"
+# A 429 is shared provider state, not a property of the worker that happened
+# to observe it.  All supervised workers publish and honor one short adaptive
+# cooldown.  A live decision-head read may retry after the cooldown; background
+# work remains deferred to its next independently scheduled unit.
+PROVIDER_RPC_RATE_LIMIT_BASE_COOLDOWN_SECONDS = 1.0
+PROVIDER_RPC_RATE_LIMIT_MAX_COOLDOWN_SECONDS = 8.0
+PROVIDER_RPC_RATE_LIMIT_STREAK_WINDOW_SECONDS = 60.0
+LIVE_DECISION_HEAD_MAXIMUM_ATTEMPTS = 3
 BACKGROUND_RPC_SERIALIZED_LANES = frozenset({
     "analysis", "backfill", "evidence", "marks",
 })
@@ -951,6 +960,10 @@ DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS = 10
 # The old blanket five-second pre-head cutoff duplicated downstream reserves
 # and discarded three finishable decisions. Head retrieval receives its own
 # bounded allowance; classification and ledger completion are sized below.
+# The normal read remains small. Adaptive throttle retries are admitted only
+# from spare headroom *above* the independently protected downstream reserve;
+# charging their rare worst case up front starved ingestion and reduced its
+# socket timeout to 2.04s in every cycle.
 DECISION_HEAD_RPC_RESERVE_SECONDS = 0.5
 # A rate floor prevents a quiet first few seconds from making the plan
 # optimistic. Cohort 5's enrichment-rate LOWER BOUND was 18.51 blocks/s at
@@ -1192,6 +1205,18 @@ def _background_rpc_priority_window(
             round(age, 6) if age is not None else None),
         "next_live_monotonic": next_live or None,
     }
+
+
+def _next_lane_launch_after_start(now_monotonic: float, cadence: float) -> float:
+    """Rebase cadence on the actual launch; never replay scheduling debt.
+
+    A delayed lane used to retain the old phase grid. A live pass delayed to
+    second 43 would therefore launch again at second 60: only 17 seconds
+    later. Production then measured 12-24 second live start intervals, RPC
+    bursts, slow interpreter startup and SQLite commit contention. Missed
+    cadence is telemetry, not work that can be recovered by starting sooner.
+    """
+    return float(now_monotonic) + max(0.001, float(cadence))
 
 
 FLOW_NEAR_HEAD_SCAN_BLOCKS = 25_000
@@ -1439,6 +1464,7 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "live_execution_enabled": False,
         "live_lane_budget_seconds": LIVE_LANE_BUDGET_SECONDS,
         "live_lane_cadence_seconds": LIVE_LANE_CADENCE_SECONDS,
+        "lane_cadence_debt_replay": False,
         "live_scan_blocks": LIVE_LANE_SCAN_BLOCKS,
         "live_enrichment_limit": LIVE_LANE_ENRICHMENT_LIMIT,
         "live_enrichment_budget_seconds": (
@@ -1453,6 +1479,15 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS,
         "background_rpc_minimum_interval_seconds":
             BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS,
+        "provider_rpc_shared_throttle_state": True,
+        "provider_rpc_rate_limit_base_cooldown_seconds":
+            PROVIDER_RPC_RATE_LIMIT_BASE_COOLDOWN_SECONDS,
+        "provider_rpc_rate_limit_max_cooldown_seconds":
+            PROVIDER_RPC_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+        "live_decision_head_maximum_attempts":
+            LIVE_DECISION_HEAD_MAXIMUM_ATTEMPTS,
+        "decision_head_rpc_reserve_seconds":
+            DECISION_HEAD_RPC_RESERVE_SECONDS,
         "evidence_completion_reserve_seconds":
             EVIDENCE_COMPLETION_RESERVE_SECONDS,
         "evidence_stage_max_seconds": EVIDENCE_STAGE_MAX_SECONDS,
@@ -1567,6 +1602,22 @@ def _rpc_rate_limited(error: BaseException | str) -> bool:
         or "response failed (429)" in text
         or "too many requests" in text
     )
+
+
+def _provider_cooldown_remaining(
+    state: dict, *, now_monotonic: float | None = None,
+) -> float:
+    """Return a reboot-safe shared provider cooldown remainder."""
+    now = time.monotonic() if now_monotonic is None else float(now_monotonic)
+    until = safe_float(state.get("cooldown_until_monotonic"), 0.0)
+    remaining = until - now
+    # Persisted monotonic timestamps belong to one OS boot.  A negative value
+    # is expired; an implausibly large value is from a previous boot/corruption
+    # and must not stop the learner indefinitely.
+    if remaining <= 0 or remaining > (
+            PROVIDER_RPC_RATE_LIMIT_MAX_COOLDOWN_SECONDS + 1.0):
+        return 0.0
+    return remaining
 
 
 def _transient_rpc_failure(error: BaseException | str) -> bool:
@@ -11167,6 +11218,8 @@ class RobinhoodLearningEngine:
         self._rpc_priority_telemetry = {
             "admissions": 0, "deferrals": 0,
             "wait_seconds": 0.0, "rate_wait_seconds": 0.0,
+            "provider_cooldown_wait_seconds": 0.0,
+            "provider_rate_limits": 0,
             "last_reason": None,
         }
         # RobinhoodRPC invokes this context at the raw HTTP boundary for
@@ -11596,6 +11649,70 @@ class RobinhoodLearningEngine:
         if (rpc is not None and hasattr(rpc, "_session")
                 and hasattr(rpc, "_call")):
             rpc.request_gate = self._rpc_request_guard
+            if hasattr(rpc, "response_observer"):
+                rpc.response_observer = self._observe_rpc_response
+
+    def _observe_rpc_response(self, status_code: int, headers: dict) -> None:
+        """Publish provider throttling as shared inter-process state."""
+        now_mono = time.monotonic()
+        now_wall = time.time()
+        path = self.root / PROVIDER_RPC_THROTTLE_STATE_FILE
+        previous = read_json(path, {}) or {}
+        status = int(status_code or 0)
+        if status == 429:
+            previous_at = safe_float(previous.get("last_429_at"), 0.0)
+            streak = (
+                max(0, safe_int(previous.get("consecutive_429"), 0)) + 1
+                if previous_at > 0 and now_wall - previous_at <= (
+                    PROVIDER_RPC_RATE_LIMIT_STREAK_WINDOW_SECONDS)
+                else 1
+            )
+            retry_after = 0.0
+            for key, value in (headers or {}).items():
+                if str(key).lower() != "retry-after":
+                    continue
+                try:
+                    retry_after = max(0.0, float(value))
+                except (TypeError, ValueError):
+                    retry_after = 0.0
+                break
+            cooldown = min(
+                PROVIDER_RPC_RATE_LIMIT_MAX_COOLDOWN_SECONDS,
+                max(
+                    retry_after,
+                    PROVIDER_RPC_RATE_LIMIT_BASE_COOLDOWN_SECONDS
+                    * (2 ** max(0, streak - 1)),
+                ),
+            )
+            payload = {
+                "schema_version": 1,
+                "status_code": status,
+                "consecutive_429": streak,
+                "last_429_at": now_wall,
+                "last_429_monotonic": now_mono,
+                "cooldown_seconds": cooldown,
+                "cooldown_until_monotonic": now_mono + cooldown,
+                "retry_after_seconds": retry_after or None,
+                "lane": self._active_lane,
+                "updated_at": _utc_now(),
+            }
+            self._rpc_priority_telemetry["provider_rate_limits"] += 1
+        elif 200 <= status < 300:
+            payload = {
+                "schema_version": 1,
+                "status_code": status,
+                "consecutive_429": 0,
+                "last_429_at": previous.get("last_429_at"),
+                "last_429_monotonic": previous.get("last_429_monotonic"),
+                "cooldown_seconds": 0.0,
+                "cooldown_until_monotonic": 0.0,
+                "retry_after_seconds": None,
+                "lane": self._active_lane,
+                "updated_at": _utc_now(),
+            }
+        else:
+            return
+        atomic_json_write(path, payload)
 
     @contextmanager
     def _rpc_request_guard(self):
@@ -11626,6 +11743,23 @@ class RobinhoodLearningEngine:
                     lock_path,
                     timeout_seconds=max(0.1, deadline.remaining()),
                 ):
+                    provider_state = read_json(
+                        self.root / PROVIDER_RPC_THROTTLE_STATE_FILE, {}) or {}
+                    cooldown = _provider_cooldown_remaining(provider_state)
+                    while cooldown > 0 and deadline.remaining() > 0.1:
+                        sleep_for = min(
+                            cooldown + 0.002,
+                            max(0.0, deadline.remaining() - 0.1))
+                        self._rpc_priority_telemetry[
+                            "provider_cooldown_wait_seconds"] += sleep_for
+                        self._rpc_priority_telemetry["last_reason"] = (
+                            "provider_rate_limit_cooldown")
+                        time.sleep(sleep_for)
+                        cooldown = _provider_cooldown_remaining(provider_state)
+                    if cooldown > 0:
+                        raise RPCError(
+                            "provider rate-limit cooldown exceeded the "
+                            "live lane deadline", -429)
                     waited = time.monotonic() - wait_started
                     self._rpc_priority_telemetry["admissions"] += 1
                     self._rpc_priority_telemetry["wait_seconds"] += waited
@@ -11692,8 +11826,16 @@ class RobinhoodLearningEngine:
                             if since_completed is not None
                             else BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS),
                     )
+                    provider_state = read_json(
+                        self.root / PROVIDER_RPC_THROTTLE_STATE_FILE, {}) or {}
+                    provider_sleep_seconds = _provider_cooldown_remaining(
+                        provider_state)
+                    if provider_sleep_seconds > rate_sleep_seconds:
+                        rate_sleep_seconds = provider_sleep_seconds
+                        last_reason = "provider_rate_limit_cooldown"
                     if rate_sleep_seconds > 0:
-                        last_reason = "background_rate_paced"
+                        if last_reason != "provider_rate_limit_cooldown":
+                            last_reason = "background_rate_paced"
                     elif window["admitted"] and maximum >= (
                             BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS):
                         waited = time.monotonic() - wait_started
@@ -11732,6 +11874,9 @@ class RobinhoodLearningEngine:
                 )
                 self._rpc_priority_telemetry[
                     "rate_wait_seconds"] += sleep_for
+                if last_reason == "provider_rate_limit_cooldown":
+                    self._rpc_priority_telemetry[
+                        "provider_cooldown_wait_seconds"] += sleep_for
                 time.sleep(sleep_for)
                 continue
             time.sleep(min(
@@ -11746,7 +11891,10 @@ class RobinhoodLearningEngine:
             f"background RPC deferred for live priority: {last_reason}")
 
     @contextmanager
-    def _rpc_deadline(self, deadline: CycleDeadline):
+    def _rpc_deadline(
+        self, deadline: CycleDeadline, *,
+        retry_attempts: int = REMOTE_RETRY_ATTEMPTS,
+    ):
         """Push the monotonic budget into this lane's blocking RPC socket."""
         original_deadline = getattr(self, "_rpc_gate_deadline", None)
         self._rpc_gate_deadline = deadline
@@ -11760,7 +11908,7 @@ class RobinhoodLearningEngine:
         remaining = max(0.5, deadline.remaining())
         # _remote_call may retry a failed request. Giving every attempt the
         # whole remaining budget made one stage consume 3x its deadline.
-        per_attempt = remaining / max(1, REMOTE_RETRY_ATTEMPTS + 1)
+        per_attempt = remaining / max(1, int(retry_attempts) + 1)
         self.rpc.timeout = max(
             0.5, min(float(original), max(0.5, per_attempt)))
         try:
@@ -12882,6 +13030,39 @@ class RobinhoodLearningEngine:
             "required_seconds": round(required, 3),
             "admitted": bool(remaining_seconds > required),
         }
+
+    def read_authoritative_decision_head(
+        self, deadline: CycleDeadline, *, downstream_required_seconds: float,
+    ) -> tuple[int, dict]:
+        """Read the decision head with bounded, cooldown-aware 429 recovery."""
+        attempts = 0
+        rate_limit_retries = 0
+        while True:
+            attempts += 1
+            try:
+                with self._rpc_deadline(deadline, retry_attempts=0):
+                    head = int(self.rpc.get_block_number())
+                return head, {
+                    "attempts": attempts,
+                    "rate_limit_retries": rate_limit_retries,
+                }
+            except RPCError as exc:
+                can_retry = bool(
+                    _rpc_rate_limited(exc)
+                    and attempts < LIVE_DECISION_HEAD_MAXIMUM_ATTEMPTS
+                    and deadline.remaining() > (
+                        max(0.0, float(downstream_required_seconds)) + 0.1)
+                )
+                if not can_retry:
+                    setattr(exc, "decision_head_attempts", attempts)
+                    setattr(
+                        exc, "decision_head_rate_limit_retries",
+                        rate_limit_retries)
+                    raise
+                # RobinhoodRPC's response observer published the cooldown
+                # before raising. The next raw request waits under the shared
+                # request mutex; test doubles simply exercise the retry bound.
+                rate_limit_retries += 1
 
     def classification_cost_estimate(self) -> float:
         """Measured seconds per classified observation (EWMA p95), or a
@@ -14686,6 +14867,8 @@ class RobinhoodLearningEngine:
         self._rpc_priority_telemetry = {
             "admissions": 0, "deferrals": 0,
             "wait_seconds": 0.0, "rate_wait_seconds": 0.0,
+            "provider_cooldown_wait_seconds": 0.0,
+            "provider_rate_limits": 0,
             "last_reason": None,
         }
         stop_heartbeat = threading.Event()
@@ -14750,8 +14933,10 @@ class RobinhoodLearningEngine:
                 heartbeat.join(timeout=1.0)
                 priority_deferred = isinstance(
                     exc, BackgroundRpcPriorityDeferred)
+                provider_deferred = _rpc_rate_limited(exc)
+                controlled_deferred = priority_deferred or provider_deferred
                 terminal_status = (
-                    "deferred" if priority_deferred else (
+                    "deferred" if controlled_deferred else (
                         "deadline_exceeded"
                         if isinstance(exc, CycleDeadlineExceeded)
                         else "failed"))
@@ -14768,13 +14953,16 @@ class RobinhoodLearningEngine:
                     "startup_consumed_seconds": round(startup_consumed, 3),
                     "startup_phases": startup_phases,
                     "duration_seconds": round(time.monotonic() - started, 3),
-                    "controlled_deferral": priority_deferred,
+                    "controlled_deferral": controlled_deferred,
                     "deferral_stage": (
                         "background_rpc_priority"
-                        if priority_deferred else None),
+                        if priority_deferred else (
+                            "provider_rpc" if provider_deferred else None)),
                     "deferral_reason": (
                         "live_rpc_reservation"
-                        if priority_deferred else None),
+                        if priority_deferred else (
+                            "provider_rate_limited"
+                            if provider_deferred else None)),
                     "rpc_priority": {
                         **self._rpc_priority_telemetry,
                         "wait_seconds": round(
@@ -14786,9 +14974,10 @@ class RobinhoodLearningEngine:
                 self.store.finish_run(
                     run_uuid, terminal_status,
                     summary=failure,
-                    error=None if priority_deferred else failure["error"])
+                    error=(
+                        None if controlled_deferred else failure["error"]))
                 atomic_json_write(self.root / f"{lane}_lane_summary.json", failure)
-                if priority_deferred:
+                if controlled_deferred:
                     return failure
                 raise
             finally:
@@ -14967,12 +15156,20 @@ class RobinhoodLearningEngine:
                             deadline=stage_deadline,
                         )
                     event_outcomes["head_block"] = outcome_head
-                except BackgroundRpcPriorityDeferred:
+                except Exception as exc:
+                    if not (
+                        isinstance(exc, BackgroundRpcPriorityDeferred)
+                        or _rpc_rate_limited(exc)
+                    ):
+                        raise
                     event_outcomes = {
                         "selected": 0, "observed": 0, "non_exitable": 0,
                         "deferred": 0, "admission_deferred": True,
                         "deferred_count_known": False,
-                        "reason": "stage_rpc_budget_exhausted",
+                        "reason": (
+                            "provider_rate_limited"
+                            if _rpc_rate_limited(exc)
+                            else "stage_rpc_budget_exhausted"),
                     }
             timings["event_outcomes_seconds"] = round(
                 time.monotonic() - stage, 3)
@@ -15107,7 +15304,9 @@ class RobinhoodLearningEngine:
             # the partial range is idempotent and no blocks disappear.
             ingestion_deadline = CycleDeadline(ingestion_available)
             try:
-                with self._rpc_deadline(ingestion_deadline):
+                with self._rpc_deadline(
+                    ingestion_deadline, retry_attempts=0,
+                ):
                     near_head = self.near_head_flow_pass(
                         deadline=ingestion_deadline,
                         cursor_name="live_lane_cursor.json",
@@ -15285,16 +15484,33 @@ class RobinhoodLearningEngine:
             if not decision_admission["admitted"]:
                 return defer_decision_head(
                     "insufficient_decision_head_headroom")
+            downstream_required = max(
+                0.0,
+                safe_float(decision_admission.get("required_seconds"))
+                - DECISION_HEAD_RPC_RESERVE_SECONDS,
+            )
             try:
-                with self._rpc_deadline(deadline):
-                    decision_head = int(self.rpc.get_block_number())
+                decision_head, decision_rpc = (
+                    self.read_authoritative_decision_head(
+                        deadline,
+                        downstream_required_seconds=downstream_required,
+                    )
+                )
             except RPCError as exc:
-                # A transport failure says nothing about token safety.  The
-                # observation is already durable; leave it unclassified and
-                # retry against an authoritative head in a later cycle.
+                # A transport failure says nothing about token safety. The
+                # observation is durable; leave it unclassified for a later
+                # authoritative decision rather than guessing at the head.
+                observation["decision_head_attempts"] = safe_int(
+                    getattr(exc, "decision_head_attempts", 1), 1)
+                observation["decision_head_rate_limit_retries"] = safe_int(
+                    getattr(
+                        exc, "decision_head_rate_limit_retries", 0), 0)
                 return defer_decision_head(
                     "decision_head_infrastructure_indeterminate",
                     infrastructure_indeterminate=True, error=str(exc))
+            observation["decision_head_attempts"] = decision_rpc["attempts"]
+            observation["decision_head_rate_limit_retries"] = (
+                decision_rpc["rate_limit_retries"])
             timings["decision_head_seconds"] = round(
                 time.monotonic() - stage, 3)
             post_ingest_tail_blocks = max(
@@ -17118,8 +17334,8 @@ def supervise_lanes(
                 launches[lane] += 1
                 if lane != "live":
                     last_background_launch = now_mono
-                while schedule["next"] <= now_mono:
-                    schedule["next"] += float(schedule["cadence"])
+                schedule["next"] = _next_lane_launch_after_start(
+                    now_mono, float(schedule["cadence"]))
             publish()
             time.sleep(1.0)
     finally:

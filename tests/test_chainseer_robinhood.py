@@ -7200,7 +7200,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v9")
+                "robinhood-operational-v10")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -8079,6 +8079,105 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(rate_state["lane"], "evidence")
             self.assertFalse(rate_state["request_failed"])
 
+    def test_provider_429_publishes_shared_adaptive_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            with patch.object(
+                rh, "PROVIDER_RPC_RATE_LIMIT_BASE_COOLDOWN_SECONDS", 0.05
+            ):
+                engine._observe_rpc_response(429, {})
+            state = rh.read_json(
+                Path(directory) / rh.PROVIDER_RPC_THROTTLE_STATE_FILE, {})
+            self.assertEqual(state["consecutive_429"], 1)
+            self.assertGreater(
+                rh._provider_cooldown_remaining(state), 0.0)
+            self.assertEqual(
+                engine._rpc_priority_telemetry["provider_rate_limits"], 1)
+            engine._observe_rpc_response(200, {})
+            cleared = rh.read_json(
+                Path(directory) / rh.PROVIDER_RPC_THROTTLE_STATE_FILE, {})
+            self.assertEqual(cleared["consecutive_429"], 0)
+            self.assertEqual(
+                rh._provider_cooldown_remaining(cleared), 0.0)
+
+    def test_live_rpc_gate_honors_shared_provider_cooldown(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine._active_lane = "live"
+            engine._active_lane_deadline = rh.CycleDeadline(2.0)
+            now = time.monotonic()
+            rh.atomic_json_write(
+                Path(directory) / rh.PROVIDER_RPC_THROTTLE_STATE_FILE,
+                {"cooldown_until_monotonic": now + 0.05},
+            )
+            started = time.monotonic()
+            with patch.dict(
+                os.environ, {"CHAINSEER_RPC_PRIORITY_REQUIRED": "1"}
+            ):
+                with engine._rpc_request_guard():
+                    admitted = time.monotonic()
+            self.assertGreaterEqual(admitted - started, 0.04)
+            self.assertGreater(
+                engine._rpc_priority_telemetry[
+                    "provider_cooldown_wait_seconds"], 0.0)
+
+    def test_direct_live_rpc_receives_the_full_child_deadline(self):
+        with tempfile.TemporaryDirectory() as directory:
+            rpc = FakeRPC([], latest=100)
+            rpc.timeout = 30.0
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=rpc, analyzer=FakeAnalyzer(),
+                market=FakeMarket())
+            deadline = rh.CycleDeadline(5.0)
+            with engine._rpc_deadline(deadline, retry_attempts=0):
+                admitted_timeout = rpc.timeout
+            self.assertGreater(admitted_timeout, 4.5)
+            self.assertEqual(rpc.timeout, 30.0)
+
+    def test_decision_head_retries_429_after_shared_cooldown(self):
+        class RateLimitedTwice(FakeRPC):
+            def __init__(self):
+                super().__init__([], latest=321)
+                self.head_calls = 0
+
+            def get_block_number(self):
+                self.head_calls += 1
+                if self.head_calls < 3:
+                    raise rh.RPCError(
+                        "RPC HTTP response failed (429)", -429)
+                return self.latest
+
+        with tempfile.TemporaryDirectory() as directory:
+            rpc = RateLimitedTwice()
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=rpc, analyzer=FakeAnalyzer(),
+                market=FakeMarket())
+            head, telemetry = engine.read_authoritative_decision_head(
+                rh.CycleDeadline(5.0), downstream_required_seconds=0.1)
+            self.assertEqual(head, 321)
+            self.assertEqual(rpc.head_calls, 3)
+            self.assertEqual(telemetry["attempts"], 3)
+            self.assertEqual(telemetry["rate_limit_retries"], 2)
+
+    def test_provider_rate_limit_is_a_controlled_lane_deferral(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+
+            def worker(_deadline):
+                raise rh.RPCError("RPC HTTP response failed (429)", -429)
+
+            result = engine._execute_lane("evidence", 5.0, worker)
+            self.assertEqual(result["status"], "deferred")
+            self.assertTrue(result["controlled_deferral"])
+            self.assertEqual(
+                result["deferral_reason"], "provider_rate_limited")
+
     def test_rpc_priority_exhaustion_is_a_controlled_lane_deferral(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = rh.RobinhoodLearningEngine(
@@ -8317,6 +8416,17 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         )
         for lane in rh.SUPERVISED_LANE_NAMES:
             self.assertIn(f'"{lane}"', source, f"{lane} missing from config")
+
+    def test_delayed_launch_rebases_instead_of_replaying_cadence_debt(self):
+        self.assertEqual(
+            rh._next_lane_launch_after_start(43.0, 30.0), 73.0)
+        source = inspect.getsource(rh.supervise_lanes)
+        launch_tail = source.split("subprocess.Popen", 1)[1]
+        self.assertIn("_next_lane_launch_after_start", launch_tail)
+        self.assertNotIn(
+            'while schedule["next"] <= now_mono', launch_tail,
+            "a delayed launch can still be followed by a catch-up burst",
+        )
 
     def test_full_verification_is_maintenance_only(self):
         source = inspect.getsource(rh.supervise_lanes)

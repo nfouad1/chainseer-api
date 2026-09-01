@@ -38,6 +38,8 @@ from chainseer_temporal_graph import build_temporal_projection
 class FakeResponse:
     def __init__(self, data):
         self._data = data
+        self.status_code = 200
+        self.headers = {}
 
     def raise_for_status(self):
         return None
@@ -419,6 +421,9 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         rpc = chainseer.RobinhoodRPC(
             "https://rpc.example.invalid", timeout=30)
         rpc.request_gate = gate
+        observed_statuses = []
+        rpc.response_observer = lambda status, _headers: (
+            observed_statuses.append(status))
         rpc._session = FakeSession({"result": hex(123)})
         self.assertEqual(rpc.get_block_number(), 123)
         self.assertEqual(rpc._session.calls[0][2], 3.25)
@@ -428,6 +433,7 @@ class ChainseerInfrastructureTests(unittest.TestCase):
         self.assertEqual(result[0]["result"], hex(10))
         self.assertEqual(rpc._session.calls[0][2], 3.25)
         self.assertEqual(events, ["enter", "exit", "enter", "exit"])
+        self.assertEqual(observed_statuses, [200, 200])
 
     def test_per_block_calls_batch_into_one_request(self):
         """Evidence pinned per record cannot share one block tag.
@@ -1525,6 +1531,11 @@ class AlertWiringTests(unittest.TestCase):
         Phase 8 alert_on_decision call site."""
         stack.enter_context(
             patch.object(
+                chainseer.RobinhoodRPC, "get_block_number", return_value=100
+            )
+        )
+        stack.enter_context(
+            patch.object(
                 chainseer.RobinhoodRPC, "get_code", return_value="0x" + "60" * 40
             )
         )
@@ -1626,11 +1637,16 @@ class AlertWiringTests(unittest.TestCase):
                 chainseer.RobinhoodRPC, "get_block_number", return_value=100
             ):
                 agent = chainseer.Chainseer(chain_root=temp_dir)
-            with ExitStack() as stack:
-                report, _ = self._run_analyze_token(
-                    stack, agent, token, basic_info, analysis, **analyze_kwargs
-                )
-                return report, agent._mocked_seal_report
+                # analyze_token pins its own block after construction. Keep
+                # this infrastructure test hermetic for that read as well;
+                # otherwise a provider 429 tests the public endpoint instead
+                # of the seal gate this fixture exists to verify.
+                with ExitStack() as stack:
+                    report, _ = self._run_analyze_token(
+                        stack, agent, token, basic_info, analysis,
+                        **analyze_kwargs
+                    )
+                    return report, agent._mocked_seal_report
 
     def test_analyze_token_seals_by_default(self):
         """The default must stay True; every existing caller relies on it."""

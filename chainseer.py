@@ -1511,6 +1511,10 @@ class RobinhoodRPC:
         # that performs several RPCs cannot accidentally bypass live-lane
         # priority merely because its outer Python context began earlier.
         self.request_gate = None
+        # Optional provider-response observer installed by supervised
+        # consumers. The request gate controls when a call starts; this hook
+        # lets independent workers share the provider's actual throttle state.
+        self.response_observer = None
 
     def _request_guard(self):
         factory = self.request_gate
@@ -1521,6 +1525,19 @@ class RobinhoodRPC:
         if maximum is None:
             return configured
         return max(0.1, min(configured, float(maximum)))
+
+    def _observe_response(self, response) -> None:
+        observer = self.response_observer
+        if not callable(observer):
+            return
+        try:
+            observer(
+                int(getattr(response, "status_code", 0) or 0),
+                dict(getattr(response, "headers", {}) or {}),
+            )
+        except Exception:
+            # Observability must never replace the authoritative RPC result.
+            pass
 
     def bind_context(self, context: ScanContext):
         self.context = context
@@ -1553,6 +1570,7 @@ class RobinhoodRPC:
                 request_timeout = self._guarded_timeout(maximum_timeout)
                 resp = self._session.post(
                     self.rpc_url, json=payload, timeout=request_timeout)
+                self._observe_response(resp)
             resp.raise_for_status()
             data = resp.json()
             if self.context is not None:
@@ -1641,6 +1659,7 @@ class RobinhoodRPC:
                     json=payload,
                     timeout=request_timeout,
                 )
+                self._observe_response(response)
             response.raise_for_status()
             body = response.json()
             if not isinstance(body, list):
