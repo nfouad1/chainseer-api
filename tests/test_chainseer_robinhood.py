@@ -9640,6 +9640,27 @@ class EvidenceOutcomeItemReserveTests(unittest.TestCase):
             rh.LANE_TERMINATION_GRACE_SECONDS,
         )
 
+    def test_exhausted_remote_budget_skips_due_row_selectors(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=50_000_000),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine.quote_pending_flow_evidence = lambda **kwargs: {}
+            engine.quote_pending_flow_observations = lambda **kwargs: {}
+            engine.observe_flow_evidence_outcomes = lambda *args, **kwargs: (
+                self.fail("event due-row selector spent completion reserve"))
+            engine.observe_flow_observation_outcomes = (
+                lambda *args, **kwargs: self.fail(
+                    "observation due-row selector spent completion reserve"))
+            result = engine.run_evidence_lane(budget_seconds=5.0)
+
+        self.assertEqual(result["status"], "complete")
+        self.assertTrue(result["event_outcomes"]["admission_deferred"])
+        self.assertTrue(
+            result["observation_outcomes"]["admission_deferred"])
+        self.assertFalse(
+            result["event_outcomes"]["deferred_count_known"])
+
     def test_deferral_is_counted_not_silent(self):
         """A deferred outcome must remain pending and be reported, so the
         backlog stays visible rather than quietly shrinking."""

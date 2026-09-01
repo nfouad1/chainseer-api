@@ -14786,22 +14786,25 @@ class RobinhoodLearningEngine:
                 time.monotonic() - stage, 3)
 
             stage = time.monotonic()
-            self.store.mark_lane_stage(
-                "evidence", "event_outcomes", run_id=self.cycle_run_uuid,
-                remaining=execution_deadline.remaining(),
-                completed=dict(timings))
             event_outcomes: dict
             if execution_deadline.remaining() < (
                     EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
-                # The selector still counts the due rows; the item reserve
-                # prevents it from starting any remote request.
-                event_outcomes = self.observe_flow_evidence_outcomes(
-                    observed_at, 0,
-                    limit=max(0, int(event_outcome_limit)),
-                    deadline=execution_deadline,
-                )
-                event_outcomes["reason"] = "completion_reserve_reached"
+                # Do not even run the due-row selector here. The production
+                # corpus measured that SQLite query at 5.1s after the remote
+                # budget was exhausted, enough to consume the entire parent
+                # completion reserve by itself.
+                event_outcomes = {
+                    "selected": 0, "observed": 0, "non_exitable": 0,
+                    "deferred": 0, "admission_deferred": True,
+                    "deferred_count_known": False,
+                    "reason": "completion_reserve_reached",
+                }
             else:
+                self.store.mark_lane_stage(
+                    "evidence", "event_outcomes",
+                    run_id=self.cycle_run_uuid,
+                    remaining=execution_deadline.remaining(),
+                    completed=dict(timings))
                 with self._rpc_deadline(execution_deadline):
                     outcome_head = int(self.rpc.get_block_number())
                     event_outcomes = self.observe_flow_evidence_outcomes(
@@ -14814,17 +14817,30 @@ class RobinhoodLearningEngine:
                 time.monotonic() - stage, 3)
 
             stage = time.monotonic()
-            self.store.mark_lane_stage(
-                "evidence", "observation_outcomes",
-                run_id=self.cycle_run_uuid,
-                remaining=execution_deadline.remaining(),
-                completed=dict(timings))
-            with self._rpc_deadline(execution_deadline):
-                observation_outcomes = self.observe_flow_observation_outcomes(
-                    observed_at,
-                    limit=max(0, int(observation_outcome_limit)),
-                    deadline=execution_deadline,
-                )
+            if execution_deadline.remaining() < (
+                    EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
+                observation_outcomes = {
+                    "due": 0, "resolved_this_cycle": 0,
+                    "non_exitable_this_cycle": 0, "failures": 0,
+                    "deferred": 0, "admission_deferred": True,
+                    "deferred_count_known": False,
+                    "reason": "completion_reserve_reached",
+                    "limit": max(0, int(observation_outcome_limit)),
+                }
+            else:
+                self.store.mark_lane_stage(
+                    "evidence", "observation_outcomes",
+                    run_id=self.cycle_run_uuid,
+                    remaining=execution_deadline.remaining(),
+                    completed=dict(timings))
+                with self._rpc_deadline(execution_deadline):
+                    observation_outcomes = (
+                        self.observe_flow_observation_outcomes(
+                            observed_at,
+                            limit=max(0, int(observation_outcome_limit)),
+                            deadline=execution_deadline,
+                        )
+                    )
             timings["observation_outcomes_seconds"] = round(
                 time.monotonic() - stage, 3)
             return {
