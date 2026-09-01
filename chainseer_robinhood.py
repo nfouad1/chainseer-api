@@ -221,6 +221,7 @@ BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 6
 BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK = 1
 BACKFILL_RECOVERY_TARGET_RATIO = 1.10
 BACKFILL_QUEUE_MAINTENANCE_MINIMUM_SECONDS = 8.0
+BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS = 20.0
 BACKFILL_RPC_URL_ENV = "CHAINSEER_ROBINHOOD_BACKFILL_RPC_URL"
 # The supervised live cadence is 30 seconds and this chain has recently
 # produced roughly ten blocks/second. Scan a bounded newest-head slice on the
@@ -1534,6 +1535,8 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK,
         "backfill_recovery_target_ratio":
             BACKFILL_RECOVERY_TARGET_RATIO,
+        "backfill_rpc_attempt_budget_seconds":
+            BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
         "backfill_rpc_isolation_supported": True,
         "backfill_rpc_chunk_model_epoch":
             BACKFILL_RPC_CHUNK_MODEL_EPOCH,
@@ -1641,13 +1644,17 @@ def _transient_rpc_failure(error: BaseException | str) -> bool:
     """Classify transport/provider failures without hiding deterministic bugs."""
     text = str(error).lower()
     return bool(
-        _rpc_rate_limited(error)
+        isinstance(error, BackgroundRpcPriorityDeferred)
+        or _rpc_rate_limited(error)
         or "rpc -2" in text
         or "timed out" in text
         or "timeout" in text
         or "cannot connect" in text
         or "transport failed" in text
         or "connection" in text
+        or " eof" in f" {text}"
+        or "connection reset" in text
+        or "remote host closed" in text
     )
 
 
@@ -16354,32 +16361,48 @@ class RobinhoodLearningEngine:
             if recovery_deadline.expired():
                 stopped_reason = "completion_reserve_reached"
                 break
+            chunk_deadline = CycleDeadline(min(
+                recovery_deadline.remaining(),
+                BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
+            ))
             try:
-                with self._rpc_deadline(recovery_deadline):
+                with self._rpc_deadline(chunk_deadline):
                     chunk = self.drain_flow_backfill(
-                        recovery_deadline, block_limit=chunk_limit)
+                        chunk_deadline, block_limit=chunk_limit)
             except RuntimeError as exc:
                 if not _transient_rpc_failure(exc):
                     raise
-                next_chunk_state = self.record_backfill_rpc_chunk_result(
-                    chunk_limit, error=exc)
+                scheduler_deferred = isinstance(
+                    exc, BackgroundRpcPriorityDeferred)
+                next_chunk_state = (
+                    self.backfill_rpc_chunk_plan(block_limit)
+                    if scheduler_deferred
+                    else self.record_backfill_rpc_chunk_result(
+                        chunk_limit, error=exc)
+                )
+                next_chunk_blocks = safe_int(
+                    next_chunk_state.get("next_chunk_blocks"),
+                    safe_int(next_chunk_state.get("chunk_blocks"), chunk_limit),
+                )
                 # Cursor remains on the attempted block. A provider throttle
                 # is a controlled no-progress cycle, not evidence corruption
                 # and not permission to launch secondary RPC discovery.
                 provider_deferral = {
                     "deferred": True,
                     "reason": (
-                        "provider_rate_limited"
-                        if _rpc_rate_limited(exc)
-                        else "provider_temporarily_unavailable"
+                        "rpc_priority_deferred" if scheduler_deferred
+                        else "provider_rate_limited"
+                            if _rpc_rate_limited(exc)
+                            else "provider_temporarily_unavailable"
                     ),
                     "error_type": type(exc).__name__,
                     "error": str(exc)[:500],
                     "attempts_per_chunk":
                         BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK,
                     "attempted_chunk_blocks": chunk_limit,
-                    "next_chunk_blocks": next_chunk_state[
-                        "next_chunk_blocks"],
+                    "next_chunk_blocks": next_chunk_blocks,
+                    "attempt_budget_seconds":
+                        BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
                     "cursor_advanced": False,
                 }
                 stopped_reason = provider_deferral["reason"]
@@ -17397,11 +17420,13 @@ def _select_background_candidate(
         and mark_count < mark_target
     ):
         return "marks"
-    if (
-        "backfill" in due_by_name
-        and bool((backfill_pressure or {}).get("priority"))
-    ):
-        return "backfill"
+    if bool((backfill_pressure or {}).get("priority")):
+        # Recovery below arrivals is an exclusive background mode. Launching
+        # analysis/evidence while a backfill worker waits for the shared RPC
+        # gate consumed 88 of its 120 seconds before its single request. Live
+        # and paced marks continue; other background RPC work resumes once the
+        # durable ten-run ratio reaches its frozen target.
+        return "backfill" if "backfill" in due_by_name else None
     return max(
         due_background,
         key=lambda item: time.monotonic() - float(item[1]["next"]),

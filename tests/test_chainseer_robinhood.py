@@ -8242,6 +8242,29 @@ class LaneSplitTests(unittest.TestCase):
             rh._remote_call("priority-test", callback, attempts=4)
         self.assertEqual(attempts, 1)
 
+    def test_provider_eof_is_a_transient_transport_failure(self):
+        self.assertTrue(rh._transient_rpc_failure(
+            RuntimeError('Post "http://provider/rpc": EOF')))
+
+    def test_backfill_rpc_priority_wait_is_bounded_and_does_not_shrink(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            engine.store.enqueue_backfill(10, 1_000, "live_lane_reanchor")
+            engine.drain_flow_backfill = lambda *_args, **_kwargs: (
+                (_ for _ in ()).throw(
+                    rh.BackgroundRpcPriorityDeferred("live reservation")))
+            before = engine.backfill_rpc_chunk_plan(1_000)["chunk_blocks"]
+            result = engine.drain_flow_backfill_until_reserve(
+                rh.CycleDeadline(30.0), block_limit=1_000)
+            deferred = result["provider_deferral"]
+            after = engine.backfill_rpc_chunk_plan(1_000)["chunk_blocks"]
+            self.assertTrue(result["provider_deferred"])
+            self.assertEqual(deferred["reason"], "rpc_priority_deferred")
+            self.assertEqual(deferred["attempt_budget_seconds"], 20.0)
+            self.assertEqual(after, before)
+
     def test_backfill_rate_limit_is_one_attempt_and_a_controlled_deferral(self):
         class RateLimitedRPC(FakeRPC):
             def __init__(self):
@@ -8523,6 +8546,13 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
             rh._select_background_candidate(
                 due, {}, backfill_pressure={"priority": True}),
             "backfill",
+        )
+        self.assertIsNone(
+            rh._select_background_candidate(
+                [("analysis", {"next": 1.0}),
+                 ("evidence", {"next": 2.0})], {},
+                backfill_pressure={"priority": True}),
+            "other background RPC work must not run beside recovery",
         )
 
     def test_full_verification_is_maintenance_only(self):
