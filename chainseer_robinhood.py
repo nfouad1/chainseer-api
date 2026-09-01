@@ -167,7 +167,13 @@ EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 # can persist its summary and release SQLite cleanly. The RPC-priority soak
 # measured a worker entering ``observation_outcomes`` with exactly 0.0s left;
 # it was then killed even though the expensive work had already completed.
-EVIDENCE_COMPLETION_RESERVE_SECONDS = 3.0
+EVIDENCE_COMPLETION_RESERVE_SECONDS = 8.0
+# No evidence stream may consume the whole lane. Production measured the
+# entry-quote stage at 85.3s, after which observation quotes began with 0.0s
+# and the worker missed its 90s deadline. Four bounded slices preserve useful
+# progress across every durable stream; the last slice is also constrained by
+# the shared completion reserve above.
+EVIDENCE_STAGE_MAX_SECONDS = 20.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
 # Operational verification performs bounded schema/readability/critical-table
 # health checks plus complete ledger and producer-Timechain verification.
@@ -405,7 +411,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v8"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v9"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -788,14 +794,14 @@ LIVE_LANE_LAUNCH_GUARD_SECONDS = 8.0
 # in-flight request and the provider's rolling rate bucket can drain before a
 # decision-head call.  A two-second guard serialized requests but still let
 # two live attempts receive HTTP 429 after back-to-back evidence workers.
-BACKGROUND_RPC_LIVE_GUARD_SECONDS = 8.0
+BACKGROUND_RPC_LIVE_GUARD_SECONDS = 5.0
 BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS = 5.0
 # Serialization is not rate limiting. Production measured 83 evidence
 # requests admitted in a 90-second lane, bunched into the short windows
 # between live passes; live then received two consecutive 429s. Pace all
 # background lanes through one shared completion-to-start interval while live
 # remains unpaced and preemptive.
-BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS = 1.0
+BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS = 0.5
 BACKGROUND_RPC_PRIORITY_POLL_SECONDS = 0.1
 BACKGROUND_RPC_PRIORITY_MAX_STATE_AGE_SECONDS = 3.0
 BACKGROUND_RPC_PRIORITY_STATE_FILE = "rpc_priority_state.json"
@@ -1447,6 +1453,9 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS,
         "background_rpc_minimum_interval_seconds":
             BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS,
+        "evidence_completion_reserve_seconds":
+            EVIDENCE_COMPLETION_RESERVE_SECONDS,
+        "evidence_stage_max_seconds": EVIDENCE_STAGE_MAX_SECONDS,
         "live_all_attempt_p95_target_seconds": 30.0,
         "decision_lag_maximum_blocks":
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
@@ -13814,6 +13823,11 @@ class RobinhoodLearningEngine:
                 market = self.v4_market.snapshot(
                     candidate, quote_block=int(event["window_end_block"]),
                 )
+            except BackgroundRpcPriorityDeferred:
+                # A stage slice ending is scheduling, not evidence that the
+                # pool failed to quote. Leave this and later rows pending.
+                deferred = len(selected) - index
+                break
             except Exception as exc:
                 market = {
                     "current_state_verified": False,
@@ -13898,6 +13912,9 @@ class RobinhoodLearningEngine:
             except CycleDeadlineExceeded:
                 deferred = len(selected) - index
                 break
+            except BackgroundRpcPriorityDeferred:
+                deferred = len(selected) - index
+                break
             except Exception:
                 failures += 1
         return {
@@ -13939,6 +13956,9 @@ class RobinhoodLearningEngine:
                 break
             try:
                 head = int(self.rpc.get_block_number())
+            except BackgroundRpcPriorityDeferred:
+                deferred = len(due_rows) - index
+                break
             except Exception:
                 head = int(due.get("window_end_block") or 0)
             try:
@@ -13958,6 +13978,9 @@ class RobinhoodLearningEngine:
                     quote_block=head,
                 )
                 exit_quote = dict(market.get("paper_exit_quote") or {})
+            except BackgroundRpcPriorityDeferred:
+                deferred = len(due_rows) - index
+                break
             except Exception as exc:
                 exit_quote = {
                     "verified": False, "reason": "exit_quote_failed",
@@ -14008,6 +14031,9 @@ class RobinhoodLearningEngine:
                 market = self.v4_market.snapshot(
                     candidate, quote_block=int(head_block),
                 )
+            except BackgroundRpcPriorityDeferred:
+                deferred = len(due_rows) - index
+                break
             except Exception as exc:
                 market = {
                     "current_state_verified": False,
@@ -14815,72 +14841,78 @@ class RobinhoodLearningEngine:
         observed_at = time.time() if now is None else float(now)
 
         def work(deadline: CycleDeadline) -> dict:
-            # The parent deadline includes durable completion. Passing it to
-            # every remote stage let a final successful request consume the
-            # full lane budget, leaving no time to persist the result.
-            execution_deadline = CycleDeadline(max(
-                0.0,
-                deadline.remaining() - EVIDENCE_COMPLETION_RESERVE_SECONDS,
-            ))
+            # Each durable stream receives an independent bounded slice. A
+            # single shared remote deadline let entry quotes consume 85.3s,
+            # after which every later stream began at zero. Recompute from the
+            # parent before each stage so unused time remains available while
+            # the completion reserve can never be allocated to remote work.
+            def next_stage_deadline() -> CycleDeadline:
+                return CycleDeadline(max(
+                    0.0,
+                    min(
+                        EVIDENCE_STAGE_MAX_SECONDS,
+                        deadline.remaining()
+                        - EVIDENCE_COMPLETION_RESERVE_SECONDS,
+                    ),
+                ))
+
             timings: dict[str, float] = {}
+
             stage = time.monotonic()
-            self.store.mark_lane_stage(
-                "evidence", "entry_quotes", run_id=self.cycle_run_uuid,
-                remaining=execution_deadline.remaining(),
-                completed=dict(timings))
-            with self._rpc_deadline(execution_deadline):
-                entry_quotes = self.quote_pending_flow_evidence(
-                    limit=max(0, int(entry_quote_limit)),
-                    deadline=execution_deadline)
+            stage_deadline = next_stage_deadline()
+            if stage_deadline.expired():
+                entry_quotes = {
+                    "entry_quotes_selected": 0,
+                    "entry_quotes_verified": 0, "quote_failures": 0,
+                    "entry_quotes_deferred": 0,
+                    "admission_deferred": True,
+                    "deferred_count_known": False,
+                    "reason": "completion_reserve_reached",
+                    "limit": max(0, int(entry_quote_limit)),
+                }
+            else:
+                self.store.mark_lane_stage(
+                    "evidence", "entry_quotes", run_id=self.cycle_run_uuid,
+                    remaining=stage_deadline.remaining(),
+                    completed=dict(timings))
+                with self._rpc_deadline(stage_deadline):
+                    entry_quotes = self.quote_pending_flow_evidence(
+                        limit=max(0, int(entry_quote_limit)),
+                        deadline=stage_deadline)
             timings["entry_quotes_seconds"] = round(
                 time.monotonic() - stage, 3)
 
             stage = time.monotonic()
-            self.store.mark_lane_stage(
-                "evidence", "observation_quotes",
-                run_id=self.cycle_run_uuid,
-                remaining=execution_deadline.remaining(),
-                completed=dict(timings))
-            with self._rpc_deadline(execution_deadline):
-                observation_quotes = self.quote_pending_flow_observations(
-                    limit=EVIDENCE_OBSERVATION_QUOTE_LIMIT,
-                    deadline=execution_deadline)
-            timings["observation_quotes_seconds"] = round(
-                time.monotonic() - stage, 3)
-
-            stage = time.monotonic()
-            event_outcomes: dict
-            if execution_deadline.remaining() < (
-                    EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
-                # Do not even run the due-row selector here. The production
-                # corpus measured that SQLite query at 5.1s after the remote
-                # budget was exhausted, enough to consume the entire parent
-                # completion reserve by itself.
-                event_outcomes = {
-                    "selected": 0, "observed": 0, "non_exitable": 0,
-                    "deferred": 0, "admission_deferred": True,
+            stage_deadline = next_stage_deadline()
+            if stage_deadline.expired():
+                observation_quotes = {
+                    "selected": 0, "quoted": 0, "decision_quotes": 0,
+                    "quote_failures": 0, "deferred": 0,
+                    "admission_deferred": True,
                     "deferred_count_known": False,
                     "reason": "completion_reserve_reached",
                 }
             else:
                 self.store.mark_lane_stage(
-                    "evidence", "event_outcomes",
+                    "evidence", "observation_quotes",
                     run_id=self.cycle_run_uuid,
-                    remaining=execution_deadline.remaining(),
+                    remaining=stage_deadline.remaining(),
                     completed=dict(timings))
-                with self._rpc_deadline(execution_deadline):
-                    outcome_head = int(self.rpc.get_block_number())
-                    event_outcomes = self.observe_flow_evidence_outcomes(
-                        observed_at, outcome_head,
-                        limit=max(0, int(event_outcome_limit)),
-                        deadline=execution_deadline,
+                with self._rpc_deadline(stage_deadline):
+                    observation_quotes = (
+                        self.quote_pending_flow_observations(
+                            limit=EVIDENCE_OBSERVATION_QUOTE_LIMIT,
+                            deadline=stage_deadline)
                     )
-                event_outcomes["head_block"] = outcome_head
-            timings["event_outcomes_seconds"] = round(
+            timings["observation_quotes_seconds"] = round(
                 time.monotonic() - stage, 3)
 
+            # The v3 cohort consumes observation outcomes. Run them before
+            # the legacy event outcome stream so the research loop cannot be
+            # starved by a perpetual event backlog.
             stage = time.monotonic()
-            if execution_deadline.remaining() < (
+            stage_deadline = next_stage_deadline()
+            if stage_deadline.remaining() < (
                     EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
                 observation_outcomes = {
                     "due": 0, "resolved_this_cycle": 0,
@@ -14894,17 +14926,55 @@ class RobinhoodLearningEngine:
                 self.store.mark_lane_stage(
                     "evidence", "observation_outcomes",
                     run_id=self.cycle_run_uuid,
-                    remaining=execution_deadline.remaining(),
+                    remaining=stage_deadline.remaining(),
                     completed=dict(timings))
-                with self._rpc_deadline(execution_deadline):
+                with self._rpc_deadline(stage_deadline):
                     observation_outcomes = (
                         self.observe_flow_observation_outcomes(
                             observed_at,
                             limit=max(0, int(observation_outcome_limit)),
-                            deadline=execution_deadline,
+                            deadline=stage_deadline,
                         )
                     )
             timings["observation_outcomes_seconds"] = round(
+                time.monotonic() - stage, 3)
+
+            stage = time.monotonic()
+            stage_deadline = next_stage_deadline()
+            event_outcomes: dict
+            if stage_deadline.remaining() < (
+                    EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
+                # Never run the due-row selector without one item's reserve.
+                # It alone measured 5.1s on the production corpus.
+                event_outcomes = {
+                    "selected": 0, "observed": 0, "non_exitable": 0,
+                    "deferred": 0, "admission_deferred": True,
+                    "deferred_count_known": False,
+                    "reason": "completion_reserve_reached",
+                }
+            else:
+                self.store.mark_lane_stage(
+                    "evidence", "event_outcomes",
+                    run_id=self.cycle_run_uuid,
+                    remaining=stage_deadline.remaining(),
+                    completed=dict(timings))
+                try:
+                    with self._rpc_deadline(stage_deadline):
+                        outcome_head = int(self.rpc.get_block_number())
+                        event_outcomes = self.observe_flow_evidence_outcomes(
+                            observed_at, outcome_head,
+                            limit=max(0, int(event_outcome_limit)),
+                            deadline=stage_deadline,
+                        )
+                    event_outcomes["head_block"] = outcome_head
+                except BackgroundRpcPriorityDeferred:
+                    event_outcomes = {
+                        "selected": 0, "observed": 0, "non_exitable": 0,
+                        "deferred": 0, "admission_deferred": True,
+                        "deferred_count_known": False,
+                        "reason": "stage_rpc_budget_exhausted",
+                    }
+            timings["event_outcomes_seconds"] = round(
                 time.monotonic() - stage, 3)
             return {
                 "entry_quotes": entry_quotes,
@@ -14914,6 +14984,7 @@ class RobinhoodLearningEngine:
                 "stage_timings_seconds": timings,
                 "completion_reserve_seconds":
                     EVIDENCE_COMPLETION_RESERVE_SECONDS,
+                "stage_max_seconds": EVIDENCE_STAGE_MAX_SECONDS,
                 "paper_only": True,
                 "live_execution_enabled": False,
                 "timechain_writer": None,

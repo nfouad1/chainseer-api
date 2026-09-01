@@ -7200,7 +7200,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v8")
+                "robinhood-operational-v9")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7218,6 +7218,12 @@ class LaneSplitTests(unittest.TestCase):
                 cohort["policy"][
                     "background_rpc_minimum_interval_seconds"],
                 rh.BACKGROUND_RPC_MINIMUM_INTERVAL_SECONDS)
+            self.assertEqual(
+                cohort["policy"]["evidence_completion_reserve_seconds"],
+                rh.EVIDENCE_COMPLETION_RESERVE_SECONDS)
+            self.assertEqual(
+                cohort["policy"]["evidence_stage_max_seconds"],
+                rh.EVIDENCE_STAGE_MAX_SECONDS)
             self.assertEqual(
                 cohort["policy"]["backfill_remote_attempts_per_chunk"], 1)
             self.assertEqual(
@@ -7786,7 +7792,7 @@ class LaneSplitTests(unittest.TestCase):
             )
             result = engine.run_evidence_lane(budget_seconds=30.0)
             self.assertEqual(result["status"], "complete")
-            self.assertEqual(calls, ["quotes", "events", "observations"])
+            self.assertEqual(calls, ["quotes", "observations", "events"])
             self.assertTrue(result["paper_only"])
             self.assertFalse(result["live_execution_enabled"])
             self.assertIsNone(result["timechain_writer"])
@@ -9676,10 +9682,23 @@ class EvidenceOutcomeItemReserveTests(unittest.TestCase):
         source = inspect.getsource(
             rh.RobinhoodLearningEngine.run_evidence_lane)
         self.assertIn("EVIDENCE_COMPLETION_RESERVE_SECONDS", source)
-        self.assertIn("execution_deadline", source)
+        self.assertIn("next_stage_deadline", source)
+        self.assertIn("EVIDENCE_STAGE_MAX_SECONDS", source)
         self.assertGreaterEqual(
             rh.EVIDENCE_COMPLETION_RESERVE_SECONDS,
             rh.LANE_TERMINATION_GRACE_SECONDS,
+        )
+        self.assertLess(
+            rh.EVIDENCE_STAGE_MAX_SECONDS,
+            rh.EVIDENCE_LANE_BUDGET_SECONDS / 4,
+        )
+
+    def test_observation_outcomes_run_before_legacy_event_outcomes(self):
+        source = inspect.getsource(
+            rh.RobinhoodLearningEngine.run_evidence_lane)
+        self.assertLess(
+            source.index("self.observe_flow_observation_outcomes"),
+            source.index("self.observe_flow_evidence_outcomes"),
         )
 
     def test_exhausted_remote_budget_skips_due_row_selectors(self):
