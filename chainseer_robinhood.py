@@ -12901,6 +12901,7 @@ class RobinhoodLearningEngine:
         records = records[-DECISION_TAIL_BLOCK_SAMPLE_WINDOW:]
         reserves: dict[int, int] = {}
         sample_counts: dict[int, int] = {}
+        breached_counts: list[int] = []
         for count in range(0, LIVE_LANE_OBSERVATION_LIMIT + 1):
             values = [
                 record["blocks"] for record in records
@@ -12916,11 +12917,21 @@ class RobinhoodLearningEngine:
                 _nearest_rank(values, DECISION_TAIL_BLOCK_QUANTILE,
                               baseline)))
             sample_counts[count] = len(values)
+            # A quantile is the right steady-state estimator, but it cannot
+            # erase an observed policy violation. Quarantine only the batch
+            # size that breached the prospective bound until that sample
+            # naturally ages out of the bounded model window. Smaller
+            # batches continue producing evidence, so one chain/provider
+            # spike cannot cause permanent observation starvation.
+            if any(value > FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                   for value in values):
+                breached_counts.append(count)
         return {
             "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
             "quantile": f"nearest_rank_p{int(DECISION_TAIL_BLOCK_QUANTILE*100)}",
             "reserves": reserves,
             "sample_counts": sample_counts,
+            "breached_counts": breached_counts,
             "samples": records,
         }
 
@@ -12958,6 +12969,7 @@ class RobinhoodLearningEngine:
             "epoch": model["epoch"], "quantile": model["quantile"],
             "reserves": model["reserves"],
             "sample_counts": model["sample_counts"],
+            "breached_counts": model["breached_counts"],
             "multi_observation_safety_blocks":
                 DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS,
         }
@@ -12978,6 +12990,8 @@ class RobinhoodLearningEngine:
         reserve = int(model["reserves"].get(0, 0))
         safety_blocks = 0
         for count in range(requested, 0, -1):
+            if count in model["breached_counts"]:
+                continue
             candidate_reserve = int(model["reserves"].get(
                 count, FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS))
             candidate_safety = (
@@ -17057,6 +17071,27 @@ def _low_priority_launch_blocked(
     return 0.0 <= seconds_to_live <= float(guard_seconds)
 
 
+def _select_background_candidate(
+    due_background: list[tuple[str, dict]], launches: dict[str, int],
+) -> str | None:
+    """Keep independent mark evidence paced with live cohort attempts."""
+    if not due_background:
+        return None
+    due_by_name = {lane: schedule for lane, schedule in due_background}
+    mark_target = math.ceil(
+        max(0, int(launches.get("live", 0)))
+        * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION)
+    if (
+        "marks" in due_by_name
+        and int(launches.get("marks", 0)) < mark_target
+    ):
+        return "marks"
+    return max(
+        due_background,
+        key=lambda item: time.monotonic() - float(item[1]["next"]),
+    )[0]
+
+
 def _full_verification_due(
     root: str | Path, *, now: float | None = None,
 ) -> bool:
@@ -17270,12 +17305,8 @@ def supervise_lanes(
                 if lane != "live" and lane not in active
                 and now_mono >= float(schedule["next"])
             ]
-            background_candidate = (
-                max(
-                    due_background,
-                    key=lambda item: now_mono - float(item[1]["next"]),
-                )[0]
-                if due_background else None)
+            background_candidate = _select_background_candidate(
+                due_background, launches)
             for lane, schedule in lanes.items():
                 if lane in active or now_mono < schedule["next"]:
                     continue

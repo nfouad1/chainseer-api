@@ -8428,6 +8428,23 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
             "a delayed launch can still be followed by a catch-up burst",
         )
 
+    def test_marks_are_prioritized_only_while_below_cohort_sample_pace(self):
+        due = [
+            ("analysis", {"next": 1.0}),
+            ("marks", {"next": 2.0}),
+        ]
+        self.assertEqual(
+            rh._select_background_candidate(
+                due, {"live": 100, "marks": 39}),
+            "marks",
+        )
+        with patch.object(rh.time, "monotonic", return_value=100.0):
+            self.assertEqual(
+                rh._select_background_candidate(
+                    due, {"live": 100, "marks": 40}),
+                "analysis",
+            )
+
     def test_full_verification_is_maintenance_only(self):
         source = inspect.getsource(rh.supervise_lanes)
         self.assertIn("verification", rh.LANE_NAMES)
@@ -10663,6 +10680,17 @@ class DecisionTailAdmissionTests(unittest.TestCase):
                 requested=2)
         self.assertEqual(plan["model"]["reserves"][1], 50)
         self.assertEqual(plan["admitted"], 0)
+
+    def test_recent_bound_breach_quarantines_only_that_batch_size(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._engine(directory)
+            engine.record_decision_tail_blocks(2, 122)
+            plan = engine.observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_000,
+                requested=2)
+        self.assertEqual(plan["model"]["breached_counts"], [2])
+        self.assertEqual(plan["admitted"], 1)
+        self.assertEqual(plan["reason"], "batch_reduced_for_freshness")
 
     def test_decision_head_uses_actual_downstream_work_not_flat_five_seconds(self):
         with tempfile.TemporaryDirectory() as directory:
