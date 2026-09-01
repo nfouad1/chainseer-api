@@ -4409,18 +4409,8 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
                 ).fetchone()[0]
             self.assertGreater(scheduled, 0)
 
-    def test_decision_stale_is_tradeable_only_with_a_verified_price(self):
-        """Policy change, deliberately recorded here.
-
-        This previously asserted that stale-at-decision could NEVER be
-        tradeable. That rule was retired because the 120-block bound it rested
-        on was unreachable on this RPC -- drift is pass duration times ~9.95
-        blocks/second, and the fastest of seven passes was 49s against the 12s
-        the bound required -- so it was not protecting anything, it was
-        refusing everything. The protection it was meant to give now comes
-        from re-taking the price: stale-at-decision is tradeable when its
-        entry price still verifies NOW, and never when it does not.
-        """
+    def test_decision_stale_is_research_only_even_with_a_verified_price(self):
+        """A late re-quote informs research but cannot authorize an entry."""
         with tempfile.TemporaryDirectory() as directory:
             store = self._store(directory)
             observation_id = self._seal(store, self.OBS_HEAD - 10)
@@ -4429,9 +4419,9 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
                                decision_quote=None)["paper_eligible"],
                 "no re-quote must still mean no paper entry",
             )
-            self.assertTrue(
+            self.assertFalse(
                 self._classify(store, observation_id)["paper_eligible"],
-                "a re-verified price is what makes it actionable",
+                "a verified stale quote must never reach paper trading",
             )
 
     def test_fresh_identity_verified_reaches_the_paper_boundary(self):
@@ -4499,8 +4489,7 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
                 "drift is recorded, not gated, until the cohort measures it",
             )
 
-    def test_block_lag_no_longer_decides_eligibility(self):
-        """1,631 blocks of drift was unreachable-by-design, not dangerous."""
+    def test_block_lag_separates_research_from_executable_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self._store(directory)
             verdict = self._classify(
@@ -4508,10 +4497,8 @@ class ProvisionalObservationCycleTests(unittest.TestCase):
             )
             self.assertEqual(verdict["arm"], "decision_stale")
             self.assertEqual(verdict["decision_head_lag_blocks"], 1_631)
-            self.assertTrue(
-                verdict["paper_eligible"],
-                "a verifiable price is what makes a signal actionable",
-            )
+            self.assertTrue(verdict["research_eligible"])
+            self.assertFalse(verdict["paper_eligible"])
 
     def test_historical_observations_stay_excluded(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -4630,6 +4617,30 @@ class ObservationLifecycleTests(unittest.TestCase):
             progress = store.cohort_progress()
             self.assertEqual(progress["completed_primary_observations"], 1)
             self.assertEqual(progress["cohort_id"], rh.FLOW_EVIDENCE_COHORT_ID)
+
+    def test_verified_stale_decision_is_research_only_never_paper(self):
+        """A verified quote must not launder an expired decision into entry."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            observation_id = self._seal(store, self.POOL, self.HEAD - 10)
+            decision_quote = {"execution_quote": {
+                "verified": True,
+                "anchor_in_raw": 1_000,
+                "anchor_out_raw": 990,
+                "token_out_raw": 10 ** 18,
+            }}
+            verdict = store.classify_flow_observation(
+                observation_id,
+                decision_head=(self.HEAD
+                               + rh.FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                               + 1),
+                identity_coverage=1.0, gates=[],
+                decision_quote=decision_quote,
+            )
+        self.assertEqual(verdict["arm"], "decision_stale")
+        self.assertTrue(verdict["research_eligible"])
+        self.assertTrue(verdict["decision_quote_verified"])
+        self.assertFalse(verdict["paper_eligible"])
 
     def test_an_unexitable_outcome_records_a_total_loss_not_a_gap(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7200,7 +7211,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v10")
+                "robinhood-operational-v11")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7209,7 +7220,7 @@ class LaneSplitTests(unittest.TestCase):
                 cohort["policy"]["decision_multi_observation_safety_blocks"],
                 rh.DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS)
             self.assertEqual(
-                cohort["policy"]["backfill_maximum_chunks_per_cycle"], 2)
+                cohort["policy"]["backfill_maximum_chunks_per_cycle"], 6)
             self.assertEqual(
                 cohort["policy"]["background_rpc_priority_gate_version"], 2)
             self.assertTrue(
@@ -7838,6 +7849,8 @@ class LaneSplitTests(unittest.TestCase):
                  "candidates_added": 0},
             ])
             engine.drain_flow_backfill = lambda deadline, **kwargs: next(chunks)
+            engine.retire_stale_observation_queue = lambda *_args, **_kwargs: (
+                self.fail("queue maintenance stole gap-recovery capacity"))
             engine.observer.sync = lambda **kwargs: self.fail(
                 "secondary discovery ran after a committed gap chunk")
             engine.v4_observer.sync = lambda **kwargs: self.fail(
@@ -7854,8 +7867,9 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(recovery["chunks_processed"], 2)
             self.assertEqual(recovery["cursor_commits"], 2)
             self.assertEqual(recovery["blocks_scanned"], 1000)
+            self.assertTrue(result["durable_observation_queue"]["deferred"])
             self.assertEqual(
-                recovery["stopped_reason"], "maximum_chunks_reached")
+                recovery["stopped_reason"], "no_pending_ranges")
 
     def test_gap_recovery_refuses_to_spend_completion_reserve(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8112,7 +8126,7 @@ class LaneSplitTests(unittest.TestCase):
             now = time.monotonic()
             rh.atomic_json_write(
                 Path(directory) / rh.PROVIDER_RPC_THROTTLE_STATE_FILE,
-                {"cooldown_until_monotonic": now + 0.05},
+                {"cooldown_until_monotonic": now + 0.2},
             )
             started = time.monotonic()
             with patch.dict(
@@ -8120,7 +8134,7 @@ class LaneSplitTests(unittest.TestCase):
             ):
                 with engine._rpc_request_guard():
                     admitted = time.monotonic()
-            self.assertGreaterEqual(admitted - started, 0.04)
+            self.assertGreaterEqual(admitted - started, 0.15)
             self.assertGreater(
                 engine._rpc_priority_telemetry[
                     "provider_cooldown_wait_seconds"], 0.0)
@@ -8162,6 +8176,29 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(rpc.head_calls, 3)
             self.assertEqual(telemetry["attempts"], 3)
             self.assertEqual(telemetry["rate_limit_retries"], 2)
+
+    def test_decision_head_fails_fast_after_an_observation_is_sealed(self):
+        class AlwaysRateLimited(FakeRPC):
+            def __init__(self):
+                super().__init__([], latest=321)
+                self.head_calls = 0
+
+            def get_block_number(self):
+                self.head_calls += 1
+                raise rh.RPCError("RPC HTTP response failed (429)", -429)
+
+        with tempfile.TemporaryDirectory() as directory:
+            rpc = AlwaysRateLimited()
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=rpc, analyzer=FakeAnalyzer(),
+                market=FakeMarket())
+            with self.assertRaises(rh.RPCError):
+                engine.read_authoritative_decision_head(
+                    rh.CycleDeadline(5.0),
+                    downstream_required_seconds=0.1,
+                    allow_rate_limit_retry=False,
+                )
+            self.assertEqual(rpc.head_calls, 1)
 
     def test_provider_rate_limit_is_a_controlled_lane_deferral(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8328,8 +8365,8 @@ class LaneSplitTests(unittest.TestCase):
             engine.seal_near_head_observations = lambda *args, **kwargs: (
                 self.fail("expired backfill debt must never enter sealing"))
             engine.drain_flow_backfill_until_reserve = lambda *args, **kwargs: {
-                "ranges_selected": 1, "chunks_processed": 1,
-                "cursor_commits": 1, "blocks_scanned": 1000,
+                "ranges_selected": 0, "chunks_processed": 0,
+                "cursor_commits": 0, "blocks_scanned": 0,
                 "candidates_added": 0,
             }
 
@@ -8377,8 +8414,8 @@ class LaneSplitTests(unittest.TestCase):
                 "features_json": "{}",
             }], "live_lane_headroom")
             engine.drain_flow_backfill_until_reserve = lambda *args, **kwargs: {
-                "ranges_selected": 1, "chunks_processed": 1,
-                "cursor_commits": 1, "blocks_scanned": 1000,
+                "ranges_selected": 0, "chunks_processed": 0,
+                "cursor_commits": 0, "blocks_scanned": 0,
                 "candidates_added": 0,
             }
             result = engine.run_backfill_lane(
@@ -8444,6 +8481,49 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
                     due, {"live": 100, "marks": 40}),
                 "analysis",
             )
+
+    def test_durable_cohort_progress_survives_supervisor_restart(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "l.sqlite3"
+            first = rh.RobinhoodLearningStore(path)
+            first.start_acceptance_cohort(
+                revision="paced", sample_target=100,
+                cohort_id="paced-cohort", checkout_revision="paced")
+            with first.connection() as connection:
+                for lane, count in (("live", 99), ("marks", 39)):
+                    connection.executemany(
+                        """INSERT INTO runs
+                           (started_at,status,run_id,lane,revision,
+                            acceptance_cohort_id)
+                           VALUES (?,'complete',?,?,?,'paced-cohort')""",
+                        [(rh._utc_now(), f"{lane}-{index}", lane, "paced")
+                         for index in range(count)],
+                    )
+            # A new store models a restarted supervisor: no launch counters
+            # survive, only the database does.
+            progress = rh.RobinhoodLearningStore(
+                path).acceptance_scheduler_progress()
+            due = [("analysis", {"next": 1.0}),
+                   ("marks", {"next": 2.0})]
+            self.assertEqual(progress["live_terminal"], 99)
+            self.assertEqual(progress["mark_terminal"], 39)
+            self.assertEqual(progress["mark_pace_target"], 40)
+            self.assertTrue(progress["closing_live_blocked"])
+            self.assertEqual(
+                rh._select_background_candidate(
+                    due, {"live": 0, "marks": 0},
+                    cohort_progress=progress),
+                "marks",
+            )
+
+    def test_backfill_deficit_preempts_ordinary_background_debt(self):
+        due = [("analysis", {"next": 1.0}),
+               ("backfill", {"next": 2.0})]
+        self.assertEqual(
+            rh._select_background_candidate(
+                due, {}, backfill_pressure={"priority": True}),
+            "backfill",
+        )
 
     def test_full_verification_is_maintenance_only(self):
         source = inspect.getsource(rh.supervise_lanes)
@@ -10684,13 +10764,37 @@ class DecisionTailAdmissionTests(unittest.TestCase):
     def test_recent_bound_breach_quarantines_only_that_batch_size(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = self._engine(directory)
+            engine.begin_decision_tail_attempt()
             engine.record_decision_tail_blocks(2, 122)
             plan = engine.observation_freshness_admission(
                 observation_head=1_000, post_ingest_head=1_000,
                 requested=2)
-        self.assertEqual(plan["model"]["breached_counts"], [2])
+        self.assertEqual(
+            plan["model"]["historical_breached_counts"], [2])
+        self.assertEqual(plan["model"]["circuit"]["blocked_counts"], [2])
         self.assertEqual(plan["admitted"], 1)
         self.assertEqual(plan["reason"], "batch_reduced_for_freshness")
+
+    def test_attempt_clock_reopens_multi_observation_without_new_samples(self):
+        """An empty sample stream must not turn one breach into deadlock."""
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._engine(directory)
+            engine.begin_decision_tail_attempt()
+            engine.record_decision_tail_blocks(2, 122)
+            for _ in range(rh.DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS):
+                engine.begin_decision_tail_attempt()
+            # Three one-observation probes are required independently of the
+            # attempt cooldown. Record them on the final three attempt ticks.
+            for _ in range(rh.DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED):
+                engine.record_decision_tail_blocks(1, 50)
+                if _ + 1 < rh.DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED:
+                    engine.begin_decision_tail_attempt()
+            plan = engine.observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_000,
+                requested=2)
+        self.assertFalse(
+            plan["model"]["circuit"]["multi_observation_blocked"])
+        self.assertEqual(plan["admitted"], 2)
 
     def test_decision_head_uses_actual_downstream_work_not_flat_five_seconds(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -11052,6 +11156,8 @@ class ProductionHardeningTests(unittest.TestCase):
                 revision="fixed", checkout_revision="fixed",
                 sample_target=2, cohort_id="exact-two")
             with patch.object(rh, "CODE_REVISION", "fixed"):
+                store.begin_run("marks-one", 25, lane="marks")
+                store.finish_run("marks-one", "complete", summary={})
                 for run_id in ("one", "two", "three"):
                     store.begin_run(run_id, 25, lane="live")
                     store.finish_run(run_id, "complete", summary={})

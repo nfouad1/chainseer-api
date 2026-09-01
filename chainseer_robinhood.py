@@ -217,8 +217,11 @@ BACKFILL_RPC_SUCCESSES_BEFORE_PROBE = 5
 # additional independently committed chunk after a successful first chunk.
 # A throttle still stops the cycle immediately, and every completed chunk has
 # already advanced its durable cursor before the next provider call begins.
-BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 2
+BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 6
 BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK = 1
+BACKFILL_RECOVERY_TARGET_RATIO = 1.10
+BACKFILL_QUEUE_MAINTENANCE_MINIMUM_SECONDS = 8.0
+BACKFILL_RPC_URL_ENV = "CHAINSEER_ROBINHOOD_BACKFILL_RPC_URL"
 # The supervised live cadence is 30 seconds and this chain has recently
 # produced roughly ten blocks/second. Scan a bounded newest-head slice on the
 # decision path; any older prefix is durably re-anchored into backfill.
@@ -411,7 +414,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v10"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v11"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -938,6 +941,10 @@ DECISION_TAIL_BLOCK_MODEL_STATE_KEY = "live_decision_tail_blocks_v1"
 DECISION_TAIL_BLOCK_MODEL_EPOCH = 1
 DECISION_TAIL_BLOCK_SAMPLE_WINDOW = 128
 DECISION_TAIL_BLOCK_DEFAULTS = {0: 25, 1: 36, 2: 59}
+DECISION_TAIL_CIRCUIT_STATE_KEY = "live_decision_tail_circuit_v1"
+DECISION_TAIL_CIRCUIT_EPOCH = 1
+DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS = 20
+DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED = 3
 #: Quantile for the block-tail reserve. LOWERED from p99 on explicit operator
 #: approval, 2026-08-29, after measuring that nearest-rank p99 cannot behave
 #: as a percentile on this window: at n=82 it selects the maximum and at the
@@ -1512,12 +1519,22 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "seal_cost_model_epoch": SEAL_COST_MODEL_EPOCH,
         "decision_tail_block_model_epoch":
             DECISION_TAIL_BLOCK_MODEL_EPOCH,
+        "decision_tail_circuit_epoch": DECISION_TAIL_CIRCUIT_EPOCH,
+        "decision_head_rate_limit_policy":
+            "fail_fast_when_observations_are_sealed",
+        "decision_multi_observation_cooldown_attempts":
+            DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS,
+        "decision_single_probe_successes_required":
+            DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED,
         "decision_multi_observation_safety_blocks":
             DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS,
         "backfill_maximum_chunks_per_cycle":
             BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE,
         "backfill_remote_attempts_per_chunk":
             BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK,
+        "backfill_recovery_target_ratio":
+            BACKFILL_RECOVERY_TARGET_RATIO,
+        "backfill_rpc_isolation_supported": True,
         "backfill_rpc_chunk_model_epoch":
             BACKFILL_RPC_CHUNK_MODEL_EPOCH,
         "backfill_initial_chunk_blocks":
@@ -4968,7 +4985,7 @@ class RobinhoodLearningStore:
             )
             research = observation_fresh
             paper = bool(
-                observation_fresh and decision_actionable
+                observation_fresh and decision_fresh and decision_actionable
                 and tier == "verified" and not list(gates or [])
             )
             verdict = {
@@ -6076,6 +6093,106 @@ class RobinhoodLearningStore:
             0, target - result["terminal_attempts"])
         return result
 
+    def acceptance_scheduler_progress(self) -> dict:
+        """Durable cohort pacing state shared across supervisor sessions."""
+        with self.connection() as connection:
+            row = connection.execute(
+                """SELECT cohort_id,revision,sample_target,policy_json
+                   FROM acceptance_cohorts WHERE status='collecting'
+                   ORDER BY started_at DESC,cohort_id DESC LIMIT 1"""
+            ).fetchone()
+            if not row:
+                return {"collecting": False}
+            policy = json.loads(row["policy_json"] or "{}")
+            counts = connection.execute(
+                """SELECT lane,status,COUNT(*) count FROM runs
+                   WHERE acceptance_cohort_id=? AND revision=?
+                   GROUP BY lane,status""",
+                (row["cohort_id"], row["revision"]),
+            ).fetchall()
+        by_lane_status = {
+            (str(item["lane"]), str(item["status"])): int(item["count"])
+            for item in counts
+        }
+        live_terminal = sum(
+            count for (lane, status), count in by_lane_status.items()
+            if lane == "live" and status != "running")
+        mark_terminal = sum(
+            count for (lane, status), count in by_lane_status.items()
+            if lane == "marks" and status != "running")
+        target = max(1, int(row["sample_target"]))
+        minimum_marks = max(1, safe_int(
+            policy.get("position_mark_minimum_samples"),
+            math.ceil(target * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION),
+        ))
+        # Five attempts is a two-mark lead at the frozen 40% ratio. It makes
+        # the independent sample obligation complete before the 100th live
+        # attempt instead of racing a final marks worker at cohort closure.
+        paced_live = min(target, live_terminal + 5)
+        mark_pace_target = min(
+            minimum_marks,
+            math.ceil(
+                paced_live * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION),
+        )
+        return {
+            "collecting": True,
+            "cohort_id": str(row["cohort_id"]),
+            "revision": str(row["revision"]),
+            "sample_target": target,
+            "live_terminal": live_terminal,
+            "mark_terminal": mark_terminal,
+            "mark_running": by_lane_status.get(("marks", "running"), 0),
+            "mark_minimum": minimum_marks,
+            "mark_pace_target": mark_pace_target,
+            "mark_deficit": max(0, mark_pace_target - mark_terminal),
+            "closing_live_blocked": bool(
+                live_terminal >= target - 1
+                and mark_terminal < minimum_marks),
+        }
+
+    def backfill_recovery_pressure(self, limit: int = 10) -> dict:
+        """Measure whether durable recovery is losing to new gap arrivals."""
+        with self.connection() as connection:
+            rows = connection.execute(
+                """SELECT summary_json FROM runs
+                   WHERE lane='backfill' AND status='complete'
+                   ORDER BY id DESC LIMIT ?""", (max(3, int(limit)),)
+            ).fetchall()
+        summaries = []
+        for row in reversed(rows):
+            try:
+                summaries.append(json.loads(row["summary_json"] or "{}"))
+            except (TypeError, ValueError, json.JSONDecodeError):
+                continue
+        backlogs = [safe_int(
+            (summary.get("backlog") or {}).get("pending_blocks"), 0)
+            for summary in summaries]
+        recovered = sum(safe_int(
+            (summary.get("durable_gap_recovery") or {}).get(
+                "blocks_scanned"), 0)
+            for summary in summaries[1:])
+        net_change = (
+            backlogs[-1] - backlogs[0] if len(backlogs) >= 2 else None)
+        arrivals = (
+            max(0, net_change + recovered)
+            if net_change is not None else None)
+        ratio = (
+            recovered / arrivals if arrivals else (
+                None if arrivals is None else 1.0))
+        return {
+            "samples": len(summaries),
+            "recovered_blocks": recovered,
+            "inferred_arrival_blocks": arrivals,
+            "net_change_blocks": net_change,
+            "recovery_to_arrival_ratio": (
+                round(ratio, 4) if ratio is not None else None),
+            "target_ratio": BACKFILL_RECOVERY_TARGET_RATIO,
+            "priority": bool(
+                len(summaries) >= 3 and backlogs
+                and backlogs[-1] > 0 and ratio is not None
+                and ratio < BACKFILL_RECOVERY_TARGET_RATIO),
+        }
+
     def start_acceptance_cohort(
         self, *, revision: str, sample_target: int = 100,
         cohort_id: str | None = None,
@@ -6358,11 +6475,22 @@ class RobinhoodLearningStore:
         now = time.time()
         with self.connection() as connection:
             cohort = connection.execute(
-                """SELECT cohort_id FROM acceptance_cohorts
+                """SELECT cohort_id,sample_target FROM acceptance_cohorts
                    WHERE status='collecting'
                    ORDER BY started_at DESC LIMIT 1"""
             ).fetchone()
             cohort_id = cohort["cohort_id"] if cohort else None
+            if cohort_id and lane == "live":
+                live_terminal = connection.execute(
+                    """SELECT COUNT(*) FROM runs
+                       WHERE acceptance_cohort_id=? AND lane='live'
+                         AND status!='running'""", (cohort_id,),
+                ).fetchone()[0]
+                if int(live_terminal) >= int(cohort["sample_target"]):
+                    # The cohort can remain open solely for its independent
+                    # marks obligation. Preserve the exact live sample while
+                    # that durable evidence catches up.
+                    cohort_id = None
             row_id = connection.execute(
                 """INSERT INTO runs(started_at,status,run_id,pid,host,
                        heartbeat_at,deadline_seconds,lane,revision,
@@ -6421,7 +6549,26 @@ class RobinhoodLearningStore:
             """SELECT COUNT(*) FROM runs
                WHERE acceptance_cohort_id=? AND lane='live'
                  AND status!='running'""", (cohort_id,)).fetchone()[0]
-        if int(terminal) >= int(cohort["sample_target"]):
+        policy_row = connection.execute(
+            "SELECT policy_json FROM acceptance_cohorts WHERE cohort_id=?",
+            (cohort_id,),
+        ).fetchone()
+        policy = json.loads(policy_row["policy_json"] or "{}")
+        minimum_marks = max(1, safe_int(
+            policy.get("position_mark_minimum_samples"),
+            math.ceil(
+                int(cohort["sample_target"])
+                * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION),
+        ))
+        mark_terminal = connection.execute(
+            """SELECT COUNT(*) FROM runs
+               WHERE acceptance_cohort_id=? AND lane='marks'
+                 AND status!='running'""", (cohort_id,),
+        ).fetchone()[0]
+        if (
+            int(terminal) >= int(cohort["sample_target"])
+            and int(mark_terminal) >= minimum_marks
+        ):
             connection.execute(
                 """UPDATE acceptance_cohorts
                    SET status='complete',closed_at=?,close_reason=?
@@ -6464,7 +6611,7 @@ class RobinhoodLearningStore:
                    WHERE run_id=? ORDER BY id DESC LIMIT 1""",
                 (run_id,),
             ).fetchone()
-            if (run and run["lane"] == "live"
+            if (run and run["lane"] in {"live", "marks"}
                     and run["acceptance_cohort_id"]
                     and status != "running"):
                 self._close_cohort_if_target(
@@ -7108,6 +7255,7 @@ class RobinhoodLearningStore:
         # Reported beside the rate: an exclusion nobody can see is
         # indistinguishable from a population that was never contaminated.
         lag_excluded_no_decision = 0
+        lag_excluded_stale_research = 0
         marks_complete = 0
         for row in live_rows:
             try:
@@ -7218,18 +7366,23 @@ class RobinhoodLearningStore:
                 classification.get("scoped_rows_selected"), 0)
             sealed = safe_int(observation.get("sealed_this_cycle"), 0)
             lag = observation.get("decision_head_lag_blocks")
+            stale_research = bool(observation.get("research_only_stale"))
             actual_decision = bool(
-                row["status"] == "complete" and processed > 0 and sealed > 0)
+                row["status"] == "complete" and processed > 0 and sealed > 0
+                and not stale_research)
             if lag is not None and actual_decision and len(lags) < target:
                 lags.append(safe_float(lag, float("inf")))
+            elif lag is not None and stale_research:
+                lag_excluded_stale_research += 1
             elif lag is not None and not actual_decision:
                 lag_excluded_no_decision += 1
             failure_stage = str(summary.get("failure_stage") or "")
             opportunity = bool(
-                selected > 0 or sealed > 0
+                not stale_research and (
+                    selected > 0 or sealed > 0
                 or failure_stage.startswith((
                     "fresh_quote_and_observation", "decision_head",
-                    "classification")))
+                    "classification"))))
             if not opportunity:
                 continue
             decision_opportunities += 1
@@ -7353,6 +7506,8 @@ class RobinhoodLearningStore:
                 # decision, so they are outside the SLO -- but the count is
                 # published, because a silent exclusion cannot be audited.
                 "excluded_no_decision": lag_excluded_no_decision,
+                "excluded_stale_research":
+                    lag_excluded_stale_research,
                 "label": "Decision-lag SLO",
             },
             "position_marks": {
@@ -11211,6 +11366,7 @@ class RobinhoodLearningEngine:
         self.root=Path(root)
         self.root.mkdir(parents=True,exist_ok=True)
         self.rpc=rpc or RobinhoodRPC(ROBINHOOD_NETWORK.rpc_url)
+        self.backfill_rpc_isolated = False
         self.store=RobinhoodLearningStore(self.root/"learning.sqlite3")
         self._active_lane: str | None = None
         self._active_lane_deadline: CycleDeadline | None = None
@@ -12901,20 +13057,25 @@ class RobinhoodLearningEngine:
         records = records[-DECISION_TAIL_BLOCK_SAMPLE_WINDOW:]
         reserves: dict[int, int] = {}
         sample_counts: dict[int, int] = {}
-        breached_counts: list[int] = []
+        historical_breached_counts: list[int] = []
         for count in range(0, LIVE_LANE_OBSERVATION_LIMIT + 1):
             values = [
                 record["blocks"] for record in records
                 if record["observations"] == count
             ]
+            successful_values = [
+                value for value in values
+                if value <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+            ]
             baseline = DECISION_TAIL_BLOCK_DEFAULTS.get(
                 count, FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS)
-            # max(baseline, ...) keeps this tighten-only: a single slow
-            # sample still raises the reserve immediately, and the measured
-            # value can never fall below the author's static default.
+            # Successful tails tighten the steady-state reserve. A breached
+            # tail belongs to the attempt-clock circuit below; folding it
+            # into a monotonic reserve would keep the batch impossible even
+            # after the circuit's recovery proof had completed.
             reserves[count] = int(max(
                 baseline,
-                _nearest_rank(values, DECISION_TAIL_BLOCK_QUANTILE,
+                _nearest_rank(successful_values, DECISION_TAIL_BLOCK_QUANTILE,
                               baseline)))
             sample_counts[count] = len(values)
             # A quantile is the right steady-state estimator, but it cannot
@@ -12925,15 +13086,114 @@ class RobinhoodLearningEngine:
             # spike cannot cause permanent observation starvation.
             if any(value > FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
                    for value in values):
-                breached_counts.append(count)
+                historical_breached_counts.append(count)
+        circuit = self.decision_tail_circuit()
         return {
             "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
             "quantile": f"nearest_rank_p{int(DECISION_TAIL_BLOCK_QUANTILE*100)}",
             "reserves": reserves,
             "sample_counts": sample_counts,
-            "breached_counts": breached_counts,
+            "historical_breached_counts": historical_breached_counts,
+            "circuit": circuit,
             "samples": records,
         }
+
+    def decision_tail_circuit(self) -> dict:
+        """Attempt-clock circuit state; progress never depends on samples."""
+        stored = self.store.scheduler_state(DECISION_TAIL_CIRCUIT_STATE_KEY)
+        if safe_int(stored.get("epoch"), 0) != DECISION_TAIL_CIRCUIT_EPOCH:
+            stored = {}
+        attempt = max(0, safe_int(stored.get("attempt_sequence"), 0))
+        breach = max(0, safe_int(stored.get("last_breach_attempt"), 0))
+        successes = max(0, safe_int(
+            stored.get("single_probe_successes"), 0))
+        attempts_since = attempt - breach if breach else None
+        multi_blocked = bool(
+            breach and (
+                attempts_since < DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS
+                or successes < DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED
+            )
+        )
+        return {
+            "epoch": DECISION_TAIL_CIRCUIT_EPOCH,
+            "attempt_sequence": attempt,
+            "last_breach_attempt": breach or None,
+            "attempts_since_breach": attempts_since,
+            "single_probe_successes": successes,
+            "multi_observation_blocked": multi_blocked,
+            "blocked_counts": [2] if multi_blocked else [],
+            "cooldown_attempts":
+                DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS,
+            "probe_successes_required":
+                DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED,
+            "seeded_from_history": bool(stored.get("seeded_from_history")),
+        }
+
+    def begin_decision_tail_attempt(self) -> dict:
+        """Advance the durable circuit clock once per live attempt."""
+        state = self.decision_tail_circuit()
+        attempt = state["attempt_sequence"] + 1
+        breach = state.get("last_breach_attempt")
+        seeded = state.get("seeded_from_history", False)
+        if breach is None and not seeded:
+            model_state = self.store.scheduler_state(
+                DECISION_TAIL_BLOCK_MODEL_STATE_KEY)
+            historical_breach = any(
+                safe_int(item.get("blocks"), 0)
+                    > FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                for item in (model_state.get("samples") or [])
+                if isinstance(item, dict)
+            )
+            if historical_breach:
+                breach = attempt
+            seeded = True
+        self._decision_tail_attempt_sequence = attempt
+        self.store.set_scheduler_state(
+            DECISION_TAIL_CIRCUIT_STATE_KEY, {
+                "epoch": DECISION_TAIL_CIRCUIT_EPOCH,
+                "revision": CODE_REVISION,
+                "attempt_sequence": attempt,
+                "last_breach_attempt": breach,
+                "single_probe_successes": state[
+                    "single_probe_successes"],
+                "seeded_from_history": seeded,
+            })
+        return self.decision_tail_circuit()
+
+    def _record_decision_tail_circuit(
+        self, observations: int, blocks: int,
+    ) -> dict:
+        state = self.decision_tail_circuit()
+        attempt = max(
+            state["attempt_sequence"],
+            safe_int(getattr(
+                self, "_decision_tail_attempt_sequence", 0), 0),
+        )
+        # Keep the public recorder correct for maintenance calls and tests as
+        # well as the normal live path, which explicitly begins an attempt.
+        if attempt <= 0:
+            state = self.begin_decision_tail_attempt()
+            attempt = state["attempt_sequence"]
+        breach = state.get("last_breach_attempt")
+        successes = state["single_probe_successes"]
+        if int(blocks) > FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS:
+            breach = attempt
+            successes = 0
+        elif int(observations) == 1 and breach:
+            successes += 1
+        elif int(observations) > 1 and breach:
+            breach = None
+            successes = 0
+        self.store.set_scheduler_state(
+            DECISION_TAIL_CIRCUIT_STATE_KEY, {
+                "epoch": DECISION_TAIL_CIRCUIT_EPOCH,
+                "revision": CODE_REVISION,
+                "attempt_sequence": attempt,
+                "last_breach_attempt": breach,
+                "single_probe_successes": successes,
+                "seeded_from_history": True,
+            })
+        return self.decision_tail_circuit()
 
     def record_decision_tail_blocks(
         self, observations: int, blocks: int,
@@ -12955,6 +13215,7 @@ class RobinhoodLearningEngine:
                 "revision": CODE_REVISION,
                 "samples": samples[-DECISION_TAIL_BLOCK_SAMPLE_WINDOW:],
             })
+        self._record_decision_tail_circuit(observations, blocks)
         return self.decision_tail_block_model()
 
     def observation_freshness_admission(
@@ -12969,7 +13230,9 @@ class RobinhoodLearningEngine:
             "epoch": model["epoch"], "quantile": model["quantile"],
             "reserves": model["reserves"],
             "sample_counts": model["sample_counts"],
-            "breached_counts": model["breached_counts"],
+            "historical_breached_counts":
+                model["historical_breached_counts"],
+            "circuit": model["circuit"],
             "multi_observation_safety_blocks":
                 DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS,
         }
@@ -12990,7 +13253,7 @@ class RobinhoodLearningEngine:
         reserve = int(model["reserves"].get(0, 0))
         safety_blocks = 0
         for count in range(requested, 0, -1):
-            if count in model["breached_counts"]:
+            if count in model["circuit"]["blocked_counts"]:
                 continue
             candidate_reserve = int(model["reserves"].get(
                 count, FLOW_DOWNSTREAM_HEAD_RESERVE_BLOCKS))
@@ -13047,6 +13310,7 @@ class RobinhoodLearningEngine:
 
     def read_authoritative_decision_head(
         self, deadline: CycleDeadline, *, downstream_required_seconds: float,
+        allow_rate_limit_retry: bool = True,
     ) -> tuple[int, dict]:
         """Read the decision head with bounded, cooldown-aware 429 recovery."""
         attempts = 0
@@ -13062,7 +13326,7 @@ class RobinhoodLearningEngine:
                 }
             except RPCError as exc:
                 can_retry = bool(
-                    _rpc_rate_limited(exc)
+                    allow_rate_limit_retry and _rpc_rate_limited(exc)
                     and attempts < LIVE_DECISION_HEAD_MAXIMUM_ATTEMPTS
                     and deadline.remaining() > (
                         max(0.0, float(downstream_required_seconds)) + 0.1)
@@ -15218,6 +15482,7 @@ class RobinhoodLearningEngine:
 
         def work(deadline: CycleDeadline) -> dict:
             timings: dict[str, float] = {}
+            decision_tail_circuit = self.begin_decision_tail_attempt()
             # Position marking now runs in its own lane (run_marks_lane).
             # Leaving it here would keep an external price API on the path
             # that must stay near the chain head.
@@ -15508,6 +15773,8 @@ class RobinhoodLearningEngine:
                     self.read_authoritative_decision_head(
                         deadline,
                         downstream_required_seconds=downstream_required,
+                        allow_rate_limit_retry=not bool(
+                            observation.get("observation_ids")),
                     )
                 )
             except RPCError as exc:
@@ -15530,6 +15797,16 @@ class RobinhoodLearningEngine:
             post_ingest_tail_blocks = max(
                 0, decision_head - int(post_ingest_head or observation_head))
             observation["decision_tail_blocks"] = post_ingest_tail_blocks
+            decision_head_lag_blocks = max(
+                0, decision_head - int(near_head.get("to_block") or 0))
+            observation["decision_head_lag_blocks"] = (
+                decision_head_lag_blocks)
+            research_only_stale = bool(
+                observation.get("observation_ids")
+                and decision_head_lag_blocks
+                    > FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+            )
+            observation["research_only_stale"] = research_only_stale
             if observation.get("observation_ids"):
                 decision_tail_model = self.record_decision_tail_blocks(
                     len(observation["observation_ids"]),
@@ -15540,6 +15817,7 @@ class RobinhoodLearningEngine:
                     "quantile": decision_tail_model["quantile"],
                     "reserves": decision_tail_model["reserves"],
                     "sample_counts": decision_tail_model["sample_counts"],
+                    "circuit": decision_tail_model["circuit"],
                 }
             stage = time.monotonic()
             self.store.mark_lane_stage(
@@ -15622,9 +15900,13 @@ class RobinhoodLearningEngine:
                 + timings["classification_seconds"]
                 + timings["ledger_append_seconds"])
             quote_delay = timings["seal_and_fresh_quote"]
-            observation["decision_head_lag_blocks"] = max(
-                0, decision_head - int(near_head.get("to_block") or 0))
             return {
+                "controlled_deferral": research_only_stale,
+                "deferral_stage": (
+                    "decision_freshness" if research_only_stale else None),
+                "deferral_reason": (
+                    "decision_head_stale_research_only"
+                    if research_only_stale else None),
                 "position_evaluations": positions,
                 "ingestion_admission": ingestion_admission,
                 "near_head_flow": near_head,
@@ -16154,6 +16436,50 @@ class RobinhoodLearningEngine:
             "backlog_shrinking": after_blocks < before_blocks,
         }
 
+    def retire_stale_observation_queue(
+        self, deadline: CycleDeadline,
+    ) -> dict:
+        """Bounded SQLite housekeeping performed only after gap recovery."""
+        queue_before = self.store.seal_queue_backlog()
+        retirement_limit = BACKFILL_STALE_RETIRE_LIMIT
+        retired_existing = self.store.retire_expired_seal_queue(
+            retirement_limit)
+        remaining_retirement = max(
+            0, retirement_limit - retired_existing)
+        expired_this_cycle = 0
+        queue_head = None
+        after_existing = self.store.seal_queue_backlog()
+        if after_existing.get("pending_windows", 0):
+            with self._rpc_deadline(deadline):
+                queue_head = int(self.rpc.get_block_number())
+            expired_this_cycle = self.store.expire_stale_seal_queue(
+                head_block=queue_head,
+                freshness_blocks=
+                    FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
+            )
+        retired_new = self.store.retire_expired_seal_queue(
+            remaining_retirement)
+        retired_total = retired_existing + retired_new
+        queue_after = self.store.seal_queue_backlog()
+        return {
+            "terminal_state": "expired_unsealed",
+            "queue_head_block": queue_head,
+            "expired_this_cycle": expired_this_cycle,
+            "stale_retired_this_cycle": retired_total,
+            "quote_calls_avoided": retired_total,
+            "observations_created": 0,
+            "active_cohort_observations_created": 0,
+            "classifications_created": 0,
+            "outcomes_scheduled": 0,
+            "paper_entries_created": 0,
+            "snapshots_preserved_for_audit": retired_total,
+            "retirement_limit": retirement_limit,
+            "expired_stale_backlog_delta": -int(retired_total),
+            "stale_backlog_shrinking": retired_total > 0,
+            "backlog_before": queue_before,
+            "backlog_after": queue_after,
+        }
+
     def run_backfill_lane(
         self, *, budget_seconds: float = BACKFILL_LANE_BUDGET_SECONDS,
         discovery_block_limit: int = DEFAULT_DISCOVERY_BLOCK_LIMIT,
@@ -16166,60 +16492,10 @@ class RobinhoodLearningEngine:
 
         def work(deadline: CycleDeadline) -> dict:
             timings: dict[str, float] = {}
-            # Retire expired observation debt WITHOUT reconstructing a quote
-            # or observation.  The old backfill path passed expired_stale into
-            # seal_near_head_observations: the last measured pass spent ~67s
-            # on 120 guaranteed quote failures and then assigned those stale
-            # reconstructions to the active v3 cohort.  The queue snapshot is
-            # the audit record; expiry is terminal, not another admission lane.
-            stage = time.monotonic()
-            queue_before = self.store.seal_queue_backlog()
-            retirement_limit = BACKFILL_STALE_RETIRE_LIMIT
-            retired_existing = self.store.retire_expired_seal_queue(
-                retirement_limit)
-            remaining_retirement = max(0, retirement_limit - retired_existing)
-            expired_this_cycle = 0
-            queue_head = None
-            after_existing = self.store.seal_queue_backlog()
-            if after_existing.get("pending_windows", 0):
-                with self._rpc_deadline(deadline):
-                    queue_head = int(self.rpc.get_block_number())
-                expired_this_cycle = self.store.expire_stale_seal_queue(
-                    head_block=queue_head,
-                    freshness_blocks=
-                        FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
-                )
-            retired_new = self.store.retire_expired_seal_queue(
-                remaining_retirement)
-            retired_total = retired_existing + retired_new
-            queue_after = self.store.seal_queue_backlog()
-            # Rows may transition pending -> expired_stale ->
-            # expired_unsealed inside this single pass. Comparing only the
-            # two endpoint expired_stale counts reports 0 -> 0 and falsely
-            # claims no convergence. Retirements are the exact durable debt
-            # reduction committed by this stage.
-            stale_delta = -int(retired_total)
-            seal_queue = {
-                "terminal_state": "expired_unsealed",
-                "queue_head_block": queue_head,
-                "expired_this_cycle": expired_this_cycle,
-                "stale_retired_this_cycle": retired_total,
-                "quote_calls_avoided": retired_total,
-                "observations_created": 0,
-                "active_cohort_observations_created": 0,
-                "classifications_created": 0,
-                "outcomes_scheduled": 0,
-                "paper_entries_created": 0,
-                "snapshots_preserved_for_audit": retired_total,
-                "retirement_limit": retirement_limit,
-                "expired_stale_backlog_delta": stale_delta,
-                "stale_backlog_shrinking": retired_total > 0,
-                "backlog_before": queue_before,
-                "backlog_after": queue_after,
-            }
-            timings["durable_observation_queue"] = round(
-                time.monotonic() - stage, 3)
-            deadline.raise_if_expired("durable_observation_queue")
+            # The acceptance trace measured recovery below arrival while
+            # SQLite retirement consumed up to 29 seconds first. Debt service
+            # therefore owns the beginning of the lane; housekeeping receives
+            # only the remainder and can never reduce committed recovery.
             stage = time.monotonic()
             gap_recovery = self.drain_flow_backfill_until_reserve(
                 deadline, block_limit=discovery_block_limit,
@@ -16228,6 +16504,30 @@ class RobinhoodLearningEngine:
             timings["durable_gap_recovery"] = round(
                 time.monotonic() - stage, 3)
             deadline.raise_if_expired("durable_gap_recovery")
+            gap_active = bool(
+                safe_int(gap_recovery.get("ranges_selected"), 0) > 0
+                or gap_recovery.get("provider_deferred"))
+            if (
+                not gap_active
+                and deadline.remaining() >=
+                    BACKFILL_QUEUE_MAINTENANCE_MINIMUM_SECONDS
+            ):
+                stage = time.monotonic()
+                seal_queue = self.retire_stale_observation_queue(deadline)
+                timings["durable_observation_queue"] = round(
+                    time.monotonic() - stage, 3)
+                deadline.raise_if_expired("durable_observation_queue")
+            else:
+                seal_queue = {
+                    "deferred": True,
+                    "reason": (
+                        "durable_gap_recovery_priority" if gap_active
+                        else "insufficient_maintenance_budget"),
+                    "minimum_seconds":
+                        BACKFILL_QUEUE_MAINTENANCE_MINIMUM_SECONDS,
+                    "remaining_seconds": round(deadline.remaining(), 3),
+                }
+                timings["durable_observation_queue"] = 0.0
             if (
                 safe_int(gap_recovery.get("ranges_selected"), 0) > 0
                 or bool(gap_recovery.get("provider_deferred"))
@@ -16276,6 +16576,8 @@ class RobinhoodLearningEngine:
                     },
                     "backlog": backlog,
                     "historical_only": True,
+                    "backfill_rpc_isolated":
+                        self.backfill_rpc_isolated,
                     "priority_mode": "oldest_durable_gap_first",
                 }
 
@@ -16328,6 +16630,7 @@ class RobinhoodLearningEngine:
                 },
                 "backlog": self.store.backfill_backlog(),
                 "historical_only": True,
+                "backfill_rpc_isolated": self.backfill_rpc_isolated,
             }
 
         return self._execute_lane("backfill", budget_seconds, work)
@@ -17073,19 +17376,32 @@ def _low_priority_launch_blocked(
 
 def _select_background_candidate(
     due_background: list[tuple[str, dict]], launches: dict[str, int],
+    *, cohort_progress: dict | None = None,
+    backfill_pressure: dict | None = None,
 ) -> str | None:
-    """Keep independent mark evidence paced with live cohort attempts."""
+    """Serve durable cohort and recovery deficits before ordinary debt."""
     if not due_background:
         return None
     due_by_name = {lane: schedule for lane, schedule in due_background}
-    mark_target = math.ceil(
-        max(0, int(launches.get("live", 0)))
-        * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION)
+    progress = cohort_progress or {}
+    if progress.get("collecting"):
+        mark_target = safe_int(progress.get("mark_pace_target"), 0)
+        mark_count = safe_int(progress.get("mark_terminal"), 0)
+    else:
+        mark_target = math.ceil(
+            max(0, int(launches.get("live", 0)))
+            * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION)
+        mark_count = int(launches.get("marks", 0))
     if (
         "marks" in due_by_name
-        and int(launches.get("marks", 0)) < mark_target
+        and mark_count < mark_target
     ):
         return "marks"
+    if (
+        "backfill" in due_by_name
+        and bool((backfill_pressure or {}).get("priority"))
+    ):
+        return "backfill"
     return max(
         due_background,
         key=lambda item: time.monotonic() - float(item[1]["next"]),
@@ -17172,6 +17488,9 @@ def supervise_lanes(
     supervisor_store = RobinhoodLearningStore(root / "learning.sqlite3")
     recovered_dead_lanes = _reconcile_dead_lane_state(supervisor_store)
     last_orphan_sweep = time.monotonic()
+    last_deficit_refresh = float("-inf")
+    cohort_progress: dict = {"collecting": False}
+    backfill_pressure: dict = {"priority": False}
     lane_job = _WindowsLaneJob()
     worker_python = str(getattr(sys, "_base_executable", None) or sys.executable)
     worker_environment = os.environ.copy()
@@ -17242,6 +17561,8 @@ def supervise_lanes(
             "launches": launches, "timeouts": timeouts, "failures": failures,
             "tail_skips": tail_skips,
             "priority_deferrals": priority_deferrals,
+            "cohort_scheduler": cohort_progress,
+            "backfill_pressure": backfill_pressure,
             "rpc_priority": rpc_priority,
             "paper_only": True, "live_execution_enabled": False,
         })
@@ -17295,6 +17616,17 @@ def supervise_lanes(
                             time.monotonic()
                             + LIVE_LANE_POST_KILL_QUIET_SECONDS)
                     active.pop(lane, None)
+            if now_mono - last_deficit_refresh >= 5.0:
+                last_deficit_refresh = now_mono
+                try:
+                    cohort_progress = (
+                        supervisor_store.acceptance_scheduler_progress())
+                    backfill_pressure = (
+                        supervisor_store.backfill_recovery_pressure())
+                except sqlite3.Error:
+                    # Deficit telemetry may defer a preference, but it may
+                    # never stop the supervisor or manufacture state.
+                    pass
             # Iterate the CONFIGURATION. A hardcoded list beside a lanes dict
             # is a second source of truth, and it silently dropped `marks`:
             # the lane was defined, budgeted and given a cadence, and never
@@ -17306,9 +17638,17 @@ def supervise_lanes(
                 and now_mono >= float(schedule["next"])
             ]
             background_candidate = _select_background_candidate(
-                due_background, launches)
+                due_background, launches,
+                cohort_progress=cohort_progress,
+                backfill_pressure=backfill_pressure)
             for lane, schedule in lanes.items():
                 if lane in active or now_mono < schedule["next"]:
+                    continue
+                if (
+                    lane == "live"
+                    and bool(cohort_progress.get("closing_live_blocked"))
+                ):
+                    priority_deferrals[lane] += 1
                     continue
                 if lane != "live" and lane != background_candidate:
                     priority_deferrals[lane] += 1
@@ -17650,12 +17990,15 @@ def live_lane_reliability_snapshot(
         selected = safe_int(
             classification_summary.get("scoped_rows_selected"), 0)
         sealed = safe_int(observation_summary.get("sealed_this_cycle"), 0)
+        stale_research = bool(
+            observation_summary.get("research_only_stale"))
         failure_stage = str(summary.get("failure_stage") or "")
         decision_opportunity = bool(
-            selected > 0 or sealed > 0
+            not stale_research and (
+                selected > 0 or sealed > 0
             or failure_stage.startswith((
                 "fresh_quote_and_observation", "decision_head",
-                "classification")))
+                "classification"))))
         if decision_opportunity:
             decision_opportunities += 1
         if row["status"] == "complete" and processed > 0:
@@ -18279,9 +18622,16 @@ def main() -> None:
         else None
     )
     engine_initialization_started = time.monotonic()
+    backfill_rpc_url = (
+        str(os.environ.get(BACKFILL_RPC_URL_ENV) or "").strip()
+        if args.command == "backfill-once" else "")
+    lane_rpc = (
+        RobinhoodRPC(backfill_rpc_url) if backfill_rpc_url else None)
     engine=RobinhoodLearningEngine(
-        args.root, chain_root=producer_chain, skill_root=args.skill_root,
+        args.root, rpc=lane_rpc,
+        chain_root=producer_chain, skill_root=args.skill_root,
     )
+    engine.backfill_rpc_isolated = bool(backfill_rpc_url)
     engine._startup_milestones = {
         "shared_deadline": bool(safe_float(
             os.environ.get("CHAINSEER_LANE_DEADLINE_MONOTONIC"), 0.0) > 0),
