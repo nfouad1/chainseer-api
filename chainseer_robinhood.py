@@ -442,7 +442,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v15"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v16"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -977,7 +977,7 @@ FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS = (
 # have pushed controlled deferrals above their frozen 20% limit. These
 # baselines are tighten-only; a bounded live p99 can raise, never lower, them.
 DECISION_TAIL_BLOCK_MODEL_STATE_KEY = "live_decision_tail_blocks_v1"
-DECISION_TAIL_BLOCK_MODEL_EPOCH = 2
+DECISION_TAIL_BLOCK_MODEL_EPOCH = 3
 # Admission timing is a runtime-capacity model, not permanent market
 # evidence.  The old 128-decision window retained pre-PAYG tails long enough
 # to reject 75 of 100 otherwise healthy attempts after provider capacity had
@@ -988,9 +988,18 @@ DECISION_TAIL_BLOCK_MODEL_EPOCH = 2
 DECISION_TAIL_BLOCK_SAMPLE_WINDOW = 32
 DECISION_TAIL_BLOCK_DEFAULTS = {0: 25, 1: 36, 2: 59}
 DECISION_TAIL_CIRCUIT_STATE_KEY = "live_decision_tail_circuit_v1"
-DECISION_TAIL_CIRCUIT_EPOCH = 1
+DECISION_TAIL_CIRCUIT_EPOCH = 2
 DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS = 20
 DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED = 3
+# A learned one-window reserve can otherwise deadlock its own recovery: no
+# observation is admitted, therefore no newer tail sample can ever age the
+# reserve down.  After five distinct live attempts with zero headroom, permit
+# one bounded calibration probe if the static, previously validated one-window
+# floor still fits.  The measured decision head remains authoritative: a probe
+# that lands beyond 120 blocks is classified research-only and can never enter
+# paper trading.  Further probes are attempt-clock throttled.
+DECISION_TAIL_RECOVERY_AFTER_EXHAUSTED_ATTEMPTS = 5
+DECISION_TAIL_RECOVERY_PROBE_COOLDOWN_ATTEMPTS = 20
 #: Quantile for the block-tail reserve. LOWERED from p99 on explicit operator
 #: approval, 2026-08-29, after measuring that nearest-rank p99 cannot behave
 #: as a percentile on this window: at n=82 it selects the maximum and at the
@@ -1585,6 +1594,14 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS,
         "decision_single_probe_successes_required":
             DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED,
+        "decision_tail_runtime_fingerprint_bound": True,
+        "decision_tail_recovery_after_exhausted_attempts":
+            DECISION_TAIL_RECOVERY_AFTER_EXHAUSTED_ATTEMPTS,
+        "decision_tail_recovery_probe_cooldown_attempts":
+            DECISION_TAIL_RECOVERY_PROBE_COOLDOWN_ATTEMPTS,
+        "decision_tail_recovery_probe_limit": 1,
+        "decision_tail_recovery_probe_static_floor_blocks":
+            DECISION_TAIL_BLOCK_DEFAULTS[1],
         "decision_multi_observation_safety_blocks":
             DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS,
         "backfill_maximum_chunks_per_cycle":
@@ -13734,12 +13751,21 @@ class RobinhoodLearningEngine:
         return model["downstream_reserve_p95"]
 
     def decision_tail_block_model(self) -> dict:
-        """Return a tighten-only measured block reserve by observation count."""
+        """Return a tighten-only reserve for the code actually executing.
+
+        Decision-tail timing is runtime calibration, not market evidence.
+        Samples from a different source digest remain auditable but must not
+        govern a changed live path.
+        """
         stored = self.store.scheduler_state(
             DECISION_TAIL_BLOCK_MODEL_STATE_KEY)
+        runtime_fingerprint = _worktree_source_digest()
         epoch_matches = safe_int(stored.get("epoch"), 0) == (
             DECISION_TAIL_BLOCK_MODEL_EPOCH)
-        raw = stored.get("samples") if epoch_matches else []
+        state_fingerprint = str(stored.get("runtime_fingerprint") or "")
+        regime_matches = bool(
+            epoch_matches and state_fingerprint == runtime_fingerprint)
+        raw = stored.get("samples") if regime_matches else []
         records: list[dict] = []
         if isinstance(raw, list):
             for item in raw:
@@ -13787,6 +13813,9 @@ class RobinhoodLearningEngine:
         circuit = self.decision_tail_circuit()
         return {
             "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
+            "runtime_fingerprint": runtime_fingerprint,
+            "state_runtime_fingerprint": state_fingerprint or None,
+            "runtime_regime_matches": regime_matches,
             "sample_window": DECISION_TAIL_BLOCK_SAMPLE_WINDOW,
             "quantile": f"nearest_rank_p{int(DECISION_TAIL_BLOCK_QUANTILE*100)}",
             "reserves": reserves,
@@ -13799,12 +13828,23 @@ class RobinhoodLearningEngine:
     def decision_tail_circuit(self) -> dict:
         """Attempt-clock circuit state; progress never depends on samples."""
         stored = self.store.scheduler_state(DECISION_TAIL_CIRCUIT_STATE_KEY)
-        if safe_int(stored.get("epoch"), 0) != DECISION_TAIL_CIRCUIT_EPOCH:
+        runtime_fingerprint = _worktree_source_digest()
+        state_matches = bool(
+            safe_int(stored.get("epoch"), 0) == DECISION_TAIL_CIRCUIT_EPOCH
+            and str(stored.get("runtime_fingerprint") or "")
+                == runtime_fingerprint
+        )
+        regime_transition_pending = bool(stored and not state_matches)
+        if not state_matches:
             stored = {}
         attempt = max(0, safe_int(stored.get("attempt_sequence"), 0))
         breach = max(0, safe_int(stored.get("last_breach_attempt"), 0))
         successes = max(0, safe_int(
             stored.get("single_probe_successes"), 0))
+        exhausted = max(0, safe_int(
+            stored.get("headroom_exhausted_attempts"), 0))
+        last_probe = max(0, safe_int(
+            stored.get("last_recovery_probe_attempt"), 0))
         attempts_since = attempt - breach if breach else None
         multi_blocked = bool(
             breach and (
@@ -13814,6 +13854,9 @@ class RobinhoodLearningEngine:
         )
         return {
             "epoch": DECISION_TAIL_CIRCUIT_EPOCH,
+            "runtime_fingerprint": runtime_fingerprint,
+            "runtime_regime_matches": state_matches,
+            "regime_transition_pending": regime_transition_pending,
             "attempt_sequence": attempt,
             "last_breach_attempt": breach or None,
             "attempts_since_breach": attempts_since,
@@ -13824,16 +13867,50 @@ class RobinhoodLearningEngine:
                 DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS,
             "probe_successes_required":
                 DECISION_SINGLE_PROBE_SUCCESSES_REQUIRED,
+            "headroom_exhausted_attempts": exhausted,
+            "recovery_after_exhausted_attempts":
+                DECISION_TAIL_RECOVERY_AFTER_EXHAUSTED_ATTEMPTS,
+            "last_recovery_probe_attempt": last_probe or None,
+            "recovery_probe_cooldown_attempts":
+                DECISION_TAIL_RECOVERY_PROBE_COOLDOWN_ATTEMPTS,
+            "recovery_probe_due": bool(
+                exhausted
+                    >= DECISION_TAIL_RECOVERY_AFTER_EXHAUSTED_ATTEMPTS
+                and (not last_probe or attempt - last_probe
+                     >= DECISION_TAIL_RECOVERY_PROBE_COOLDOWN_ATTEMPTS)
+            ),
             "seeded_from_history": bool(stored.get("seeded_from_history")),
         }
 
     def begin_decision_tail_attempt(self) -> dict:
         """Advance the durable circuit clock once per live attempt."""
+        stored = self.store.scheduler_state(DECISION_TAIL_CIRCUIT_STATE_KEY)
+        runtime_fingerprint = _worktree_source_digest()
+        regime_transition = bool(
+            stored and (
+                safe_int(stored.get("epoch"), 0)
+                    != DECISION_TAIL_CIRCUIT_EPOCH
+                or str(stored.get("runtime_fingerprint") or "")
+                    != runtime_fingerprint
+            )
+        )
+        if regime_transition:
+            archive_key = (
+                f"{DECISION_TAIL_CIRCUIT_STATE_KEY}:archive:"
+                f"epoch-{safe_int(stored.get('epoch'), 0)}:"
+                f"{int(time.time() * 1000)}")
+            self.store.set_scheduler_state(archive_key, stored)
         state = self.decision_tail_circuit()
         attempt = state["attempt_sequence"] + 1
         breach = state.get("last_breach_attempt")
         seeded = state.get("seeded_from_history", False)
-        if breach is None and not seeded:
+        # A changed runtime starts with one-window calibration. It may not
+        # inherit permissive multi-window state from code whose timing it no
+        # longer shares.
+        if regime_transition:
+            breach = attempt
+            seeded = True
+        elif breach is None and not seeded:
             model_state = self.store.scheduler_state(
                 DECISION_TAIL_BLOCK_MODEL_STATE_KEY)
             historical_breach = any(
@@ -13841,6 +13918,8 @@ class RobinhoodLearningEngine:
                     > FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
                 for item in (model_state.get("samples") or [])
                 if isinstance(item, dict)
+                and str(item.get("runtime_fingerprint") or "")
+                    == runtime_fingerprint
             )
             if historical_breach:
                 breach = attempt
@@ -13850,10 +13929,15 @@ class RobinhoodLearningEngine:
             DECISION_TAIL_CIRCUIT_STATE_KEY, {
                 "epoch": DECISION_TAIL_CIRCUIT_EPOCH,
                 "revision": CODE_REVISION,
+                "runtime_fingerprint": runtime_fingerprint,
                 "attempt_sequence": attempt,
                 "last_breach_attempt": breach,
                 "single_probe_successes": state[
                     "single_probe_successes"],
+                "headroom_exhausted_attempts": state[
+                    "headroom_exhausted_attempts"],
+                "last_recovery_probe_attempt": state[
+                    "last_recovery_probe_attempt"],
                 "seeded_from_history": seeded,
             })
         return self.decision_tail_circuit()
@@ -13886,10 +13970,49 @@ class RobinhoodLearningEngine:
             DECISION_TAIL_CIRCUIT_STATE_KEY, {
                 "epoch": DECISION_TAIL_CIRCUIT_EPOCH,
                 "revision": CODE_REVISION,
+                "runtime_fingerprint": _worktree_source_digest(),
                 "attempt_sequence": attempt,
                 "last_breach_attempt": breach,
                 "single_probe_successes": successes,
+                "headroom_exhausted_attempts": state[
+                    "headroom_exhausted_attempts"],
+                "last_recovery_probe_attempt": state[
+                    "last_recovery_probe_attempt"],
                 "seeded_from_history": True,
+            })
+        return self.decision_tail_circuit()
+
+    def _record_decision_tail_admission(
+        self, *, admitted: int, recovery_probe: bool,
+    ) -> dict:
+        """Advance the no-headroom recovery clock once per admission plan."""
+        state = self.decision_tail_circuit()
+        attempt = max(
+            state["attempt_sequence"],
+            safe_int(getattr(
+                self, "_decision_tail_attempt_sequence", 0), 0),
+        )
+        exhausted = (
+            0 if admitted > 0
+            else state["headroom_exhausted_attempts"] + 1
+        )
+        last_probe = (
+            attempt if recovery_probe
+            else state.get("last_recovery_probe_attempt")
+        )
+        self.store.set_scheduler_state(
+            DECISION_TAIL_CIRCUIT_STATE_KEY, {
+                "epoch": DECISION_TAIL_CIRCUIT_EPOCH,
+                "revision": CODE_REVISION,
+                "runtime_fingerprint": _worktree_source_digest(),
+                "attempt_sequence": attempt,
+                "last_breach_attempt": state.get("last_breach_attempt"),
+                "single_probe_successes": state[
+                    "single_probe_successes"],
+                "headroom_exhausted_attempts": exhausted,
+                "last_recovery_probe_attempt": last_probe,
+                "seeded_from_history": state.get(
+                    "seeded_from_history", False),
             })
         return self.decision_tail_circuit()
 
@@ -13898,12 +14021,22 @@ class RobinhoodLearningEngine:
     ) -> dict:
         """Append one successful decision-tail measurement."""
         model = self.decision_tail_block_model()
+        runtime_fingerprint = _worktree_source_digest()
+        stored = self.store.scheduler_state(
+            DECISION_TAIL_BLOCK_MODEL_STATE_KEY)
+        if stored and not model["runtime_regime_matches"]:
+            archive_key = (
+                f"{DECISION_TAIL_BLOCK_MODEL_STATE_KEY}:archive:"
+                f"epoch-{safe_int(stored.get('epoch'), 0)}:"
+                f"{int(time.time() * 1000)}")
+            self.store.set_scheduler_state(archive_key, stored)
         samples = list(model["samples"])
         samples.append({
             "observations": max(0, int(observations)),
             "blocks": max(0, int(blocks)),
             "run_id": str(getattr(self, "cycle_run_uuid", "") or ""),
             "revision": CODE_REVISION,
+            "runtime_fingerprint": runtime_fingerprint,
             "at": time.time(),
             "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
         })
@@ -13911,6 +14044,7 @@ class RobinhoodLearningEngine:
             DECISION_TAIL_BLOCK_MODEL_STATE_KEY, {
                 "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
                 "revision": CODE_REVISION,
+                "runtime_fingerprint": runtime_fingerprint,
                 "samples": samples[-DECISION_TAIL_BLOCK_SAMPLE_WINDOW:],
             })
         self._record_decision_tail_circuit(observations, blocks)
@@ -13926,6 +14060,10 @@ class RobinhoodLearningEngine:
         model = self.decision_tail_block_model()
         model_report = {
             "epoch": model["epoch"],
+            "runtime_fingerprint": model["runtime_fingerprint"],
+            "state_runtime_fingerprint":
+                model["state_runtime_fingerprint"],
+            "runtime_regime_matches": model["runtime_regime_matches"],
             "sample_window": model["sample_window"],
             "quantile": model["quantile"],
             "reserves": model["reserves"],
@@ -13952,6 +14090,9 @@ class RobinhoodLearningEngine:
         admitted = 0
         reserve = int(model["reserves"].get(0, 0))
         safety_blocks = 0
+        recovery_probe = False
+        learned_single_reserve = int(model["reserves"].get(
+            1, DECISION_TAIL_BLOCK_DEFAULTS[1]))
         for count in range(requested, 0, -1):
             if count in model["circuit"]["blocked_counts"]:
                 continue
@@ -13968,17 +14109,42 @@ class RobinhoodLearningEngine:
                 reserve = candidate_reserve
                 safety_blocks = candidate_safety
                 break
+        # Bounded exploration prevents a learned reserve from permanently
+        # blocking its own replacement samples. It is allowed only after a
+        # sustained zero-admission streak, only for one window, only when the
+        # validated static floor still fits, and no more often than the
+        # attempt-clock cooldown. The authoritative decision head below still
+        # decides freshness; a miss is research-only and never paper-eligible.
+        static_single_reserve = int(DECISION_TAIL_BLOCK_DEFAULTS[1])
+        if (
+            admitted == 0 and requested > 0
+            and model["circuit"]["recovery_probe_due"]
+            and lag + static_single_reserve
+                <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+        ):
+            admitted = 1
+            reserve = static_single_reserve
+            safety_blocks = 0
+            recovery_probe = True
+        circuit_after = model["circuit"]
+        if requested > 0:
+            circuit_after = self._record_decision_tail_admission(
+                admitted=admitted, recovery_probe=recovery_probe)
+        model_report["circuit_after_admission"] = circuit_after
         return {
             "requested": requested, "admitted": admitted,
             "reason": (
-                "requested_batch_fits" if admitted == requested
+                "decision_tail_recovery_probe" if recovery_probe
+                else "requested_batch_fits" if admitted == requested
                 else "batch_reduced_for_freshness" if admitted > 0
                 else "decision_tail_headroom_exhausted"),
             "observation_head": int(observation_head),
             "post_ingest_head": int(post_ingest_head),
             "post_ingest_lag_blocks": lag,
             "tail_reserve_blocks": reserve,
+            "learned_single_tail_reserve_blocks": learned_single_reserve,
             "safety_blocks": safety_blocks,
+            "recovery_probe": recovery_probe,
             "prospective_bound_blocks":
                 FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS,
             "model": model_report,

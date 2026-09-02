@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v15")
+                "robinhood-operational-v16")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -11136,6 +11136,7 @@ class DecisionTailAdmissionTests(unittest.TestCase):
                 {
                     "epoch": rh.DECISION_TAIL_BLOCK_MODEL_EPOCH,
                     "revision": "previous-runtime-regime",
+                    "runtime_fingerprint": rh._worktree_source_digest(),
                     "samples": old + current,
                 },
             )
@@ -11147,6 +11148,121 @@ class DecisionTailAdmissionTests(unittest.TestCase):
             rh.DECISION_TAIL_BLOCK_SAMPLE_WINDOW)
         self.assertEqual(plan["model"]["reserves"][1], 36)
         self.assertEqual(plan["admitted"], 1)
+
+    def test_changed_runtime_archives_old_calibration_and_starts_single(self):
+        """Timing evidence cannot cross a source-digest regime boundary."""
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            rh, "_worktree_source_digest", return_value="runtime-new"
+        ):
+            engine = self._engine(directory)
+            engine.store.set_scheduler_state(
+                rh.DECISION_TAIL_BLOCK_MODEL_STATE_KEY,
+                {
+                    "epoch": rh.DECISION_TAIL_BLOCK_MODEL_EPOCH,
+                    "runtime_fingerprint": "runtime-old",
+                    "samples": [
+                        {"observations": 1, "blocks": 105}
+                        for _ in range(32)
+                    ],
+                },
+            )
+            engine.store.set_scheduler_state(
+                rh.DECISION_TAIL_CIRCUIT_STATE_KEY,
+                {
+                    "epoch": rh.DECISION_TAIL_CIRCUIT_EPOCH,
+                    "runtime_fingerprint": "runtime-old",
+                    "attempt_sequence": 99,
+                    "single_probe_successes": 9,
+                    "seeded_from_history": True,
+                },
+            )
+            circuit = engine.begin_decision_tail_attempt()
+            plan = engine.observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_070,
+                requested=2)
+            engine.record_decision_tail_blocks(1, 20)
+            with engine.store.connection() as connection:
+                archives = connection.execute(
+                    """SELECT COUNT(*) FROM flow_scheduler_state
+                       WHERE key LIKE ? OR key LIKE ?""",
+                    (rh.DECISION_TAIL_BLOCK_MODEL_STATE_KEY + ":archive:%",
+                     rh.DECISION_TAIL_CIRCUIT_STATE_KEY + ":archive:%"),
+                ).fetchone()[0]
+        self.assertTrue(circuit["multi_observation_blocked"])
+        self.assertEqual(plan["model"]["sample_counts"][1], 0)
+        self.assertEqual(plan["model"]["reserves"][1], 36)
+        self.assertEqual(plan["admitted"], 1)
+        self.assertGreaterEqual(archives, 2)
+
+    def test_exhausted_learned_reserve_gets_one_throttled_recovery_probe(self):
+        """The estimator must be able to collect the sample that repairs it."""
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            rh, "_worktree_source_digest", return_value="runtime-current"
+        ):
+            engine = self._engine(directory)
+            engine.store.set_scheduler_state(
+                rh.DECISION_TAIL_BLOCK_MODEL_STATE_KEY,
+                {
+                    "epoch": rh.DECISION_TAIL_BLOCK_MODEL_EPOCH,
+                    "runtime_fingerprint": "runtime-current",
+                    "samples": [
+                        {"observations": 1, "blocks": 90}
+                        for _ in range(32)
+                    ],
+                },
+            )
+            for _ in range(
+                    rh.DECISION_TAIL_RECOVERY_AFTER_EXHAUSTED_ATTEMPTS):
+                engine.begin_decision_tail_attempt()
+                plan = engine.observation_freshness_admission(
+                    observation_head=1_000, post_ingest_head=1_070,
+                    requested=2)
+                self.assertEqual(plan["admitted"], 0)
+            engine.begin_decision_tail_attempt()
+            probe = engine.observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_070,
+                requested=2)
+            engine.record_decision_tail_blocks(1, 121)
+            engine.begin_decision_tail_attempt()
+            throttled = engine.observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_070,
+                requested=2)
+        self.assertEqual(probe["admitted"], 1)
+        self.assertTrue(probe["recovery_probe"])
+        self.assertEqual(probe["reason"], "decision_tail_recovery_probe")
+        self.assertEqual(probe["tail_reserve_blocks"], 36)
+        self.assertEqual(probe["learned_single_tail_reserve_blocks"], 90)
+        self.assertEqual(throttled["admitted"], 0)
+        self.assertFalse(throttled["recovery_probe"])
+        self.assertEqual(
+            rh.FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS, 120)
+
+    def test_recovery_probe_never_overrides_the_static_freshness_floor(self):
+        with tempfile.TemporaryDirectory() as directory, patch.object(
+            rh, "_worktree_source_digest", return_value="runtime-current"
+        ):
+            engine = self._engine(directory)
+            engine.store.set_scheduler_state(
+                rh.DECISION_TAIL_BLOCK_MODEL_STATE_KEY,
+                {
+                    "epoch": rh.DECISION_TAIL_BLOCK_MODEL_EPOCH,
+                    "runtime_fingerprint": "runtime-current",
+                    "samples": [
+                        {"observations": 1, "blocks": 90}
+                        for _ in range(32)
+                    ],
+                },
+            )
+            plan = None
+            for _ in range(
+                    rh.DECISION_TAIL_RECOVERY_AFTER_EXHAUSTED_ATTEMPTS + 1):
+                engine.begin_decision_tail_attempt()
+                plan = engine.observation_freshness_admission(
+                    observation_head=1_000, post_ingest_head=1_085,
+                    requested=2)
+        self.assertIsNotNone(plan)
+        self.assertEqual(plan["admitted"], 0)
+        self.assertFalse(plan["recovery_probe"])
 
     def test_recent_bound_breach_quarantines_only_that_batch_size(self):
         with tempfile.TemporaryDirectory() as directory:

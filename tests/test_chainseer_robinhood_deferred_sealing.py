@@ -244,8 +244,8 @@ class EngineSealingTests(unittest.TestCase):
         self.assertEqual(engine.timechain_recorder.tc.seal_calls, 0,
                          "decision path performed Timechain work")
 
-    def test_due_certificate_refresh_precedes_entry_capable_work(self):
-        """A missing/stale certificate owns the first analysis-lane slot."""
+    def test_certificate_refresh_waits_until_analysis_writer_exits(self):
+        """The certificate lane must attest the final producer head."""
         engine = object.__new__(rh.RobinhoodLearningEngine)
         engine.root = self.root
         engine.root.mkdir(parents=True, exist_ok=True)
@@ -273,10 +273,15 @@ class EngineSealingTests(unittest.TestCase):
         })()
 
         result = engine.run_analysis_lane(budget_seconds=10.0)
-        self.assertEqual(order[0], "certificate_refresh")
-        self.assertEqual(order[1:], [
+        self.assertEqual(order, [
             "outcomes", "market_rechecks", "analyses", "deferred_seals"])
-        self.assertTrue(result["certificate_refresh"]["published"])
+        self.assertNotIn("certificate_refresh", order)
+        self.assertEqual(
+            result["certificate_refresh"]["delegated_to"],
+            "certificate_lane")
+        self.assertEqual(
+            result["certificate_refresh"]["trigger"],
+            "after_analysis_writer_exit")
 
 
 if __name__ == "__main__":
