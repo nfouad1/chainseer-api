@@ -424,7 +424,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v11"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v12"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -959,8 +959,15 @@ FLOW_PRESEAL_MAXIMUM_HEAD_LAG_BLOCKS = (
 # have pushed controlled deferrals above their frozen 20% limit. These
 # baselines are tighten-only; a bounded live p99 can raise, never lower, them.
 DECISION_TAIL_BLOCK_MODEL_STATE_KEY = "live_decision_tail_blocks_v1"
-DECISION_TAIL_BLOCK_MODEL_EPOCH = 1
-DECISION_TAIL_BLOCK_SAMPLE_WINDOW = 128
+DECISION_TAIL_BLOCK_MODEL_EPOCH = 2
+# Admission timing is a runtime-capacity model, not permanent market
+# evidence.  The old 128-decision window retained pre-PAYG tails long enough
+# to reject 75 of 100 otherwise healthy attempts after provider capacity had
+# demonstrably changed.  Thirty-two completed decisions still cover several
+# minutes of independent live cycles, while allowing the tighten-only reserve
+# to return to its conservative static floor after a sustained new regime.
+# Bound breaches remain fail-closed in the separate attempt-clock circuit.
+DECISION_TAIL_BLOCK_SAMPLE_WINDOW = 32
 DECISION_TAIL_BLOCK_DEFAULTS = {0: 25, 1: 36, 2: 59}
 DECISION_TAIL_CIRCUIT_STATE_KEY = "live_decision_tail_circuit_v1"
 DECISION_TAIL_CIRCUIT_EPOCH = 1
@@ -1540,6 +1547,8 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "seal_cost_model_epoch": SEAL_COST_MODEL_EPOCH,
         "decision_tail_block_model_epoch":
             DECISION_TAIL_BLOCK_MODEL_EPOCH,
+        "decision_tail_block_sample_window":
+            DECISION_TAIL_BLOCK_SAMPLE_WINDOW,
         "decision_tail_circuit_epoch": DECISION_TAIL_CIRCUIT_EPOCH,
         "decision_head_rate_limit_policy":
             "fail_fast_when_observations_are_sealed",
@@ -13736,6 +13745,7 @@ class RobinhoodLearningEngine:
         circuit = self.decision_tail_circuit()
         return {
             "epoch": DECISION_TAIL_BLOCK_MODEL_EPOCH,
+            "sample_window": DECISION_TAIL_BLOCK_SAMPLE_WINDOW,
             "quantile": f"nearest_rank_p{int(DECISION_TAIL_BLOCK_QUANTILE*100)}",
             "reserves": reserves,
             "sample_counts": sample_counts,
@@ -13873,7 +13883,9 @@ class RobinhoodLearningEngine:
             int(requested), LIVE_LANE_OBSERVATION_LIMIT))
         model = self.decision_tail_block_model()
         model_report = {
-            "epoch": model["epoch"], "quantile": model["quantile"],
+            "epoch": model["epoch"],
+            "sample_window": model["sample_window"],
+            "quantile": model["quantile"],
             "reserves": model["reserves"],
             "sample_counts": model["sample_counts"],
             "historical_breached_counts":

@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v11")
+                "robinhood-operational-v12")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -11013,6 +11013,29 @@ class DecisionTailAdmissionTests(unittest.TestCase):
                 requested=2)
         self.assertEqual(plan["model"]["reserves"][1], 50)
         self.assertEqual(plan["admitted"], 0)
+
+    def test_sustained_capacity_regime_ages_out_old_tail_reserve(self):
+        """Pre-upgrade timing cannot starve a verified faster regime forever."""
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._engine(directory)
+            old = [{"observations": 1, "blocks": 90} for _ in range(32)]
+            current = [{"observations": 1, "blocks": 10} for _ in range(32)]
+            engine.store.set_scheduler_state(
+                rh.DECISION_TAIL_BLOCK_MODEL_STATE_KEY,
+                {
+                    "epoch": rh.DECISION_TAIL_BLOCK_MODEL_EPOCH,
+                    "revision": "previous-runtime-regime",
+                    "samples": old + current,
+                },
+            )
+            plan = engine.observation_freshness_admission(
+                observation_head=1_000, post_ingest_head=1_070,
+                requested=2)
+        self.assertEqual(
+            plan["model"]["sample_window"],
+            rh.DECISION_TAIL_BLOCK_SAMPLE_WINDOW)
+        self.assertEqual(plan["model"]["reserves"][1], 36)
+        self.assertEqual(plan["admitted"], 1)
 
     def test_recent_bound_breach_quarantines_only_that_batch_size(self):
         with tempfile.TemporaryDirectory() as directory:
