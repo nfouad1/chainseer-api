@@ -17034,9 +17034,14 @@ class RobinhoodLearningEngine:
         provider_chunk_limit = int(chunk_plan["chunk_blocks"])
         log_batch_size = max(1, safe_int(
             getattr(self.rpc, "maximum_log_batch_size", 1), 1))
-        chunk_limit = (
-            BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS
-            if log_batch_size > 1 else provider_chunk_limit)
+        # Transport capability and SQLite commit capacity are independent.
+        # PAYG may serve 750 blocks in one RPC, but the production corpus
+        # proved that applying a dense 750-block response can exceed the
+        # transaction deadline. Keep the durable commit quantum at the proven
+        # 250-block bound regardless of whether transport uses one request or
+        # several provider-safe subranges.
+        chunk_limit = min(
+            provider_chunk_limit, BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS)
         available = max(0.0, deadline.remaining() - max(0.0, reserve_seconds))
         if available <= 0:
             return {

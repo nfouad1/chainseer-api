@@ -8064,7 +8064,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(
                 result["stopped_reason"], "completion_reserve_reached")
 
-    def test_gap_recovery_chunks_are_hard_bounded_at_provider_safe_cap(self):
+    def test_gap_recovery_chunks_are_hard_bounded_at_sqlite_safe_cap(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = rh.RobinhoodLearningEngine(
                 directory, rpc=FakeRPC([], latest=100),
@@ -8088,15 +8088,15 @@ class LaneSplitTests(unittest.TestCase):
                 reserve_seconds=0.1,
             )
             self.assertEqual(limits, [
-                rh.BACKFILL_GAP_CHUNK_BLOCKS,
-                rh.BACKFILL_GAP_CHUNK_BLOCKS,
+                rh.BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS,
+                rh.BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS,
             ])
             self.assertEqual(
                 result["chunk_limit_blocks"],
-                rh.BACKFILL_GAP_CHUNK_BLOCKS)
+                rh.BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS)
             self.assertEqual(
                 result["blocks_scanned"],
-                rh.BACKFILL_GAP_CHUNK_BLOCKS)
+                rh.BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS)
 
     def test_second_backfill_throttle_preserves_first_committed_chunk(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -8129,7 +8129,8 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(result["chunks_processed"], 1)
             self.assertEqual(result["cursor_commits"], 1)
             self.assertEqual(
-                result["blocks_scanned"], rh.BACKFILL_GAP_CHUNK_BLOCKS)
+                result["blocks_scanned"],
+                rh.BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS)
             self.assertEqual(result["candidates_added"], 2)
             self.assertTrue(result["provider_deferred"])
             self.assertEqual(
@@ -8477,8 +8478,8 @@ class LaneSplitTests(unittest.TestCase):
                 "backfill_provider_deferred")
             self.assertEqual(
                 recovery["next_chunk_blocks"],
-                rh.BACKFILL_GAP_CHUNK_BLOCKS,
-                "a 429 changes cadence, not query size")
+                rh.BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS,
+                "a 429 preserves the SQLite-safe atomic bound")
 
     def test_backfill_hysteresis_requires_a_success_streak_before_probe(self):
         with tempfile.TemporaryDirectory() as directory:
