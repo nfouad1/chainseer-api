@@ -18,6 +18,7 @@ venv/
 chainseer_chain/
 chainseer_chain_archive_corrupted/
 chainseer_backups/
+chainseer_memory_federation/
 benchmark_data/
 base_learning/
 base_prototype/

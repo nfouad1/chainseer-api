@@ -120,6 +120,7 @@ misreading a field. All are independently versioned:
 | `EVIDENCE_MANIFEST_SCHEMA_VERSION` | `chainseer_outcome_ledger.py` | `1.0` |
 | `TEMPORAL_GRAPH_SCHEMA_VERSION` | `chainseer_temporal_graph.py` | `1.0` |
 | `GOVERNANCE_SCHEMA_VERSION` | `chainseer_governance.py` | `1.0` |
+| `FEDERATION_SCHEMA_VERSION` | `chainseer_memory_federation.py` | `1.0` |
 
 Recall responses, citation proofs, status payloads, backup manifests, and
 the persisted temporal projection all carry `schema_version`. A projection
@@ -176,10 +177,22 @@ resolve with `binding_state: derived_from_legacy_analysis_ring` and
 not laundered into looking sealed-at-analysis.
 
 These remain separate authoritative Timechains with separate faculty
-registries by design. Nothing federates them into a *shared* Outcome
-Ledger or Entity Graph yet: there is no cross-chain evidence-signing or
-citation scheme, so a claim still cannot cite a ring from a chain other
-than the one it was recalled from. Treat cross-chain memory as unbuilt.
+registries by design. `chainseer_memory_federation.py` now provides the
+shared, verified projection boundary: it ingests only analyses that were
+evidence-bound when sealed and outcomes that verify against the exact source
+analysis. Every projection pins the source id, genesis, Ring index, full Ring
+hash, evidence hashes, and source head snapshot. Re-ingestion is idempotent,
+and truncation, source forks, invalid outcomes, or broken citations fail
+closed. Queries re-verify both the federation and each cited producer.
+
+The first production source is deliberately Robinhood-only
+(`robinhood-learning`). Its low-priority, no-RPC memory lane runs after the
+producer-head certificate and writes a different Timechain. Solana and other
+producers are not enabled merely because their Ring types are recognised;
+each source must be added explicitly after its own complete evidence →
+analysis → outcome loop is proven. This is hash-pinned federation, not an
+authenticated multi-party consensus or a claim that independent producers
+have cryptographically signed each other.
 
 ## Expected scale
 

@@ -62,6 +62,7 @@ from chainseer_outcome_ledger import (
 )
 from chainseer_temporal_graph import TemporalGraphStore
 from chainseer_robinhood_commitments import (
+    CERTIFICATE_FILE_NAME,
     DecisionCommitmentStore,
     DecisionCommitmentError,
     evaluate_integrity_certificate,
@@ -153,7 +154,8 @@ MARKS_LANE_BUDGET_SECONDS = 90.0
 #: drifted from the lane configuration once; anything iterating lanes reads
 #: this or the config dict, never its own copy.
 SUPERVISED_LANE_NAMES = (
-    "live", "marks", "evidence", "analysis", "backfill")
+    "live", "marks", "evidence", "analysis", "certificate", "memory",
+    "backfill")
 LANE_NAMES = (*SUPERVISED_LANE_NAMES, "verification")
 #: How long past its deadline the supervisor lets a lane run before killing
 #: it. A censored attempt is charged deadline + this, so a reliability failure
@@ -175,6 +177,22 @@ EVIDENCE_COMPLETION_RESERVE_SECONDS = 8.0
 # the shared completion reserve above.
 EVIDENCE_STAGE_MAX_SECONDS = 20.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
+# Integrity-head publication is deliberately separate from analysis. The old
+# analysis-first refresh could be starved by backfill priority and then be
+# invalidated when the same analysis worker appended more rings. This lane
+# verifies the final producer head after each writer exits and periodically
+# refreshes an otherwise quiet chain.
+CERTIFICATE_LANE_BUDGET_SECONDS = 60.0
+CERTIFICATE_LANE_CADENCE_SECONDS = 5 * 60.0
+CERTIFICATE_RETRY_CADENCE_SECONDS = 30.0
+# Federation is a derived, rebuildable projection. It reads the verified
+# Robinhood producer and writes a different Timechain, performs no RPC, and
+# therefore belongs in its own low-priority lane after certification.
+MEMORY_LANE_BUDGET_SECONDS = 120.0
+MEMORY_LANE_CADENCE_SECONDS = 5 * 60.0
+MEMORY_RETRY_CADENCE_SECONDS = 30.0
+DEFAULT_MEMORY_FEDERATION_ROOT = "chainseer_memory_federation"
+ROBINHOOD_MEMORY_SOURCE_ID = "robinhood-learning"
 # Operational verification performs bounded schema/readability/critical-table
 # health checks plus complete ledger and producer-Timechain verification.
 # Both SQLite quick_check and integrity_check exceeded practical maintenance
@@ -424,7 +442,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v12"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v14"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -1505,6 +1523,15 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "live_enrichment_budget_seconds": (
             LIVE_LANE_ENRICHMENT_BUDGET_SECONDS),
         "backfill_lane_cadence_seconds": BACKFILL_LANE_CADENCE_SECONDS,
+        "certificate_lane_budget_seconds":
+            CERTIFICATE_LANE_BUDGET_SECONDS,
+        "certificate_lane_cadence_seconds":
+            CERTIFICATE_LANE_CADENCE_SECONDS,
+        "certificate_refresh_after_analysis": True,
+        "memory_lane_budget_seconds": MEMORY_LANE_BUDGET_SECONDS,
+        "memory_lane_cadence_seconds": MEMORY_LANE_CADENCE_SECONDS,
+        "memory_ingest_after_certificate": True,
+        "memory_source_id": ROBINHOOD_MEMORY_SOURCE_ID,
         "scheduled_backfill_block_limit": BACKFILL_GAP_CHUNK_BLOCKS,
         "background_rpc_priority_gate_version": 2,
         "background_rpc_serialized": True,
@@ -16773,33 +16800,14 @@ class RobinhoodLearningEngine:
                 except Exception:
                     pass
 
-            # Integrity refresh owns the first reservation in this lane.
-            # Entry-capable rechecks and analyses must never run ahead of a
-            # due certificate refresh and consume the budget it requires.
-            certificate_refresh = None
-            certificate = load_integrity_certificate(self.root)
-            cert_age = time.time() - safe_float(
-                certificate.get("published_epoch"), 0.0)
-            cert_max_age = safe_float(
-                certificate.get("expires_at"), time.time() + 1.0
-            ) - safe_float(
-                certificate.get("published_epoch"), time.time())
-            needs_refresh = (
-                not certificate
-                or cert_age > max(0.0, cert_max_age * 0.5))
-            if self.timechain_recorder is not None and needs_refresh:
-                stage = time.monotonic()
-                _mark_analysis_stage("certificate_refresh")
-                try:
-                    certificate_refresh = self.publish_integrity_certificate()
-                except Exception as exc:
-                    # Analysis may continue, but any exposure-increasing
-                    # action remains fail-closed on the stale certificate.
-                    certificate_refresh = {
-                        "published": False, "reason": str(exc)[:200]}
-                timings["certificate_refresh"] = round(
-                    time.monotonic() - stage, 3)
-                deadline.raise_if_expired("certificate_refresh")
+            # A separate certificate lane verifies the FINAL producer head
+            # after this writer exits. Publishing here before outcomes,
+            # analyses, and deferred seals made a fresh certificate stale in
+            # the same process that created it.
+            certificate_refresh = {
+                "delegated_to": "certificate_lane",
+                "trigger": "after_analysis_writer_exit",
+            }
             stage = time.monotonic()
             with self._rpc_deadline(deadline):
                 # Bounded by what outcomes may spend, not by the whole lane
@@ -17975,6 +17983,111 @@ class RobinhoodLearningEngine:
         """Run the bounded daily certificate without claiming full DB proof."""
         return self._verify(full=False)
 
+    def run_certificate_lane(
+        self, *, budget_seconds: float = CERTIFICATE_LANE_BUDGET_SECONDS,
+    ) -> dict:
+        """Verify and publish the current producer-Timechain head.
+
+        This lane never appends a producer ring. The supervisor runs it after
+        every analysis writer and on a periodic fallback cadence, so the
+        published head cannot be invalidated by later work in the same
+        process. Any failure leaves the existing certificate untouched and
+        the execution gate remains fail-closed.
+        """
+        def work(deadline: CycleDeadline) -> dict:
+            started = time.monotonic()
+            deadline.raise_if_expired("certificate_refresh")
+            result = self.publish_integrity_certificate()
+            deadline.raise_if_expired("certificate_refresh")
+            certificate = result.get("certificate") or {}
+            return {
+                "certificate_refresh": result,
+                "integrity_ok": bool(result.get("verification_ok")),
+                "published_head_index": certificate.get("head_index"),
+                "published_ring_count": certificate.get("ring_count"),
+                "stage_timings_seconds": {
+                    "certificate_refresh": round(
+                        time.monotonic() - started, 3),
+                },
+                "timechain_writer": False,
+            }
+
+        return self._execute_lane("certificate", budget_seconds, work)
+
+    def run_memory_lane(
+        self,
+        *,
+        federation_root: str | Path = DEFAULT_MEMORY_FEDERATION_ROOT,
+        budget_seconds: float = MEMORY_LANE_BUDGET_SECONDS,
+    ) -> dict:
+        """Project the certified producer into federated verified memory.
+
+        The source Timechain stays authoritative. This lane performs no RPC,
+        does not append to the producer, and leaves a completion reserve so a
+        large initial corpus is resumed in later idempotent batches instead
+        of being killed mid-write.
+        """
+        if self.timechain_recorder is None:
+            raise RuntimeError("producer Timechain is disabled")
+
+        def work(deadline: CycleDeadline) -> dict:
+            from chainseer_memory_federation import (
+                FederatedMemoryCore,
+                MemorySource,
+            )
+
+            started = time.monotonic()
+            deadline.raise_if_expired("memory_initialization")
+            certificate = load_integrity_certificate(self.root)
+            current_head = self.timechain_recorder.tc._current_head()
+            current_count = (
+                int(current_head["index"]) + 1 if current_head else 0)
+            certificate_ok, certificate_reason, _detail = (
+                evaluate_integrity_certificate(
+                    certificate, current_ring_count=current_count))
+            exact_certified_head = bool(
+                certificate_ok
+                and safe_int(certificate.get("ring_count"), -1)
+                    == current_count
+                and safe_int(certificate.get("head_index"), -1)
+                    == safe_int((current_head or {}).get("index"), -2)
+                and str(certificate.get("head_hash") or "")
+                    == str((current_head or {}).get("ring_hash") or "")
+            )
+            if not exact_certified_head:
+                raise RuntimeError(
+                    "memory source head is not exactly certified: "
+                    + certificate_reason)
+            memory_root = Path(federation_root)
+            federation_tc = self.timechain_recorder.tc.__class__(memory_root)
+            core = FederatedMemoryCore(
+                federation_tc,
+                memory_root,
+                [MemorySource(
+                    ROBINHOOD_MEMORY_SOURCE_ID,
+                    self.timechain_recorder.root,
+                    self.timechain_recorder.tc,
+                )],
+            )
+            result = core.ingest(
+                ROBINHOOD_MEMORY_SOURCE_ID,
+                deadline_monotonic=max(
+                    time.monotonic(), deadline.deadline - 3.0),
+            )
+            return {
+                "memory_ingest": result,
+                "memory_status": core.status(),
+                "controlled_deferral": not bool(result.get("complete")),
+                "stage_timings_seconds": {
+                    "memory_ingest": round(time.monotonic() - started, 3),
+                },
+                "timechain_writer": False,
+                "producer_timechain_writer": False,
+                "rpc_requests": 0,
+            }
+
+        return self._execute_lane("memory", budget_seconds, work)
+
     def run_verification_lane(
         self, *, budget_seconds: float = VERIFICATION_LANE_BUDGET_SECONDS,
     ) -> dict:
@@ -18106,7 +18219,9 @@ def _lane_creation_flags(lane: str) -> int:
     flags = int(getattr(subprocess, "CREATE_NO_WINDOW", 0))
     if lane == "live":
         flags |= int(getattr(subprocess, "ABOVE_NORMAL_PRIORITY_CLASS", 0))
-    elif lane in {"analysis", "backfill", "verification"}:
+    elif lane in {
+        "analysis", "backfill", "certificate", "memory", "verification",
+    }:
         flags |= int(getattr(subprocess, "BELOW_NORMAL_PRIORITY_CLASS", 0))
     return flags
 
@@ -18118,6 +18233,11 @@ def _low_priority_launch_blocked(
     """Reserve worker-startup capacity around every live launch."""
     if lane == "live":
         return False
+    integrity_sequence = {"analysis", "certificate", "memory"}
+    if lane in integrity_sequence and any(
+        active in integrity_sequence for active in active_lanes
+    ):
+        return True
     if "live" in active_lanes:
         return True
     seconds_to_live = float(next_live) - float(now)
@@ -18128,11 +18248,21 @@ def _select_background_candidate(
     due_background: list[tuple[str, dict]], launches: dict[str, int],
     *, cohort_progress: dict | None = None,
     backfill_pressure: dict | None = None,
+    certificate_urgent: bool = False,
+    memory_urgent: bool = False,
 ) -> str | None:
     """Serve durable cohort and recovery deficits before ordinary debt."""
     if not due_background:
         return None
     due_by_name = {lane: schedule for lane, schedule in due_background}
+    # Integrity publication has no RPC and authorizes no action by itself.
+    # It must outrank backfill pressure after the sole Timechain writer exits,
+    # otherwise the safety gate can remain stale indefinitely while recovery
+    # correctly monopolizes background RPC.
+    if certificate_urgent and "certificate" in due_by_name:
+        return "certificate"
+    if memory_urgent and "memory" in due_by_name:
+        return "memory"
     progress = cohort_progress or {}
     if progress.get("collecting"):
         mark_target = safe_int(progress.get("mark_pace_target"), 0)
@@ -18160,6 +18290,21 @@ def _select_background_candidate(
     )[0]
 
 
+def _integrity_certificate_refresh_due(
+    root: str | Path, *, now: float | None = None,
+) -> bool:
+    """Refresh at half-TTL; never widen the fixed certificate policy."""
+    certificate = load_integrity_certificate(root)
+    if not certificate:
+        return True
+    current = time.time() if now is None else float(now)
+    published = safe_float(certificate.get("published_epoch"), None)
+    expires = safe_float(certificate.get("expires_at"), None)
+    if published is None or expires is None or expires <= published:
+        return True
+    return current >= published + ((expires - published) * 0.5)
+
+
 def _full_verification_due(
     root: str | Path, *, now: float | None = None,
 ) -> bool:
@@ -18180,6 +18325,7 @@ def supervise_lanes(
     discovery_block_limit: int, analysis_limit: int,
     outcome_limit: int, outcome_recovery_limit: int,
     market_recheck_limit: int,
+    memory_root: str | Path = DEFAULT_MEMORY_FEDERATION_ROOT,
     live_cadence_seconds: float = LIVE_LANE_CADENCE_SECONDS,
     marks_cadence_seconds: float = MARKS_LANE_CADENCE_SECONDS,
     evidence_cadence_seconds: float = EVIDENCE_LANE_CADENCE_SECONDS,
@@ -18220,6 +18366,18 @@ def supervise_lanes(
             "cadence": max(30.0, analysis_cadence_seconds),
             "budget": ANALYSIS_LANE_BUDGET_SECONDS, "next": started_mono + 3.0,
         },
+        "certificate": {
+            "command": "certificate-once",
+            "cadence": CERTIFICATE_LANE_CADENCE_SECONDS,
+            "budget": CERTIFICATE_LANE_BUDGET_SECONDS,
+            "next": started_mono + 4.0,
+        },
+        "memory": {
+            "command": "memory-once",
+            "cadence": MEMORY_LANE_CADENCE_SECONDS,
+            "budget": MEMORY_LANE_BUDGET_SECONDS,
+            "next": started_mono + 5.0,
+        },
         "backfill": {
             "command": "backfill-once",
             "cadence": max(60.0, backfill_cadence_seconds),
@@ -18243,6 +18401,8 @@ def supervise_lanes(
     last_deficit_refresh = float("-inf")
     cohort_progress: dict = {"collecting": False}
     backfill_pressure: dict = {"priority": False}
+    certificate_urgent = _integrity_certificate_refresh_due(root)
+    memory_urgent = True
     lane_job = _WindowsLaneJob()
     worker_python = str(getattr(sys, "_base_executable", None) or sys.executable)
     worker_environment = os.environ.copy()
@@ -18264,6 +18424,8 @@ def supervise_lanes(
             "--chain-root", str(chain_root), "--skill-root", str(skill_root),
             "--lane-budget-seconds", str(lanes[lane]["budget"]),
         ]
+        if lane == "memory":
+            command += ["--memory-root", str(memory_root)]
         if lane == "analysis":
             command += [
                 "--analysis-limit", str(analysis_limit),
@@ -18349,6 +18511,27 @@ def supervise_lanes(
                     item["stderr"].close()
                     failures[lane] += int(code != 0)
                     active.pop(lane, None)
+                    if lane == "analysis" and code == 0:
+                        # The only Timechain writer finished. Verify exactly
+                        # that final head before ordinary background work.
+                        certificate_urgent = True
+                        lanes["certificate"]["next"] = min(
+                            float(lanes["certificate"]["next"]), now_mono)
+                    elif lane == "certificate":
+                        certificate_urgent = code != 0
+                        if code == 0:
+                            memory_urgent = True
+                            lanes["memory"]["next"] = min(
+                                float(lanes["memory"]["next"]), now_mono)
+                        else:
+                            lanes["certificate"]["next"] = (
+                                now_mono
+                                + CERTIFICATE_RETRY_CADENCE_SECONDS)
+                    elif lane == "memory":
+                        memory_urgent = code != 0
+                        if code != 0:
+                            lanes["memory"]["next"] = (
+                                now_mono + MEMORY_RETRY_CADENCE_SECONDS)
                 elif now_mono >= item["deadline"]:
                     process.kill()
                     try:
@@ -18379,6 +18562,10 @@ def supervise_lanes(
                     # Deficit telemetry may defer a preference, but it may
                     # never stop the supervisor or manufacture state.
                     pass
+                if _integrity_certificate_refresh_due(root):
+                    certificate_urgent = True
+                    lanes["certificate"]["next"] = min(
+                        float(lanes["certificate"]["next"]), now_mono)
             # Iterate the CONFIGURATION. A hardcoded list beside a lanes dict
             # is a second source of truth, and it silently dropped `marks`:
             # the lane was defined, budgeted and given a cadence, and never
@@ -18392,7 +18579,9 @@ def supervise_lanes(
             background_candidate = _select_background_candidate(
                 due_background, launches,
                 cohort_progress=cohort_progress,
-                backfill_pressure=backfill_pressure)
+                backfill_pressure=backfill_pressure,
+                certificate_urgent=certificate_urgent,
+                memory_urgent=memory_urgent)
             for lane, schedule in lanes.items():
                 if lane in active or now_mono < schedule["next"]:
                     continue
@@ -18461,7 +18650,9 @@ def supervise_lanes(
                         LANE_TERMINATION_GRACE_SECONDS),
                     "priority": (
                         "above_normal" if lane == "live" else (
-                            "below_normal" if lane in {"analysis", "backfill"}
+                            "below_normal" if lane in {
+                                "analysis", "backfill", "certificate", "memory"
+                            }
                             else "normal")),
                 }
                 launches[lane] += 1
@@ -19284,7 +19475,9 @@ def main() -> None:
         "command",
         choices=(
             "learn-once", "marks-once", "live-once", "evidence-once",
-            "analysis-once", "backfill-once", "verification-once",
+            "analysis-once", "certificate-once", "memory-once",
+            "backfill-once",
+            "verification-once",
             "full-verification-once",
             "lanes", "status", "dashboard", "verify", "reflect",
             "audit", "repair-outcomes", "cohort-start", "cohort-status",
@@ -19297,6 +19490,8 @@ def main() -> None:
         "--evidence-cadence-seconds", type=float,
         default=EVIDENCE_LANE_CADENCE_SECONDS)
     parser.add_argument("--root",default=DEFAULT_ROOT)
+    parser.add_argument(
+        "--memory-root", default=DEFAULT_MEMORY_FEDERATION_ROOT)
     parser.add_argument("--host",default="127.0.0.1")
     parser.add_argument("--port",type=int,default=DEFAULT_DASHBOARD_PORT)
     parser.add_argument("--discovery-block-limit",type=int,default=DEFAULT_DISCOVERY_BLOCK_LIMIT)
@@ -19361,6 +19556,7 @@ def main() -> None:
         result = supervise_lanes(
             args.root, chain_root=args.chain_root,
             skill_root=args.skill_root,
+            memory_root=args.memory_root,
             duration_seconds=max(5.0, args.duration_seconds),
             discovery_block_limit=max(1, args.discovery_block_limit),
             analysis_limit=max(0, args.analysis_limit),
@@ -19382,8 +19578,8 @@ def main() -> None:
         args.chain_root
         if args.command in {
             "learn-once", "analysis-once", "verify", "repair-outcomes",
-            "reflect", "audit", "verification-once",
-            "full-verification-once",
+            "reflect", "audit", "certificate-once", "verification-once",
+            "full-verification-once", "memory-once",
         }
         else None
     )
@@ -19418,6 +19614,20 @@ def main() -> None:
             budget_seconds=max(
                 30.0, args.lane_budget_seconds
                 or VERIFICATION_LANE_BUDGET_SECONDS))
+        print(json.dumps(summary, indent=2)); return
+    if args.command=="certificate-once":
+        summary = engine.run_certificate_lane(
+            budget_seconds=max(
+                15.0, args.lane_budget_seconds
+                or CERTIFICATE_LANE_BUDGET_SECONDS))
+        print(json.dumps(summary, indent=2))
+        raise SystemExit(0 if summary.get("integrity_ok") else 1)
+    if args.command=="memory-once":
+        summary = engine.run_memory_lane(
+            federation_root=args.memory_root,
+            budget_seconds=max(
+                15.0, args.lane_budget_seconds
+                or MEMORY_LANE_BUDGET_SECONDS))
         print(json.dumps(summary, indent=2)); return
     if args.command=="full-verification-once":
         summary = engine.run_full_verification_lane(

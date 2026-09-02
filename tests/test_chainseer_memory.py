@@ -339,11 +339,13 @@ class MemoryCoreDocumentationTests(unittest.TestCase):
             self.assertIn(ring_type, self.doc)
             self.assertIn(ring_type, SUPPORTED_ANALYSIS_RING_TYPES)
 
-    def test_cross_chain_citation_is_still_documented_as_unbuilt(self):
-        # Recognising the launch ring types is read-side only. It must not be
-        # mistaken for federation: a claim still cannot cite a ring from
-        # another chain, and the doc has to keep saying so.
-        self.assertIn("Treat cross-chain memory as unbuilt", self.doc)
+    def test_verified_federation_boundary_is_documented(self):
+        self.assertIn("chainseer_memory_federation.py", self.doc)
+        self.assertIn("Queries re-verify both the federation", self.doc)
+        self.assertIn(
+            "first production source is deliberately Robinhood-only",
+            self.doc,
+        )
 
     def test_documented_namespaces_match_the_code(self):
         from chainseer_outcome_ledger import _ring_network_subject

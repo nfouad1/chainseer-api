@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v12")
+                "robinhood-operational-v14")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -8765,6 +8765,41 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
             "other background RPC work must not run beside recovery",
         )
 
+    def test_certificate_refresh_preempts_backfill_pressure(self):
+        due = [("certificate", {"next": 3.0}),
+               ("backfill", {"next": 2.0})]
+        self.assertEqual(
+            rh._select_background_candidate(
+                due, {}, backfill_pressure={"priority": True},
+                certificate_urgent=True),
+            "certificate",
+        )
+
+    def test_memory_ingest_follows_certificate_before_backfill(self):
+        due = [
+            ("memory", {"next": 2.0}),
+            ("backfill", {"next": 1.0}),
+        ]
+        self.assertEqual(
+            rh._select_background_candidate(
+                due, {}, backfill_pressure={"priority": True},
+                memory_urgent=True),
+            "memory",
+        )
+
+    def test_certificate_refresh_is_due_at_half_ttl(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            rh.atomic_json_write(root / rh.CERTIFICATE_FILE_NAME, {
+                "verification_result": "pass",
+                "published_epoch": 1_000.0,
+                "expires_at": 1_900.0,
+            })
+            self.assertFalse(rh._integrity_certificate_refresh_due(
+                root, now=1_449.0))
+            self.assertTrue(rh._integrity_certificate_refresh_due(
+                root, now=1_450.0))
+
     def test_backfill_launch_reserves_startup_plus_rpc_window(self):
         self.assertTrue(rh._low_priority_launch_blocked(
             "backfill", {}, now=100.0, next_live=111.0,
@@ -8777,6 +8812,16 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         source = inspect.getsource(rh.supervise_lanes)
         self.assertIn(
             "BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS", source)
+
+    def test_producer_writer_certificate_and_memory_are_mutually_exclusive(self):
+        for lane, active in (
+            ("analysis", {"certificate": {}}),
+            ("certificate", {"analysis": {}}),
+            ("memory", {"analysis": {}}),
+            ("analysis", {"memory": {}}),
+        ):
+            self.assertTrue(rh._low_priority_launch_blocked(
+                lane, active, now=100.0, next_live=200.0))
 
     def test_full_verification_is_maintenance_only(self):
         source = inspect.getsource(rh.supervise_lanes)
@@ -8818,6 +8863,24 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         self.assertGreater(rh.EVIDENCE_LANE_CADENCE_SECONDS, 0)
         self.assertTrue(hasattr(
             rh.RobinhoodLearningEngine, "run_evidence_lane"))
+
+    def test_certificate_is_a_real_non_writing_lane(self):
+        self.assertIn("certificate", rh.SUPERVISED_LANE_NAMES)
+        self.assertGreater(rh.CERTIFICATE_LANE_BUDGET_SECONDS, 0)
+        self.assertGreater(rh.CERTIFICATE_LANE_CADENCE_SECONDS, 0)
+        self.assertTrue(hasattr(
+            rh.RobinhoodLearningEngine, "run_certificate_lane"))
+
+    def test_memory_is_a_real_non_rpc_lane(self):
+        self.assertIn("memory", rh.SUPERVISED_LANE_NAMES)
+        self.assertIn("memory", rh.LANE_NAMES)
+        self.assertTrue(hasattr(
+            rh.RobinhoodLearningEngine, "run_memory_lane"))
+        self.assertEqual(
+            inspect.signature(rh.supervise_lanes).parameters[
+                "memory_root"].default,
+            rh.DEFAULT_MEMORY_FEDERATION_ROOT,
+        )
 
 
 def _utc_now_iso():
@@ -10887,7 +10950,10 @@ class AnalysisLaneDeadlineTests(unittest.TestCase):
         body = self._body().split("def run_analysis_lane", 1)[1][:5000]
         self.assertIn("_mark_analysis_stage", body)
         self.assertIn('_mark_analysis_stage("outcomes")', body)
-        self.assertIn('_mark_analysis_stage("certificate_refresh")', body)
+        self.assertIn('"delegated_to": "certificate_lane"', body)
+        self.assertNotIn(
+            'self.publish_integrity_certificate()', body,
+            "analysis must not certify a head before it finishes appending")
         # Telemetry must not become a new way to die: a store without the
         # method goes unattributed rather than raising.
         self.assertIn('getattr(self.store, "mark_lane_stage", None)', body)
