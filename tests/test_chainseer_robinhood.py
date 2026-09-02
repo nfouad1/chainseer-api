@@ -1175,6 +1175,48 @@ class RobinhoodLearningTests(unittest.TestCase):
             self.assertEqual(selected["token_address"], TOKEN.lower())
             self.assertTrue(selected["flow_shadow_qualified"])
 
+    def test_historical_ingest_never_regresses_current_pool_projection(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+            initialize = {
+                "kind": "initialize", "pool_id": POOL_ID,
+                "currency0": TOKEN.lower(),
+                "currency1": rh.USDG_ADDRESS.lower(),
+                "token_address": TOKEN.lower(),
+                "anchor_address": rh.USDG_ADDRESS.lower(),
+                "fee_tier": 3000, "tick_spacing": 60,
+                "hooks_address": rh.ZERO_ADDRESS, "block_number": 100,
+                "sqrt_price_x96": 1 << 96, "tick": 0,
+            }
+            def swap(block, suffix, price):
+                return {
+                    "kind": "swap", "pool_id": POOL_ID,
+                    "block_number": block,
+                    "transaction_hash": "0x" + suffix * 64,
+                    "log_index": 0, "sender_hint": PAIR.lower(),
+                    "amount0_raw": -100, "amount1_raw": 10,
+                    "sqrt_price_x96": price,
+                    "active_liquidity": 10**18, "tick": block,
+                    "block_timestamp": None,
+                }
+            store.apply_v4_events([
+                initialize, swap(200, "2", 2 << 96)])
+            before = store.recent_flow_signals(1)[0]
+            store.apply_v4_events(
+                [swap(150, "1", 1 << 96)], historical_only=True)
+            after = store.recent_flow_signals(1)[0]
+            with store.connection() as connection:
+                pool = connection.execute(
+                    "SELECT transaction_hash,last_tick FROM v4_pools "
+                    "WHERE pool_id=?", (POOL_ID,)).fetchone()
+                swaps = connection.execute(
+                    "SELECT COUNT(*) FROM swap_observations WHERE pool_id=?",
+                    (POOL_ID,)).fetchone()[0]
+            self.assertEqual(swaps, 2)
+            self.assertEqual(pool["transaction_hash"], "0x" + "2" * 64)
+            self.assertEqual(pool["last_tick"], 200)
+            self.assertEqual(after["window_end_block"], before["window_end_block"])
+
     def test_v4_flow_signal_caps_insufficient_sender_evidence(self):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
@@ -1598,6 +1640,31 @@ class RobinhoodLearningTests(unittest.TestCase):
                 rpc, store, cursor).sync(block_limit=5, lookback=5)
             spans = [(start, end) for start, end, *_ in rpc.calls]
             self.assertEqual(spans, [(95, 96), (97, 98), (99, 99)])
+            self.assertEqual(coverage["rpc_windows"], 3)
+            self.assertEqual(json.loads(cursor.read_text())["next_block"], 100)
+
+    def test_v4_batches_configured_safe_windows_on_an_isolated_rpc(self):
+        class BatchedRPC(FakeRPC):
+            maximum_log_range_blocks = 2
+            maximum_log_batch_size = 2
+
+            def get_logs_batch(self, ranges, address=None, topics=None):
+                self.calls.append((list(ranges), address, topics))
+                return [
+                    {"from_block": start, "to_block": end, "logs": []}
+                    for start, end in ranges
+                ]
+
+        with tempfile.TemporaryDirectory() as directory:
+            cursor = Path(directory) / "v4.json"
+            store = rh.RobinhoodLearningStore(Path(directory) / "learn.sqlite3")
+            rpc = BatchedRPC(latest=100)
+            _, coverage = rh.RobinhoodV4Observer(
+                rpc, store, cursor).sync(block_limit=5, lookback=5)
+            self.assertEqual(
+                [call[0] for call in rpc.calls],
+                [[(95, 96), (97, 98)], [(99, 99)]],
+            )
             self.assertEqual(coverage["rpc_windows"], 3)
             self.assertEqual(json.loads(cursor.read_text())["next_block"], 100)
 
@@ -3303,6 +3370,54 @@ class FlowEvidenceEndToEndTests(unittest.TestCase):
                 "verified": verified, "anchor_out_raw": anchor_out,
             },
         }
+
+    def test_event_archive_miss_remains_pending_and_is_backed_off(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            self._signal(store, self.POOL, qualified=True,
+                         end_block=self.HEAD - 10, score=75.0)
+            store.capture_flow_signal_events(self.HEAD, now=1_000.0)
+
+            class Market:
+                def snapshot(self, _candidate, quote_block=None):
+                    raise RuntimeError(
+                        f"[RPC -32000] metadata is not found, {quote_block}")
+
+            engine = rh.RobinhoodLearningEngine.__new__(
+                rh.RobinhoodLearningEngine)
+            engine.store, engine.v4_market = store, Market()
+            first = engine.quote_pending_flow_evidence(limit=1)
+            second = engine.quote_pending_flow_evidence(limit=1)
+
+            self.assertEqual(first["historical_state_unavailable"], 1)
+            self.assertEqual(second["entry_quotes_selected"], 0)
+            with store.connection() as connection:
+                event = connection.execute(
+                    "SELECT quote_status,quote_verified,quote_attempts,"
+                    " quote_failure_class FROM flow_signal_events"
+                ).fetchone()
+            self.assertEqual(event["quote_status"], "pending")
+            self.assertFalse(event["quote_verified"])
+            self.assertEqual(event["quote_attempts"], 1)
+            self.assertEqual(
+                event["quote_failure_class"],
+                "historical_state_unavailable")
+
+    def test_zero_token_is_terminal_invalid_evidence_not_provider_failure(self):
+        class RPC:
+            def call(self, *_args, **_kwargs):
+                raise AssertionError("invalid token must fail before RPC")
+
+        market = rh.RobinhoodV4MarketClient(
+            RPC(), SimpleNamespace(), SimpleNamespace())
+        result = market.snapshot({
+            "pool_id": "0x" + "ab" * 32,
+            "token_address": rh.ZERO_ADDRESS,
+        }, quote_block=123)
+        self.assertFalse(result["current_state_verified"])
+        self.assertEqual(result["reason"], "invalid_token_address")
+        self.assertEqual(
+            result["execution_quote"]["reason"], "invalid_token_address")
 
     def test_qualifying_fresh_signal_produces_event_control_quote_and_outcome(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -7061,6 +7176,26 @@ class BackfillQueueTests(unittest.TestCase):
             store.enqueue_backfill(200, 300, "new")
             self.assertEqual(store.pending_backfill()[0]["from_block"], 1)
 
+    def test_one_scan_span_retires_multiple_short_debt_rows(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = self._store(directory)
+            store.enqueue_backfill(100, 199, "old")
+            time.sleep(0.01)
+            store.enqueue_backfill(300, 399, "middle")
+            time.sleep(0.01)
+            store.enqueue_backfill(500, 999, "new")
+            span = store.next_backfill_scan_span(550)
+            self.assertEqual(
+                (span["from_block"], span["to_block"], span["rows_selected"]),
+                (100, 649, 3),
+            )
+            committed = store.commit_backfill_scan_span(100, 649)
+            self.assertEqual(committed["completed"], 2)
+            self.assertEqual(committed["advanced"], 1)
+            pending = store.pending_backfill()
+            self.assertEqual(len(pending), 1)
+            self.assertEqual(pending[0]["next_block"], 650)
+
     def test_an_inverted_range_is_refused(self):
         with tempfile.TemporaryDirectory() as directory:
             store = self._store(directory)
@@ -8305,7 +8440,9 @@ class LaneSplitTests(unittest.TestCase):
             after = engine.backfill_rpc_chunk_plan(1_000)["chunk_blocks"]
             self.assertTrue(result["provider_deferred"])
             self.assertEqual(deferred["reason"], "rpc_priority_deferred")
-            self.assertEqual(deferred["attempt_budget_seconds"], 20.0)
+            self.assertEqual(
+                deferred["attempt_budget_seconds"],
+                rh.BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS)
             self.assertEqual(after, before)
 
     def test_backfill_rate_limit_is_one_attempt_and_a_controlled_deferral(self):
@@ -11194,6 +11331,85 @@ class ProductionHardeningTests(unittest.TestCase):
             self.assertTrue(quotes["decision_quote_verified"])
             self.assertTrue(classification["paper_eligible"])
 
+    def test_observation_quote_queue_prefers_new_state_and_defers_archive_miss(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            old_id = store.seal_flow_observation(
+                pool_id="0x" + "ab" * 32, token_address=TOKEN,
+                observation_head=110, window_start_block=90,
+                window_end_block=100, transaction_hashes=["0x01"],
+                features={}, quote={"verified": False}, quote_block=100,
+                now=1.0, role="signal", gap_count=0,
+            )
+            new_id = store.seal_flow_observation(
+                pool_id="0x" + "cd" * 32, token_address=TOKEN,
+                observation_head=210, window_start_block=190,
+                window_end_block=200, transaction_hashes=["0x02"],
+                features={}, quote={"verified": False}, quote_block=200,
+                now=2.0, role="matched_control", gap_count=1,
+            )
+
+            self.assertEqual(
+                store.pending_flow_observation_quotes(1, now=10.0)[0][
+                    "observation_id"],
+                new_id,
+            )
+            attempt = store.record_flow_observation_quote_attempt(
+                new_id, error=RuntimeError("metadata is not found, 200"),
+                now=10.0, retry_seconds=60.0,
+            )
+            self.assertEqual(
+                attempt["failure_class"], "historical_state_unavailable")
+            self.assertEqual(
+                store.pending_flow_observation_quotes(1, now=11.0)[0][
+                    "observation_id"],
+                old_id,
+            )
+            self.assertEqual(
+                store.pending_flow_observation_quotes(1, now=71.0)[0][
+                    "observation_id"],
+                new_id,
+            )
+
+    def test_archive_miss_is_not_recorded_as_market_evidence_or_retried_now(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            observation_id = store.seal_flow_observation(
+                pool_id="0x" + "ef" * 32, token_address=TOKEN,
+                observation_head=1_000, window_start_block=500,
+                window_end_block=990, transaction_hashes=["0xaa"],
+                features={}, quote={"verified": False}, quote_block=990,
+                now=1.0, role="signal", gap_count=0,
+            )
+
+            class Market:
+                def snapshot(self, _candidate, quote_block=None):
+                    raise RuntimeError(
+                        f"[RPC -32000] metadata is not found, {quote_block}")
+
+            engine = rh.RobinhoodLearningEngine.__new__(
+                rh.RobinhoodLearningEngine)
+            engine.store, engine.v4_market = store, Market()
+            first = engine.quote_pending_flow_observations(limit=1)
+            second = engine.quote_pending_flow_observations(limit=1)
+
+            self.assertEqual(first["historical_state_unavailable"], 1)
+            self.assertEqual(first["provider_unavailable"], 1)
+            self.assertEqual(second["selected"], 0)
+            with store.connection() as connection:
+                self.assertIsNone(connection.execute(
+                    "SELECT 1 FROM flow_observation_quotes"
+                    " WHERE observation_id=?", (observation_id,),
+                ).fetchone())
+                attempt = connection.execute(
+                    "SELECT attempts,failure_class"
+                    " FROM flow_observation_quote_attempts"
+                    " WHERE observation_id=?", (observation_id,),
+                ).fetchone()
+            self.assertEqual(attempt["attempts"], 1)
+            self.assertEqual(
+                attempt["failure_class"], "historical_state_unavailable")
+
     def test_authoritative_missing_market_closes_after_three_marks(self):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
@@ -11359,3 +11575,111 @@ class ProductionHardeningTests(unittest.TestCase):
             operational = rh.read_json(root / "verification_status.json", {})
             self.assertTrue(operational["sqlite_operational_health"])
             self.assertIsNone(operational["sqlite_integrity"])
+
+
+class EvidenceQueueCapabilityTests(unittest.TestCase):
+    def test_batch_pressure_halves_the_persisted_batch_size(self):
+        class FakeStore:
+            state = {
+                rh.SECONDARY_RPC_CAPABILITY_STATE_KEY: {
+                    "model_epoch": rh.SECONDARY_RPC_CAPABILITY_MODEL_EPOCH,
+                    "effective_log_batch_size": 4,
+                }
+            }
+            def scheduler_state(self, key):
+                return dict(self.state.get(key) or {})
+            def set_scheduler_state(self, key, value):
+                self.state[key] = dict(value)
+        class FakeRPC:
+            maximum_log_batch_size = 4
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.rpc, engine.store = FakeRPC(), FakeStore()
+        state = engine.record_secondary_rpc_batch_pressure(
+            rh.RPCError("[RPC 429] compute units per second", 429))
+        self.assertEqual(state["effective_log_batch_size"], 2)
+        self.assertEqual(engine.rpc.maximum_log_batch_size, 2)
+        self.assertTrue(rh._rpc_rate_limited(
+            RuntimeError("wrapped [RPC 429] compute units per second")))
+
+    def test_capability_probe_enables_batching_when_range_is_capped(self):
+        class FakeStore:
+            state = {}
+            def scheduler_state(self, key):
+                return dict(self.state.get(key) or {})
+            def set_scheduler_state(self, key, value):
+                self.state[key] = dict(value)
+        class FakeRPC:
+            rpc_url = "https://provider.invalid/v2/secret-key"
+            maximum_log_range_blocks = 10
+            maximum_log_batch_size = 1
+            def get_block_number(self): return 20_000
+            def get_logs(self, start, end, **_kwargs):
+                raise rh.RPCError(
+                    "Free tier eth_getLogs requests up to a 10 block range",
+                    -32000)
+            def get_logs_batch(self, ranges, **_kwargs):
+                return [
+                    {"from_block": start, "to_block": end, "logs": []}
+                    for start, end in ranges
+                ]
+            def get_code(self, *args, **kwargs): return "0x6000"
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.backfill_rpc_isolated = True
+        engine.rpc, engine.store = FakeRPC(), FakeStore()
+        result = engine.configure_secondary_rpc_capabilities(force=True)
+        self.assertEqual(result["effective_log_range_blocks"], 10)
+        self.assertTrue(result["log_batch_supported"])
+        self.assertEqual(
+            result["effective_log_batch_size"],
+            rh.SECONDARY_RPC_INITIAL_LOG_BATCH_SIZE)
+        self.assertEqual(
+            engine.rpc.maximum_log_batch_size,
+            rh.SECONDARY_RPC_INITIAL_LOG_BATCH_SIZE)
+
+    def test_hot_queue_excludes_archive_rows_when_archive_is_unavailable(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "learning.sqlite3")
+            with store.connection() as connection:
+                for suffix, block in (("hot", 950), ("old", 100)):
+                    connection.execute(
+                        """INSERT INTO flow_observations (
+                               observation_id,policy_version,pool_id,token_address,
+                               observation_head,observation_head_lag_blocks,
+                               observed_at,observed_at_epoch,window_start_block,
+                               window_end_block,transaction_set_hash,
+                               transaction_count,features_json,quote_json,
+                               quote_verified,sealed_at,cohort_id)
+                           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (suffix, rh.FLOW_EVIDENCE_POLICY_VERSION,
+                         "0x" + suffix.ljust(64, "0"), "0x" + "1" * 40,
+                         1000, 1, rh._utc_now(), 1.0, block - 10, block,
+                         suffix, 1, "{}", "{}", 0, rh._utc_now(), "test"),
+                    )
+            hot = store.pending_flow_observation_quotes(
+                10, head_block=1000, archive_enabled=False)
+            self.assertEqual([row["observation_id"] for row in hot], ["hot"])
+            all_rows = store.pending_flow_observation_quotes(
+                10, head_block=1000, archive_enabled=True)
+            self.assertEqual(
+                [row["observation_id"] for row in all_rows], ["hot", "old"])
+
+    def test_capability_probe_keeps_url_secret_and_enables_archive(self):
+        class FakeStore:
+            state = {}
+            def scheduler_state(self, key):
+                return dict(self.state.get(key) or {})
+            def set_scheduler_state(self, key, value):
+                self.state[key] = dict(value)
+        class FakeRPC:
+            rpc_url = "https://provider.invalid/v2/secret-key"
+            maximum_log_range_blocks = 10
+            def get_block_number(self): return 20_000
+            def get_logs(self, *args, **kwargs): return []
+            def get_code(self, *args, **kwargs): return "0x6000"
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.backfill_rpc_isolated = True
+        engine.rpc, engine.store = FakeRPC(), FakeStore()
+        result = engine.configure_secondary_rpc_capabilities(force=True)
+        self.assertTrue(result["archive_supported"])
+        self.assertEqual(result["effective_log_range_blocks"], 0)
+        self.assertNotIn("secret-key", json.dumps(result))

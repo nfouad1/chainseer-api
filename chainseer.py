@@ -1593,8 +1593,21 @@ class RobinhoodRPC:
                 f"RPC request timed out after {request_timeout}s", -2)
         except requests.exceptions.HTTPError as exc:
             status = getattr(exc.response, "status_code", None)
+            detail = ""
+            response = getattr(exc, "response", None)
+            if response is not None:
+                try:
+                    body = response.json()
+                    if isinstance(body, dict):
+                        error = body.get("error") or {}
+                        detail = str(
+                            error.get("message") or body.get("message") or "")
+                except (TypeError, ValueError, requests.exceptions.JSONDecodeError):
+                    detail = str(getattr(response, "text", "") or "")
+            detail = " ".join(detail.split())[:500]
             raise RPCError(
-                f"RPC HTTP response failed ({status or 'unknown status'})",
+                f"RPC HTTP response failed ({status or 'unknown status'})"
+                + (f": {detail}" if detail else ""),
                 -(int(status) if status else 3),
             ) from exc
         except requests.exceptions.RequestException as exc:
@@ -1700,8 +1713,21 @@ class RobinhoodRPC:
             ) from exc
         except requests.exceptions.HTTPError as exc:
             status = getattr(exc.response, "status_code", None)
+            detail = ""
+            response = getattr(exc, "response", None)
+            if response is not None:
+                try:
+                    body = response.json()
+                    if isinstance(body, dict):
+                        error = body.get("error") or {}
+                        detail = str(
+                            error.get("message") or body.get("message") or "")
+                except (TypeError, ValueError, requests.exceptions.JSONDecodeError):
+                    detail = str(getattr(response, "text", "") or "")
+            detail = " ".join(detail.split())[:500]
             raise RPCError(
-                f"RPC HTTP response failed ({status or 'unknown status'})",
+                f"RPC HTTP response failed ({status or 'unknown status'})"
+                + (f": {detail}" if detail else ""),
                 -(int(status) if status else 3),
             ) from exc
         except requests.exceptions.RequestException as exc:
@@ -1760,6 +1786,46 @@ class RobinhoodRPC:
         if topics:
             params["topics"] = topics
         return self._call("eth_getLogs", [params])
+
+    def get_logs_batch(
+        self, ranges: list[tuple[int, int]], *, address: str = None,
+        topics: list = None,
+    ) -> list[dict]:
+        """Fetch independent log ranges in one JSON-RPC HTTP round trip.
+
+        Each result remains associated with its requested range. A per-call
+        provider error aborts the batch so callers cannot advance a durable
+        cursor across an unobserved hole.
+        """
+        calls = []
+        normalized = []
+        for from_block, to_block in ranges:
+            start, end = int(from_block), int(to_block)
+            params = {"fromBlock": hex(start), "toBlock": hex(end)}
+            if address:
+                params["address"] = address
+            if topics:
+                params["topics"] = topics
+            normalized.append((start, end))
+            calls.append(("eth_getLogs", [params]))
+        responses = self._batch_call(calls)
+        results = []
+        for (start, end), response in zip(normalized, responses):
+            error = response.get("error") or {}
+            if error:
+                try:
+                    error_code = int(error.get("code") or -1)
+                except (TypeError, ValueError):
+                    error_code = -1
+                raise RPCError(
+                    str(error.get("message") or "Unknown batched log error"),
+                    error_code,
+                )
+            results.append({
+                "from_block": start, "to_block": end,
+                "logs": response.get("result") or [],
+            })
+        return results
 
     def call(self, to_address: str, data: str, block=None) -> str:
         return self._call("eth_call", [{"to": to_address, "data": data}, self._block_tag(block)])

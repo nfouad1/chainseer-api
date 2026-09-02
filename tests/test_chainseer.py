@@ -407,6 +407,23 @@ class ImmuneLockdownReasonTests(unittest.TestCase):
 
 
 class ChainseerInfrastructureTests(unittest.TestCase):
+    def test_log_ranges_batch_into_one_request_without_losing_range_binding(self):
+        rpc = chainseer.RobinhoodRPC("https://rpc.example.invalid")
+        rpc._session = EchoBatchSession()
+        rows = rpc.get_logs_batch(
+            [(100, 109), (110, 119)],
+            address="0x" + "a" * 40, topics=["0x" + "b" * 64],
+        )
+        self.assertEqual(len(rpc._session.calls), 1)
+        payload = rpc._session.calls[0][1]
+        self.assertEqual(len(payload), 2)
+        self.assertEqual(
+            payload[0]["params"][0]["fromBlock"], hex(100))
+        self.assertEqual(
+            [(row["from_block"], row["to_block"]) for row in rows],
+            [(100, 109), (110, 119)],
+        )
+
     def test_raw_single_and_batch_requests_honor_request_gate_timeout(self):
         events = []
 
