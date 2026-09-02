@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v14")
+                "robinhood-operational-v15")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -8787,6 +8787,18 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
             "memory",
         )
 
+    def test_memory_ingest_waits_until_acceptance_cohort_finishes(self):
+        due = [
+            ("memory", {"next": 1.0}),
+            ("backfill", {"next": 2.0}),
+        ]
+        self.assertEqual(
+            rh._select_background_candidate(
+                due, {}, cohort_progress={"collecting": True},
+                backfill_pressure={"priority": True}, memory_urgent=True),
+            "backfill",
+        )
+
     def test_certificate_refresh_is_due_at_half_ttl(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -8799,6 +8811,36 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
                 root, now=1_449.0))
             self.assertTrue(rh._integrity_certificate_refresh_due(
                 root, now=1_450.0))
+
+    def test_memory_due_is_constant_time_certified_head_comparison(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory) / "runtime"
+            memory = Path(directory) / "memory"
+            (memory / "chain").mkdir(parents=True)
+            (memory / "chain" / "rings.jsonl").write_text(
+                "{}\n", encoding="utf-8")
+            root.mkdir()
+            certificate = {
+                "head_index": 7, "head_hash": "a" * 64, "ring_count": 8,
+            }
+            rh.atomic_json_write(
+                root / rh.CERTIFICATE_FILE_NAME, certificate)
+            rh.atomic_json_write(root / "memory_lane_summary.json", {
+                "status": "complete",
+                "memory_ingest": {
+                    "complete": True,
+                    "source_snapshot": {
+                        "head_index": 7,
+                        "head_hash": "a" * 64,
+                        "ring_count": 8,
+                    },
+                },
+            })
+            self.assertFalse(rh._memory_ingest_due(root, memory))
+            certificate["head_hash"] = "b" * 64
+            rh.atomic_json_write(
+                root / rh.CERTIFICATE_FILE_NAME, certificate)
+            self.assertTrue(rh._memory_ingest_due(root, memory))
 
     def test_backfill_launch_reserves_startup_plus_rpc_window(self):
         self.assertTrue(rh._low_priority_launch_blocked(
@@ -8822,6 +8864,9 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
         ):
             self.assertTrue(rh._low_priority_launch_blocked(
                 lane, active, now=100.0, next_live=200.0))
+        for reader in ("certificate", "memory"):
+            self.assertTrue(rh._low_priority_launch_blocked(
+                "live", {reader: {}}, now=100.0, next_live=100.0))
 
     def test_full_verification_is_maintenance_only(self):
         source = inspect.getsource(rh.supervise_lanes)
