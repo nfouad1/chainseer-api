@@ -235,7 +235,10 @@ BACKFILL_RPC_SUCCESSES_BEFORE_PROBE = 5
 # additional independently committed chunk after a successful first chunk.
 # A throttle still stops the cycle immediately, and every completed chunk has
 # already advanced its durable cursor before the next provider call begins.
-BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 6
+# Safety ceiling only. Admission below is governed by the lane deadline and
+# the observed cost of successful chunks. The former six-chunk ceiling ended
+# healthy runs with 75-102 seconds unused and recovery below chain arrival.
+BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE = 24
 BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS = 250
 BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK = 1
 BACKFILL_RECOVERY_TARGET_RATIO = 1.10
@@ -446,7 +449,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v19"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v20"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 #: A convergence claim needs a fixed, attributed time series. Ten completed
@@ -17459,6 +17462,7 @@ class RobinhoodLearningEngine:
 
         recovery_deadline = CycleDeadline(available)
         chunks: list[dict] = []
+        chunk_seconds: list[float] = []
         stopped_reason = "no_pending_ranges"
         provider_deferral: dict | None = None
         next_chunk_state: dict | None = None
@@ -17466,10 +17470,25 @@ class RobinhoodLearningEngine:
             if recovery_deadline.expired():
                 stopped_reason = "completion_reserve_reached"
                 break
+            if chunk_seconds:
+                ordered_costs = sorted(chunk_seconds)
+                projected_cost = ordered_costs[min(
+                    len(ordered_costs) - 1,
+                    max(0, math.ceil(0.95 * len(ordered_costs)) - 1),
+                )]
+                # The recovery deadline already excludes the lane completion
+                # reserve. Do not begin a chunk that the successful cost
+                # distribution says cannot finish inside what remains.
+                if recovery_deadline.remaining() <= max(
+                    0.25, projected_cost
+                ):
+                    stopped_reason = "projected_chunk_cost_exceeds_headroom"
+                    break
             chunk_deadline = CycleDeadline(min(
                 recovery_deadline.remaining(),
                 BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
             ))
+            chunk_started = time.monotonic()
             try:
                 with self._rpc_deadline(chunk_deadline):
                     chunk = self.drain_flow_backfill(
@@ -17524,6 +17543,8 @@ class RobinhoodLearningEngine:
                 stopped_reason = "no_pending_ranges"
                 break
             chunks.append(dict(chunk))
+            chunk_seconds.append(max(
+                0.0, time.monotonic() - chunk_started))
             next_chunk_state = self.record_backfill_rpc_chunk_result(
                 chunk_limit, error=None)
             progressed = (
@@ -17547,6 +17568,14 @@ class RobinhoodLearningEngine:
             "ranges_selected": sum(
                 safe_int(row.get("ranges_selected"), 0) for row in chunks),
             "chunks_processed": len(chunks),
+            "maximum_chunks_per_cycle":
+                BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE,
+            "successful_chunk_p95_seconds": (
+                round(sorted(chunk_seconds)[min(
+                    len(chunk_seconds) - 1,
+                    max(0, math.ceil(0.95 * len(chunk_seconds)) - 1),
+                )], 3) if chunk_seconds else None
+            ),
             # advance_backfill is committed inside every successful chunk.
             "cursor_commits": len(chunks),
             "blocks_scanned": sum(

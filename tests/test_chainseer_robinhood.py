@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v19")
+                "robinhood-operational-v20")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7398,7 +7398,7 @@ class LaneSplitTests(unittest.TestCase):
                 cohort["policy"]["decision_multi_observation_safety_blocks"],
                 rh.DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS)
             self.assertEqual(
-                cohort["policy"]["backfill_maximum_chunks_per_cycle"], 6)
+                cohort["policy"]["backfill_maximum_chunks_per_cycle"], 24)
             self.assertEqual(
                 cohort["policy"]["background_rpc_priority_gate_version"], 2)
             self.assertTrue(
@@ -8100,6 +8100,38 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(
                 result["blocks_scanned"],
                 rh.BACKFILL_BATCHED_LOGICAL_CHUNK_BLOCKS)
+
+    def test_gap_recovery_uses_headroom_beyond_the_old_six_chunk_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            calls = 0
+
+            def drain(_deadline, *, block_limit):
+                nonlocal calls
+                calls += 1
+                if calls <= 8:
+                    return {
+                        "ranges_selected": 1,
+                        "blocks_scanned": block_limit,
+                        "candidates_added": 0,
+                        "completed": False,
+                        "from_block": 1,
+                        "to_block": block_limit,
+                    }
+                return {"ranges_selected": 0, "blocks_scanned": 0,
+                        "candidates_added": 0}
+
+            engine.drain_flow_backfill = drain
+            result = engine.drain_flow_backfill_until_reserve(
+                rh.CycleDeadline(10.0), block_limit=5_000,
+                reserve_seconds=0.1,
+            )
+            self.assertEqual(result["chunks_processed"], 8)
+            self.assertEqual(result["stopped_reason"], "no_pending_ranges")
+            self.assertGreater(
+                result["maximum_chunks_per_cycle"], 8)
 
     def test_second_backfill_throttle_preserves_first_committed_chunk(self):
         with tempfile.TemporaryDirectory() as directory:
