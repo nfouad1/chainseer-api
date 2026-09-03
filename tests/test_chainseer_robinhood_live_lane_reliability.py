@@ -824,21 +824,18 @@ class DeferredRecoveryTests(unittest.TestCase):
                 " flow_observation_classifications")}
         self.assertIn("fresh-0", classified)
         self.assertNotIn("fresh-1", classified)
-        # Cycle 2 passes ONLY its own fresh id with a generous limit: the
-        # current-cycle id classifies first, THEN the OLDEST deferred rows
-        # (fresh-1 from cycle 1 is now just a deferred row, older than it
-        # only in sealed_at... but old-* rows are older still, so they go
-        # first). The P0 guarantee: fresh-1 is eventually revisited.
+        # Cycle 2 passes only its own fresh id. Live classification must not
+        # touch the historical backlog even with spare admission.
         cycle2 = self.engine.classify_sealed_observations(
             12346, observation_ids=["fresh-2"], admission_limit=3)
-        self.assertEqual(cycle2["scoped_rows_processed"], 3)
+        self.assertEqual(cycle2["scoped_rows_processed"], 1)
         with self.store.connection() as connection:
             classified = {row[0] for row in connection.execute(
                 "SELECT observation_id FROM"
                 " flow_observation_classifications")}
         self.assertIn("fresh-2", classified)
-        self.assertIn("old-000", classified,
-                      "deferred observations are eventually revisited")
+        self.assertNotIn("old-000", classified,
+                         "live headroom is isolated from deferred backlog")
         self.assertNotIn("old-039", classified,
                          "a bounded LIMIT fills from the oldest, not at random")
         # A third cycle with a generous limit catches everything left,
@@ -858,13 +855,10 @@ class DeferredRecoveryTests(unittest.TestCase):
         seed_observation(self.store, "fresh-0", sealed_at=2000.0)
         result = self.engine.classify_sealed_observations(
             1, observation_ids=["fresh-0"], admission_limit=4)
-        # Materialized rows never exceeded the slots: selected <= limit + 1
-        # (the current-cycle id), even though 2001 unclassified rows exist.
-        self.assertLessEqual(result["scoped_rows_selected"], 4 + 1)
-        self.assertEqual(result["scoped_rows_processed"], 4)
-        self.assertGreater(result["scoped_rows_deferred"], 1990)
-        self.assertEqual(result["admission"]["admission_exceeded"],
-                         2001 - 4)
+        self.assertEqual(result["scoped_rows_selected"], 1)
+        self.assertEqual(result["scoped_rows_processed"], 1)
+        self.assertEqual(result["scoped_rows_deferred"], 0)
+        self.assertEqual(result["admission"]["admission_exceeded"], 0)
 
     def test_no_timechain_operation_on_the_decision_critical_path(self):
         spy = _SpyTimechain()

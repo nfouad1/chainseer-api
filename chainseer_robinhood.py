@@ -442,7 +442,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v16"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v17"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 
@@ -790,6 +790,10 @@ CLASSIFICATION_COST_P95_MIN_SAMPLES = 8
 #: the cycle must still append its ledger entry and write summaries after
 #: classification returns.
 CLASSIFICATION_COMPLETION_RESERVE_SECONDS = 3.0
+#: Fixed headroom for selecting the current observation set and opening the
+#: SQLite transaction. Per-observation timing starts after selection, so this
+#: cost must be budgeted separately from the learned per-row estimate.
+CLASSIFICATION_SELECTION_RESERVE_SECONDS = 1.5
 #: Weight on the newest p95 sample for the classification cost estimate.
 CLASSIFICATION_COST_SMOOTHING = 0.3
 #: Ceiling on how many queued windows one live cycle may pull ahead of fresh
@@ -1630,6 +1634,9 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "live_observation_limit": LIVE_LANE_OBSERVATION_LIMIT,
         "live_decision_reserve_seconds":
             LIVE_LANE_DECISION_RESERVE_SECONDS,
+        "classification_selection_reserve_seconds":
+            CLASSIFICATION_SELECTION_RESERVE_SECONDS,
+        "live_classification_scope": "current_cycle_observations_only",
     }
 
 
@@ -14159,6 +14166,7 @@ class RobinhoodLearningEngine:
             self.classification_cost_estimate() * observations)
         downstream = (
             CLASSIFICATION_COMPLETION_RESERVE_SECONDS
+            + CLASSIFICATION_SELECTION_RESERVE_SECONDS
             + classification_seconds)
         required = downstream + DECISION_HEAD_RPC_RESERVE_SECONDS
         return {
@@ -14168,6 +14176,8 @@ class RobinhoodLearningEngine:
                 classification_seconds, 3),
             "completion_reserve_seconds":
                 CLASSIFICATION_COMPLETION_RESERVE_SECONDS,
+            "selection_reserve_seconds":
+                CLASSIFICATION_SELECTION_RESERVE_SECONDS,
             "head_rpc_reserve_seconds":
                 DECISION_HEAD_RPC_RESERVE_SECONDS,
             "required_seconds": round(required, 3),
@@ -14342,7 +14352,9 @@ class RobinhoodLearningEngine:
         cost = self.classification_cost_estimate()
         usable = max(
             0.0,
-            remaining_seconds - CLASSIFICATION_COMPLETION_RESERVE_SECONDS)
+            remaining_seconds
+            - CLASSIFICATION_COMPLETION_RESERVE_SECONDS
+            - CLASSIFICATION_SELECTION_RESERVE_SECONDS)
         if cost <= 0 or usable <= 0:
             admitted = 0
         else:
@@ -14356,6 +14368,8 @@ class RobinhoodLearningEngine:
             "remaining_seconds_at_admission": round(remaining_seconds, 3),
             "completion_reserve_seconds":
                 CLASSIFICATION_COMPLETION_RESERVE_SECONDS,
+            "selection_reserve_seconds":
+                CLASSIFICATION_SELECTION_RESERVE_SECONDS,
         }
 
     def seal_near_head_observations(
@@ -14938,15 +14952,15 @@ class RobinhoodLearningEngine:
         # BOUNDED selection. The old query materialized EVERY unclassified
         # observation -- thousands of rows -- plus Python-side re-sorting,
         # then the cumulative GROUP BY aggregated the whole cohort: all of it
-        # on the decision-critical path. Now: current-cycle ids first (they
-        # are known by primary key), then the oldest deferred rows fill the
-        # remaining admission slots via SQL ORDER BY ... LIMIT ? -- the
-        # backlog is never loaded into Python beyond what this cycle will
-        # actually process.
+        # on the decision-critical path. Now, an explicit current-cycle scope
+        # is primary-key-only; an omitted scope is the bounded, oldest-first
+        # asynchronous backlog path. The live path never mixes the two.
         limit = (
             None if admission_limit is None else max(0, int(admission_limit)))
         rows: list[dict] = []
         current_selected = 0
+        if deadline is not None:
+            deadline.raise_if_expired("classification_selection")
         with self.store.connection() as connection:
             base_columns = """
                     SELECT o.observation_id, o.pool_id, o.token_address,
@@ -14960,13 +14974,11 @@ class RobinhoodLearningEngine:
                           WHERE c.observation_id = o.observation_id)
                     """
             order = " ORDER BY o.sealed_at ASC, o.observation_id ASC "
-            if observation_ids:
-                # Current-cycle observations classify FIRST so a decision
-                # attaches while evidence is freshest. They arrive by primary
-                # key from the just-sealed batch (a handful of rows), so
-                # selecting them uncapped by the limit is bounded by
-                # construction -- and the admission report still needs to see
-                # them all to account for what was deferred.
+            if observation_ids is not None:
+                # Current-cycle observations arrive by primary key from the
+                # just-sealed batch (a handful of rows). Selecting all of them
+                # is bounded by construction; slicing happens after selection
+                # so admission can report scoped deferrals exactly.
                 ids = [str(i) for i in observation_ids]
                 chunk = max(1, min(len(ids), 500))
                 for start in range(0, len(ids), chunk):
@@ -14979,7 +14991,11 @@ class RobinhoodLearningEngine:
                 current_selected = len(rows)
             remaining_slots = None if limit is None else max(
                 0, limit - current_selected)
-            if limit is None or remaining_slots > 0:
+            # Supplying observation_ids is an explicit live-lane scope. Do
+            # not fill spare slots with historical backlog on this latency-
+            # critical path. Callers that omit the scope drain it separately.
+            if (observation_ids is None
+                    and (limit is None or remaining_slots > 0)):
                 deferred_query = (
                     base_columns + order + " LIMIT ?")
                 params: list = [FLOW_EVIDENCE_POLICY_VERSION]
@@ -14992,13 +15008,20 @@ class RobinhoodLearningEngine:
                     params.append(CLASSIFICATION_BACKLOG_SCAN_LIMIT)
                 rows.extend(dict(row) for row in connection.execute(
                     deferred_query, params))
-            unclassified_total = connection.execute(
-                """SELECT COUNT(*) FROM flow_observations o
-                   WHERE o.policy_version=? AND NOT EXISTS (
-                       SELECT 1 FROM flow_observation_classifications c
-                       WHERE c.observation_id=o.observation_id)""",
-                (FLOW_EVIDENCE_POLICY_VERSION,),
-            ).fetchone()[0]
+            if observation_ids is None:
+                unclassified_total = connection.execute(
+                    """SELECT COUNT(*) FROM flow_observations o
+                       WHERE o.policy_version=? AND NOT EXISTS (
+                           SELECT 1 FROM flow_observation_classifications c
+                           WHERE c.observation_id=o.observation_id)""",
+                    (FLOW_EVIDENCE_POLICY_VERSION,),
+                ).fetchone()[0]
+            else:
+                # O(current batch), including the important [] case. The
+                # live denominator must never become the global corpus.
+                unclassified_total = len(rows)
+        if deadline is not None:
+            deadline.raise_if_expired("classification_selection")
         admitted_rows = rows
         admission_exceeded = 0
         if limit is not None:
@@ -16778,13 +16801,30 @@ class RobinhoodLearningEngine:
             )
             timings["classification_remaining_at_admission"] = round(
                 remaining_at_admission, 3)
-            classification = self.classify_sealed_observations(
-                decision_head,
-                observation_ids=list(observation.get("observation_ids") or []),
-                deadline=deadline,
-                admission_limit=admission["admitted"],
-                allow_remote_quotes=False,
-            )
+            current_observation_ids = list(
+                observation.get("observation_ids") or [])
+            classification_deferred = bool(
+                current_observation_ids and admission["admitted"] <= 0)
+            if classification_deferred:
+                # Do not start even the bounded selection query when its
+                # fixed reserve no longer fits. The sealed observations stay
+                # durable for the asynchronous classifier.
+                classification = {
+                    "classified_this_cycle": 0,
+                    "scoped_rows_selected": 0,
+                    "scoped_rows_processed": 0,
+                    "scoped_rows_deferred": len(current_observation_ids),
+                    "controlled_deferral": True,
+                    "reason": "insufficient_classification_headroom",
+                }
+            else:
+                classification = self.classify_sealed_observations(
+                    decision_head,
+                    observation_ids=current_observation_ids,
+                    deadline=deadline,
+                    admission_limit=admission["admitted"],
+                    allow_remote_quotes=False,
+                )
             classification["admission_decision"] = admission
             timings["classification_seconds"] = round(
                 time.monotonic() - stage, 3)
@@ -16825,12 +16865,17 @@ class RobinhoodLearningEngine:
                 + timings["ledger_append_seconds"])
             quote_delay = timings["seal_and_fresh_quote"]
             return {
-                "controlled_deferral": research_only_stale,
+                "controlled_deferral": (
+                    research_only_stale or classification_deferred),
                 "deferral_stage": (
-                    "decision_freshness" if research_only_stale else None),
+                    "decision_freshness" if research_only_stale else (
+                        "classification_admission"
+                        if classification_deferred else None)),
                 "deferral_reason": (
                     "decision_head_stale_research_only"
-                    if research_only_stale else None),
+                    if research_only_stale else (
+                        "insufficient_classification_headroom"
+                        if classification_deferred else None)),
                 "position_evaluations": positions,
                 "ingestion_admission": ingestion_admission,
                 "near_head_flow": near_head,

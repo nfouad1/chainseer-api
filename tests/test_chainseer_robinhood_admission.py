@@ -48,9 +48,10 @@ class AdmissionControllerTests(unittest.TestCase):
             fresh.classification_cost_estimate(), estimate)
 
     def test_admission_fits_budget_with_reserve(self):
-        # 10s remaining, 3s reserve, 1.7s/candidate -> floor(7/1.7) = 4.
+        # 10s remaining, 3s completion + 1.5s selection reserve,
+        # 1.7s/candidate -> floor(5.5/1.7) = 3.
         result = self.engine.classification_admission(100, 10.0)
-        self.assertEqual(result["admitted"], int(7.0 // 1.7))
+        self.assertEqual(result["admitted"], int(5.5 // 1.7))
         self.assertEqual(result["deferred"], 100 - result["admitted"])
         self.assertEqual(result["candidates"], 100)
 
@@ -112,25 +113,20 @@ class DeferredNotDroppedTests(unittest.TestCase):
                 },
             )
 
-    def test_production_two_cycle_deferral(self):
-        """Production shape: each cycle passes its OWN observation_ids.
-        Cycle 1 seals obs A and B but can only classify one; B is
-        durably deferred. Cycle 2 passes C and D -- and must STILL
-        revisit deferred B (prioritized behind current-cycle ids),
-        proving deferral is revisited by the production path."""
+    def test_live_scope_never_drains_historical_backlog(self):
+        """Live cycles classify only their IDs; analysis drains backlog."""
         for i in range(4):
             self._seed_observation(f"obs-{chr(65 + i)}")
         decision_head = 12345
 
-        # Cycle 1: sealed A, B. Budget admits only 1; the other 3
-        # UNCLASSIFIED rows (B plus the two not yet sealed) are deferred.
+        # Cycle 1: only A and B belong to this live scope.
         cycle1 = self.engine.classify_sealed_observations(
             decision_head,
             observation_ids=["obs-A", "obs-B"],
             admission_limit=1)
         self.assertEqual(cycle1["scoped_rows_processed"], 1)
         self.assertEqual(
-            cycle1["admission"]["admission_exceeded"], 3)
+            cycle1["admission"]["admission_exceeded"], 1)
         processed_first = {
             e["observation_id"] for e in
             self.engine.store.recent_classified_observations()
@@ -144,8 +140,7 @@ class DeferredNotDroppedTests(unittest.TestCase):
         # Deferred observation survives unclassified.
         self.assertNotIn("obs-B", classified)
 
-        # Cycle 2 (production shape): pass ONLY current-cycle ids C, D --
-        # yet deferred B must still be revisited and classified.
+        # Cycle 2 must not spend live headroom on deferred B.
         cycle2 = self.engine.classify_sealed_observations(
             decision_head,
             observation_ids=["obs-C", "obs-D"],
@@ -154,7 +149,16 @@ class DeferredNotDroppedTests(unittest.TestCase):
             classified = {row[0] for row in connection.execute(
                 "SELECT observation_id FROM"
                 " flow_observation_classifications")}
-        self.assertEqual(len(classified), 4)
+        self.assertEqual(len(classified), 3)
+        self.assertNotIn("obs-B", classified)
+
+        # The asynchronous/no-scope path subsequently drains it.
+        self.engine.classify_sealed_observations(
+            decision_head, admission_limit=10)
+        with self.engine.store.connection() as connection:
+            classified = {row[0] for row in connection.execute(
+                "SELECT observation_id FROM"
+                " flow_observation_classifications")}
         self.assertIn("obs-B", classified)
 
     def test_current_cycle_ids_prioritized_over_deferred(self):
@@ -178,6 +182,21 @@ class DeferredNotDroppedTests(unittest.TestCase):
                 " flow_observation_classifications")}
         self.assertIn("new-0", classified)
         self.assertNotIn("new-1", classified)
+
+    def test_empty_live_scope_does_not_become_backlog_scan(self):
+        """An explicit empty batch means no live work, not all old work."""
+        for i in range(20):
+            self._seed_observation(f"old-{i}")
+        result = self.engine.classify_sealed_observations(
+            2, observation_ids=[], admission_limit=10)
+        self.assertEqual(result["scoped_rows_selected"], 0)
+        self.assertEqual(result["scoped_rows_processed"], 0)
+        self.assertEqual(result["scoped_rows_deferred"], 0)
+        with self.engine.store.connection() as connection:
+            classified = connection.execute(
+                "SELECT COUNT(*) FROM flow_observation_classifications"
+            ).fetchone()[0]
+        self.assertEqual(classified, 0)
 
 
 if __name__ == "__main__":

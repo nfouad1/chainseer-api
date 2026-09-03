@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v16")
+                "robinhood-operational-v17")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -11299,13 +11299,13 @@ class DecisionTailAdmissionTests(unittest.TestCase):
             plan["model"]["circuit"]["multi_observation_blocked"])
         self.assertEqual(plan["admitted"], 2)
 
-    def test_decision_head_uses_actual_downstream_work_not_flat_five_seconds(self):
+    def test_decision_head_reserves_fixed_and_per_observation_work(self):
         with tempfile.TemporaryDirectory() as directory:
             engine = self._engine(directory)
             engine.classification_cost_estimate = lambda: 0.05
-            plan = engine.decision_head_admission(2, 4.0)
+            plan = engine.decision_head_admission(2, 6.0)
         self.assertTrue(plan["admitted"])
-        self.assertEqual(plan["required_seconds"], 3.6)
+        self.assertEqual(plan["required_seconds"], 5.1)
 
 
 class IngestionPhaseTimingTests(unittest.TestCase):
