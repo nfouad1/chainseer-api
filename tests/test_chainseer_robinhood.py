@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v17")
+                "robinhood-operational-v18")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7434,6 +7434,9 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(
                 cohort["policy"]["backfill_minimum_chunk_blocks"],
                 rh.BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS)
+            self.assertEqual(
+                cohort["policy"]["backfill_minimum_samples"],
+                rh.ACCEPTANCE_BACKFILL_MINIMUM_SAMPLES)
             self.assertFalse(cohort["policy"]["live_execution_enabled"])
             expected_hash = hashlib.sha256(
                 rh._canonical(cohort["policy"]).encode("utf-8")
@@ -8741,6 +8744,10 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
             self.assertEqual(progress["live_terminal"], 99)
             self.assertEqual(progress["mark_terminal"], 39)
             self.assertEqual(progress["mark_pace_target"], 40)
+            self.assertEqual(progress["backfill_complete"], 0)
+            self.assertEqual(
+                progress["backfill_deficit"],
+                rh.ACCEPTANCE_BACKFILL_MINIMUM_SAMPLES)
             self.assertTrue(progress["closing_live_blocked"])
             self.assertEqual(
                 rh._select_background_candidate(
@@ -8763,6 +8770,21 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
                  ("evidence", {"next": 2.0})], {},
                 backfill_pressure={"priority": True}),
             "other background RPC work must not run beside recovery",
+        )
+
+    def test_cohort_backfill_sample_deficit_is_scheduled_explicitly(self):
+        due = [("analysis", {"next": 1.0}),
+               ("backfill", {"next": 2.0})]
+        progress = {
+            "collecting": True,
+            "mark_pace_target": 0,
+            "mark_terminal": 0,
+            "backfill_deficit": 10,
+        }
+        self.assertEqual(
+            rh._select_background_candidate(
+                due, {}, cohort_progress=progress),
+            "backfill",
         )
 
     def test_certificate_refresh_preempts_backfill_pressure(self):
@@ -11740,9 +11762,18 @@ class ProductionHardeningTests(unittest.TestCase):
             with patch.object(rh, "CODE_REVISION", "fixed"):
                 store.begin_run("marks-one", 25, lane="marks")
                 store.finish_run("marks-one", "complete", summary={})
-                for run_id in ("one", "two", "three"):
+                for run_id in ("one", "two"):
                     store.begin_run(run_id, 25, lane="live")
                     store.finish_run(run_id, "complete", summary={})
+                self.assertEqual(
+                    store.acceptance_cohort()["status"], "collecting")
+                for index in range(
+                        rh.ACCEPTANCE_BACKFILL_MINIMUM_SAMPLES):
+                    run_id = f"backfill-{index}"
+                    store.begin_run(run_id, 120, lane="backfill")
+                    store.finish_run(run_id, "complete", summary={})
+                store.begin_run("three", 25, lane="live")
+                store.finish_run("three", "complete", summary={})
             cohort = store.acceptance_cohort()
             self.assertEqual(cohort["status"], "complete")
             self.assertEqual(cohort["terminal_attempts"], 2)
@@ -11752,6 +11783,31 @@ class ProductionHardeningTests(unittest.TestCase):
                     "SELECT acceptance_cohort_id FROM runs WHERE run_id='three'"
                 ).fetchone()[0]
             self.assertIsNone(third)
+
+    def test_legacy_cohort_is_not_retroactively_given_backfill_obligation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="legacy", checkout_revision="legacy",
+                sample_target=1, cohort_id="legacy-no-backfill")
+            with store.connection() as connection:
+                row = connection.execute(
+                    "SELECT policy_json FROM acceptance_cohorts "
+                    "WHERE cohort_id='legacy-no-backfill'").fetchone()
+                policy = json.loads(row["policy_json"])
+                policy.pop("backfill_minimum_samples")
+                connection.execute(
+                    "UPDATE acceptance_cohorts SET policy_json=? "
+                    "WHERE cohort_id='legacy-no-backfill'",
+                    (rh._canonical(policy),),
+                )
+            with patch.object(rh, "CODE_REVISION", "legacy"):
+                store.begin_run("legacy-mark", 25, lane="marks")
+                store.finish_run("legacy-mark", "complete", summary={})
+                store.begin_run("legacy-live", 25, lane="live")
+                store.finish_run("legacy-live", "complete", summary={})
+            self.assertEqual(
+                store.acceptance_cohort()["status"], "complete")
 
     def test_full_verification_due_uses_cached_certificate_age(self):
         with tempfile.TemporaryDirectory() as directory:

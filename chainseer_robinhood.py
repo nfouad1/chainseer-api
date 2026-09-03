@@ -442,9 +442,13 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v17"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v18"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
+#: A convergence claim needs a fixed, attributed time series. Ten completed
+#: backfill runs match the bounded trend window and prevent cohort closure
+#: before its thirteenth criterion has evidence.
+ACCEPTANCE_BACKFILL_MINIMUM_SAMPLES = 10
 
 
 def _seal_cost_defaults() -> dict:
@@ -1583,6 +1587,7 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "position_mark_minimum_samples": max(
             1, math.ceil(
                 target * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION)),
+        "backfill_minimum_samples": ACCEPTANCE_BACKFILL_MINIMUM_SAMPLES,
         "position_mark_minimum_rate": 1.0,
         "seal_stall_rate_maximum": SEAL_STALL_RATE_MAX,
         "seal_stall_minimum_samples": SEAL_STALL_GUARD_MIN_SAMPLES,
@@ -6529,11 +6534,16 @@ class RobinhoodLearningStore:
         mark_terminal = sum(
             count for (lane, status), count in by_lane_status.items()
             if lane == "marks" and status != "running")
+        backfill_complete = by_lane_status.get(("backfill", "complete"), 0)
         target = max(1, int(row["sample_target"]))
         minimum_marks = max(1, safe_int(
             policy.get("position_mark_minimum_samples"),
             math.ceil(target * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION),
         ))
+        backfill_requirement = policy.get("backfill_minimum_samples")
+        minimum_backfill = (
+            max(3, safe_int(backfill_requirement, 3))
+            if backfill_requirement is not None else 0)
         # Five attempts is a two-mark lead at the frozen 40% ratio. It makes
         # the independent sample obligation complete before the 100th live
         # attempt instead of racing a final marks worker at cohort closure.
@@ -6554,9 +6564,14 @@ class RobinhoodLearningStore:
             "mark_minimum": minimum_marks,
             "mark_pace_target": mark_pace_target,
             "mark_deficit": max(0, mark_pace_target - mark_terminal),
+            "backfill_complete": backfill_complete,
+            "backfill_minimum": minimum_backfill,
+            "backfill_deficit": max(
+                0, minimum_backfill - backfill_complete),
             "closing_live_blocked": bool(
                 live_terminal >= target - 1
-                and mark_terminal < minimum_marks),
+                and (mark_terminal < minimum_marks
+                     or backfill_complete < minimum_backfill)),
         }
 
     def backfill_recovery_pressure(self, limit: int = 10) -> dict:
@@ -7098,9 +7113,19 @@ class RobinhoodLearningStore:
                WHERE acceptance_cohort_id=? AND lane='marks'
                  AND status!='running'""", (cohort_id,),
         ).fetchone()[0]
+        backfill_requirement = policy.get("backfill_minimum_samples")
+        minimum_backfill = (
+            max(3, safe_int(backfill_requirement, 3))
+            if backfill_requirement is not None else 0)
+        backfill_complete = connection.execute(
+            """SELECT COUNT(*) FROM runs
+               WHERE acceptance_cohort_id=? AND lane='backfill'
+                 AND status='complete'""", (cohort_id,),
+        ).fetchone()[0]
         if (
             int(terminal) >= int(cohort["sample_target"])
             and int(mark_terminal) >= minimum_marks
+            and int(backfill_complete) >= minimum_backfill
         ):
             connection.execute(
                 """UPDATE acceptance_cohorts
@@ -7144,7 +7169,7 @@ class RobinhoodLearningStore:
                    WHERE run_id=? ORDER BY id DESC LIMIT 1""",
                 (run_id,),
             ).fetchone()
-            if (run and run["lane"] in {"live", "marks"}
+            if (run and run["lane"] in {"live", "marks", "backfill"}
                     and run["acceptance_cohort_id"]
                     and status != "running"):
                 self._close_cohort_if_target(
@@ -7669,6 +7694,8 @@ class RobinhoodLearningStore:
             cohort_policy.get("decision_minimum_samples"), target))
         mark_sample_target = max(1, safe_int(
             cohort_policy.get("position_mark_minimum_samples"), target))
+        backfill_sample_target = max(3, safe_int(
+            cohort_policy.get("backfill_minimum_samples"), 3))
         decision_lag_maximum = max(0, safe_int(
             cohort_policy.get("decision_lag_maximum_blocks"),
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS))
@@ -8104,7 +8131,12 @@ class RobinhoodLearningStore:
                 "label": "Seal-stage stall rate",
             },
             "backfill_convergence": {
-                "pass": backfill_trend["decreasing"], "value": backfill_trend,
+                "pass": bool(
+                    backfill_trend["samples"] >= backfill_sample_target
+                    and backfill_trend["decreasing"]),
+                "value": backfill_trend,
+                "samples": backfill_trend["samples"],
+                "sample_target": backfill_sample_target,
                 "target": "net decreasing (gross recovery shown separately)",
                 "label": "Backfill convergence",
             },
@@ -18511,6 +18543,14 @@ def _select_background_candidate(
         and mark_count < mark_target
     ):
         return "marks"
+    if (
+        progress.get("collecting")
+        and safe_int(progress.get("backfill_deficit"), 0) > 0
+    ):
+        # Backfill is a frozen cohort obligation, not best-effort debt. Give
+        # it attributed samples before ordinary analysis/evidence work so the
+        # convergence criterion cannot remain structurally empty.
+        return "backfill" if "backfill" in due_by_name else None
     if bool((backfill_pressure or {}).get("priority")):
         # Recovery below arrivals is an exclusive background mode. Launching
         # analysis/evidence while a backfill worker waits for the shared RPC
@@ -19090,6 +19130,7 @@ def dashboard_operational_snapshot(
         integrity = _dashboard_integrity(
             root, chain_root=chain_root, skill_root=skill_root)
     stabilization = store.stabilization_summary(integrity=integrity)
+    from chainseer_recursive_learning import latest_shadow_learning
     return {
         "timestamp":_utc_now(),"network":"robinhood","chain_id":ROBINHOOD_NETWORK.chain_id,
         "learning":store.summary(),
@@ -19127,6 +19168,7 @@ def dashboard_operational_snapshot(
             },
         },
         "stabilization": stabilization,
+        "recursive_learning": latest_shadow_learning(root),
         "decision_gate": _dashboard_decision_gate(root),
         "discovery_coverage":cursor.get("coverage") or summary.get("discovery_coverage") or {},
         "discovery_coverage_by_source":{
@@ -19758,6 +19800,7 @@ def main() -> None:
             "full-verification-once",
             "lanes", "status", "dashboard", "verify", "reflect",
             "audit", "repair-outcomes", "cohort-start", "cohort-status",
+            "recursive-once",
         ),
     )
     parser.add_argument(
@@ -19828,6 +19871,15 @@ def main() -> None:
             )
         else:
             result = store.acceptance_cohort()
+        print(json.dumps(result, indent=2)); return
+    if args.command == "recursive-once":
+        from chainseer_recursive_learning import run_shadow_learning
+        result = run_shadow_learning(
+            args.root,
+            source_policy_version=ACCEPTANCE_COHORT_POLICY_VERSION,
+            source_revision=_workspace_revision(),
+            source_digest=_worktree_source_digest(),
+        )
         print(json.dumps(result, indent=2)); return
     if args.command=="lanes":
         result = supervise_lanes(
