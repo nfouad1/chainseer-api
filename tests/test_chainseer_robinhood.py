@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v18")
+                "robinhood-operational-v19")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -9665,16 +9665,18 @@ class SealStageBudgetTests(unittest.TestCase):
             "a reserve that large would starve sealing instead of bounding it",
         )
 
-    def test_the_live_lane_passes_its_reserve_to_the_seal_stage(self):
-        """A constant nobody reads is the defect this project keeps repeating:
-        a Job Object assigned after the child exited, a CycleDeadline created
-        and never checked, four stage call sites passing no arguments."""
+    def test_the_live_lane_passes_its_computed_reserve_to_the_seal_stage(self):
+        """The pre-seal count-dependent reserve must govern sealing itself."""
         source = Path("chainseer_robinhood.py").read_text(
             encoding="utf-8", errors="replace")
         live = source.split("def run_live_lane", 1)[1].split(
             "def _analyze_candidates", 1)[0]
+        self.assertIn("time_admission = self.observation_time_admission", live)
         self.assertIn(
-            "reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS", live)
+            'reserve_seconds=time_admission[\n'
+            '                                "decision_tail_reserve_seconds"]',
+            live,
+        )
 
 
 class BatchedQuotePrimeTests(unittest.TestCase):

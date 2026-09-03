@@ -294,6 +294,10 @@ LIVE_LANE_OBSERVATION_LIMIT = 2
 #: than lost; classification cannot, because an unclassified observation has
 #: no decision attached to it.
 LIVE_LANE_DECISION_RESERVE_SECONDS = 5.0
+# Live-lane stage markers are diagnostic breadcrumbs, not business data. A
+# contended marker must never consume the decision budget it is meant to
+# explain.
+LIVE_STAGE_TELEMETRY_BUSY_TIMEOUT_MS = 25
 #: Cold-start per-window seal cost, replaced by a measured EWMA after the
 #: first pass. 2.0s is the observed 16.4s median over the 8-window limit.
 SEAL_WINDOW_COST_SECONDS_DEFAULT = 2.0
@@ -442,7 +446,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v18"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v19"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 #: A convergence claim needs a fixed, attributed time series. Ten completed
@@ -6403,8 +6407,10 @@ class RobinhoodLearningStore:
             return {}
         return value if isinstance(value, dict) else {}
 
-    def set_scheduler_state(self, key: str, value: dict) -> None:
-        with self.connection() as connection:
+    def set_scheduler_state(
+        self, key: str, value: dict, *, busy_timeout_ms: int | None = None,
+    ) -> None:
+        with self.connection(busy_timeout_ms=busy_timeout_ms) as connection:
             connection.execute(
                 """INSERT INTO flow_scheduler_state(key,value_json,updated_at)
                    VALUES (?,?,?)
@@ -6417,10 +6423,11 @@ class RobinhoodLearningStore:
     def record_seal_cost_samples(
         self, updates: dict, *, status: str, run_id: str,
         epoch: int, revision: str, sample_count: int = 1,
+        busy_timeout_ms: int | None = None,
     ) -> None:
         """Append cohort-scoped seal samples beyond the rolling estimator."""
         records: list[tuple] = []
-        with self.connection() as connection:
+        with self.connection(busy_timeout_ms=busy_timeout_ms) as connection:
             run = connection.execute(
                 """SELECT acceptance_cohort_id,revision FROM runs
                    WHERE run_id=? ORDER BY id DESC LIMIT 1""",
@@ -7361,7 +7368,7 @@ class RobinhoodLearningStore:
         self, lane: str, stage: str, run_id: str | None = None,
         remaining: float | None = None, completed: dict | None = None,
         detail: dict | None = None,
-    ) -> None:
+    ) -> bool:
         """Also record HEADROOM, not just which stage was running.
 
         Attribution alone misleads: 5 of 6 post-change live failures died in
@@ -7380,19 +7387,35 @@ class RobinhoodLearningStore:
         sub-stage, with `detail` carrying the window index and pool id so a
         forced termination names the exact window it died on.
         """
-        with self.connection() as connection:
-            connection.execute(
-                """UPDATE lane_state
-                   SET current_stage=?, stage_started_at=?,
-                       deadline_remaining_at_stage_start=?,
-                       completed_stage_seconds_json=?,
-                       stage_detail_json=?
-                   WHERE lane=? AND status='running'
-                     AND (? IS NULL OR run_id=?)""",
-                (str(stage), time.time(), remaining,
-                 _canonical(completed or {}), _canonical(detail or {}),
-                 str(lane), run_id, run_id),
-            )
+        # The live lane is deadline-critical. Its telemetry is deliberately
+        # best-effort: waiting behind an unrelated SQLite writer can make the
+        # measurement itself cause the deadline failure. Evidence and other
+        # lanes retain the normal durable timeout.
+        busy_timeout_ms = (
+            LIVE_STAGE_TELEMETRY_BUSY_TIMEOUT_MS
+            if str(lane) == "live" else None)
+        try:
+            with self.connection(busy_timeout_ms=busy_timeout_ms) as connection:
+                connection.execute(
+                    """UPDATE lane_state
+                       SET current_stage=?, stage_started_at=?,
+                           deadline_remaining_at_stage_start=?,
+                           completed_stage_seconds_json=?,
+                           stage_detail_json=?
+                       WHERE lane=? AND status='running'
+                         AND (? IS NULL OR run_id=?)""",
+                    (str(stage), time.time(), remaining,
+                     _canonical(completed or {}), _canonical(detail or {}),
+                     str(lane), run_id, run_id),
+                )
+            return True
+        except sqlite3.OperationalError as exc:
+            message = str(exc).lower()
+            if str(lane) == "live" and (
+                "locked" in message or "busy" in message
+            ):
+                return False
+            raise
 
     def lane_failure_stage(self, lane: str, run_id: str) -> dict:
         """The persisted stage for a run, for child-side failure payloads."""
@@ -13667,7 +13690,8 @@ class RobinhoodLearningEngine:
         return self.seal_cost_model()["per_window_cost_p95"]
 
     def _blend_seal_model(self, updates: dict, censored: bool = False,
-                          sample_count: int = 0) -> dict:
+                          sample_count: int = 0,
+                          best_effort: bool = False) -> dict:
         """Append raw timing samples with provenance; derive nearest-rank p95.
 
         Kept under the historical method name for compatibility with callers,
@@ -13689,7 +13713,19 @@ class RobinhoodLearningEngine:
                 f"{SEAL_COST_MODEL_STATE_KEY}:archive:"
                 f"epoch-{safe_int(stored.get('epoch'), 0)}:"
                 f"{int(time.time())}")
-            self.store.set_scheduler_state(archive_key, stored)
+            try:
+                self.store.set_scheduler_state(
+                    archive_key, stored,
+                    busy_timeout_ms=(
+                        LIVE_STAGE_TELEMETRY_BUSY_TIMEOUT_MS
+                        if best_effort else None),
+                )
+            except sqlite3.OperationalError as exc:
+                if not best_effort or not any(
+                    word in str(exc).lower() for word in ("locked", "busy")
+                ):
+                    raise
+                return self.seal_cost_model()
         run_id = str(getattr(self, "cycle_run_uuid", "") or "")
         payload = _append_seal_cost_records(
             stored, updates,
@@ -13697,7 +13733,18 @@ class RobinhoodLearningEngine:
             run_id=run_id, revision=CODE_REVISION,
             recorded_at=time.time(), sample_count=sample_count,
         )
-        self.store.set_scheduler_state(SEAL_COST_MODEL_STATE_KEY, payload)
+        busy_timeout_ms = (
+            LIVE_STAGE_TELEMETRY_BUSY_TIMEOUT_MS if best_effort else None)
+        try:
+            self.store.set_scheduler_state(
+                SEAL_COST_MODEL_STATE_KEY, payload,
+                busy_timeout_ms=busy_timeout_ms)
+        except sqlite3.OperationalError as exc:
+            if not best_effort or not any(
+                word in str(exc).lower() for word in ("locked", "busy")
+            ):
+                raise
+            return self.seal_cost_model()
         for scalar in updates:
             field = SEAL_COST_SAMPLE_FIELDS[scalar]
             for record in _valid_seal_sample_records(payload.get(field)):
@@ -13706,11 +13753,20 @@ class RobinhoodLearningEngine:
                                - safe_float(payload.get("last_sample_at"), 0.0))
                         > 0.001):
                     continue
-                self.store.record_seal_cost_samples(
-                    {scalar: record["value"]}, status=record["status"],
-                    run_id=run_id, epoch=SEAL_COST_MODEL_EPOCH,
-                    revision=CODE_REVISION, sample_count=sample_count,
-                )
+                try:
+                    self.store.record_seal_cost_samples(
+                        {scalar: record["value"]}, status=record["status"],
+                        run_id=run_id, epoch=SEAL_COST_MODEL_EPOCH,
+                        revision=CODE_REVISION, sample_count=sample_count,
+                        busy_timeout_ms=busy_timeout_ms,
+                    )
+                except sqlite3.OperationalError as exc:
+                    if not best_effort or not any(
+                        word in str(exc).lower()
+                        for word in ("locked", "busy")
+                    ):
+                        raise
+                    return self.seal_cost_model()
         return self.seal_cost_model()
 
     def record_seal_cost(
@@ -13787,6 +13843,15 @@ class RobinhoodLearningEngine:
         """Fold a completed cycle's decision-tail duration into the p95."""
         model = self._blend_seal_model({
             "downstream_reserve_p95": max(0.0, float(seconds))})
+        return model["downstream_reserve_p95"]
+
+    def record_downstream_reserve_censored(self, seconds: float) -> float:
+        """Record a decision-tail lower bound without lowering admission."""
+        current = self.downstream_reserve_estimate()
+        model = self._blend_seal_model({
+            "downstream_reserve_p95": max(current, float(seconds))},
+            censored=True, best_effort=True,
+        )
         return model["downstream_reserve_p95"]
 
     def decision_tail_block_model(self) -> dict:
@@ -14214,6 +14279,64 @@ class RobinhoodLearningEngine:
                 DECISION_HEAD_RPC_RESERVE_SECONDS,
             "required_seconds": round(required, 3),
             "admitted": bool(remaining_seconds > required),
+        }
+
+    def observation_time_admission(
+        self, requested: int, remaining_seconds: float,
+    ) -> dict:
+        """Choose the largest observation batch whose complete tail fits.
+
+        The same count-dependent decision reserve is passed into sealing and
+        checked again before the decision-head RPC. This prevents sealing two
+        observations and only afterwards discovering that their decision tail
+        never fit; marginal cycles degrade safely from two observations to one.
+        """
+        requested = max(0, min(int(requested), LIVE_LANE_OBSERVATION_LIMIT))
+        remaining = max(0.0, float(remaining_seconds))
+        model = self.live_planning_seal_cost_model()
+        candidates = []
+        admitted = 0
+        admitted_reserve = max(
+            LIVE_LANE_DECISION_RESERVE_SECONDS,
+            model["downstream_reserve_p95"],
+        )
+        for count in range(requested, 0, -1):
+            decision = self.decision_head_admission(count, float("inf"))
+            tail = max(
+                LIVE_LANE_DECISION_RESERVE_SECONDS,
+                model["downstream_reserve_p95"],
+                decision["required_seconds"],
+            )
+            required = (
+                model["fixed_observation_cost_p95"]
+                + model["queue_settlement_p95"]
+                + model["per_window_cost_p95"] * count
+                + tail
+            )
+            candidates.append({
+                "observations": count,
+                "required_seconds": round(required, 3),
+                "decision_tail_reserve_seconds": round(tail, 3),
+            })
+            if remaining > required:
+                admitted = count
+                admitted_reserve = tail
+                break
+        minimum_required = (
+            candidates[-1]["required_seconds"] if candidates else 0.0)
+        return {
+            "requested": requested,
+            "admitted": admitted,
+            "deferred": max(0, requested - admitted),
+            "reason": (
+                "requested_batch_fits" if admitted == requested
+                else "batch_reduced_for_headroom" if admitted > 0
+                else "insufficient_observation_headroom"
+            ),
+            "remaining_seconds": round(remaining, 3),
+            "minimum_required_seconds": minimum_required,
+            "decision_tail_reserve_seconds": round(admitted_reserve, 3),
+            "candidates": candidates,
         }
 
     def read_authoritative_decision_head(
@@ -16641,7 +16764,6 @@ class RobinhoodLearningEngine:
 
             stage = time.monotonic()
             touched = list(near_head.get("touched_pool_ids") or [])
-            observation_model = self.live_planning_seal_cost_model()
             observation_head = int(near_head.get("to_block") or 0)
             post_ingest_head = (
                 int(near_head["head_block_after"])
@@ -16651,12 +16773,10 @@ class RobinhoodLearningEngine:
                 post_ingest_head=post_ingest_head,
                 requested=LIVE_LANE_OBSERVATION_LIMIT,
             )
-            observation_minimum = (
-                max(LIVE_LANE_DECISION_RESERVE_SECONDS,
-                    observation_model["downstream_reserve_p95"])
-                + observation_model["fixed_observation_cost_p95"]
-                + observation_model["queue_settlement_p95"])
-            if deadline.remaining() <= observation_minimum:
+            time_admission = self.observation_time_admission(
+                freshness_admission["admitted"], deadline.remaining())
+            observation_minimum = time_admission["minimum_required_seconds"]
+            if time_admission["admitted"] <= 0:
                 # Selection itself is a measured fixed cost.  Starting it
                 # when that cost cannot fit caused the second failed soak
                 # attempt to enter classification with 0.313s left even
@@ -16679,8 +16799,9 @@ class RobinhoodLearningEngine:
                         observation = self.seal_near_head_observations(
                             observation_head, observed_at,
                             pool_ids=touched, deadline=deadline,
-                            limit=freshness_admission["admitted"],
-                            reserve_seconds=LIVE_LANE_DECISION_RESERVE_SECONDS,
+                            limit=time_admission["admitted"],
+                            reserve_seconds=time_admission[
+                                "decision_tail_reserve_seconds"],
                             # Historical durable work must not consume the
                             # freshness budget. It is drained by backfill.
                             queue_drain_limit=0,
@@ -16696,6 +16817,7 @@ class RobinhoodLearningEngine:
                     self.record_seal_cost_censored(time.monotonic() - stage)
                     raise
             observation["freshness_admission"] = freshness_admission
+            observation["time_admission"] = time_admission
             timings["fresh_quote_and_observation_seconds"] = round(
                 time.monotonic() - stage, 3)
             stage = time.monotonic()
@@ -16740,6 +16862,8 @@ class RobinhoodLearningEngine:
             )
             observation["decision_head_admission"] = decision_admission
             if not decision_admission["admitted"]:
+                self.record_downstream_reserve_censored(
+                    decision_admission["required_seconds"])
                 return defer_decision_head(
                     "insufficient_decision_head_headroom")
             downstream_required = max(

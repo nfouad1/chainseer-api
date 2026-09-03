@@ -11,6 +11,7 @@ no Timechain operation on the decision-critical path.
 from __future__ import annotations
 
 import json
+import math
 import multiprocessing
 import sqlite3
 import tempfile
@@ -351,16 +352,27 @@ class IngestionAdmissionTests(unittest.TestCase):
                 "per_window_cost_p95": 1.0,
                 "downstream_reserve_p95": 5.0,
             }
+            engine.observation_freshness_admission = lambda **_kwargs: {
+                "requested": 1, "admitted": 1,
+                "reason": "requested_batch_fits"}
 
             def consume_tail(*_args, **_kwargs):
-                time.sleep(1.2)
                 return {"observation_ids": ["durable-observation"],
                         "sealed_this_cycle": 1}
 
             engine.seal_near_head_observations = consume_tail
+            original_admission = engine.decision_head_admission
+
+            def admission(observations, remaining_seconds):
+                result = original_admission(observations, remaining_seconds)
+                if math.isfinite(remaining_seconds):
+                    result["admitted"] = False
+                return result
+
+            engine.decision_head_admission = admission
             engine.rpc.get_block_number = lambda: self.fail(
                 "decision-head RPC must not start without its reserved tail")
-            summary = engine.run_live_lane(budget_seconds=6.0)
+            summary = engine.run_live_lane(budget_seconds=10.0)
             self.assertEqual(summary["status"], "deferred")
             self.assertEqual(summary["deferral_stage"], "decision_head")
             self.assertEqual(
@@ -789,6 +801,47 @@ class AdmissionEstimatorTests(unittest.TestCase):
                 make_engine(root, store).downstream_reserve_estimate(),
                 measured,
                 "the estimate must be durable across engine instances")
+
+    def test_observation_time_admission_reduces_two_windows_to_one(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            engine = make_engine(root, store)
+            engine.live_planning_seal_cost_model = lambda: {
+                "fixed_observation_cost_p95": 1.0,
+                "queue_settlement_p95": 1.0,
+                "per_window_cost_p95": 2.0,
+                "downstream_reserve_p95": 5.0,
+            }
+            engine.classification_cost_estimate = lambda: 0.25
+            # Two need 11s; one needs 9s. Marginal headroom must preserve one
+            # complete decision rather than sealing two incomplete ones.
+            plan = engine.observation_time_admission(2, 10.0)
+            self.assertEqual(plan["admitted"], 1)
+            self.assertEqual(plan["reason"], "batch_reduced_for_headroom")
+
+    def test_live_stage_telemetry_never_waits_behind_database_writer(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            store = rh.RobinhoodLearningStore(root / "l.sqlite3")
+            run_id = "telemetry-contention"
+            store.begin_run(run_id, 25.0, lane="live")
+            blocker = store._connect()
+            try:
+                blocker.execute("BEGIN IMMEDIATE")
+                blocker.execute(
+                    "UPDATE lane_state SET current_stage='blocker' "
+                    "WHERE lane='live'")
+                started = time.monotonic()
+                written = store.mark_lane_stage(
+                    "live", "decision_head", run_id=run_id,
+                    remaining=5.0)
+                elapsed = time.monotonic() - started
+            finally:
+                blocker.rollback()
+                blocker.close()
+            self.assertFalse(written)
+            self.assertLess(elapsed, 0.5)
 
 
 class DeferredRecoveryTests(unittest.TestCase):
