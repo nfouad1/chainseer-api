@@ -244,6 +244,11 @@ BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK = 1
 BACKFILL_RECOVERY_TARGET_RATIO = 1.10
 BACKFILL_QUEUE_MAINTENANCE_MINIMUM_SECONDS = 8.0
 BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS = 55.0
+# A backfill log request may not start in the generic five-second background
+# window. Production measured 12.312s chunk p95; reserving 15s after the
+# supervisor's five-second live guard prevents an in-flight historical request
+# from occupying the provider mutex when the next live scan becomes due.
+BACKFILL_RPC_MINIMUM_SAFE_WINDOW_SECONDS = 15.0
 BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS = 12.0
 BACKFILL_RPC_URL_ENV = "CHAINSEER_ROBINHOOD_BACKFILL_RPC_URL"
 BACKFILL_RPC_LOG_RANGE_LIMIT_ENV = (
@@ -449,7 +454,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v20"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v21"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 #: A convergence claim needs a fixed, attributed time series. Ten completed
@@ -1250,6 +1255,7 @@ class BackgroundRpcPriorityDeferred(RuntimeError):
 
 def _background_rpc_priority_window(
     state: dict, *, now_monotonic: float | None = None,
+    minimum_window_seconds: float = BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS,
 ) -> dict:
     """Classify one supervisor-published background RPC window.
 
@@ -1270,7 +1276,7 @@ def _background_rpc_priority_window(
         reason = "priority_state_stale"
     elif bool(state.get("live_active")):
         reason = "live_lane_active"
-    elif available < BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS:
+    elif available < max(0.0, float(minimum_window_seconds)):
         reason = "live_lane_imminent"
     else:
         reason = "safe_background_window"
@@ -1281,6 +1287,8 @@ def _background_rpc_priority_window(
         "state_age_seconds": (
             round(age, 6) if age is not None else None),
         "next_live_monotonic": next_live or None,
+        "minimum_window_seconds": max(
+            0.0, float(minimum_window_seconds)),
     }
 
 
@@ -1628,6 +1636,8 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             BACKFILL_RECOVERY_TARGET_RATIO,
         "backfill_rpc_attempt_budget_seconds":
             BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
+        "backfill_rpc_minimum_safe_window_seconds":
+            BACKFILL_RPC_MINIMUM_SAFE_WINDOW_SECONDS,
         "backfill_launch_minimum_live_window_seconds":
             BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS,
         "backfill_rpc_isolation_supported": True,
@@ -12712,11 +12722,17 @@ class RobinhoodLearningEngine:
             return
 
         last_reason = "priority_state_unavailable"
+        minimum_window = (
+            BACKFILL_RPC_MINIMUM_SAFE_WINDOW_SECONDS
+            if lane == "backfill"
+            else BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS
+        )
         while deadline.remaining() > 0.1:
             rate_sleep_seconds = 0.0
             state = read_json(
                 self.root / BACKGROUND_RPC_PRIORITY_STATE_FILE, {}) or {}
-            window = _background_rpc_priority_window(state)
+            window = _background_rpc_priority_window(
+                state, minimum_window_seconds=minimum_window)
             last_reason = str(window["reason"])
             if window["admitted"]:
                 try:
@@ -12736,7 +12752,8 @@ class RobinhoodLearningEngine:
                     state = read_json(
                         self.root / BACKGROUND_RPC_PRIORITY_STATE_FILE,
                         {}) or {}
-                    window = _background_rpc_priority_window(state)
+                    window = _background_rpc_priority_window(
+                        state, minimum_window_seconds=minimum_window)
                     last_reason = str(window["reason"])
                     maximum = min(
                         deadline.remaining(),
@@ -12771,8 +12788,7 @@ class RobinhoodLearningEngine:
                     if rate_sleep_seconds > 0:
                         if last_reason != "provider_rate_limit_cooldown":
                             last_reason = "background_rate_paced"
-                    elif window["admitted"] and maximum >= (
-                            BACKGROUND_RPC_MINIMUM_WINDOW_SECONDS):
+                    elif window["admitted"] and maximum >= minimum_window:
                         waited = time.monotonic() - wait_started
                         self._rpc_priority_telemetry["admissions"] += 1
                         self._rpc_priority_telemetry[

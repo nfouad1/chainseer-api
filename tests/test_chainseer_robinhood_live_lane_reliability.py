@@ -261,7 +261,9 @@ class IngestionAdmissionTests(unittest.TestCase):
         self.assertEqual(
             policy["scheduled_backfill_block_limit"],
             rh.BACKFILL_GAP_CHUNK_BLOCKS)
-        self.assertEqual(policy["backfill_maximum_chunks_per_cycle"], 6)
+        self.assertEqual(policy["backfill_maximum_chunks_per_cycle"], 24)
+        self.assertEqual(
+            policy["backfill_rpc_minimum_safe_window_seconds"], 15.0)
         self.assertEqual(policy["backfill_remote_attempts_per_chunk"], 1)
 
     def test_insufficient_ingestion_headroom_is_a_non_success_deferral(self):
@@ -432,6 +434,24 @@ class SupervisorPriorityTests(unittest.TestCase):
         }, now_monotonic=now)
         self.assertFalse(active["admitted"])
         self.assertEqual(active["reason"], "live_lane_active")
+
+    def test_backfill_requires_a_full_chunk_window_before_live(self):
+        now = 100.0
+        state = {
+            "published_monotonic": now,
+            "next_live_monotonic": (
+                now + rh.BACKGROUND_RPC_LIVE_GUARD_SECONDS + 10.0),
+            "live_active": False,
+        }
+        generic = rh._background_rpc_priority_window(
+            state, now_monotonic=now)
+        backfill = rh._background_rpc_priority_window(
+            state, now_monotonic=now,
+            minimum_window_seconds=
+                rh.BACKFILL_RPC_MINIMUM_SAFE_WINDOW_SECONDS)
+        self.assertTrue(generic["admitted"])
+        self.assertFalse(backfill["admitted"])
+        self.assertEqual(backfill["reason"], "live_lane_imminent")
 
     def test_background_launch_is_blocked_while_live_is_active_or_due(self):
         self.assertTrue(rh._low_priority_launch_blocked(

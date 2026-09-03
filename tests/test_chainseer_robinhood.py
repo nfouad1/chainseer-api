@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v20")
+                "robinhood-operational-v21")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7399,6 +7399,9 @@ class LaneSplitTests(unittest.TestCase):
                 rh.DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS)
             self.assertEqual(
                 cohort["policy"]["backfill_maximum_chunks_per_cycle"], 24)
+            self.assertEqual(
+                cohort["policy"][
+                    "backfill_rpc_minimum_safe_window_seconds"], 15.0)
             self.assertEqual(
                 cohort["policy"]["background_rpc_priority_gate_version"], 2)
             self.assertTrue(
@@ -8177,13 +8180,13 @@ class LaneSplitTests(unittest.TestCase):
                 directory, rpc=FakeRPC([], latest=100),
                 analyzer=FakeAnalyzer(), market=FakeMarket())
             engine._active_lane = "backfill"
-            engine._active_lane_deadline = rh.CycleDeadline(8.0)
+            engine._active_lane_deadline = rh.CycleDeadline(20.0)
             now = time.monotonic()
             rh.atomic_json_write(
                 Path(directory) / rh.BACKGROUND_RPC_PRIORITY_STATE_FILE,
                 {
                     "published_monotonic": now,
-                    "next_live_monotonic": now + 20.0,
+                    "next_live_monotonic": now + 25.0,
                     "live_active": False,
                 },
             )
@@ -8191,8 +8194,8 @@ class LaneSplitTests(unittest.TestCase):
                 os.environ, {"CHAINSEER_RPC_PRIORITY_REQUIRED": "1"}
             ):
                 with engine._rpc_request_guard() as maximum:
-                    self.assertGreater(maximum, 7.0)
-                    self.assertLessEqual(maximum, 8.0)
+                    self.assertGreater(maximum, 15.0)
+                    self.assertLessEqual(maximum, 20.0)
             self.assertEqual(
                 engine._rpc_priority_telemetry["admissions"], 1)
 
@@ -8231,13 +8234,13 @@ class LaneSplitTests(unittest.TestCase):
             ]
             for engine in engines:
                 engine._active_lane = "backfill"
-                engine._active_lane_deadline = rh.CycleDeadline(8.0)
+                engine._active_lane_deadline = rh.CycleDeadline(20.0)
             now = time.monotonic()
             rh.atomic_json_write(
                 Path(directory) / rh.BACKGROUND_RPC_PRIORITY_STATE_FILE,
                 {
                     "published_monotonic": now,
-                    "next_live_monotonic": now + 20.0,
+                    "next_live_monotonic": now + 25.0,
                     "live_active": False,
                 },
             )
