@@ -465,9 +465,15 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v23"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v24"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
+#: Analysis convergence is a separate, slow-lane obligation.  Three terminal
+#: attempts are the minimum needed by the existing trend definition.  The
+#: FIRST three attempts are the frozen population: a failure or missing
+#: backlog measurement remains a red result instead of being replaced by a
+#: later, favourable run.
+ACCEPTANCE_ANALYSIS_MINIMUM_SAMPLES = 3
 #: A convergence claim needs a fixed, attributed time series. Ten completed
 #: backfill runs match the bounded trend window and prevent cohort closure
 #: before its thirteenth criterion has evidence.
@@ -1544,6 +1550,40 @@ def _canonical(value) -> str:
     return json.dumps(value, sort_keys=True, separators=(",", ":"), default=str)
 
 
+def _summary_backlog_measurement(
+    summary_json: str | dict | None, key: str,
+) -> int | None:
+    """Return one schema-valid non-negative integral backlog measurement.
+
+    Acceptance closure and acceptance evaluation must agree about what a
+    measurement is.  Coercing a missing string, boolean, NaN, or negative
+    value to zero would manufacture convergence evidence, so malformed
+    telemetry stays explicitly absent.
+    """
+    try:
+        summary = (
+            summary_json if isinstance(summary_json, dict)
+            else json.loads(summary_json or "{}")
+        )
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(summary, dict):
+        return None
+    backlog = summary.get("backlog") or {}
+    if not isinstance(backlog, dict):
+        return None
+    value = backlog.get(str(key))
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    numeric = float(value)
+    if (
+        not math.isfinite(numeric) or numeric < 0
+        or not numeric.is_integer()
+    ):
+        return None
+    return int(numeric)
+
+
 def operational_acceptance_policy(sample_target: int = 100) -> dict:
     """The immutable safety/SLO policy pinned to an acceptance cohort.
 
@@ -1613,7 +1653,14 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
         "position_mark_minimum_samples": max(
             1, math.ceil(
                 target * ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION)),
+        "analysis_minimum_samples": ACCEPTANCE_ANALYSIS_MINIMUM_SAMPLES,
+        "analysis_sample_population": "first_n_terminal_attempts",
+        "analysis_missing_measurement_policy":
+            "fail_without_replacement",
+        "analysis_deficit_priority":
+            "bounded_ahead_of_backfill_pressure",
         "backfill_minimum_samples": ACCEPTANCE_BACKFILL_MINIMUM_SAMPLES,
+        "backfill_sample_population": "first_n_complete_runs",
         "position_mark_minimum_rate": 1.0,
         "seal_stall_rate_maximum": SEAL_STALL_RATE_MAX,
         "seal_stall_minimum_samples": SEAL_STALL_GUARD_MIN_SAMPLES,
@@ -6555,10 +6602,16 @@ class RobinhoodLearningStore:
             and str(result.get("revision") or "") != checkout_revision
         )
         target = max(1, safe_int(result.get("sample_target"), 100))
-        result["collection_complete"] = (
+        result["live_collection_complete"] = (
             result["terminal_attempts"] >= target)
-        result["remaining_attempts"] = max(
+        # A cohort can remain open after its exact live sample is frozen while
+        # independent marks/backfill/analysis obligations finish. Do not call
+        # that intermediate state complete in the API or dashboard.
+        result["collection_complete"] = result.get("status") == "complete"
+        remaining_live = max(
             0, target - result["terminal_attempts"])
+        result["remaining_live_attempts"] = remaining_live
+        result["remaining_attempts"] = remaining_live
         return result
 
     def acceptance_scheduler_progress(self) -> dict:
@@ -6578,6 +6631,18 @@ class RobinhoodLearningStore:
                    GROUP BY lane,status""",
                 (row["cohort_id"], row["revision"]),
             ).fetchall()
+            analysis_requirement = policy.get("analysis_minimum_samples")
+            minimum_analysis = (
+                max(1, safe_int(analysis_requirement, 1))
+                if analysis_requirement is not None else 0
+            )
+            analysis_attempt_rows = connection.execute(
+                """SELECT status,summary_json FROM runs
+                   WHERE acceptance_cohort_id=? AND revision=?
+                     AND lane='analysis' AND status!='running'
+                   ORDER BY id ASC LIMIT ?""",
+                (row["cohort_id"], row["revision"], minimum_analysis),
+            ).fetchall()
         by_lane_status = {
             (str(item["lane"]), str(item["status"])): int(item["count"])
             for item in counts
@@ -6589,6 +6654,16 @@ class RobinhoodLearningStore:
             count for (lane, status), count in by_lane_status.items()
             if lane == "marks" and status != "running")
         backfill_complete = by_lane_status.get(("backfill", "complete"), 0)
+        analysis_terminal = sum(
+            count for (lane, status), count in by_lane_status.items()
+            if lane == "analysis" and status != "running")
+        analysis_complete = by_lane_status.get(("analysis", "complete"), 0)
+        analysis_measurements = sum(
+            item["status"] == "complete"
+            and _summary_backlog_measurement(
+                item["summary_json"], "pending_analysis") is not None
+            for item in analysis_attempt_rows
+        )
         target = max(1, int(row["sample_target"]))
         minimum_marks = max(1, safe_int(
             policy.get("position_mark_minimum_samples"),
@@ -6618,6 +6693,12 @@ class RobinhoodLearningStore:
             "mark_minimum": minimum_marks,
             "mark_pace_target": mark_pace_target,
             "mark_deficit": max(0, mark_pace_target - mark_terminal),
+            "analysis_terminal": analysis_terminal,
+            "analysis_complete": analysis_complete,
+            "analysis_measurements": analysis_measurements,
+            "analysis_minimum": minimum_analysis,
+            "analysis_deficit": max(
+                0, minimum_analysis - analysis_terminal),
             "backfill_complete": backfill_complete,
             "backfill_minimum": minimum_backfill,
             "backfill_deficit": max(
@@ -6626,6 +6707,13 @@ class RobinhoodLearningStore:
                 live_terminal >= target - 1
                 and (mark_terminal < minimum_marks
                      or backfill_complete < minimum_backfill)),
+            # Analysis does not block the user-facing live scanner. Once the
+            # exact live target is reached, begin_run leaves later live cycles
+            # unscoped while the cohort remains open for this side obligation.
+            "closure_obligations_pending": bool(
+                mark_terminal < minimum_marks
+                or backfill_complete < minimum_backfill
+                or analysis_terminal < minimum_analysis),
         }
 
     def backfill_recovery_pressure(self, limit: int = 10) -> dict:
@@ -7110,8 +7198,9 @@ class RobinhoodLearningStore:
                 ).fetchone()[0]
                 if int(live_terminal) >= int(cohort["sample_target"]):
                     # The cohort can remain open solely for its independent
-                    # marks obligation. Preserve the exact live sample while
-                    # that durable evidence catches up.
+                    # background-lane obligations. Preserve the exact live
+                    # sample while that durable evidence catches up; the
+                    # live scanner itself continues outside the cohort.
                     cohort_id = None
             row_id = connection.execute(
                 """INSERT INTO runs(started_at,status,run_id,pid,host,
@@ -7196,10 +7285,26 @@ class RobinhoodLearningStore:
                WHERE acceptance_cohort_id=? AND lane='backfill'
                  AND status='complete'""", (cohort_id,),
         ).fetchone()[0]
+        analysis_requirement = policy.get("analysis_minimum_samples")
+        minimum_analysis = (
+            max(1, safe_int(analysis_requirement, 1))
+            if analysis_requirement is not None else 0
+        )
+        # Terminal attempts, not successful measurements, close the sample
+        # obligation.  A failed or malformed attempt therefore remains in the
+        # immutable first-N population and makes the criterion red; the
+        # scheduler never retries until it happens to obtain a favourable
+        # trend. Missing policy means no retroactive debt for older cohorts.
+        analysis_terminal = connection.execute(
+            """SELECT COUNT(*) FROM runs
+               WHERE acceptance_cohort_id=? AND lane='analysis'
+                 AND status!='running'""", (cohort_id,),
+        ).fetchone()[0]
         if (
             int(terminal) >= int(cohort["sample_target"])
             and int(mark_terminal) >= minimum_marks
             and int(backfill_complete) >= minimum_backfill
+            and int(analysis_terminal) >= minimum_analysis
         ):
             connection.execute(
                 """UPDATE acceptance_cohorts
@@ -7243,7 +7348,8 @@ class RobinhoodLearningStore:
                    WHERE run_id=? ORDER BY id DESC LIMIT 1""",
                 (run_id,),
             ).fetchone()
-            if (run and run["lane"] in {"live", "marks", "backfill"}
+            if (run and run["lane"] in {
+                    "live", "marks", "backfill", "analysis"}
                     and run["acceptance_cohort_id"]
                     and status != "running"):
                 self._close_cohort_if_target(
@@ -7784,8 +7890,16 @@ class RobinhoodLearningStore:
             cohort_policy.get("decision_minimum_samples"), target))
         mark_sample_target = max(1, safe_int(
             cohort_policy.get("position_mark_minimum_samples"), target))
+        analysis_sample_target = max(3, safe_int(
+            cohort_policy.get("analysis_minimum_samples"), 3))
         backfill_sample_target = max(3, safe_int(
             cohort_policy.get("backfill_minimum_samples"), 3))
+        frozen_analysis_population = bool(
+            cohort_id and cohort_policy.get("analysis_sample_population")
+            == "first_n_terminal_attempts")
+        frozen_backfill_population = bool(
+            cohort_id and cohort_policy.get("backfill_sample_population")
+            == "first_n_complete_runs")
         decision_lag_maximum = max(0, safe_int(
             cohort_policy.get("decision_lag_maximum_blocks"),
             FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS))
@@ -7831,6 +7945,16 @@ class RobinhoodLearningStore:
                        ORDER BY id ASC LIMIT ?""",
                     (cohort_id, cohort_revision, target),
                 )]
+                analysis_attempt_rows = [
+                    dict(row) for row in connection.execute(
+                        """SELECT status,summary_json FROM runs
+                           WHERE lane='analysis' AND status!='running'
+                             AND acceptance_cohort_id=? AND revision=?
+                           ORDER BY id ASC LIMIT ?""",
+                        (cohort_id, cohort_revision,
+                         analysis_sample_target),
+                    )
+                ] if frozen_analysis_population else []
             else:
                 live_rows = [dict(row) for row in connection.execute(
                     """SELECT status,summary_json FROM runs
@@ -7847,38 +7971,54 @@ class RobinhoodLearningStore:
                        ORDER BY id DESC LIMIT ?""", (max(1_000, target * 10),)
                 )]
                 mark_rows = []
+                analysis_attempt_rows = []
             identity_violations = int(connection.execute(
                 """SELECT COUNT(*) FROM flow_observation_classifications
                    WHERE paper_eligible=1 AND identity_tier!='verified'"""
             ).fetchone()[0])
 
-            def backlog_series(lane: str, key: str) -> list[int]:
+            def backlog_series(
+                lane: str, key: str, *, limit: int = 10,
+                first_population: bool = False,
+            ) -> list[int]:
                 filters = ["lane=?", "status='complete'"]
                 parameters: list[object] = [lane]
-                order = "DESC"
+                order = "ASC" if first_population else "DESC"
                 if cohort_id:
                     filters.extend([
                         "acceptance_cohort_id=?", "revision=?"])
                     parameters.extend([cohort_id, cohort_revision])
-                parameters.append(10)
+                parameters.append(max(1, int(limit)))
                 rows = connection.execute(
                     "SELECT summary_json FROM runs WHERE "
                     + " AND ".join(filters)
                     + f" ORDER BY id {order} LIMIT ?", parameters,
                 ).fetchall()
                 values: list[int] = []
-                for item in reversed(rows):
-                    try:
-                        value = (json.loads(item["summary_json"] or "{}").get(
-                            "backlog") or {}).get(key)
-                        if value is not None:
-                            values.append(max(0, int(value)))
-                    except (TypeError, ValueError, json.JSONDecodeError):
-                        continue
+                ordered_rows = rows if first_population else reversed(rows)
+                for item in ordered_rows:
+                    value = _summary_backlog_measurement(
+                        item["summary_json"], key)
+                    if value is not None:
+                        values.append(value)
                 return values
 
-            backfill_values = backlog_series("backfill", "pending_blocks")
-            analysis_values = backlog_series("analysis", "pending_analysis")
+            backfill_values = backlog_series(
+                "backfill", "pending_blocks",
+                limit=(backfill_sample_target
+                       if frozen_backfill_population else 10),
+                first_population=frozen_backfill_population,
+            )
+            if frozen_analysis_population:
+                analysis_values = [
+                    value for item in analysis_attempt_rows
+                    for value in [_summary_backlog_measurement(
+                        item["summary_json"], "pending_analysis")]
+                    if item["status"] == "complete" and value is not None
+                ]
+            else:
+                analysis_values = backlog_series(
+                    "analysis", "pending_analysis")
             backfill_summary_filters = ["lane='backfill'", "status='complete'"]
             backfill_summary_parameters: list[object] = []
             if cohort_id:
@@ -7886,15 +8026,22 @@ class RobinhoodLearningStore:
                     "acceptance_cohort_id=?", "revision=?"])
                 backfill_summary_parameters.extend([
                     cohort_id, cohort_revision])
-            backfill_summary_parameters.append(10)
+            backfill_summary_parameters.append(
+                backfill_sample_target
+                if frozen_backfill_population else 10)
+            backfill_summary_order = (
+                "ASC" if frozen_backfill_population else "DESC")
             backfill_summary_rows = connection.execute(
                 "SELECT summary_json FROM runs WHERE "
                 + " AND ".join(backfill_summary_filters)
-                + " ORDER BY id DESC LIMIT ?",
+                + f" ORDER BY id {backfill_summary_order} LIMIT ?",
                 backfill_summary_parameters,
             ).fetchall()
             backfill_summaries: list[dict] = []
-            for item in reversed(backfill_summary_rows):
+            ordered_backfill_rows = (
+                backfill_summary_rows if frozen_backfill_population
+                else reversed(backfill_summary_rows))
+            for item in ordered_backfill_rows:
                 try:
                     backfill_summaries.append(json.loads(
                         item["summary_json"] or "{}"))
@@ -8126,8 +8273,35 @@ class RobinhoodLearningStore:
                 round(recovered_blocks / inferred_arrivals, 4)
                 if inferred_arrivals else (
                     None if inferred_arrivals is None else 1.0)),
+            "population": (
+                "first_n_complete_runs" if frozen_backfill_population
+                else "latest_complete_runs"),
         })
         analysis_trend = trend(analysis_values)
+        analysis_terminal_samples = (
+            len(analysis_attempt_rows) if frozen_analysis_population
+            else len(analysis_values))
+        analysis_invalid_samples = max(
+            0, analysis_terminal_samples - len(analysis_values))
+        analysis_trend.update({
+            "terminal_attempts": analysis_terminal_samples,
+            "valid_measurements": len(analysis_values),
+            "invalid_or_failed_attempts": analysis_invalid_samples,
+            "population": (
+                "first_n_terminal_attempts" if frozen_analysis_population
+                else "latest_complete_runs"),
+        })
+        analysis_convergence_pass = bool(
+            analysis_trend["decreasing"]
+            and (
+                not frozen_analysis_population
+                or (
+                    analysis_terminal_samples >= analysis_sample_target
+                    and len(analysis_values) == analysis_sample_target
+                    and analysis_invalid_samples == 0
+                )
+            )
+        )
         integrity = dict(integrity or {})
         integrity_pass = bool(integrity.get("ok"))
         criteria = {
@@ -8231,8 +8405,14 @@ class RobinhoodLearningStore:
                 "label": "Backfill convergence",
             },
             "analysis_convergence": {
-                "pass": analysis_trend["decreasing"], "value": analysis_trend,
-                "target": "decreasing", "label": "Analysis backlog",
+                "pass": analysis_convergence_pass,
+                "value": analysis_trend,
+                "samples": len(analysis_values),
+                "sample_target": analysis_sample_target,
+                "target": (
+                    "first frozen terminal attempts all measured; "
+                    "backlog net decreasing or zero"),
+                "label": "Analysis backlog",
             },
             "identity_fail_closed": {
                 "pass": identity_violations == 0, "value": identity_violations,
@@ -19018,6 +19198,16 @@ def _select_background_candidate(
         and mark_count < mark_target
     ):
         return "marks"
+    if (
+        progress.get("collecting")
+        and safe_int(progress.get("analysis_deficit"), 0) > 0
+        and "analysis" in due_by_name
+    ):
+        # This priority is bounded by the frozen first-N attempt quota. It
+        # breaks the measured starvation cycle (154 deferrals under exclusive
+        # backfill pressure) without permanently taking recovery capacity or
+        # moving Timechain work onto the live lane.
+        return "analysis"
     if (
         progress.get("collecting")
         and safe_int(progress.get("backfill_deficit"), 0) > 0

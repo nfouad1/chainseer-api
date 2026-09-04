@@ -7418,7 +7418,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v23")
+                "robinhood-operational-v24")
             self.assertEqual(
                 cohort["policy"]["decision_head_rate_limit_policy"],
                 "bounded_retry_inside_protected_downstream_tail")
@@ -7429,6 +7429,18 @@ class LaneSplitTests(unittest.TestCase):
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
                 cohort["policy"]["position_mark_minimum_samples"], 2)
+            self.assertEqual(
+                cohort["policy"]["analysis_minimum_samples"],
+                rh.ACCEPTANCE_ANALYSIS_MINIMUM_SAMPLES)
+            self.assertEqual(
+                cohort["policy"]["analysis_sample_population"],
+                "first_n_terminal_attempts")
+            self.assertEqual(
+                cohort["policy"]["analysis_missing_measurement_policy"],
+                "fail_without_replacement")
+            self.assertEqual(
+                cohort["policy"]["backfill_sample_population"],
+                "first_n_complete_runs")
             self.assertEqual(
                 cohort["policy"]["decision_multi_observation_safety_blocks"],
                 rh.DECISION_MULTI_OBSERVATION_SAFETY_BLOCKS)
@@ -8976,6 +8988,14 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
             self.assertEqual(progress["live_terminal"], 99)
             self.assertEqual(progress["mark_terminal"], 39)
             self.assertEqual(progress["mark_pace_target"], 40)
+            self.assertEqual(progress["analysis_terminal"], 0)
+            self.assertEqual(progress["analysis_measurements"], 0)
+            self.assertEqual(
+                progress["analysis_minimum"],
+                rh.ACCEPTANCE_ANALYSIS_MINIMUM_SAMPLES)
+            self.assertEqual(
+                progress["analysis_deficit"],
+                rh.ACCEPTANCE_ANALYSIS_MINIMUM_SAMPLES)
             self.assertEqual(progress["backfill_complete"], 0)
             self.assertEqual(
                 progress["backfill_deficit"],
@@ -8987,6 +9007,48 @@ class SupervisorLaunchesEveryLaneTests(unittest.TestCase):
                     cohort_progress=progress),
                 "marks",
             )
+
+    def test_analysis_deficit_preempts_backfill_pressure_only_until_quota(self):
+        due = [
+            ("analysis", {"next": 1.0}),
+            ("backfill", {"next": 2.0}),
+        ]
+        progress = {
+            "collecting": True,
+            "mark_pace_target": 40,
+            "mark_terminal": 40,
+            "analysis_deficit": 1,
+            "backfill_deficit": 10,
+        }
+        self.assertEqual(
+            rh._select_background_candidate(
+                due, {}, cohort_progress=progress,
+                backfill_pressure={"priority": True}),
+            "analysis",
+        )
+        progress["analysis_deficit"] = 0
+        self.assertEqual(
+            rh._select_background_candidate(
+                due, {}, cohort_progress=progress,
+                backfill_pressure={"priority": True}),
+            "backfill",
+        )
+
+    def test_analysis_deficit_does_not_idle_other_due_background_work(self):
+        progress = {
+            "collecting": True,
+            "mark_pace_target": 0,
+            "mark_terminal": 0,
+            "analysis_deficit": 2,
+            "backfill_deficit": 1,
+        }
+        self.assertEqual(
+            rh._select_background_candidate(
+                [("backfill", {"next": 2.0})], {},
+                cohort_progress=progress),
+            "backfill",
+            "analysis priority is bounded to times when analysis is due",
+        )
 
     def test_backfill_deficit_preempts_ordinary_background_debt(self):
         due = [("analysis", {"next": 1.0}),
@@ -12025,24 +12087,155 @@ class ProductionHardeningTests(unittest.TestCase):
                 for run_id in ("one", "two"):
                     store.begin_run(run_id, 25, lane="live")
                     store.finish_run(run_id, "complete", summary={})
-                self.assertEqual(
-                    store.acceptance_cohort()["status"], "collecting")
+                draining = store.acceptance_cohort()
+                self.assertEqual(draining["status"], "collecting")
+                self.assertTrue(draining["live_collection_complete"])
+                self.assertFalse(draining["collection_complete"])
+                self.assertEqual(draining["remaining_live_attempts"], 0)
                 for index in range(
                         rh.ACCEPTANCE_BACKFILL_MINIMUM_SAMPLES):
                     run_id = f"backfill-{index}"
                     store.begin_run(run_id, 120, lane="backfill")
-                    store.finish_run(run_id, "complete", summary={})
+                    store.finish_run(run_id, "complete", summary={
+                        "backlog": {"pending_blocks": 100 - index},
+                    })
+                self.assertEqual(
+                    store.acceptance_cohort()["status"], "collecting")
+                for index in range(
+                        rh.ACCEPTANCE_ANALYSIS_MINIMUM_SAMPLES):
+                    run_id = f"analysis-{index}"
+                    store.begin_run(run_id, 120, lane="analysis")
+                    store.finish_run(run_id, "complete", summary={
+                        "backlog": {"pending_analysis": 3 - index},
+                    })
                 store.begin_run("three", 25, lane="live")
                 store.finish_run("three", "complete", summary={})
             cohort = store.acceptance_cohort()
             self.assertEqual(cohort["status"], "complete")
+            self.assertTrue(cohort["live_collection_complete"])
+            self.assertTrue(cohort["collection_complete"])
             self.assertEqual(cohort["terminal_attempts"], 2)
             self.assertEqual(cohort["close_reason"], "sample_target_reached")
+            analysis = store.stabilization_summary(
+                integrity={"ok": True})["criteria"]["analysis_convergence"]
+            self.assertTrue(analysis["pass"])
+            self.assertEqual(analysis["samples"], 3)
+            self.assertEqual(
+                analysis["value"]["population"],
+                "first_n_terminal_attempts")
             with store.connection() as connection:
                 third = connection.execute(
                     "SELECT acceptance_cohort_id FROM runs WHERE run_id='three'"
                 ).fetchone()[0]
             self.assertIsNone(third)
+
+    def test_analysis_attempt_quota_closes_red_without_optional_resampling(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="fixed", checkout_revision="fixed",
+                sample_target=1, cohort_id="analysis-first-three")
+            with patch.object(rh, "CODE_REVISION", "fixed"):
+                store.begin_run("mark", 25, lane="marks")
+                store.finish_run("mark", "complete", summary={})
+                for index in range(
+                        rh.ACCEPTANCE_BACKFILL_MINIMUM_SAMPLES):
+                    run_id = f"backfill-{index}"
+                    store.begin_run(run_id, 120, lane="backfill")
+                    store.finish_run(run_id, "complete", summary={
+                        "backlog": {"pending_blocks": 100 - index},
+                    })
+                store.begin_run("live", 25, lane="live")
+                store.finish_run("live", "complete", summary={})
+
+                store.begin_run("analysis-failed", 120, lane="analysis")
+                store.finish_run("analysis-failed", "failed", summary={})
+                store.begin_run("analysis-measured", 120, lane="analysis")
+                store.finish_run("analysis-measured", "complete", summary={
+                    "backlog": {"pending_analysis": 4},
+                })
+                progress = store.acceptance_scheduler_progress()
+                self.assertEqual(progress["analysis_terminal"], 2)
+                self.assertEqual(progress["analysis_complete"], 1)
+                self.assertEqual(progress["analysis_measurements"], 1)
+                self.assertEqual(progress["analysis_deficit"], 1)
+
+                store.begin_run("analysis-missing", 120, lane="analysis")
+                store.finish_run("analysis-missing", "complete", summary={})
+
+            self.assertEqual(store.acceptance_cohort()["status"], "complete")
+            criterion = store.stabilization_summary(
+                integrity={"ok": True})["criteria"]["analysis_convergence"]
+            self.assertFalse(criterion["pass"])
+            self.assertEqual(criterion["sample_target"], 3)
+            self.assertEqual(criterion["value"]["terminal_attempts"], 3)
+            self.assertEqual(criterion["value"]["valid_measurements"], 1)
+            self.assertEqual(
+                criterion["value"]["invalid_or_failed_attempts"], 2)
+            self.assertEqual(
+                criterion["value"]["population"],
+                "first_n_terminal_attempts")
+
+            # A later healthy run is outside the closed population and cannot
+            # wash either failed attempt out of the acceptance result.
+            with patch.object(rh, "CODE_REVISION", "fixed"):
+                store.begin_run("analysis-later", 120, lane="analysis")
+                store.finish_run("analysis-later", "complete", summary={
+                    "backlog": {"pending_analysis": 0},
+                })
+            later = store.stabilization_summary(
+                integrity={"ok": True})["criteria"]["analysis_convergence"]
+            self.assertFalse(later["pass"])
+            self.assertEqual(later["value"]["terminal_attempts"], 3)
+
+    def test_v24_backfill_convergence_uses_frozen_first_ten(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.start_acceptance_cohort(
+                revision="fixed", checkout_revision="fixed",
+                sample_target=100, cohort_id="backfill-first-ten")
+            with patch.object(rh, "CODE_REVISION", "fixed"):
+                for index, pending in enumerate(
+                        [100, 110, 120, 130, 140, 150,
+                         160, 170, 180, 190, 0]):
+                    run_id = f"backfill-{index}"
+                    store.begin_run(run_id, 120, lane="backfill")
+                    store.finish_run(run_id, "complete", summary={
+                        "backlog": {"pending_blocks": pending},
+                    })
+            criterion = store.stabilization_summary(
+                integrity={"ok": True})["criteria"]["backfill_convergence"]
+            self.assertFalse(criterion["pass"])
+            self.assertEqual(criterion["samples"], 10)
+            self.assertEqual(criterion["value"]["oldest"], 100)
+            self.assertEqual(criterion["value"]["current"], 190)
+            self.assertEqual(
+                criterion["value"]["population"],
+                "first_n_complete_runs")
+
+    def test_acceptance_backlog_measurement_rejects_synthetic_zeroes(self):
+        self.assertEqual(rh._summary_backlog_measurement(
+            {"backlog": {"pending_analysis": 0}},
+            "pending_analysis"), 0)
+        self.assertEqual(rh._summary_backlog_measurement(
+            {"backlog": {"pending_analysis": 4.0}},
+            "pending_analysis"), 4)
+        for summary in (
+            None,
+            [],
+            {"backlog": []},
+            {"backlog": {"pending_analysis": True}},
+            {"backlog": {"pending_analysis": "0"}},
+            {"backlog": {"pending_analysis": -1}},
+            {"backlog": {"pending_analysis": 1.5}},
+            {"backlog": {"pending_analysis": float("nan")}},
+            "not-json",
+        ):
+            self.assertIsNone(
+                rh._summary_backlog_measurement(
+                    summary, "pending_analysis"),
+                summary,
+            )
 
     def test_legacy_cohort_is_not_retroactively_given_backfill_obligation(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -12056,6 +12249,7 @@ class ProductionHardeningTests(unittest.TestCase):
                     "WHERE cohort_id='legacy-no-backfill'").fetchone()
                 policy = json.loads(row["policy_json"])
                 policy.pop("backfill_minimum_samples")
+                policy.pop("analysis_minimum_samples")
                 connection.execute(
                     "UPDATE acceptance_cohorts SET policy_json=? "
                     "WHERE cohort_id='legacy-no-backfill'",
