@@ -20541,11 +20541,43 @@ def main() -> None:
         print(json.dumps(result, indent=2)); return
     if args.command == "recursive-once":
         from chainseer_recursive_learning import run_shadow_learning
+        recursive_root = Path(args.root)
+        recursive_store = RobinhoodLearningStore(
+            recursive_root / "learning.sqlite3")
+        recursive_integrity = _dashboard_integrity(
+            recursive_root, chain_root=args.chain_root,
+            skill_root=args.skill_root,
+        )
+        recursive_stabilization = recursive_store.stabilization_summary(
+            integrity=recursive_integrity)
+        recursive_cohort = (
+            recursive_stabilization.get("acceptance_cohort") or {})
+        recursive_source_permissions = {
+            source: not recursive_store.source_entry_risk(source)["quarantined"]
+            for source in (SOURCE_V2, SOURCE_V3, SOURCE_V4)
+        }
+        recursive_source_permissions[SOURCE_V4] = bool(
+            recursive_source_permissions[SOURCE_V4]
+            and V4_PAPER_ADMISSION_ENABLED)
         result = run_shadow_learning(
             args.root,
             source_policy_version=ACCEPTANCE_COHORT_POLICY_VERSION,
             source_revision=_workspace_revision(),
             source_digest=_worktree_source_digest(),
+            source_permissions=recursive_source_permissions,
+            operational_evidence={
+                "stabilized": (
+                    str(recursive_stabilization.get("status") or "").upper()
+                    == "STABILIZED"
+                ),
+                "cohort_id": recursive_cohort.get("cohort_id"),
+                "revision": recursive_cohort.get("revision"),
+                "policy_hash": recursive_cohort.get("policy_hash"),
+                "criteria_passed": recursive_stabilization.get(
+                    "criteria_passed", 0),
+                "criteria_total": recursive_stabilization.get(
+                    "criteria_total", 0),
+            },
         )
         print(json.dumps(result, indent=2)); return
     if args.command=="lanes":
