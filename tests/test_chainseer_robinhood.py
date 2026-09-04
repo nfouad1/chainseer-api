@@ -7389,7 +7389,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v21")
+                "robinhood-operational-v22")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -7402,6 +7402,13 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(
                 cohort["policy"][
                     "backfill_rpc_minimum_safe_window_seconds"], 15.0)
+            self.assertTrue(
+                cohort["policy"]["backfill_cooperative_preemption"])
+            self.assertEqual(
+                cohort["policy"][
+                    "backfill_cooperative_minimum_window_seconds"], 5.0)
+            self.assertEqual(
+                cohort["policy"]["backfill_ingest_event_chunk_size"], 100)
             self.assertEqual(
                 cohort["policy"]["background_rpc_priority_gate_version"], 2)
             self.assertTrue(
@@ -8135,6 +8142,151 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(result["stopped_reason"], "no_pending_ranges")
             self.assertGreater(
                 result["maximum_chunks_per_cycle"], 8)
+
+    def test_isolated_backfill_still_obeys_the_live_host_window(self):
+        """A second endpoint isolates RPC quota, not CPU or SQLite."""
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            now = time.monotonic()
+            state_path = (
+                Path(directory) / rh.BACKGROUND_RPC_PRIORITY_STATE_FILE)
+            rh.atomic_json_write(state_path, {
+                "published_monotonic": now,
+                "next_live_monotonic": (
+                    now + rh.BACKGROUND_RPC_LIVE_GUARD_SECONDS + 7.0),
+                "live_active": False,
+            })
+            with patch.dict(os.environ, {
+                rh.BACKFILL_COOPERATIVE_PREEMPTION_ENV: "1",
+            }):
+                admitted = engine.backfill_live_priority_window()
+                self.assertTrue(admitted["required"])
+                self.assertTrue(admitted["admitted"])
+                rh.atomic_json_write(state_path, {
+                    "published_monotonic": time.monotonic(),
+                    "next_live_monotonic": (
+                        time.monotonic()
+                        + rh.BACKGROUND_RPC_LIVE_GUARD_SECONDS + 7.0),
+                    "live_active": True,
+                })
+                blocked = engine.backfill_live_priority_window()
+            self.assertFalse(blocked["admitted"])
+            self.assertEqual(blocked["reason"], "live_lane_active")
+
+    def test_short_live_window_uses_a_smaller_durable_backfill_quantum(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            calls = []
+
+            def priority_window():
+                return {
+                    "required": True, "admitted": True,
+                    "reason": "safe_background_window",
+                    "available_seconds": 6.0,
+                }
+
+            def drain(deadline, *, block_limit):
+                calls.append((block_limit, deadline.remaining()))
+                if len(calls) == 1:
+                    return {
+                        "ranges_selected": 1,
+                        "blocks_scanned": block_limit,
+                        "candidates_added": 0,
+                        "completed": False,
+                        "from_block": 1,
+                        "to_block": block_limit,
+                    }
+                return {
+                    "ranges_selected": 0, "blocks_scanned": 0,
+                    "candidates_added": 0,
+                }
+
+            engine.backfill_live_priority_window = priority_window
+            engine.drain_flow_backfill = drain
+            result = engine.drain_flow_backfill_until_reserve(
+                rh.CycleDeadline(20.0), block_limit=5_000,
+                reserve_seconds=0.1,
+            )
+            self.assertEqual(
+                [row[0] for row in calls],
+                [rh.BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS] * 2,
+            )
+            self.assertTrue(all(0.0 < row[1] <= 6.0 for row in calls))
+            self.assertEqual(result["chunks_processed"], 1)
+            self.assertEqual(
+                result["cooperative_preemption"]["event_chunk_size"],
+                rh.BACKFILL_INGEST_EVENT_CHUNK_SIZE,
+            )
+
+    def test_live_preemption_does_not_poison_the_provider_chunk_model(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = rh.RobinhoodLearningEngine(
+                directory, rpc=FakeRPC([], latest=100),
+                analyzer=FakeAnalyzer(), market=FakeMarket())
+            windows = iter([
+                {"required": True, "admitted": True,
+                 "reason": "safe_background_window",
+                 "available_seconds": 20.0},
+                {"required": True, "admitted": False,
+                 "reason": "live_lane_imminent", "available_seconds": 0.0},
+                {"required": True, "admitted": True,
+                 "reason": "safe_background_window",
+                 "available_seconds": 20.0},
+            ])
+            engine.backfill_live_priority_window = lambda: next(windows)
+            attempts = 0
+
+            def drain(_deadline, *, block_limit):
+                nonlocal attempts
+                attempts += 1
+                if attempts == 1:
+                    raise rh.CycleDeadlineExceeded(
+                        "near_head_ingest_commit")
+                return {
+                    "ranges_selected": 0, "blocks_scanned": 0,
+                    "candidates_added": 0,
+                }
+
+            engine.drain_flow_backfill = drain
+            engine.record_backfill_rpc_chunk_result = (
+                lambda *_args, **_kwargs: self.fail(
+                    "a live scheduler preemption is not provider evidence"))
+            result = engine.drain_flow_backfill_until_reserve(
+                rh.CycleDeadline(20.0), block_limit=5_000,
+                reserve_seconds=0.1,
+            )
+            self.assertEqual(result["chunks_processed"], 0)
+            self.assertEqual(
+                result["cooperative_preemption"]["preemptions"], 1)
+            self.assertEqual(result["stopped_reason"], "no_pending_ranges")
+
+    def test_historical_ingest_exposes_deadline_checks_between_small_commits(self):
+        source = inspect.getsource(rh.RobinhoodV4Observer.sync)
+        self.assertIn("BACKFILL_INGEST_EVENT_CHUNK_SIZE", source)
+        for stage in (
+            "v4_observer_head", "v4_observer_logs", "v4_observer_apply",
+            "v4_observer_activations", "v4_observer_cursor",
+        ):
+            self.assertIn(stage, source)
+        apply_source = inspect.getsource(
+            rh.RobinhoodLearningStore._apply_v4_events)
+        self.assertIn("set_progress_handler", apply_source)
+        self.assertIn("deadline.expired()", apply_source)
+
+    def test_expired_backfill_cursor_commit_leaves_the_range_unchanged(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            store.enqueue_backfill(10, 19, "live_lane_reanchor")
+            with self.assertRaises(rh.CycleDeadlineExceeded):
+                store.commit_backfill_scan_span(
+                    10, 14, deadline=rh.CycleDeadline(0.0))
+            pending = store.pending_backfill()[0]
+            self.assertIsNone(pending.get("next_block"))
+            self.assertEqual(pending["attempts"], 0)
 
     def test_second_backfill_throttle_preserves_first_committed_chunk(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -10132,6 +10284,32 @@ class StageIsFullyAttributedTests(SealStageBudgetTests):
         body = source.split("def seal_near_head_observations", 1)[1].split(
             "def classify_sealed_observations", 1)[0]
         self.assertEqual(body.count("self.store.seal_queue_backlog()"), 1)
+        self.assertIn("if include_aggregate_telemetry:", body)
+
+    def test_live_sealing_defers_global_censuses_until_after_the_decision(self):
+        """A committed observation must not wait on dashboard telemetry."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._windows(store, 1)
+            engine = self._engine(directory, store)
+
+            def forbidden_backlog():
+                self.fail("the global queue census ran in the live interval")
+
+            store.seal_queue_backlog = forbidden_backlog
+            result = engine.seal_near_head_observations(
+                self.HEAD, self.NOW,
+                include_aggregate_telemetry=False,
+            )
+            self.assertEqual(result["sealed_this_cycle"], 1)
+            self.assertIsNone(result["cumulative_observations"])
+            self.assertTrue(result["aggregate_telemetry"]["deferred"])
+            self.assertTrue(result["seal_queue_backlog"]["deferred"])
+            self.assertIn("aggregate_telemetry", result["phase_seconds"])
+
+    def test_live_lane_explicitly_selects_the_nonblocking_telemetry_path(self):
+        source = inspect.getsource(rh.RobinhoodLearningEngine.run_live_lane)
+        self.assertIn("include_aggregate_telemetry=False", source)
 
     def test_decision_head_and_classification_are_timed_separately(self):
         source = Path("chainseer_robinhood.py").read_text(

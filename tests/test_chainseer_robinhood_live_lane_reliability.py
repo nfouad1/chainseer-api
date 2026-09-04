@@ -11,6 +11,7 @@ no Timechain operation on the decision-critical path.
 from __future__ import annotations
 
 import json
+import inspect
 import math
 import multiprocessing
 import sqlite3
@@ -264,6 +265,11 @@ class IngestionAdmissionTests(unittest.TestCase):
         self.assertEqual(policy["backfill_maximum_chunks_per_cycle"], 24)
         self.assertEqual(
             policy["backfill_rpc_minimum_safe_window_seconds"], 15.0)
+        self.assertTrue(policy["backfill_cooperative_preemption"])
+        self.assertEqual(
+            policy["backfill_cooperative_minimum_window_seconds"], 5.0)
+        self.assertEqual(
+            policy["backfill_ingest_event_chunk_size"], 100)
         self.assertEqual(policy["backfill_remote_attempts_per_chunk"], 1)
 
     def test_insufficient_ingestion_headroom_is_a_non_success_deferral(self):
@@ -464,6 +470,11 @@ class SupervisorPriorityTests(unittest.TestCase):
             next_live=101.0 + rh.LIVE_LANE_LAUNCH_GUARD_SECONDS))
         self.assertFalse(rh._low_priority_launch_blocked(
             "live", {"live": object()}, now=100.0, next_live=100.0))
+
+    def test_supervisor_enables_host_preemption_even_for_isolated_backfill_rpc(self):
+        source = inspect.getsource(rh.supervise_lanes)
+        self.assertIn("BACKFILL_COOPERATIVE_PREEMPTION_ENV", source)
+        self.assertIn('"1" if lane == "backfill" else "0"', source)
 
     @unittest.skipUnless(rh.os.name == "nt", "Windows priority classes")
     def test_live_process_priority_exceeds_background_priority(self):

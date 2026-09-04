@@ -249,6 +249,17 @@ BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS = 55.0
 # supervisor's five-second live guard prevents an in-flight historical request
 # from occupying the provider mutex when the next live scan becomes due.
 BACKFILL_RPC_MINIMUM_SAFE_WINDOW_SECONDS = 15.0
+# The isolated PAYG endpoint deliberately bypasses the shared provider mutex,
+# but it still shares this process host and SQLite corpus with the live lane.
+# Cooperatively pause it at durable chunk boundaries whenever the supervisor's
+# next-live reservation closes.  Five seconds is the minimum useful window for
+# a reduced 125-block chunk; the child deadline is tightened to the actual
+# published window, so an RPC or apply pass cannot silently run through it.
+BACKFILL_COOPERATIVE_PREEMPTION_ENV = (
+    "CHAINSEER_BACKFILL_COOPERATIVE_PREEMPTION")
+BACKFILL_COOPERATIVE_MINIMUM_WINDOW_SECONDS = 5.0
+BACKFILL_COOPERATIVE_POLL_SECONDS = 0.1
+BACKFILL_INGEST_EVENT_CHUNK_SIZE = 100
 BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS = 12.0
 BACKFILL_RPC_URL_ENV = "CHAINSEER_ROBINHOOD_BACKFILL_RPC_URL"
 BACKFILL_RPC_LOG_RANGE_LIMIT_ENV = (
@@ -454,7 +465,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v21"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v22"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 #: A convergence claim needs a fixed, attributed time series. Ten completed
@@ -1638,6 +1649,11 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
         "backfill_rpc_minimum_safe_window_seconds":
             BACKFILL_RPC_MINIMUM_SAFE_WINDOW_SECONDS,
+        "backfill_cooperative_preemption": True,
+        "backfill_cooperative_minimum_window_seconds":
+            BACKFILL_COOPERATIVE_MINIMUM_WINDOW_SECONDS,
+        "backfill_ingest_event_chunk_size":
+            BACKFILL_INGEST_EVENT_CHUNK_SIZE,
         "backfill_launch_minimum_live_window_seconds":
             BACKFILL_LAUNCH_MINIMUM_LIVE_WINDOW_SECONDS,
         "backfill_rpc_isolation_supported": True,
@@ -3944,9 +3960,17 @@ class RobinhoodLearningStore:
                 try:
                     self._apply_v4_events(
                         chunk, busy_timeout_ms=busy_ms,
-                        historical_only=historical_only)
+                        historical_only=historical_only,
+                        deadline=deadline)
                     break
                 except sqlite3.OperationalError as error:
+                    if (
+                        deadline is not None
+                        and deadline.expired()
+                        and "interrupted" in str(error).lower()
+                    ):
+                        raise CycleDeadlineExceeded(
+                            "near_head_ingest_commit") from error
                     locked = "database is locked" in str(error).lower()
                     if not locked or attempt >= INGEST_LOCK_RETRY_ATTEMPTS:
                         raise
@@ -3961,9 +3985,17 @@ class RobinhoodLearningStore:
     def _apply_v4_events(
         self, events: list[dict], *, busy_timeout_ms: int | None = None,
         historical_only: bool = False,
+        deadline: CycleDeadline | None = None,
     ) -> None:
         """The write itself. Wrapped by apply_v4_events for lock retry."""
         with self.connection(busy_timeout_ms=busy_timeout_ms) as connection:
+            if deadline is not None:
+                # A small historical chunk is only a useful preemption point
+                # if SQLite can also interrupt a dense statement inside that
+                # chunk.  Closing this connection rolls the transaction back;
+                # the durable range cursor therefore remains replay-safe.
+                connection.set_progress_handler(
+                    lambda: 1 if deadline.expired() else 0, 10_000)
             affected_flow_pools = set()
             event_pool_ids = sorted({
                 str(event.get("pool_id") or "") for event in events
@@ -6957,12 +6989,21 @@ class RobinhoodLearningStore:
         }
 
     def commit_backfill_scan_span(
-        self, from_block: int, to_block: int,
+        self, from_block: int, to_block: int, *,
+        deadline: CycleDeadline | None = None,
     ) -> dict:
         """Advance every debt row fully observed by a continuous scan."""
         start, end = int(from_block), int(to_block)
         completed = advanced = 0
-        with self.connection() as connection:
+        busy_ms = None
+        if deadline is not None:
+            deadline.raise_if_expired("flow_backfill_cursor_commit")
+            busy_ms = max(1, min(
+                1000, int(max(0.0, deadline.remaining() - 0.05) * 1000)))
+        with self.connection(busy_timeout_ms=busy_ms) as connection:
+            if deadline is not None:
+                connection.set_progress_handler(
+                    lambda: 1 if deadline.expired() else 0, 10_000)
             rows = connection.execute(
                 """SELECT from_block,to_block,
                           COALESCE(next_block,from_block) cursor
@@ -6972,6 +7013,8 @@ class RobinhoodLearningStore:
                    ORDER BY enqueued_at""", (start, end)
             ).fetchall()
             for row in rows:
+                if deadline is not None:
+                    deadline.raise_if_expired("flow_backfill_cursor_commit")
                 if int(row["to_block"]) <= end:
                     connection.execute(
                         """UPDATE flow_backfill_queue SET completed_at=?,
@@ -7008,8 +7051,17 @@ class RobinhoodLearningStore:
     def advance_backfill(
         self, from_block: int, to_block: int, next_block: int,
         *, error: str | None = None,
+        deadline: CycleDeadline | None = None,
     ) -> None:
-        with self.connection() as connection:
+        busy_ms = None
+        if deadline is not None:
+            deadline.raise_if_expired("flow_backfill_error_telemetry")
+            busy_ms = max(1, min(
+                1000, int(max(0.0, deadline.remaining() - 0.05) * 1000)))
+        with self.connection(busy_timeout_ms=busy_ms) as connection:
+            if deadline is not None:
+                connection.set_progress_handler(
+                    lambda: 1 if deadline.expired() else 0, 10_000)
             connection.execute(
                 """UPDATE flow_backfill_queue
                    SET next_block=?,attempts=attempts+1,last_attempt_at=?,last_error=?
@@ -10617,11 +10669,15 @@ class RobinhoodV4Observer:
         deadline: CycleDeadline | None = None,
     ) -> tuple[list[dict], dict]:
         latest = _remote_call("Robinhood latest block", self.rpc.get_block_number)
+        if deadline is not None:
+            deadline.raise_if_expired("v4_observer_head")
         state = self._state()
         start = safe_int(state.get("next_block"), max(0, latest - lookback))
         start = min(start, latest)
         end = min(latest, start + max(1, block_limit) - 1)
         logs, rpc_windows = self._adaptive_logs(start, end)
+        if deadline is not None:
+            deadline.raise_if_expired("v4_observer_logs")
         anchors = {WETH_ADDRESS.lower(), USDG_ADDRESS.lower()}
         known_pool_ids = self.store.known_v4_pool_ids()
         events = []
@@ -10685,9 +10741,12 @@ class RobinhoodV4Observer:
                 counts["swap"] += 1
         self.store.apply_v4_events(
             events, deadline=deadline,
-            chunk_size=(500 if self.historical_only
+            chunk_size=(BACKFILL_INGEST_EVENT_CHUNK_SIZE
+                        if self.historical_only
                         else INGEST_EVENT_CHUNK_SIZE),
             historical_only=self.historical_only)
+        if deadline is not None:
+            deadline.raise_if_expired("v4_observer_apply")
         activations = self.store.pending_v4_activations()
         activations_available = len(activations)
         if activation_limit is not None:
@@ -10695,6 +10754,8 @@ class RobinhoodV4Observer:
         candidates = []
         activation_block_times: dict[int, int] = {}
         for pool in activations:
+            if deadline is not None:
+                deadline.raise_if_expired("v4_observer_activations")
             token = pool["token_address"]
             activation_block = pool["swapped_block"]
             if activation_block not in activation_block_times:
@@ -10719,6 +10780,8 @@ class RobinhoodV4Observer:
                 "pool_id": pool["pool_id"], "hooks_address": pool["hooks_address"],
                 "fee_tier": pool["fee_tier"], "tick_spacing": pool["tick_spacing"],
             })
+        if deadline is not None:
+            deadline.raise_if_expired("v4_observer_cursor")
         coverage = {
             "from_block": start, "to_block": end, "latest_block": latest,
             "blocks_scanned": end-start+1, "logs_seen": len(logs or []),
@@ -14556,6 +14619,7 @@ class RobinhoodLearningEngine:
         include_fresh: bool = True,
         stage_lane: str = "live",
         defer_quotes: bool = False,
+        include_aggregate_telemetry: bool = True,
     ) -> dict:
         """Seal every near-head window, pinned to the OBSERVATION head.
 
@@ -15029,12 +15093,41 @@ class RobinhoodLearningEngine:
             # and a hard termination must leave every unprocessed window in
             # the durable queue rather than silently dropped.
             queued_now = settle_queue()
-        backlog = self.store.seal_queue_backlog()
-        with self.store.connection() as connection:
-            cumulative = connection.execute(
-                "SELECT COUNT(*) FROM flow_observations WHERE policy_version=?",
-                (FLOW_EVIDENCE_POLICY_VERSION,),
-            ).fetchone()[0]
+        # These are global, derived censuses -- neither one binds the
+        # observation nor participates in its decision.  Production v21
+        # measured their previously unattributed position here at 3.001s
+        # median, 5.141s p95 and 6.720s max.  They ran after the immutable row
+        # was committed but before decision-head, causing all three
+        # decision-usefulness misses.  The live caller now defers them to the
+        # read-only dashboard/background path; non-critical callers retain
+        # the full snapshot for compatibility and diagnostics.
+        aggregate_started = time.monotonic()
+        if include_aggregate_telemetry:
+            backlog = self.store.seal_queue_backlog()
+            with self.store.connection() as connection:
+                cumulative = connection.execute(
+                    "SELECT COUNT(*) FROM flow_observations"
+                    " WHERE policy_version=?",
+                    (FLOW_EVIDENCE_POLICY_VERSION,),
+                ).fetchone()[0]
+            aggregate_telemetry = {
+                "deferred": False,
+                "source": "synchronous_noncritical_caller",
+            }
+        else:
+            backlog = {
+                "deferred": True,
+                "reason": "outside_live_observation_to_decision_path",
+                "source": "dashboard_or_background_lane",
+            }
+            cumulative = None
+            aggregate_telemetry = {
+                "deferred": True,
+                "reason": "protect_authoritative_decision_headroom",
+                "source": "dashboard_or_background_lane",
+            }
+        phase.setdefault("aggregate_telemetry", []).append(
+            time.monotonic() - aggregate_started)
         return {
             "windows_considered": len(windows),
             "windows_available": windows_available,
@@ -15099,6 +15192,7 @@ class RobinhoodLearningEngine:
             "sealed_this_cycle": len(sealed),
             "observation_ids": sealed,
             "cumulative_observations": cumulative,
+            "aggregate_telemetry": aggregate_telemetry,
             "quote_failures": failures, "observation_head": int(head_block),
         }
 
@@ -16827,6 +16921,7 @@ class RobinhoodLearningEngine:
                             include_fresh=True,
                             stage_lane="live",
                             defer_quotes=True,
+                            include_aggregate_telemetry=False,
                         )
                 except CycleDeadlineExceeded:
                     # CENSORED sample: this attempt was killed inside sealing.
@@ -17383,6 +17478,35 @@ class RobinhoodLearningEngine:
             BACKFILL_RPC_CHUNK_STATE_KEY, payload)
         return payload
 
+    def backfill_live_priority_window(self) -> dict:
+        """Return the supervisor's current cooperative backfill window.
+
+        A configured secondary RPC isolates provider capacity, not CPU or the
+        shared SQLite writer.  This second boundary therefore remains active
+        even when the raw-RPC mutex is intentionally bypassed.  Standalone
+        maintenance commands opt out unless the supervisor explicitly sets
+        the environment contract.
+        """
+        required = os.environ.get(
+            BACKFILL_COOPERATIVE_PREEMPTION_ENV, "") == "1"
+        if not required:
+            return {
+                "required": False,
+                "admitted": True,
+                "reason": "standalone_or_unsupervised",
+                "available_seconds": None,
+                "minimum_window_seconds":
+                    BACKFILL_COOPERATIVE_MINIMUM_WINDOW_SECONDS,
+            }
+        state = read_json(
+            self.root / BACKGROUND_RPC_PRIORITY_STATE_FILE, {}) or {}
+        window = _background_rpc_priority_window(
+            state,
+            minimum_window_seconds=(
+                BACKFILL_COOPERATIVE_MINIMUM_WINDOW_SECONDS),
+        )
+        return {"required": True, **window}
+
     def drain_flow_backfill(
         self, deadline: CycleDeadline, *, block_limit: int,
     ) -> dict:
@@ -17419,7 +17543,7 @@ class RobinhoodLearningEngine:
             ])
             next_block = int(coverage.get("to_block") or end) + 1
             committed = self.store.commit_backfill_scan_span(
-                start, next_block - 1)
+                start, next_block - 1, deadline=deadline)
             return {
                 "ranges_selected": int(committed["rows_touched"]),
                 "range": [start, end],
@@ -17432,9 +17556,22 @@ class RobinhoodLearningEngine:
                 "backlog": self.store.backfill_backlog(),
             }
         except Exception as exc:
-            self.store.advance_backfill(
-                first_row["from_block"], first_row["to_block"], start,
-                error=str(exc)[:500])
+            # A scheduler/deadline preemption is not a failed range attempt.
+            # Its transaction was rolled back and the cursor already points
+            # at ``start``; an error write here can itself wait on SQLite and
+            # run into the live reservation we are trying to protect.
+            if not (
+                isinstance(exc, CycleDeadlineExceeded)
+                or deadline.expired()
+            ):
+                try:
+                    self.store.advance_backfill(
+                        first_row["from_block"], first_row["to_block"], start,
+                        error=str(exc)[:500], deadline=deadline)
+                except (CycleDeadlineExceeded, sqlite3.Error):
+                    # Error telemetry is subordinate to the original error
+                    # and may never extend the historical worker into live.
+                    pass
             raise
 
     def drain_flow_backfill_until_reserve(
@@ -17482,8 +17619,39 @@ class RobinhoodLearningEngine:
         stopped_reason = "no_pending_ranges"
         provider_deferral: dict | None = None
         next_chunk_state: dict | None = None
+        live_priority_wait_seconds = 0.0
+        live_priority_waits = 0
+        live_priority_preemptions = 0
+        attempted_chunk_limits: list[int] = []
+        last_priority_window: dict | None = None
         for _ in range(BACKFILL_MAXIMUM_CHUNKS_PER_CYCLE):
             if recovery_deadline.expired():
+                stopped_reason = "completion_reserve_reached"
+                break
+            # A separate endpoint removes provider contention but not host
+            # CPU, filesystem cache or SQLite-writer contention.  Sleep while
+            # live is active/imminent, then bind this chunk's own deadline to
+            # the remaining supervisor-published safe window.  The process
+            # stays alive and resumes in the next gap, avoiding repeated
+            # interpreter/database startup without doing background work in
+            # the decision interval.
+            priority_window = self.backfill_live_priority_window()
+            if not priority_window["admitted"]:
+                live_priority_waits += 1
+                wait_started = time.monotonic()
+                while (
+                    not priority_window["admitted"]
+                    and recovery_deadline.remaining() > 0.1
+                ):
+                    time.sleep(min(
+                        BACKFILL_COOPERATIVE_POLL_SECONDS,
+                        recovery_deadline.remaining(),
+                    ))
+                    priority_window = self.backfill_live_priority_window()
+                live_priority_wait_seconds += max(
+                    0.0, time.monotonic() - wait_started)
+            last_priority_window = dict(priority_window)
+            if not priority_window["admitted"]:
                 stopped_reason = "completion_reserve_reached"
                 break
             if chunk_seconds:
@@ -17500,16 +17668,55 @@ class RobinhoodLearningEngine:
                 ):
                     stopped_reason = "projected_chunk_cost_exceeds_headroom"
                     break
-            chunk_deadline = CycleDeadline(min(
+            attempt_chunk_limit = chunk_limit
+            cooperative_window = None
+            if priority_window.get("required"):
+                cooperative_window = max(
+                    0.1,
+                    safe_float(priority_window.get("available_seconds"), 0.0),
+                )
+                # Dense ranges that cannot safely fit the full 250-block
+                # quantum still get a bounded 125-block attempt.  The normal
+                # chunk hysteresis sees the real result and may grow again;
+                # this is scheduling, not a hidden provider-size override.
+                if cooperative_window < (
+                    BACKFILL_RPC_MINIMUM_SAFE_WINDOW_SECONDS
+                ):
+                    attempt_chunk_limit = min(
+                        chunk_limit,
+                        BACKFILL_GAP_MINIMUM_CHUNK_BLOCKS,
+                    )
+            chunk_budget = min(
                 recovery_deadline.remaining(),
                 BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
-            ))
+            )
+            if cooperative_window is not None:
+                chunk_budget = min(chunk_budget, cooperative_window)
+            chunk_deadline = CycleDeadline(max(0.1, chunk_budget))
+            attempted_chunk_limits.append(attempt_chunk_limit)
             chunk_started = time.monotonic()
             try:
                 with self._rpc_deadline(chunk_deadline):
                     chunk = self.drain_flow_backfill(
-                        chunk_deadline, block_limit=chunk_limit)
+                        chunk_deadline, block_limit=attempt_chunk_limit)
             except RuntimeError as exc:
+                priority_after = self.backfill_live_priority_window()
+                cooperatively_preempted = bool(
+                    priority_window.get("required")
+                    and (
+                        chunk_deadline.expired()
+                        or not priority_after.get("admitted")
+                    )
+                )
+                if cooperatively_preempted:
+                    # The durable range cursor did not advance; any event
+                    # chunks committed before the boundary are INSERT OR
+                    # IGNORE and therefore safe to replay.  Do not teach the
+                    # provider-size model that a scheduler preemption was a
+                    # transport failure.
+                    live_priority_preemptions += 1
+                    stopped_reason = "live_priority_preempted"
+                    continue
                 if not _transient_rpc_failure(exc):
                     raise
                 scheduler_deferred = isinstance(
@@ -17523,7 +17730,7 @@ class RobinhoodLearningEngine:
                     self.backfill_rpc_chunk_plan(block_limit)
                     if scheduler_deferred
                     else self.record_backfill_rpc_chunk_result(
-                        chunk_limit, error=exc)
+                        attempt_chunk_limit, error=exc)
                 )
                 next_chunk_blocks = safe_int(
                     next_chunk_state.get("next_chunk_blocks"),
@@ -17544,7 +17751,7 @@ class RobinhoodLearningEngine:
                     "error": str(exc)[:500],
                     "attempts_per_chunk":
                         BACKFILL_REMOTE_ATTEMPTS_PER_CHUNK,
-                    "attempted_chunk_blocks": chunk_limit,
+                    "attempted_chunk_blocks": attempt_chunk_limit,
                     "next_chunk_blocks": next_chunk_blocks,
                     "attempt_budget_seconds":
                         BACKFILL_RPC_ATTEMPT_BUDGET_SECONDS,
@@ -17562,7 +17769,7 @@ class RobinhoodLearningEngine:
             chunk_seconds.append(max(
                 0.0, time.monotonic() - chunk_started))
             next_chunk_state = self.record_backfill_rpc_chunk_result(
-                chunk_limit, error=None)
+                attempt_chunk_limit, error=None)
             progressed = (
                 safe_int(chunk.get("blocks_scanned"), 0) > 0
                 or bool(chunk.get("completed"))
@@ -17605,6 +17812,7 @@ class RobinhoodLearningEngine:
             "first_from_block": first.get("from_block"),
             "last_to_block": last.get("to_block"),
             "chunk_limit_blocks": chunk_limit,
+            "attempted_chunk_limits": attempted_chunk_limits,
             "provider_chunk_limit_blocks": provider_chunk_limit,
             "log_batch_size": log_batch_size,
             "chunk_plan": chunk_plan,
@@ -17616,6 +17824,15 @@ class RobinhoodLearningEngine:
             "stopped_reason": stopped_reason,
             "provider_deferred": bool(provider_deferral),
             "provider_deferral": provider_deferral,
+            "cooperative_preemption": {
+                "required": bool(
+                    (last_priority_window or {}).get("required")),
+                "waits": live_priority_waits,
+                "wait_seconds": round(live_priority_wait_seconds, 3),
+                "preemptions": live_priority_preemptions,
+                "last_window": last_priority_window,
+                "event_chunk_size": BACKFILL_INGEST_EVENT_CHUNK_SIZE,
+            },
             "backlog_before": before, "backlog": after,
             "pending_blocks_delta": after_blocks - before_blocks,
             "backlog_shrinking": after_blocks < before_blocks,
@@ -19121,6 +19338,8 @@ def supervise_lanes(
                         "0" if lane == "evidence" and str(
                             lane_environment.get(BACKFILL_RPC_URL_ENV) or ""
                         ).strip() else "1"))
+                lane_environment[BACKFILL_COOPERATIVE_PREEMPTION_ENV] = (
+                    "1" if lane == "backfill" else "0")
                 process = subprocess.Popen(
                     command_for(lane), cwd=str(Path(__file__).resolve().parent),
                     stdout=stdout, stderr=stderr, env=lane_environment,
