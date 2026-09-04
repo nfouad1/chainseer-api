@@ -4186,6 +4186,33 @@ class IdentityDeadlineTests(unittest.TestCase):
             self.assertEqual(result["stopped_at_deadline"], 1)
             self.assertGreaterEqual(result["observed_batch_seconds"], 0.18)
 
+    def test_provider_429_stops_optional_enrichment_after_first_batch(self):
+        class RateLimitedRPC(FakeRPC):
+            def __init__(self):
+                super().__init__([], latest=100)
+                self.batches = 0
+
+            def get_transactions(self, _hashes):
+                self.batches += 1
+                raise rh.RPCError(
+                    "RPC HTTP response failed (429): Too Many Requests", -429)
+
+        with tempfile.TemporaryDirectory() as directory:
+            rpc = RateLimitedRPC()
+            engine = self._engine(directory, rpc)
+            result = engine._resolve_origin_batches(
+                [f"0xrate{index:04d}" for index in range(50)],
+                time.monotonic() + 10.0,
+            )
+            self.assertEqual(rpc.batches, 1)
+            self.assertEqual(
+                result["attempted"], rh.FLOW_ORIGIN_COLD_BATCH_SIZE)
+            self.assertEqual(
+                result["failures"], rh.FLOW_ORIGIN_COLD_BATCH_SIZE)
+            self.assertEqual(result["provider_pressure_stops"], 1)
+            self.assertEqual(result["stopped_reason"], "provider_rate_limited")
+            self.assertEqual(result["stopped_at_deadline"], 0)
+
     def test_successful_batch_cost_includes_commit_and_recompute(self):
         """Admission must price the whole unit, not stop its clock at RPC."""
         with tempfile.TemporaryDirectory() as directory:
@@ -4222,6 +4249,8 @@ class IdentityDeadlineTests(unittest.TestCase):
                 "failures": 1,
                 "affected_pools": 0,
                 "stopped_at_deadline": 1,
+                "provider_pressure_stops": 0,
+                "stopped_reason": None,
                 "observed_batch_seconds": 0.234,
                 "observed_remote_seconds": 0.123,
                 "observed_commit_seconds": 0.111,
@@ -7389,7 +7418,13 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v22")
+                "robinhood-operational-v23")
+            self.assertEqual(
+                cohort["policy"]["decision_head_rate_limit_policy"],
+                "bounded_retry_inside_protected_downstream_tail")
+            self.assertEqual(
+                cohort["policy"]["live_enrichment_rate_limit_policy"],
+                "stop_optional_batches_after_first_429")
             self.assertEqual(
                 cohort["policy"]["decision_minimum_samples"], 2)
             self.assertEqual(
@@ -8545,29 +8580,39 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(rpc.head_calls, 3)
             self.assertEqual(telemetry["attempts"], 3)
             self.assertEqual(telemetry["rate_limit_retries"], 2)
+            self.assertGreater(telemetry["budget_seconds"], 4.0)
+            self.assertEqual(telemetry["downstream_reserve_seconds"], 0.1)
 
-    def test_decision_head_fails_fast_after_an_observation_is_sealed(self):
-        class AlwaysRateLimited(FakeRPC):
+    def test_decision_head_retry_preserves_the_downstream_tail(self):
+        class RateLimitedOnce(FakeRPC):
             def __init__(self):
                 super().__init__([], latest=321)
+                self.timeout = 30.0
                 self.head_calls = 0
+                self.timeouts = []
 
             def get_block_number(self):
                 self.head_calls += 1
-                raise rh.RPCError("RPC HTTP response failed (429)", -429)
+                self.timeouts.append(self.timeout)
+                if self.head_calls == 1:
+                    raise rh.RPCError(
+                        "RPC HTTP response failed (429)", -429)
+                return self.latest
 
         with tempfile.TemporaryDirectory() as directory:
-            rpc = AlwaysRateLimited()
+            rpc = RateLimitedOnce()
             engine = rh.RobinhoodLearningEngine(
                 directory, rpc=rpc, analyzer=FakeAnalyzer(),
                 market=FakeMarket())
-            with self.assertRaises(rh.RPCError):
-                engine.read_authoritative_decision_head(
-                    rh.CycleDeadline(5.0),
-                    downstream_required_seconds=0.1,
-                    allow_rate_limit_retry=False,
-                )
-            self.assertEqual(rpc.head_calls, 1)
+            head, telemetry = engine.read_authoritative_decision_head(
+                rh.CycleDeadline(2.0),
+                downstream_required_seconds=1.4,
+            )
+            self.assertEqual(head, 321)
+            self.assertEqual(rpc.head_calls, 2)
+            self.assertEqual(telemetry["rate_limit_retries"], 1)
+            self.assertEqual(telemetry["downstream_reserve_seconds"], 1.4)
+            self.assertTrue(all(timeout <= 0.65 for timeout in rpc.timeouts))
 
     def test_provider_rate_limit_is_a_controlled_lane_deferral(self):
         with tempfile.TemporaryDirectory() as directory:

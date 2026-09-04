@@ -465,7 +465,7 @@ SOURCE_DIGEST_MODULES = (
     "chainseer_core.py",
 )
 ACCEPTANCE_COHORT_SCHEMA_VERSION = 2
-ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v22"
+ACCEPTANCE_COHORT_POLICY_VERSION = "robinhood-operational-v23"
 ACCEPTANCE_DECISION_SAMPLE_FRACTION = 0.50
 ACCEPTANCE_POSITION_MARK_SAMPLE_FRACTION = 0.40
 #: A convergence claim needs a fixed, attributed time series. Ten completed
@@ -1624,7 +1624,9 @@ def operational_acceptance_policy(sample_target: int = 100) -> dict:
             DECISION_TAIL_BLOCK_SAMPLE_WINDOW,
         "decision_tail_circuit_epoch": DECISION_TAIL_CIRCUIT_EPOCH,
         "decision_head_rate_limit_policy":
-            "fail_fast_when_observations_are_sealed",
+            "bounded_retry_inside_protected_downstream_tail",
+        "live_enrichment_rate_limit_policy":
+            "stop_optional_batches_after_first_429",
         "decision_multi_observation_cooldown_attempts":
             DECISION_MULTI_OBSERVATION_COOLDOWN_ATTEMPTS,
         "decision_single_probe_successes_required":
@@ -13073,6 +13075,9 @@ class RobinhoodLearningEngine:
             "affected_pools": affected_pools,
             "selected_active": attempted_active,
             "selected_historical": attempted_historical,
+            "provider_pressure_stops": batch.get(
+                "provider_pressure_stops", 0),
+            "stopped_reason": batch.get("stopped_reason"),
             "pending_after": pending["total"],
             "pending_active_after": pending["active"],
             "pending_historical_after": pending["historical"],
@@ -13093,6 +13098,8 @@ class RobinhoodLearningEngine:
         resolved = unavailable = failures = affected_pools = attempted = 0
         discarded_after_deadline = 0
         deadline_stops = 0
+        provider_pressure_stops = 0
+        stopped_reason = None
         batch_seconds = 0.0
         remote_seconds = 0.0
         commit_seconds = 0.0
@@ -13135,7 +13142,7 @@ class RobinhoodLearningEngine:
                             lambda chunk=chunk: self.rpc.get_transactions(chunk),
                             attempts=1,
                         )
-            except Exception:
+            except Exception as exc:
                 # A failed remote batch consumed real freshness budget too.
                 # Previously only successful calls updated ``batch_seconds``;
                 # after an expensive failure the next batch therefore saw a
@@ -13147,6 +13154,16 @@ class RobinhoodLearningEngine:
                 batch_seconds = max(observed, batch_seconds * 0.5)
                 remote_seconds = max(observed, remote_seconds * 0.5)
                 failures += len(chunk)
+                if _rpc_rate_limited(exc):
+                    # Identity enrichment is optional at this boundary; the
+                    # final authoritative decision-head read is not. Once the
+                    # provider asks us to slow down, another optional batch
+                    # can only amplify pressure and consume the cooldown that
+                    # the mandatory head sample needs. The hashes remain
+                    # unresolved in the durable queue for a later pass.
+                    provider_pressure_stops += 1
+                    stopped_reason = "provider_rate_limited"
+                    break
                 first_batch = False
                 previous_batch_size = len(chunk)
                 offset += len(chunk)
@@ -13188,6 +13205,8 @@ class RobinhoodLearningEngine:
             "unavailable": unavailable, "failures": failures,
             "affected_pools": affected_pools,
             "stopped_at_deadline": deadline_stops,
+            "provider_pressure_stops": provider_pressure_stops,
+            "stopped_reason": stopped_reason,
             "discarded_after_deadline": discarded_after_deadline,
             "observed_batch_seconds": round(batch_seconds, 3),
             "observed_remote_seconds": round(remote_seconds, 3),
@@ -13283,6 +13302,9 @@ class RobinhoodLearningEngine:
             "failures": batch["failures"],
             "affected_pools": batch["affected_pools"],
             "stopped_at_deadline": batch["stopped_at_deadline"],
+            "provider_pressure_stops": batch.get(
+                "provider_pressure_stops", 0),
+            "stopped_reason": batch.get("stopped_reason"),
             "discarded_after_deadline": batch.get(
                 "discarded_after_deadline", 0),
             "observed_batch_seconds": batch["observed_batch_seconds"],
@@ -14425,30 +14447,74 @@ class RobinhoodLearningEngine:
         self, deadline: CycleDeadline, *, downstream_required_seconds: float,
         allow_rate_limit_retry: bool = True,
     ) -> tuple[int, dict]:
-        """Read the decision head with bounded, cooldown-aware 429 recovery."""
+        """Read the decision head with bounded, cooldown-aware 429 recovery.
+
+        The RPC owns only the time above the independently measured
+        classification/ledger reserve. A slow call or provider cooldown can
+        therefore defer the head, but can never consume work already admitted
+        downstream. A successful retry is still authoritative: its newly read
+        block is what the 120-block paper-eligibility gate evaluates.
+        """
+        downstream_reserved = max(
+            0.0, float(downstream_required_seconds))
+        head_deadline_monotonic = deadline.deadline - downstream_reserved
+        head_deadline = CycleDeadline(
+            max(0.0, head_deadline_monotonic - time.monotonic()),
+            deadline_monotonic=head_deadline_monotonic,
+        )
+        initial_head_budget = head_deadline.remaining()
         attempts = 0
         rate_limit_retries = 0
         while True:
+            if head_deadline.remaining() <= 0.0:
+                exc = RPCError(
+                    "decision-head RPC exhausted its protected budget", -2)
+                setattr(exc, "decision_head_attempts", attempts)
+                setattr(
+                    exc, "decision_head_rate_limit_retries",
+                    rate_limit_retries)
+                setattr(
+                    exc, "decision_head_budget_seconds",
+                    initial_head_budget)
+                setattr(
+                    exc, "decision_head_budget_remaining_seconds", 0.0)
+                setattr(
+                    exc, "decision_head_downstream_reserve_seconds",
+                    downstream_reserved)
+                raise exc
             attempts += 1
             try:
-                with self._rpc_deadline(deadline, retry_attempts=0):
+                with self._rpc_deadline(head_deadline, retry_attempts=0):
                     head = int(self.rpc.get_block_number())
                 return head, {
                     "attempts": attempts,
                     "rate_limit_retries": rate_limit_retries,
+                    "budget_seconds": round(initial_head_budget, 3),
+                    "budget_remaining_seconds": round(
+                        head_deadline.remaining(), 3),
+                    "downstream_reserve_seconds": round(
+                        downstream_reserved, 3),
                 }
             except RPCError as exc:
                 can_retry = bool(
                     allow_rate_limit_retry and _rpc_rate_limited(exc)
                     and attempts < LIVE_DECISION_HEAD_MAXIMUM_ATTEMPTS
-                    and deadline.remaining() > (
-                        max(0.0, float(downstream_required_seconds)) + 0.1)
+                    and head_deadline.remaining() > 0.1
                 )
                 if not can_retry:
                     setattr(exc, "decision_head_attempts", attempts)
                     setattr(
                         exc, "decision_head_rate_limit_retries",
                         rate_limit_retries)
+                    setattr(
+                        exc, "decision_head_budget_seconds",
+                        initial_head_budget)
+                    setattr(
+                        exc, "decision_head_budget_remaining_seconds",
+                        head_deadline.remaining())
+                    setattr(
+                        exc, "decision_head_downstream_reserve_seconds",
+                        downstream_reserved)
                     raise
                 # RobinhoodRPC's response observer published the cooldown
                 # before raising. The next raw request waits under the shared
@@ -16990,8 +17056,12 @@ class RobinhoodLearningEngine:
                     self.read_authoritative_decision_head(
                         deadline,
                         downstream_required_seconds=downstream_required,
-                        allow_rate_limit_retry=not bool(
-                            observation.get("observation_ids")),
+                        # A retry cannot make a stale observation executable:
+                        # the newly read head remains authoritative and the
+                        # 120-block gate below still fails closed. Disabling
+                        # retries after sealing instead discarded a v22
+                        # decision with 18.56 seconds of usable headroom.
+                        allow_rate_limit_retry=True,
                     )
                 )
             except RPCError as exc:
@@ -17003,12 +17073,31 @@ class RobinhoodLearningEngine:
                 observation["decision_head_rate_limit_retries"] = safe_int(
                     getattr(
                         exc, "decision_head_rate_limit_retries", 0), 0)
+                observation["decision_head_budget_seconds"] = round(
+                    safe_float(getattr(
+                        exc, "decision_head_budget_seconds", 0.0), 0.0), 3)
+                observation["decision_head_budget_remaining_seconds"] = round(
+                    safe_float(getattr(
+                        exc, "decision_head_budget_remaining_seconds", 0.0),
+                        0.0), 3)
+                observation[
+                    "decision_head_downstream_reserve_seconds"] = round(
+                        safe_float(getattr(
+                            exc,
+                            "decision_head_downstream_reserve_seconds",
+                            downstream_required), downstream_required), 3)
                 return defer_decision_head(
                     "decision_head_infrastructure_indeterminate",
                     infrastructure_indeterminate=True, error=str(exc))
             observation["decision_head_attempts"] = decision_rpc["attempts"]
             observation["decision_head_rate_limit_retries"] = (
                 decision_rpc["rate_limit_retries"])
+            observation["decision_head_budget_seconds"] = (
+                decision_rpc["budget_seconds"])
+            observation["decision_head_budget_remaining_seconds"] = (
+                decision_rpc["budget_remaining_seconds"])
+            observation["decision_head_downstream_reserve_seconds"] = (
+                decision_rpc["downstream_reserve_seconds"])
             timings["decision_head_seconds"] = round(
                 time.monotonic() - stage, 3)
             post_ingest_tail_blocks = max(
