@@ -317,6 +317,93 @@ class ShadowPathStoreTests(unittest.TestCase):
 
 
 class ShadowPathEvidenceLaneTests(unittest.TestCase):
+    def _backlogged_engine(self, directory):
+        store,_ = ShadowPathStoreTests()._captured(directory)
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.store = store
+        engine.v4_market = MagicMock()
+
+        def quote(candidate, *, include_execution_quote=True, quote_block=None):
+            amount = candidate["shadow_entry_anchor_in_raw"]
+            return {
+                "current_state_verified": True,"quote_block":quote_block,
+                "execution_quote": {
+                    "verified":True,"passes_round_trip_limit":True,
+                    "quote_block":quote_block,"round_trip_ratio":0.99,
+                    "anchor_in_raw":amount,"token_out_raw":str(10**18),
+                    "token_decimals":18},
+                "paper_exit_quote": {
+                    "verified":True,"token_in_raw":str(10**18),
+                    "anchor_out_raw":str(int(amount)*99//100)},
+            }
+        engine.v4_market.snapshot.side_effect = quote
+        engine.observe_flow_shadow_path_marks(1_001,10_000_000,limit=2)
+        engine.v4_market.snapshot.reset_mock()
+        return engine
+
+    def test_backlog_drains_beyond_four_in_fifo_order_with_hard_row_cap(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._backlogged_engine(directory)
+            result = engine.observe_flow_shadow_path_marks(2_000,10_000_000,limit=1000)
+            self.assertEqual(result["observed"],32)
+            self.assertEqual(result["limit"],32)
+            self.assertTrue(result["batch_cap_reached"])
+            self.assertTrue(result["more_due_available"])
+            blocks=[c.kwargs["quote_block"]
+                    for c in engine.v4_market.snapshot.call_args_list]
+            self.assertEqual(blocks,sorted(blocks))
+            self.assertTrue(sp.verify_measurement_ledger(engine.store.path)["ok"])
+            tail=engine.observe_flow_shadow_path_marks(2_001,10_000_000)
+            self.assertEqual(tail["observed"],2)
+            self.assertFalse(tail["more_due_available"])
+
+    def test_larger_batch_stops_before_spending_item_reserve(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._backlogged_engine(directory)
+            deadline = MagicMock()
+            deadline.remaining.side_effect = [20.0,8.0,7.9]
+            result=engine.observe_flow_shadow_path_marks(
+                2_000,10_000_000,deadline=deadline)
+            self.assertEqual(result["observed"],2)
+            self.assertEqual(result["deferred"],30)
+            self.assertEqual(result["stop_reason"],"deadline_reserve")
+            self.assertEqual(engine.v4_market.snapshot.call_count,2)
+            self.assertFalse(result["batch_cap_reached"])
+
+    def test_larger_batch_stops_on_provider_rate_limit(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._backlogged_engine(directory)
+            engine.v4_market.snapshot.side_effect = RuntimeError("RPC -429: too many requests")
+            result=engine.observe_flow_shadow_path_marks(2_000,10_000_000)
+            self.assertEqual(result["observed"],0)
+            self.assertEqual(result["failures"],1)
+            self.assertEqual(result["stop_reason"],"provider_rate_limited")
+            self.assertEqual(engine.v4_market.snapshot.call_count,1)
+
+    def test_larger_batch_yields_to_rpc_priority_without_retrying(self):
+        with tempfile.TemporaryDirectory() as directory:
+            engine = self._backlogged_engine(directory)
+            engine.v4_market.snapshot.side_effect = rh.BackgroundRpcPriorityDeferred(
+                "live reservation")
+            result=engine.observe_flow_shadow_path_marks(2_000,10_000_000)
+            self.assertEqual(result["observed"],0)
+            self.assertEqual(result["failures"],0)
+            self.assertEqual(result["deferred"],32)
+            self.assertEqual(result["stop_reason"],"rpc_priority")
+            self.assertEqual(engine.v4_market.snapshot.call_count,1)
+
+    def test_zero_capacity_does_no_selection_or_rpc(self):
+        engine = rh.RobinhoodLearningEngine.__new__(rh.RobinhoodLearningEngine)
+        engine.store,engine.v4_market=MagicMock(),MagicMock()
+        result=engine.observe_flow_shadow_path_marks(2_000,10_000_000,limit=0)
+        self.assertEqual(result["observed"],0)
+        engine.store.due_flow_shadow_path_marks.assert_not_called()
+        engine.v4_market.snapshot.assert_not_called()
+
+    def test_operational_capacity_change_preserves_frozen_policy_hash(self):
+        self.assertEqual(sp.policy_hash(),
+            "6b61bb4f2f645a90343546c5e78a249237946d379cd79c19c3e950a52edcef21")
+
     def test_engine_quotes_the_frozen_target_block_not_current_head(self):
         with tempfile.TemporaryDirectory() as directory:
             store,result = ShadowPathStoreTests()._captured(directory)

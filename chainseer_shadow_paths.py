@@ -31,7 +31,11 @@ SAMPLE_BASIS_POINTS = 2_000
 SAMPLE_BUCKETS = 10_000
 BLOCKS_PER_SECOND = 10.0
 FINALITY_BLOCKS = 20
-MARKS_PER_EVIDENCE_CYCLE = 4
+# Operational ceiling, deliberately outside policy_definition(). Archive
+# targets and sampling are frozen; how quickly the same targets are drained
+# is not an experimental parameter. The evidence stage deadline remains the
+# authoritative cap, including its per-item and completion reserves.
+MARKS_PER_EVIDENCE_CYCLE = 32
 RETRY_SECONDS = 15 * 60.0
 FRICTION_BPS = 100.0
 

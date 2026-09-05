@@ -16715,16 +16715,26 @@ class RobinhoodLearningEngine:
         outcome existed.  This stage never enters the live lane and never
         changes admission or a paper position.
         """
-        due_rows = self.store.due_flow_shadow_path_marks(
-            now,int(head_block),max(0,int(limit)))
+        started = time.monotonic()
+        bounded_limit = min(max(0, int(limit)), EVIDENCE_SHADOW_PATH_MARK_LIMIT)
+        # One-row lookahead reports saturation without a full backlog count.
+        # Keep target-block FIFO ordering and never select on market returns.
+        selected_rows = self.store.due_flow_shadow_path_marks(
+            now, int(head_block), bounded_limit + 1) if bounded_limit else []
+        more_due_available = len(selected_rows) > bounded_limit
+        due_rows = selected_rows[:bounded_limit]
         observed = entry_marketable = non_exitable = cascaded = 0
         deferred = failures = provider_unavailable = 0
+        attempted = 0
+        stop_reason = "batch_cap" if more_due_available else "selected_batch_drained"
         for index, due in enumerate(due_rows):
             if (deadline is not None
                     and deadline.remaining()
                     < EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
                 deferred = len(due_rows) - index
+                stop_reason = "deadline_reserve"
                 break
+            attempted += 1
             candidate = {
                 "shadow_path_quote": True,
                 "pool_id": due["pool_id"],
@@ -16763,6 +16773,7 @@ class RobinhoodLearningEngine:
                 )
             except BackgroundRpcPriorityDeferred:
                 deferred = len(due_rows) - index
+                stop_reason = "rpc_priority"
                 break
             except Exception as exc:
                 attempt = self.store.record_flow_shadow_path_attempt(
@@ -16776,6 +16787,7 @@ class RobinhoodLearningEngine:
                     })
                 if _rpc_rate_limited(exc):
                     deferred = len(due_rows) - index - 1
+                    stop_reason = "provider_rate_limited"
                     break
                 continue
             try:
@@ -16807,7 +16819,12 @@ class RobinhoodLearningEngine:
             "failures": failures,
             "provider_unavailable": provider_unavailable,
             "deferred": deferred, "head_block": int(head_block),
-            "limit": max(0,int(limit)),
+            "limit": bounded_limit,
+            "attempted": attempted,
+            "more_due_available": more_due_available,
+            "batch_cap_reached": stop_reason == "batch_cap",
+            "stop_reason": stop_reason,
+            "elapsed_seconds": round(time.monotonic() - started, 3),
             "policy_version": FLOW_SHADOW_PATH_POLICY_VERSION,
             "exact_target_blocks": True,
             "paper_only": True, "live_execution_enabled": False,

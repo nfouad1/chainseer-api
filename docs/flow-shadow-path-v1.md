@@ -13,8 +13,7 @@ remain authoritative.
   of the ETH/USD price when a delayed entry quote is resolved.
 - Anchor entry at the event's decision head block. Schedule 18 checkpoints through
   seven nominal days, using ten blocks per second and a 20-block finality delay.
-- Resolve at most four quotes per evidence cycle, within the existing deadline.
-  Provider failures retry; missing evidence is never booked as a trading loss.
+- Provider failures retry; missing evidence is never booked as a trading loss.
 - Preserve unsellable entries as explicit attrition. Never treat their terminal
   accounting rows as successful market quotes.
 
@@ -39,6 +38,15 @@ attrition require review before any execution experiment. No profit claim follow
 from an operational pass or from selecting a training winner.
 
 ## Operation and verification
+
+The collector resolves up to 32 quotes per evidence cycle, stopping sooner at
+the existing 20-second stage deadline's eight-second item reserve, RPC priority
+deferral, or provider rate limit. The lane's completion reserve is unchanged.
+This replaces the initial four-quote ceiling, which saturated even when four
+quotes used only about 1.4 seconds. No additional concurrency is introduced.
+Exact target blocks, FIFO ordering, sampling, and the experiment hash are
+unchanged. Batch telemetry reports the stop reason, elapsed time, and a bounded
+one-row lookahead for remaining eligible work (not a full backlog count).
 
 `flow_shadow_paths` and its schedules are immutable. Terminal measurements form
 an append-only hash chain; retries are separate mutable state. Evaluation reads
