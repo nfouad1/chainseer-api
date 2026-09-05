@@ -3,7 +3,7 @@ import tempfile
 import time
 import unittest
 from pathlib import Path
-from unittest.mock import patch
+from unittest.mock import MagicMock, patch
 
 import chainseer_robinhood as rh
 import chainseer_shadow_paths as sp
@@ -16,6 +16,51 @@ CONTROL_POOL = "0x" + "cd" * 32
 
 
 class ShadowPathPolicyTests(unittest.TestCase):
+    def test_native_currency_is_shadow_only_and_never_calls_erc20_metadata(self):
+        client = rh.RobinhoodV4MarketClient.__new__(rh.RobinhoodV4MarketClient)
+        client.store = MagicMock()
+        client.store.v4_pool.return_value = {
+            "currency0": rh.ZERO_ADDRESS, "currency1": rh.USDG_ADDRESS,
+            "token_address": rh.ZERO_ADDRESS,"anchor_address": rh.USDG_ADDRESS,
+            "fee_tier": 3000,"tick_spacing": 60,"hooks_address": rh.ZERO_ADDRESS}
+        client.store.latest_v4_custody.return_value = {}
+        candidate = {"pool_id": POOL,"token_address": rh.ZERO_ADDRESS,
+                     "shadow_entry_anchor_address": rh.USDG_ADDRESS,
+                     "shadow_entry_anchor_in_raw": sp.ENTRY_ANCHOR_IN_RAW["stable"]}
+        rejected = client.snapshot(candidate,quote_block=123)
+        self.assertEqual(rejected["reason"],"invalid_token_address")
+        candidate["shadow_path_quote"] = True
+        candidate["paper_quantity"] = 1
+        candidate["shadow_exit_token_in_raw"] = str(10**18)
+        with (patch.object(client,"_cached_call",return_value="0x1000"),
+              patch.object(client,"_decode_slot0",return_value=(2**96,0)),
+              patch.object(client,"_cached_decimals",return_value=6) as decimals,
+              patch.object(client,"_cached_total_supply") as supply,
+              patch.object(client,"_quote_exact_input_single",
+                           side_effect=[(10**18,100),(99*10**6,100),(98*10**6,100)]) as quote):
+            result = client.snapshot(candidate,quote_block=123)
+        decimals.assert_called_once_with(rh.USDG_ADDRESS,123)
+        supply.assert_not_called()
+        self.assertTrue(result["execution_quote"]["verified"])
+        self.assertEqual(result["execution_quote"]["token_decimals"],18)
+        self.assertEqual(result["paper_exit_quote"]["token_in_raw"],str(10**18))
+        self.assertIsNone(result["market_cap_usd"])
+        self.assertTrue(all(c.kwargs["block"] == 123 for c in quote.call_args_list))
+
+    def test_shadow_currency_mismatch_is_rejected_before_rpc(self):
+        client = rh.RobinhoodV4MarketClient.__new__(rh.RobinhoodV4MarketClient)
+        client.store = MagicMock()
+        client.store.v4_pool.return_value = {
+            "currency0": TOKEN,"currency1": rh.USDG_ADDRESS,
+            "token_address": TOKEN,"anchor_address": rh.USDG_ADDRESS}
+        with patch.object(client,"_cached_call") as rpc:
+            result = client.snapshot({
+                "pool_id": POOL,"token_address": rh.ZERO_ADDRESS,
+                "shadow_path_quote": True,
+                "shadow_entry_anchor_address": rh.USDG_ADDRESS},quote_block=123)
+        rpc.assert_not_called()
+        self.assertEqual(result["reason"],"shadow_anchor_binding_mismatch")
+
     def test_fixed_anchor_probe_does_not_depend_on_later_usd_price(self):
         client = rh.RobinhoodV4MarketClient.__new__(rh.RobinhoodV4MarketClient)
         pool = {"anchor_address": rh.WETH_ADDRESS,
@@ -50,6 +95,46 @@ class ShadowPathPolicyTests(unittest.TestCase):
 
 
 class ShadowPathStoreTests(unittest.TestCase):
+    def test_verified_retry_resolves_integrity_failure_without_erasing_attempt(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store,_ = self._captured(directory)
+            due = store.due_flow_shadow_path_marks(1_001,20_000,limit=1)[0]
+            store.record_flow_shadow_path_attempt(
+                due["path_id"],0,now=1_001,error="metadata unsupported",
+                failure_class="evidence_integrity_failure")
+            self.assertFalse(sp.verify_measurement_ledger(store.path)["ok"])
+            store.record_flow_shadow_path_attempt(
+                due["path_id"],0,now=1_001.5,error=TimeoutError("provider timeout"))
+            self.assertFalse(sp.verify_measurement_ledger(store.path)["ok"])
+            quote = {"current_state_verified": True,"quote_block":due["target_block"],
+                     "execution_quote": {"verified": True,"passes_round_trip_limit": True,
+                         "quote_block":due["target_block"],"round_trip_ratio":0.99,
+                         "anchor_in_raw":due["entry_anchor_in_raw"],"token_out_raw":"1000"}}
+            store.record_flow_shadow_path_measurement(
+                due,quote,quote_block=due["target_block"],now=1_002)
+            verified = sp.verify_measurement_ledger(store.path)
+            self.assertTrue(verified["ok"],verified)
+            summary = store.flow_shadow_path_summary()
+            self.assertEqual(summary["integrity_failures"],0)
+            self.assertEqual(summary["historical_integrity_failures"],1)
+            self.assertEqual(summary["resolved_integrity_failures"],1)
+            with store.connection() as connection:
+                self.assertEqual(connection.execute(
+                    "SELECT last_error FROM flow_shadow_path_attempts").fetchone()[0],
+                    "metadata unsupported")
+
+    def test_unverified_measurement_cannot_discharge_integrity_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store,_ = self._captured(directory)
+            due = store.due_flow_shadow_path_marks(1_001,20_000,limit=1)[0]
+            store.record_flow_shadow_path_attempt(
+                due["path_id"],0,now=1_001,error="binding mismatch",
+                failure_class="evidence_integrity_failure")
+            store.record_flow_shadow_path_measurement(
+                due,{"quote_block":due["target_block"],"execution_quote":{"verified":False}},
+                quote_block=due["target_block"],now=1_002)
+            self.assertFalse(sp.verify_measurement_ledger(store.path)["ok"])
+
     @staticmethod
     def _signal(store, pool, *, qualified, end_block, score):
         with store.connection() as connection:

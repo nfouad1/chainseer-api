@@ -488,9 +488,16 @@ def verify_measurement_ledger(
               ON s.path_id=m.path_id AND s.step_index=m.step_index
             WHERE s.path_id IS NULL OR m.schedule_hash<>s.schedule_hash
             """).fetchone()[0]
+        # Rejected attempts remain recorded. Only a later verified quote for
+        # the SAME checkpoint can discharge them; its hash and all bindings
+        # are checked below before this verifier can return ok.
         integrity_failures = connection.execute(
-            "SELECT COUNT(*) FROM flow_shadow_path_attempts"
-            " WHERE failure_class='evidence_integrity_failure'"
+            "SELECT COUNT(*) FROM flow_shadow_path_attempts a"
+            " LEFT JOIN flow_shadow_path_measurements m"
+            " ON m.path_id=a.path_id AND m.step_index=a.step_index"
+            " AND m.quote_verified=1 AND m.observed_at>=a.last_attempt_at"
+            " WHERE a.failure_class='evidence_integrity_failure'"
+            " AND m.sequence IS NULL"
         ).fetchone()[0]
     finally:
         if own_connection:

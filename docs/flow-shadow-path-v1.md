@@ -58,3 +58,25 @@ reads `flow_shadow_exit_v1.json` and current collection counters.
 
 The dashboard separates current collection from completed strategy evidence.
 An empty experiment correctly reports `collecting_training_paths`.
+
+### Native-currency and process-exit repair
+
+V4 represents native currency with address zero ([CurrencyLibrary](https://github.com/Uniswap/v4-core/blob/main/src/types/Currency.sol)).
+The shadow quote adapter supports that currency only after checking both pool
+currencies and the frozen anchor. It uses 18 native decimals, makes no native
+ERC20 metadata calls, and leaves native market cap unknown. Ordinary candidate
+admission and V4 paper/live restrictions are unchanged. Existing sampled paths
+retain their original entry blocks, schedules, and matched controls.
+
+Collector integrity errors remain recorded and cannot be overwritten by a
+subsequent transport error. A later verified, hash-chained quote at the same
+checkpoint resolves the outstanding error; an unverified quote cannot do so.
+The counters distinguish historical, resolved, and outstanding errors. No old
+measurement or failed evaluation report is deleted or rewritten.
+
+The supervisor reconciles exited children before removing them, including at
+shutdown. An unfinished database row becomes a failure even if the process
+returns zero, retaining its exit code and last stage. Completed rows and newer
+owners are untouched. This closes an observability/ownership gap; it does not
+establish why the original worker died or guarantee no future process failures.
+The old 99/100 cohort remains an unsuccessful cohort.

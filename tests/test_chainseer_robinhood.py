@@ -10933,10 +10933,14 @@ class PeriodicOrphanSweepTests(unittest.TestCase):
     def test_the_sweep_runs_inside_the_loop_not_only_at_startup(self):
         source = Path("chainseer_robinhood.py").read_text(
             encoding="utf-8", errors="replace")
-        loop = source.split("while time.monotonic() < stop_at:", 1)[1][:1600]
+        loop = source.split("while time.monotonic() < stop_at:", 1)[1].split(
+            "if now_mono - last_deficit_refresh", 1)[0]
         self.assertIn("_reconcile_dead_lane_state", loop,
                       "recovery is startup-only again")
         self.assertIn("ORPHAN_SWEEP_INTERVAL_SECONDS", loop)
+        self.assertLess(loop.index("finalize_exited_lane"),
+                        loop.index("_reconcile_dead_lane_state"),
+                        "known child exit codes must be captured before generic recovery")
 
     def test_the_interval_is_shorter_than_a_supervisor_session(self):
         """A cadence longer than the session it runs in is startup-only with
@@ -10950,7 +10954,8 @@ class PeriodicOrphanSweepTests(unittest.TestCase):
         the stale row it was cleaning up."""
         source = Path("chainseer_robinhood.py").read_text(
             encoding="utf-8", errors="replace")
-        loop = source.split("while time.monotonic() < stop_at:", 1)[1][:1600]
+        loop = source.split("while time.monotonic() < stop_at:", 1)[1].split(
+            "if now_mono - last_deficit_refresh", 1)[0]
         block = loop.split("_reconcile_dead_lane_state", 1)[1][:200]
         self.assertIn("except Exception", block)
 

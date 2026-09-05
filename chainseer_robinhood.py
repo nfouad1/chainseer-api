@@ -5775,8 +5775,14 @@ class RobinhoodLearningStore:
                     attempts=flow_shadow_path_attempts.attempts+1,
                     last_attempt_at=excluded.last_attempt_at,
                     retry_after=excluded.retry_after,
-                    failure_class=excluded.failure_class,
-                    last_error=excluded.last_error
+                    failure_class=CASE
+                      WHEN flow_shadow_path_attempts.failure_class='evidence_integrity_failure'
+                      THEN flow_shadow_path_attempts.failure_class
+                      ELSE excluded.failure_class END,
+                    last_error=CASE
+                      WHEN flow_shadow_path_attempts.failure_class='evidence_integrity_failure'
+                      THEN flow_shadow_path_attempts.last_error
+                      ELSE excluded.last_error END
                 """,
                 (
                     path_id,int(step_index),observed_at,retry_after,
@@ -5991,9 +5997,17 @@ class RobinhoodLearningStore:
                     "SELECT COUNT(*) FROM flow_shadow_path_measurements"
                     " WHERE step_index=0 AND status='observed' AND exit_valid=1"
                 ).fetchone()[0]
-                integrity_failures = connection.execute(
+                historical_integrity_failures = connection.execute(
                     "SELECT COUNT(*) FROM flow_shadow_path_attempts"
                     " WHERE failure_class='evidence_integrity_failure'"
+                ).fetchone()[0]
+                integrity_failures = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_path_attempts a"
+                    " LEFT JOIN flow_shadow_path_measurements m"
+                    " ON m.path_id=a.path_id AND m.step_index=a.step_index"
+                    " AND m.quote_verified=1 AND m.observed_at>=a.last_attempt_at"
+                    " WHERE a.failure_class='evidence_integrity_failure'"
+                    " AND m.sequence IS NULL"
                 ).fetchone()[0]
                 entry_terminal = connection.execute(
                     "SELECT COUNT(*) FROM flow_shadow_path_measurements"
@@ -6044,6 +6058,9 @@ class RobinhoodLearningStore:
             "nominal_due_unmeasured": int(nominal_due),
             "provider_attempts": int(attempts),
             "integrity_failures": int(integrity_failures),
+            "historical_integrity_failures": int(historical_integrity_failures),
+            "resolved_integrity_failures": int(
+                historical_integrity_failures - integrity_failures),
             "entry_terminal_paths": int(entry_terminal),
             "entry_marketable_paths": int(entry_marketable),
             "entry_unmarketable_paths": int(entry_unmarketable),
@@ -8221,6 +8238,68 @@ class RobinhoodLearningStore:
             "stage_elapsed_seconds": (
                 round(time.time() - started, 3) if started else None),
         }
+
+    def finalize_exited_lane(
+        self, lane: str, pid: int, returncode: int, *,
+        attempt_started_at: float,
+    ) -> bool:
+        """Record an observed process exit, never infer success from exit(0).
+
+        Called before the supervisor forgets a child, including shutdown.
+        Scope by lane/PID/launch timestamp so PID reuse cannot close an older
+        attempt, and update the current lane pointer only for this run_id.
+        The old failed cohort is deliberately not repaired by this method.
+        """
+        now = time.time()
+        launched = datetime.fromtimestamp(
+            float(attempt_started_at), timezone.utc).isoformat()
+        with self.connection() as connection:
+            # Normal finalized children need no write lock on the hot path.
+            present = connection.execute(
+                "SELECT 1 FROM runs WHERE lane=? AND pid=?"
+                " AND status='running' AND started_at>=? LIMIT 1",
+                (str(lane), int(pid), launched),
+            ).fetchone()
+            if not present:
+                return False
+            connection.execute("BEGIN IMMEDIATE")
+            rows = connection.execute(
+                "SELECT * FROM runs WHERE lane=? AND pid=?"
+                " AND status='running' AND started_at>=? ORDER BY id",
+                (str(lane), int(pid), launched),
+            ).fetchall()
+            for row in rows:
+                state = connection.execute(
+                    "SELECT * FROM lane_state WHERE lane=? AND run_id=?",
+                    (str(lane), row["run_id"]),
+                ).fetchone()
+                failure = {
+                    "schema_version": 1, "status": "failed", "lane": str(lane),
+                    "run_id": row["run_id"], "pid": int(pid),
+                    "returncode": int(returncode),
+                    "reason": "worker_exited_without_finalizing",
+                    "duration_seconds": round(max(0.0, now-attempt_started_at), 3),
+                    "timestamp": _utc_now(),
+                    "failure_stage": state["current_stage"] if state else None,
+                    "stage_detail_json": state["stage_detail_json"] if state else None,
+                    "previous_heartbeat_at": row["heartbeat_at"],
+                }
+                connection.execute(
+                    "UPDATE runs SET status='failed',completed_at=?,summary_json=?"
+                    " WHERE id=? AND status='running'",
+                    (_utc_now(), _canonical(failure), row["id"]),
+                )
+                connection.execute(
+                    "UPDATE lane_state SET status='failed',completed_at=?,"
+                    " heartbeat_at=?,summary_json=?,last_error=?"
+                    " WHERE lane=? AND run_id=? AND pid=? AND status='running'",
+                    (now, now, _canonical(failure), failure["reason"],
+                     str(lane), row["run_id"], int(pid)),
+                )
+                if str(lane) == "live":
+                    self._close_cohort_if_target(
+                        connection, row["acceptance_cohort_id"])
+            return bool(rows)
 
     def terminate_lane(
         self, lane: str, pid: int, reason: str,
@@ -12742,8 +12821,10 @@ class RobinhoodV4MarketClient:
         if len(pool_id.removeprefix("0x")) != 64:
             return {}
         token = str(candidate.get("token_address") or "").lower()
+        shadow_quote = candidate.get("shadow_path_quote") is True
+        native_token = token == ZERO_ADDRESS.lower()
         if (not ADDRESS_RE.fullmatch(token)
-                or token == ZERO_ADDRESS.lower()):
+                or (native_token and not shadow_quote)):
             return {
                 "source": "uniswap_v4_state_view",
                 "current_state_verified": False,
@@ -12752,6 +12833,26 @@ class RobinhoodV4MarketClient:
                     "verified": False, "reason": "invalid_token_address"},
                 "quote_block": quote_block,
             }
+        # Native currency is address(0) in V4, not an ERC20. Only the
+        # explicitly research-only path may quote it. Bind both currencies
+        # before any state/metadata RPC; ordinary admission remains unchanged.
+        if shadow_quote:
+            pool = self.store.v4_pool(pool_id)
+            anchor = str((pool or {}).get("anchor_address") or "").lower()
+            expected_anchor = str(
+                candidate.get("shadow_entry_anchor_address") or "").lower()
+            currencies = {str((pool or {}).get(key) or "").lower()
+                          for key in ("currency0", "currency1")}
+            if (not pool or anchor not in {WETH_ADDRESS.lower(), USDG_ADDRESS.lower()}
+                    or expected_anchor != anchor or token == anchor
+                    or currencies != {token, anchor}
+                    or str(pool.get("token_address") or "").lower() != token):
+                return {
+                    "source": "uniswap_v4_state_view",
+                    "current_state_verified": False,
+                    "reason": "shadow_anchor_binding_mismatch",
+                    "quote_block": quote_block,
+                }
         argument = pool_id.removeprefix("0x")
         liquidity_raw = self._cached_call(
             UNISWAP_V4_STATE_VIEW,
@@ -12791,9 +12892,11 @@ class RobinhoodV4MarketClient:
                 "anchor_address": anchor,
                 "quote_block": quote_block,
             }
-        token_decimals = self._cached_decimals(token, quote_block)
+        token_decimals = 18 if native_token else self._cached_decimals(token, quote_block)
         anchor_decimals = self._cached_decimals(anchor, quote_block)
-        total_supply = self._cached_total_supply(token, quote_block)
+        # Native currency has no ERC20 totalSupply. Market cap stays unknown;
+        # supply is diagnostic, not an input to the executable exit return.
+        total_supply = 0 if native_token else self._cached_total_supply(token, quote_block)
         if str(anchor).lower() == USDG_ADDRESS.lower():
             anchor_usd, anchor_source = 1.0, "usdg_par_assumption"
         else:
@@ -16623,6 +16726,7 @@ class RobinhoodLearningEngine:
                 deferred = len(due_rows) - index
                 break
             candidate = {
+                "shadow_path_quote": True,
                 "pool_id": due["pool_id"],
                 "token_address": due["token_address"],
                 "shadow_entry_anchor_address": due["entry_anchor_address"],
@@ -20283,21 +20387,19 @@ def supervise_lanes(
             # plus grace, or which the lane has already superseded. Running it
             # on a cadence costs one indexed query and removes the dependency
             # on restart timing.
-            if now_mono - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS:
-                last_orphan_sweep = now_mono
-                try:
-                    _reconcile_dead_lane_state(supervisor_store)
-                except Exception:
-                    # Recovery is housekeeping; never let it stop scheduling.
-                    pass
             for lane, item in list(active.items()):
                 process = item["process"]
                 code = process.poll()
                 if code is not None:
+                    unfinalized = supervisor_store.finalize_exited_lane(
+                        lane, process.pid, code,
+                        attempt_started_at=item["wall_started"])
                     item["stdout"].close()
                     item["stderr"].close()
-                    failures[lane] += int(code != 0)
+                    failures[lane] += int(code != 0 or unfinalized)
                     active.pop(lane, None)
+                    if unfinalized:
+                        code = code or 1
                     if lane == "analysis" and code == 0:
                         # The only Timechain writer finished. Verify exactly
                         # that final head before ordinary background work.
@@ -20343,6 +20445,15 @@ def supervise_lanes(
                             time.monotonic()
                             + LIVE_LANE_POST_KILL_QUIET_SECONDS)
                     active.pop(lane, None)
+            # Reap known child exits first, retaining their actual exit code.
+            # The generic sweep is only the fallback for unowned/orphan rows.
+            if now_mono - last_orphan_sweep >= ORPHAN_SWEEP_INTERVAL_SECONDS:
+                last_orphan_sweep = now_mono
+                try:
+                    _reconcile_dead_lane_state(supervisor_store)
+                except Exception:
+                    # Recovery is housekeeping; never let it stop scheduling.
+                    pass
             if now_mono - last_deficit_refresh >= 5.0:
                 last_deficit_refresh = now_mono
                 try:
@@ -20463,7 +20574,8 @@ def supervise_lanes(
     finally:
         for lane, item in list(active.items()):
             process = item["process"]
-            if process.poll() is None:
+            exit_code = process.poll()
+            if exit_code is None:
                 process.kill()
                 try:
                     process.wait(timeout=5)
@@ -20472,6 +20584,11 @@ def supervise_lanes(
                 supervisor_store.terminate_lane(
                     lane, process.pid, "supervisor_window_closed",
                     attempt_started_at=item["wall_started"])
+            else:
+                unfinalized = supervisor_store.finalize_exited_lane(
+                    lane, process.pid, exit_code,
+                    attempt_started_at=item["wall_started"])
+                failures[lane] += int(exit_code != 0 or unfinalized)
             item["stdout"].close()
             item["stderr"].close()
         active.clear()
