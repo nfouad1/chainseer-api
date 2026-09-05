@@ -199,6 +199,37 @@ def _probe() -> int:
     return 0
 
 
+def refresh_shadow_exit_report(root: Path) -> dict:
+    """Run the offline evaluator hourly in its own bounded process.
+
+    The supervisor has already joined its lanes when this is called. The
+    direct interpreter inherits Task Scheduler's process ownership; no shell
+    or venv launcher can leave an orphan if the 30-second budget expires.
+    """
+    artifact = root / "flow_shadow_exit_v1.json"
+    if artifact.exists() and time.time() - artifact.stat().st_mtime < 3_600:
+        return {"status": "cadence_not_due"}
+    bootstrap = (
+        "import runpy,sys; "
+        f"sys.path.insert(0,{str(VENV_SITE_PACKAGES)!r}); "
+        "sys.argv=['chainseer_robinhood.py','shadow-exit-once',"
+        f"'--root',{str(root)!r}]; "
+        "runpy.run_path('chainseer_robinhood.py',run_name='__main__')"
+    )
+    try:
+        result = subprocess.run(
+            [sys.executable,"-X","utf8","-c",bootstrap],
+            cwd=WORKSPACE,stdout=subprocess.DEVNULL,stderr=subprocess.DEVNULL,
+            timeout=30,check=False,
+            creationflags=(subprocess.CREATE_NO_WINDOW
+                           if sys.platform == "win32" else 0),
+        )
+        return {"status": "complete" if result.returncode == 0 else "failed",
+                "returncode": result.returncode}
+    except subprocess.TimeoutExpired:
+        return {"status": "deferred", "reason": "offline_evaluation_timeout"}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--duration-seconds", type=float, default=285.0)
@@ -282,6 +313,7 @@ def main() -> int:
             outcome_recovery_limit=max(0, int(args.outcome_recovery_limit)),
             market_recheck_limit=max(0, int(args.market_recheck_limit)),
         )
+        result["shadow_exit_report"] = refresh_shadow_exit_report(root)
         _runner_status(
             root, status="complete", started=started, result=result,
             filename=status_filename,

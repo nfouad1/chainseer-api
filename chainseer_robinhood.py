@@ -73,6 +73,24 @@ from chainseer_robinhood_reflection import (
     RobinhoodReflectionCoordinator,
     default_skill_root,
 )
+from chainseer_shadow_paths import (
+    BLOCKS_PER_SECOND as FLOW_SHADOW_PATH_BLOCKS_PER_SECOND,
+    FINALITY_BLOCKS as FLOW_SHADOW_PATH_FINALITY_BLOCKS,
+    FRICTION_BPS as FLOW_SHADOW_PATH_FRICTION_BPS,
+    ENTRY_ANCHOR_IN_RAW as FLOW_SHADOW_ENTRY_ANCHOR_IN_RAW,
+    MARKS_PER_EVIDENCE_CYCLE as EVIDENCE_SHADOW_PATH_MARK_LIMIT,
+    POLICY_VERSION as FLOW_SHADOW_PATH_POLICY_VERSION,
+    RETRY_SECONDS as FLOW_SHADOW_PATH_RETRY_SECONDS,
+    SAMPLE_BASIS_POINTS as FLOW_SHADOW_PATH_SAMPLE_BASIS_POINTS,
+    SCHEDULE as FLOW_SHADOW_PATH_SCHEDULE,
+    measurement_hash as _flow_shadow_measurement_hash,
+    path_id as _flow_shadow_path_id,
+    policy_hash as _flow_shadow_policy_hash,
+    policy_json as _flow_shadow_policy_json,
+    sample_bucket as _flow_shadow_sample_bucket,
+    schedule_rows as _flow_shadow_schedule_rows,
+    selected as _flow_shadow_selected,
+)
 
 PROCESS_IMPORTS_COMPLETED_MONOTONIC = time.monotonic()
 
@@ -172,8 +190,8 @@ EVIDENCE_LANE_BUDGET_SECONDS = 90.0
 EVIDENCE_COMPLETION_RESERVE_SECONDS = 8.0
 # No evidence stream may consume the whole lane. Production measured the
 # entry-quote stage at 85.3s, after which observation quotes began with 0.0s
-# and the worker missed its 90s deadline. Four bounded slices preserve useful
-# progress across every durable stream; the last slice is also constrained by
+# and the worker missed its 90s deadline. Five bounded slices preserve useful
+# progress across all five durable streams; the last slice is also constrained by
 # the shared completion reserve above.
 EVIDENCE_STAGE_MAX_SECONDS = 20.0
 BACKFILL_LANE_BUDGET_SECONDS = 120.0
@@ -459,6 +477,7 @@ def _worktree_source_digest() -> str:
 #: Modules whose content defines live-lane behaviour for acceptance purposes.
 SOURCE_DIGEST_MODULES = (
     "chainseer_robinhood.py",
+    "chainseer_shadow_paths.py",
     "chainseer_robinhood_commitments.py",
     "chainseer_robinhood_gate.py",
     "chainseer.py",
@@ -3215,6 +3234,112 @@ class RobinhoodLearningStore:
                     ON flow_signal_events(eligible_for_evaluation,signal_role,signaled_at);
                 CREATE INDEX IF NOT EXISTS idx_flow_outcome_due
                     ON flow_signal_outcomes(status,target_at);
+                -- Prospective exit-policy evidence.  Membership and every
+                -- target block are frozen at signal capture.  Resolution may
+                -- happen much later, but the archive quote is always pinned
+                -- to the scheduled block, so queue latency cannot silently
+                -- change a 15-minute mark into a 24-minute (or two-day) mark.
+                CREATE TABLE IF NOT EXISTS flow_shadow_paths (
+                    path_id TEXT PRIMARY KEY,
+                    policy_version TEXT NOT NULL,
+                    policy_hash TEXT NOT NULL,
+                    policy_json TEXT NOT NULL,
+                    event_id TEXT NOT NULL UNIQUE,
+                    cohort_id TEXT NOT NULL,
+                    source_version TEXT NOT NULL,
+                    pool_id TEXT NOT NULL,
+                    token_address TEXT NOT NULL,
+                    signal_role TEXT NOT NULL,
+                    matched_path_id TEXT,
+                    arm TEXT NOT NULL,
+                    sampled_by_event_id TEXT NOT NULL,
+                    sample_bucket INTEGER NOT NULL,
+                    entry_anchor_address TEXT NOT NULL,
+                    entry_anchor_kind TEXT NOT NULL,
+                    entry_anchor_in_raw TEXT NOT NULL,
+                    entry_block INTEGER NOT NULL,
+                    signaled_at REAL NOT NULL,
+                    blocks_per_second REAL NOT NULL,
+                    created_at TEXT NOT NULL,
+                    FOREIGN KEY(event_id) REFERENCES flow_signal_events(event_id)
+                );
+                CREATE TABLE IF NOT EXISTS flow_shadow_path_schedule (
+                    path_id TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    label TEXT NOT NULL,
+                    nominal_offset_seconds INTEGER NOT NULL,
+                    offset_blocks INTEGER NOT NULL,
+                    target_block INTEGER NOT NULL,
+                    target_at REAL NOT NULL,
+                    kind TEXT NOT NULL,
+                    policy_hash TEXT NOT NULL,
+                    schedule_hash TEXT NOT NULL UNIQUE,
+                    PRIMARY KEY(path_id,step_index),
+                    FOREIGN KEY(path_id) REFERENCES flow_shadow_paths(path_id)
+                );
+                CREATE TABLE IF NOT EXISTS flow_shadow_path_attempts (
+                    path_id TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    attempts INTEGER NOT NULL DEFAULT 0,
+                    last_attempt_at REAL NOT NULL,
+                    retry_after REAL NOT NULL,
+                    failure_class TEXT NOT NULL,
+                    last_error TEXT NOT NULL,
+                    PRIMARY KEY(path_id,step_index),
+                    FOREIGN KEY(path_id,step_index)
+                        REFERENCES flow_shadow_path_schedule(path_id,step_index)
+                );
+                CREATE TABLE IF NOT EXISTS flow_shadow_path_measurements (
+                    sequence INTEGER PRIMARY KEY AUTOINCREMENT,
+                    path_id TEXT NOT NULL,
+                    step_index INTEGER NOT NULL,
+                    schedule_hash TEXT NOT NULL,
+                    status TEXT NOT NULL,
+                    observed_at REAL NOT NULL,
+                    quote_block INTEGER,
+                    quote_json TEXT,
+                    quote_verified INTEGER NOT NULL DEFAULT 0,
+                    exit_valid INTEGER NOT NULL DEFAULT 0,
+                    net_return REAL,
+                    price_multiple REAL,
+                    liquidity_usd REAL,
+                    error TEXT,
+                    previous_hash TEXT NOT NULL,
+                    record_hash TEXT NOT NULL UNIQUE,
+                    UNIQUE(path_id,step_index),
+                    FOREIGN KEY(path_id,step_index)
+                        REFERENCES flow_shadow_path_schedule(path_id,step_index)
+                );
+                CREATE INDEX IF NOT EXISTS idx_flow_shadow_path_due
+                    ON flow_shadow_path_schedule(target_block,path_id,step_index);
+                CREATE INDEX IF NOT EXISTS idx_flow_shadow_path_attempt_due
+                    ON flow_shadow_path_attempts(retry_after,path_id,step_index);
+                CREATE INDEX IF NOT EXISTS idx_flow_shadow_path_measurement_key
+                    ON flow_shadow_path_measurements(path_id,step_index);
+                CREATE TRIGGER IF NOT EXISTS flow_shadow_paths_no_update
+                BEFORE UPDATE ON flow_shadow_paths BEGIN
+                    SELECT RAISE(ABORT,'flow shadow paths are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS flow_shadow_paths_no_delete
+                BEFORE DELETE ON flow_shadow_paths BEGIN
+                    SELECT RAISE(ABORT,'flow shadow paths are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS flow_shadow_schedule_no_update
+                BEFORE UPDATE ON flow_shadow_path_schedule BEGIN
+                    SELECT RAISE(ABORT,'flow shadow path schedules are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS flow_shadow_schedule_no_delete
+                BEFORE DELETE ON flow_shadow_path_schedule BEGIN
+                    SELECT RAISE(ABORT,'flow shadow path schedules are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS flow_shadow_measurements_no_update
+                BEFORE UPDATE ON flow_shadow_path_measurements BEGIN
+                    SELECT RAISE(ABORT,'flow shadow path measurements are append-only');
+                END;
+                CREATE TRIGGER IF NOT EXISTS flow_shadow_measurements_no_delete
+                BEFORE DELETE ON flow_shadow_path_measurements BEGIN
+                    SELECT RAISE(ABORT,'flow shadow path measurements are append-only');
+                END;
                 CREATE TABLE IF NOT EXISTS transaction_origins (
                     transaction_hash TEXT PRIMARY KEY,
                     origin_address TEXT,
@@ -3302,6 +3427,19 @@ class RobinhoodLearningStore:
                     ON v4_custody_snapshots(observed_at,pool_id);
                 """
             )
+            shadow_path_columns = {
+                row[1] for row in connection.execute(
+                    "PRAGMA table_info(flow_shadow_paths)")
+            }
+            for name,declaration in {
+                "entry_anchor_address": "TEXT NOT NULL DEFAULT ''",
+                "entry_anchor_kind": "TEXT NOT NULL DEFAULT ''",
+                "entry_anchor_in_raw": "TEXT NOT NULL DEFAULT '0'",
+            }.items():
+                if name not in shadow_path_columns:
+                    connection.execute(
+                        "ALTER TABLE flow_shadow_paths"
+                        f" ADD COLUMN {name} {declaration}")
             columns = {row[1] for row in connection.execute("PRAGMA table_info(candidates)")}
             migrations = {
                 "source_version": "TEXT NOT NULL DEFAULT 'uniswap_v2'",
@@ -5494,6 +5632,429 @@ class RobinhoodLearningStore:
             )
         return verdict
 
+    def _insert_flow_shadow_path(
+        self, connection: sqlite3.Connection, event_id: str, *,
+        sampled_by_event_id: str, matched_event_id: str | None = None,
+    ) -> dict:
+        """Atomically pre-register one exact-block path with its signal event.
+
+        This is intentionally a local SQLite write.  No quote, provider call,
+        or historical scan is permitted on the live capture path.  The
+        evidence lane may resolve the frozen blocks later without changing
+        which blocks the experiment promised to measure.
+        """
+        event = connection.execute(
+            "SELECT * FROM flow_signal_events WHERE event_id=?", (event_id,)
+        ).fetchone()
+        if not event or not bool(event["eligible_for_evaluation"]):
+            return {"created": False, "path_id": None, "marks": 0,
+                    "reason": "event_not_evaluation_eligible"}
+        if event["source_version"] != SOURCE_V4:
+            return {"created": False, "path_id": None, "marks": 0,
+                    "reason": "source_adapter_unavailable"}
+        pool = connection.execute(
+            "SELECT anchor_address FROM v4_pools WHERE pool_id=?",
+            (event["pool_id"],),
+        ).fetchone()
+        anchor_address = str(pool["anchor_address"] if pool else "").lower()
+        if anchor_address == WETH_ADDRESS.lower():
+            anchor_kind = "wrapped_native"
+        elif anchor_address == USDG_ADDRESS.lower():
+            anchor_kind = "stable"
+        else:
+            return {"created": False, "path_id": None, "marks": 0,
+                    "reason": "supported_anchor_metadata_unavailable"}
+        anchor_in_raw = FLOW_SHADOW_ENTRY_ANCHOR_IN_RAW[anchor_kind]
+        path = _flow_shadow_path_id(event_id)
+        matched_path = (
+            _flow_shadow_path_id(matched_event_id) if matched_event_id else None)
+        definition_json = _flow_shadow_policy_json()
+        definition_hash = _flow_shadow_policy_hash()
+        bucket = _flow_shadow_sample_bucket(sampled_by_event_id)
+        inserted = connection.execute(
+            """
+            INSERT OR IGNORE INTO flow_shadow_paths (
+                path_id,policy_version,policy_hash,policy_json,event_id,
+                cohort_id,source_version,pool_id,token_address,signal_role,
+                matched_path_id,arm,sampled_by_event_id,sample_bucket,
+                entry_anchor_address,entry_anchor_kind,entry_anchor_in_raw,
+                entry_block,signaled_at,blocks_per_second,created_at
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                path,FLOW_SHADOW_PATH_POLICY_VERSION,definition_hash,
+                definition_json,event_id,event["cohort_id"],
+                event["source_version"],event["pool_id"],
+                event["token_address"],event["signal_role"],matched_path,
+                event["arm"],sampled_by_event_id,bucket,
+                anchor_address,anchor_kind,anchor_in_raw,
+                int(event["head_block"]),float(event["signaled_at"]),
+                FLOW_SHADOW_PATH_BLOCKS_PER_SECOND,_utc_now(),
+            ),
+        ).rowcount
+        if not inserted:
+            return {"created": False, "path_id": path, "marks": 0,
+                    "reason": "already_enrolled"}
+        schedules = _flow_shadow_schedule_rows(
+            path, int(event["head_block"]), float(event["signaled_at"]))
+        connection.executemany(
+            """
+            INSERT INTO flow_shadow_path_schedule (
+                path_id,step_index,label,nominal_offset_seconds,
+                offset_blocks,target_block,target_at,kind,policy_hash,
+                schedule_hash
+            ) VALUES (?,?,?,?,?,?,?,?,?,?)
+            """,
+            [
+                (
+                    row["path_id"],row["step_index"],row["label"],
+                    row["nominal_offset_seconds"],row["offset_blocks"],
+                    row["target_block"],row["target_at"],row["kind"],
+                    row["policy_hash"],row["schedule_hash"],
+                )
+                for row in schedules
+            ],
+        )
+        return {"created": True, "path_id": path, "marks": len(schedules),
+                "reason": None}
+
+    def due_flow_shadow_path_marks(
+        self, now: float, head_block: int, limit: int = 4,
+    ) -> list[dict]:
+        """Return exact target blocks whose archive quote is now finalizable."""
+        finalized_head = max(0, int(head_block) - FLOW_SHADOW_PATH_FINALITY_BLOCKS)
+        with self.connection() as connection:
+            return [dict(row) for row in connection.execute(
+                """
+                SELECT s.*,p.event_id,p.pool_id,p.token_address,p.signal_role,
+                       p.matched_path_id,p.source_version,p.arm,
+                       p.entry_anchor_address,p.entry_anchor_kind,
+                       p.entry_anchor_in_raw,
+                       entry.status entry_status,
+                       entry.quote_json entry_quote_json,
+                       entry.quote_verified entry_quote_verified,
+                       entry.exit_valid entry_exit_valid
+                FROM flow_shadow_path_schedule s
+                JOIN flow_shadow_paths p USING(path_id)
+                LEFT JOIN flow_shadow_path_measurements done
+                  ON done.path_id=s.path_id AND done.step_index=s.step_index
+                LEFT JOIN flow_shadow_path_attempts a
+                  ON a.path_id=s.path_id AND a.step_index=s.step_index
+                LEFT JOIN flow_shadow_path_measurements entry
+                  ON entry.path_id=s.path_id AND entry.step_index=0
+                WHERE done.sequence IS NULL AND s.target_block<=?
+                  AND (a.retry_after IS NULL OR a.retry_after<=?)
+                  AND (s.step_index=0 OR (
+                        entry.status='observed' AND entry.exit_valid=1))
+                ORDER BY s.target_block,s.path_id,s.step_index LIMIT ?
+                """,
+                (finalized_head,float(now),max(0,int(limit))),
+            )]
+
+    def record_flow_shadow_path_attempt(
+        self, path_id: str, step_index: int, *, error: BaseException | str,
+        now: float | None = None,
+        retry_seconds: float = FLOW_SHADOW_PATH_RETRY_SECONDS,
+        failure_class: str | None = None,
+    ) -> dict:
+        observed_at = time.time() if now is None else float(now)
+        classified_failure = failure_class or (
+            "historical_state_unavailable"
+            if _rpc_historical_state_unavailable(error)
+            else "provider_or_transport_failure"
+        )
+        retry_after = observed_at + max(1.0, float(retry_seconds))
+        with self.connection() as connection:
+            connection.execute(
+                """
+                INSERT INTO flow_shadow_path_attempts (
+                    path_id,step_index,attempts,last_attempt_at,retry_after,
+                    failure_class,last_error
+                ) VALUES (?,?,1,?,?,?,?)
+                ON CONFLICT(path_id,step_index) DO UPDATE SET
+                    attempts=flow_shadow_path_attempts.attempts+1,
+                    last_attempt_at=excluded.last_attempt_at,
+                    retry_after=excluded.retry_after,
+                    failure_class=excluded.failure_class,
+                    last_error=excluded.last_error
+                """,
+                (
+                    path_id,int(step_index),observed_at,retry_after,
+                    classified_failure,str(error)[:500],
+                ),
+            )
+            attempts = connection.execute(
+                "SELECT attempts FROM flow_shadow_path_attempts"
+                " WHERE path_id=? AND step_index=?",
+                (path_id,int(step_index)),
+            ).fetchone()[0]
+        return {
+            "attempts": int(attempts), "failure_class": classified_failure,
+            "retry_after": retry_after,
+        }
+
+    @staticmethod
+    def _append_flow_shadow_measurement(
+        connection: sqlite3.Connection, due: dict, payload: dict,
+    ) -> None:
+        previous_row = connection.execute(
+            "SELECT record_hash FROM flow_shadow_path_measurements"
+            " ORDER BY sequence DESC LIMIT 1"
+        ).fetchone()
+        previous = str(previous_row[0]) if previous_row else "0" * 64
+        ordered_payload = {
+            key: payload.get(key) for key in (
+                "path_id", "step_index", "status", "observed_at",
+                "quote_block", "quote_json", "quote_verified", "exit_valid",
+                "net_return", "price_multiple", "liquidity_usd", "error",
+            )
+        }
+        record_hash = _flow_shadow_measurement_hash(
+            previous,str(due["schedule_hash"]),ordered_payload)
+        connection.execute(
+            """
+            INSERT INTO flow_shadow_path_measurements (
+                path_id,step_index,schedule_hash,status,observed_at,
+                quote_block,quote_json,quote_verified,exit_valid,net_return,
+                price_multiple,liquidity_usd,error,previous_hash,record_hash
+            ) VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)
+            """,
+            (
+                ordered_payload["path_id"],ordered_payload["step_index"],
+                due["schedule_hash"],ordered_payload["status"],
+                ordered_payload["observed_at"],ordered_payload["quote_block"],
+                ordered_payload["quote_json"],ordered_payload["quote_verified"],
+                ordered_payload["exit_valid"],ordered_payload["net_return"],
+                ordered_payload["price_multiple"],
+                ordered_payload["liquidity_usd"],ordered_payload["error"],
+                previous,record_hash,
+            ),
+        )
+
+    def record_flow_shadow_path_measurement(
+        self, due: dict, market: dict, *, quote_block: int, now: float,
+    ) -> dict:
+        """Append one exact-block quote, or one explicit market failure.
+
+        Transport failures never call this method; they remain retry state in
+        ``flow_shadow_path_attempts``.  Consequently a terminal unexitable
+        measurement is an economic fact returned by the block-pinned quoter,
+        not a provider timeout disguised as a rug.
+        """
+        if int(quote_block) != int(due["target_block"]):
+            raise ValueError("shadow path quote must match scheduled target block")
+        if safe_int(market.get("quote_block"),-1) != int(quote_block):
+            raise ValueError("shadow path market is not bound to scheduled block")
+        if market.get("reason") in {
+                "pool_metadata_unavailable", "shadow_anchor_binding_mismatch",
+                "invalid_token_address"}:
+            raise ValueError("shadow path pool metadata is not verified")
+        if market.get("reason") == "anchor_usd_price_unavailable":
+            raise TimeoutError("anchor price provider unavailable")
+        quote_json = _canonical(market)
+        status = "observed"
+        quote_verified = exit_valid = False
+        net_return = price_multiple = None
+        error = None
+        liquidity = safe_float(market.get("liquidity_usd"),0.0) or None
+
+        if int(due["step_index"]) == 0:
+            entry_quote = dict(market.get("execution_quote") or {})
+            if (entry_quote.get("verified")
+                    and safe_int(entry_quote.get("quote_block"),-1)
+                    != int(quote_block)):
+                raise ValueError(
+                    "shadow path entry quote is not bound to scheduled block")
+            if entry_quote.get("verified") and (
+                    str(entry_quote.get("anchor_in_raw"))
+                    != str(due["entry_anchor_in_raw"])
+                    or safe_int(entry_quote.get("token_out_raw"),0) <= 0):
+                raise ValueError("shadow path entry notional or quantity mismatch")
+            quote_verified = bool(
+                market.get("current_state_verified") is not False
+                and entry_quote.get("verified"))
+            exit_valid = bool(
+                quote_verified and entry_quote.get("passes_round_trip_limit"))
+            if quote_verified:
+                ratio = safe_float(entry_quote.get("round_trip_ratio"),0.0)
+                net_return = ratio * (
+                    1 - FLOW_SHADOW_PATH_FRICTION_BPS / 10_000) - 1
+            price_multiple = 1.0 if quote_verified else None
+            if not exit_valid:
+                status = "entry_unmarketable"
+                error = str(
+                    entry_quote.get("reason")
+                    or market.get("reason") or "entry_quote_unmarketable")[:500]
+        else:
+            try:
+                entry_market = json.loads(due.get("entry_quote_json") or "{}")
+            except (TypeError, ValueError, json.JSONDecodeError):
+                entry_market = {}
+            entry_quote = dict(entry_market.get("execution_quote") or {})
+            exit_quote = dict(market.get("paper_exit_quote") or {})
+            if exit_quote.get("verified") and (
+                    str(exit_quote.get("token_in_raw"))
+                    != str(entry_quote.get("token_out_raw"))):
+                raise ValueError("shadow path exit quantity mismatch")
+            entry_anchor = safe_float(entry_quote.get("anchor_in_raw"),0.0)
+            exit_anchor = safe_float(exit_quote.get("anchor_out_raw"),0.0)
+            quote_verified = bool(exit_quote.get("verified"))
+            exit_valid = bool(
+                quote_verified and entry_anchor > 0 and exit_anchor > 0)
+            if exit_valid:
+                net_return = exit_anchor / entry_anchor * (
+                    1 - FLOW_SHADOW_PATH_FRICTION_BPS / 10_000) - 1
+            else:
+                status = "non_exitable"
+                net_return = -1.0
+                error = str(
+                    exit_quote.get("reason") or market.get("reason")
+                    or "exit_quote_unmarketable")[:500]
+            entry_price = safe_float(entry_market.get("price_usd"),0.0)
+            exit_price = safe_float(market.get("price_usd"),0.0)
+            if entry_price > 0 and exit_price > 0:
+                price_multiple = exit_price / entry_price
+
+        payload = {
+            "path_id": due["path_id"],
+            "step_index": int(due["step_index"]),
+            "status": status,
+            "observed_at": float(now),
+            "quote_block": int(quote_block),
+            "quote_json": quote_json,
+            "quote_verified": int(quote_verified),
+            "exit_valid": int(exit_valid),
+            "net_return": net_return,
+            "price_multiple": price_multiple,
+            "liquidity_usd": liquidity,
+            "error": error,
+        }
+        with self.connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            self._append_flow_shadow_measurement(connection,due,payload)
+            cascaded = 0
+            if status == "entry_unmarketable":
+                remaining = [dict(row) for row in connection.execute(
+                    """
+                    SELECT s.* FROM flow_shadow_path_schedule s
+                    LEFT JOIN flow_shadow_path_measurements m
+                      ON m.path_id=s.path_id AND m.step_index=s.step_index
+                    WHERE s.path_id=? AND s.step_index>0 AND m.sequence IS NULL
+                    ORDER BY s.step_index
+                    """,
+                    (due["path_id"],),
+                )]
+                for schedule in remaining:
+                    terminal = {
+                        "path_id": due["path_id"],
+                        "step_index": int(schedule["step_index"]),
+                        "status": "entry_unmarketable",
+                        "observed_at": float(now),
+                        "quote_block": None,
+                        "quote_json": None,
+                        "quote_verified": 0,
+                        "exit_valid": 0,
+                        "net_return": None,
+                        "price_multiple": None,
+                        "liquidity_usd": None,
+                        "error": "entry_unmarketable",
+                    }
+                    self._append_flow_shadow_measurement(
+                        connection,schedule,terminal)
+                    cascaded += 1
+        return {
+            "status": status, "quote_verified": quote_verified,
+            "exit_valid": exit_valid, "net_return": net_return,
+            "cascaded": cascaded,
+        }
+
+    def flow_shadow_path_summary(self, now: float | None = None) -> dict:
+        observed_at = time.time() if now is None else float(now)
+        try:
+            with self.connection() as connection:
+                paths = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_paths").fetchone()[0]
+                qualified = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_paths"
+                    " WHERE signal_role='qualified'").fetchone()[0]
+                controls = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_paths"
+                    " WHERE signal_role='matched_control'").fetchone()[0]
+                scheduled = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_path_schedule").fetchone()[0]
+                measured = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_path_measurements").fetchone()[0]
+                attempts = connection.execute(
+                    "SELECT COALESCE(SUM(attempts),0)"
+                    " FROM flow_shadow_path_attempts").fetchone()[0]
+                entry_marketable = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_path_measurements"
+                    " WHERE step_index=0 AND status='observed' AND exit_valid=1"
+                ).fetchone()[0]
+                integrity_failures = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_path_attempts"
+                    " WHERE failure_class='evidence_integrity_failure'"
+                ).fetchone()[0]
+                entry_terminal = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_path_measurements"
+                    " WHERE step_index=0"
+                ).fetchone()[0]
+                entry_unmarketable = connection.execute(
+                    "SELECT COUNT(*) FROM flow_shadow_path_measurements"
+                    " WHERE step_index=0 AND status='entry_unmarketable'"
+                ).fetchone()[0]
+                by_label = {
+                    row[0]: int(row[1]) for row in connection.execute(
+                        """
+                        SELECT s.label,COUNT(m.sequence)
+                        FROM flow_shadow_path_schedule s
+                        LEFT JOIN flow_shadow_path_measurements m
+                          ON m.path_id=s.path_id AND m.step_index=s.step_index
+                        GROUP BY s.step_index,s.label ORDER BY s.step_index
+                        """)
+                }
+                nominal_due = connection.execute(
+                    """
+                    SELECT COUNT(*) FROM flow_shadow_path_schedule s
+                    LEFT JOIN flow_shadow_path_measurements m
+                      ON m.path_id=s.path_id AND m.step_index=s.step_index
+                    WHERE m.sequence IS NULL AND s.target_at<=?
+                    """,
+                    (observed_at,),
+                ).fetchone()[0]
+                last = connection.execute(
+                    "SELECT MAX(sequence) FROM flow_shadow_path_measurements"
+                ).fetchone()[0]
+        except sqlite3.OperationalError:
+            return {
+                "status": "not_initialized",
+                "policy_version": FLOW_SHADOW_PATH_POLICY_VERSION,
+                "paths": 0, "scheduled_marks": 0,
+                "measured_marks": 0,
+            }
+        return {
+            "status": "collecting" if paths else "awaiting_first_path",
+            "policy_version": FLOW_SHADOW_PATH_POLICY_VERSION,
+            "policy_hash": _flow_shadow_policy_hash(),
+            "sample_basis_points": FLOW_SHADOW_PATH_SAMPLE_BASIS_POINTS,
+            "paths": int(paths), "qualified_paths": int(qualified),
+            "control_paths": int(controls),
+            "scheduled_marks": int(scheduled),
+            "measured_marks": int(measured),
+            "nominal_due_unmeasured": int(nominal_due),
+            "provider_attempts": int(attempts),
+            "integrity_failures": int(integrity_failures),
+            "entry_terminal_paths": int(entry_terminal),
+            "entry_marketable_paths": int(entry_marketable),
+            "entry_unmarketable_paths": int(entry_unmarketable),
+            "measured_by_label": by_label,
+            "latest_measurement_sequence": (
+                int(last) if last is not None else None),
+            "claim_scope": "exact-block checkpoint-executable shadow evidence",
+            "promotion_enabled": False,
+            "live_execution_enabled": False,
+        }
+
     def capture_flow_signal_events(
         self, head_block: int, now: float, *, ingest_head_block: int | None = None,
         pool_ids: list[str] | None = None,
@@ -5512,6 +6073,9 @@ class RobinhoodLearningStore:
         controls_created = 0
         historical_created = 0
         stale_arm_created = 0
+        shadow_paths_created = 0
+        shadow_path_marks_scheduled = 0
+        shadow_path_enrollment_failures = 0
         scoped_pool_ids = (
             None if pool_ids is None else list(dict.fromkeys(
                 str(pool_id) for pool_id in pool_ids if pool_id
@@ -5545,14 +6109,23 @@ class RobinhoodLearningStore:
                 )
                 row["limitations"] = json.loads(row.pop("limitations_json") or "[]")
                 row["features"] = json.loads(row.pop("features_json") or "{}")
-            fresh = [
-                row for row in rows
-                if 0 <= head_block - int(row["window_end_block"])
-                <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
-            ]
+            def observation_fresh(row: dict) -> bool:
+                decision_lag = head_block - int(row["window_end_block"])
+                ingest_lag = (
+                    int(ingest_head_block) - int(row["window_end_block"])
+                    if ingest_head_block else None
+                )
+                return bool(
+                    0 <= decision_lag <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                    or ingest_lag is not None
+                    and 0 <= ingest_lag
+                    <= FLOW_MAXIMUM_PROSPECTIVE_HEAD_LAG_BLOCKS
+                )
+
+            prospective = [row for row in rows if observation_fresh(row)]
             qualified = [row for row in rows if bool(row["shadow_qualified"])]
-            fresh_controls = [
-                row for row in fresh if not bool(row["shadow_qualified"])
+            prospective_controls = [
+                row for row in prospective if not bool(row["shadow_qualified"])
             ]
             last_qualified_blocks = {
                 row["pool_id"]: int(row["last_block"])
@@ -5661,31 +6234,64 @@ class RobinhoodLearningStore:
                 last_qualified_blocks[signal["pool_id"]] = int(
                     signal["window_end_block"]
                 )
-                if signal not in fresh:
-                    continue
-                candidates = [
-                    row for row in fresh_controls if row["pool_id"] not in used_controls
-                ]
-                if not candidates:
-                    continue
-                control = min(
-                    candidates,
-                    key=lambda row: (
-                        abs(float(row["shadow_score"]) - float(signal["shadow_score"])),
-                        abs(int(row["swap_count"]) - int(signal["swap_count"])),
-                        abs(int(row["window_end_block"]) - int(signal["window_end_block"])),
-                        row["pool_id"],
-                    ),
-                )
-                control_id = insert_event(control, "matched_control", signal_id)
-                if control_id:
-                    used_controls.add(control["pool_id"])
+                control_id = None
+                if signal in prospective:
+                    candidates = [
+                        row for row in prospective_controls
+                        if row["pool_id"] not in used_controls
+                    ]
+                    if candidates:
+                        control = min(
+                            candidates,
+                            key=lambda row: (
+                                abs(float(row["shadow_score"])
+                                    - float(signal["shadow_score"])),
+                                abs(int(row["swap_count"])
+                                    - int(signal["swap_count"])),
+                                abs(int(row["window_end_block"])
+                                    - int(signal["window_end_block"])),
+                                row["pool_id"],
+                            ),
+                        )
+                        control_id = insert_event(
+                            control, "matched_control", signal_id)
+                        if control_id:
+                            used_controls.add(control["pool_id"])
+
+                # Membership is decided NOW, before any entry or outcome
+                # quote exists. Controls inherit their signal's deterministic
+                # bucket, so the paired arm cannot be selected after returns
+                # are known. This local write is the only path work on the
+                # live lane; every remote quote belongs to the evidence lane.
+                if _flow_shadow_selected(signal_id):
+                    enrolled = self._insert_flow_shadow_path(
+                        connection,signal_id,
+                        sampled_by_event_id=signal_id,
+                        matched_event_id=control_id)
+                    shadow_paths_created += int(enrolled["created"])
+                    shadow_path_marks_scheduled += enrolled["marks"]
+                    shadow_path_enrollment_failures += int(
+                        not enrolled["created"])
+                    if control_id and enrolled["created"]:
+                        control_path = self._insert_flow_shadow_path(
+                            connection,control_id,
+                            sampled_by_event_id=signal_id,
+                            matched_event_id=signal_id)
+                        shadow_paths_created += int(control_path["created"])
+                        shadow_path_marks_scheduled += control_path["marks"]
+                        shadow_path_enrollment_failures += int(
+                            not control_path["created"])
         return {
             "created": len(created), "event_ids": created,
             "qualified_created": qualified_created,
             "controls_created": controls_created,
             "historical_created": historical_created,
             "stale_arm_created": stale_arm_created,
+            "shadow_paths_created": shadow_paths_created,
+            "shadow_path_marks_scheduled": shadow_path_marks_scheduled,
+            "shadow_path_enrollment_failures":
+                shadow_path_enrollment_failures,
+            "shadow_path_policy_version": FLOW_SHADOW_PATH_POLICY_VERSION,
             "head_block": head_block, "cohort_id": cohort_id,
             "capture_scope": (
                 "all_flow_signals" if pool_ids is None else "touched_pools"
@@ -12060,13 +12666,16 @@ class RobinhoodV4MarketClient:
         anchor_usd: float,
         token_usd: float,
         block: int | str | None = None,
+        anchor_in_raw: int | None = None,
     ) -> dict:
-        """Simulate a $100 buy and immediate sell against the exact pool key."""
+        """Simulate a frozen-anchor buy and sell against the exact pool key."""
         anchor = str(pool["anchor_address"]).lower()
         currency0 = str(pool["currency0"]).lower()
         buy_zero_for_one = currency0 == anchor
-        anchor_in = int(
-            V4_QUOTE_PROBE_USD / max(anchor_usd, 1e-30) * (10 ** anchor_decimals)
+        anchor_in = (
+            int(anchor_in_raw) if anchor_in_raw is not None
+            else int(V4_QUOTE_PROBE_USD / max(anchor_usd,1e-30)
+                     * (10 ** anchor_decimals))
         )
         if anchor_in <= 0:
             return {"verified": False, "reason": "invalid_probe_amount"}
@@ -12097,7 +12706,8 @@ class RobinhoodV4MarketClient:
         return {
             "verified": bool(token_out > 0 and anchor_out > 0),
             "quoter": UNISWAP_V4_QUOTER,
-            "probe_usd": V4_QUOTE_PROBE_USD,
+            "probe_usd": anchor_in / (10 ** anchor_decimals) * anchor_usd,
+            "probe_anchor_units": anchor_in / (10 ** anchor_decimals),
             "anchor_in_raw": str(anchor_in),
             "token_out_raw": str(token_out),
             "anchor_out_raw": str(anchor_out),
@@ -12156,11 +12766,31 @@ class RobinhoodV4MarketClient:
         active_liquidity = int(liquidity_raw or "0x0", 16)
         sqrt_price, tick = self._decode_slot0(slot0_raw)
         if active_liquidity <= 0 or sqrt_price <= 0:
-            return {"source": "uniswap_v4_state_view", "current_state_verified": False}
+            return {
+                "source": "uniswap_v4_state_view",
+                "current_state_verified": False,
+                "reason": "inactive_or_unpriced_pool",
+                "quote_block": quote_block,
+            }
         pool = self.store.v4_pool(pool_id)
         if not pool:
-            return {}
+            return {
+                "source": "uniswap_v4_state_view",
+                "current_state_verified": False,
+                "reason": "pool_metadata_unavailable",
+                "quote_block": quote_block,
+            }
         anchor = pool["anchor_address"]
+        expected_anchor = str(
+            candidate.get("shadow_entry_anchor_address") or "").lower()
+        if expected_anchor and expected_anchor != str(anchor).lower():
+            return {
+                "source": "uniswap_v4_state_view",
+                "current_state_verified": False,
+                "reason": "shadow_anchor_binding_mismatch",
+                "anchor_address": anchor,
+                "quote_block": quote_block,
+            }
         token_decimals = self._cached_decimals(token, quote_block)
         anchor_decimals = self._cached_decimals(anchor, quote_block)
         total_supply = self._cached_total_supply(token, quote_block)
@@ -12170,7 +12800,8 @@ class RobinhoodV4MarketClient:
             anchor_usd, anchor_source = self.anchors.wrapped_native_usd()
         if anchor_usd <= 0:
             return {"source": "uniswap_v4_state_view", "current_state_verified": False,
-                    "reason": "anchor_usd_price_unavailable"}
+                    "reason": "anchor_usd_price_unavailable",
+                    "quote_block": quote_block}
         raw_ratio = (sqrt_price / (1 << 96)) ** 2
         human_ratio = raw_ratio * (10 ** (token_decimals-anchor_decimals) if pool["currency0"].lower()==token.lower() else 10 ** (anchor_decimals-token_decimals))
         if pool["currency0"].lower() == token.lower():
@@ -12190,6 +12821,9 @@ class RobinhoodV4MarketClient:
                 anchor_usd=anchor_usd,
                 token_usd=token_usd,
                 block=quote_block,
+                anchor_in_raw=(
+                    safe_int(candidate.get("shadow_entry_anchor_in_raw"),0)
+                    or None),
             )
             if include_execution_quote else None
         )
@@ -12197,7 +12831,10 @@ class RobinhoodV4MarketClient:
         paper_exit = None
         if paper_quantity > 0:
             try:
-                token_in = int(paper_quantity * token_scale)
+                token_in = (
+                    int(candidate["shadow_exit_token_in_raw"])
+                    if candidate.get("shadow_exit_token_in_raw") is not None
+                    else int(paper_quantity * token_scale))
                 sell_zero_for_one = pool["currency0"].lower() == token.lower()
                 anchor_out, gas_estimate = self._quote_exact_input_single(
                     pool,
@@ -12213,6 +12850,10 @@ class RobinhoodV4MarketClient:
                     "gas_estimate": gas_estimate,
                 }
             except Exception as exc:
+                if (isinstance(exc, BackgroundRpcPriorityDeferred)
+                        or _transient_rpc_failure(exc)
+                        or _rpc_historical_state_unavailable(exc)):
+                    raise
                 paper_exit = {
                     "verified": False,
                     "reason": "v4_paper_exit_quote_failed",
@@ -12221,6 +12862,7 @@ class RobinhoodV4MarketClient:
         custody = self.store.latest_v4_custody(pool_id)
         return {
             "pool_id": pool_id, "source": "uniswap_v4_state_view",
+            "anchor_address": anchor,
             "price_usd": token_usd or None, "liquidity_usd": liquidity_usd or None,
             "market_cap_usd": token_usd*supply if token_usd and supply else None,
             "fdv_usd": token_usd*supply if token_usd and supply else None,
@@ -15958,6 +16600,115 @@ class RobinhoodLearningEngine:
             "non_exitable": non_exitable, "deferred": deferred,
         }
 
+    def observe_flow_shadow_path_marks(
+        self, now: float, head_block: int,
+        limit: int = EVIDENCE_SHADOW_PATH_MARK_LIMIT,
+        *, deadline: CycleDeadline | None = None,
+    ) -> dict:
+        """Resolve pre-registered exit paths at their exact target blocks.
+
+        Unlike the legacy horizon resolver, queue lateness is harmless here:
+        every quote is an archive read pinned to the block selected before the
+        outcome existed.  This stage never enters the live lane and never
+        changes admission or a paper position.
+        """
+        due_rows = self.store.due_flow_shadow_path_marks(
+            now,int(head_block),max(0,int(limit)))
+        observed = entry_marketable = non_exitable = cascaded = 0
+        deferred = failures = provider_unavailable = 0
+        for index, due in enumerate(due_rows):
+            if (deadline is not None
+                    and deadline.remaining()
+                    < EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
+                deferred = len(due_rows) - index
+                break
+            candidate = {
+                "pool_id": due["pool_id"],
+                "token_address": due["token_address"],
+                "shadow_entry_anchor_address": due["entry_anchor_address"],
+                "shadow_entry_anchor_in_raw": due["entry_anchor_in_raw"],
+            }
+            include_entry_quote = int(due["step_index"]) == 0
+            if not include_entry_quote:
+                try:
+                    entry_market = json.loads(
+                        due.get("entry_quote_json") or "{}")
+                except (TypeError, ValueError, json.JSONDecodeError):
+                    entry_market = {}
+                entry_quote = dict(
+                    entry_market.get("execution_quote") or {})
+                token_decimals = safe_int(
+                    entry_quote.get("token_decimals"),18)
+                token_out_raw = safe_int(
+                    entry_quote.get("token_out_raw"),0)
+                if token_out_raw <= 0:
+                    self.store.record_flow_shadow_path_attempt(
+                        due["path_id"],int(due["step_index"]),
+                        error="invalid sealed entry quantity",now=now,
+                        failure_class="evidence_integrity_failure")
+                    failures += 1
+                    continue
+                candidate["paper_quantity"] = (
+                    token_out_raw / (10 ** token_decimals))
+                candidate["shadow_exit_token_in_raw"] = str(token_out_raw)
+            try:
+                market = self.v4_market.snapshot(
+                    candidate,
+                    include_execution_quote=include_entry_quote,
+                    quote_block=int(due["target_block"]),
+                )
+            except BackgroundRpcPriorityDeferred:
+                deferred = len(due_rows) - index
+                break
+            except Exception as exc:
+                attempt = self.store.record_flow_shadow_path_attempt(
+                    due["path_id"],int(due["step_index"]),
+                    error=exc,now=now)
+                failures += 1
+                provider_unavailable += int(
+                    attempt["failure_class"] in {
+                        "provider_or_transport_failure",
+                        "historical_state_unavailable",
+                    })
+                if _rpc_rate_limited(exc):
+                    deferred = len(due_rows) - index - 1
+                    break
+                continue
+            try:
+                result = self.store.record_flow_shadow_path_measurement(
+                    due,market,quote_block=int(due["target_block"]),now=now)
+            except ValueError as exc:
+                self.store.record_flow_shadow_path_attempt(
+                    due["path_id"],int(due["step_index"]),error=exc,now=now,
+                    failure_class="evidence_integrity_failure")
+                failures += 1
+                continue
+            except TimeoutError as exc:
+                self.store.record_flow_shadow_path_attempt(
+                    due["path_id"],int(due["step_index"]),error=exc,now=now)
+                failures += 1
+                provider_unavailable += 1
+                continue
+            observed += 1
+            entry_marketable += int(
+                int(due["step_index"]) == 0
+                and result["status"] == "observed")
+            non_exitable += int(result["status"] == "non_exitable")
+            cascaded += int(result["cascaded"])
+        return {
+            "selected": len(due_rows), "observed": observed,
+            "entry_marketable": entry_marketable,
+            "non_exitable": non_exitable,
+            "terminal_cascaded": cascaded,
+            "failures": failures,
+            "provider_unavailable": provider_unavailable,
+            "deferred": deferred, "head_block": int(head_block),
+            "limit": max(0,int(limit)),
+            "policy_version": FLOW_SHADOW_PATH_POLICY_VERSION,
+            "exact_target_blocks": True,
+            "paper_only": True, "live_execution_enabled": False,
+        }
+
     def _best_executable_market(self, candidate: dict) -> dict:
         """Find the most liquid safely identifiable venue for a watched token."""
         choices = []
@@ -16742,6 +17493,7 @@ class RobinhoodLearningEngine:
         entry_quote_limit: int = EVIDENCE_ENTRY_QUOTE_LIMIT,
         event_outcome_limit: int = EVIDENCE_EVENT_OUTCOME_LIMIT,
         observation_outcome_limit: int = EVIDENCE_OBSERVATION_OUTCOME_LIMIT,
+        shadow_path_mark_limit: int = EVIDENCE_SHADOW_PATH_MARK_LIMIT,
     ) -> dict:
         """Price and follow prospective evidence, never execute positions.
 
@@ -16853,6 +17605,67 @@ class RobinhoodLearningEngine:
             timings["observation_outcomes_seconds"] = round(
                 time.monotonic() - stage, 3)
 
+            # Exact-block shadow paths are the strategy-evaluation stream.
+            # They outrank legacy event endpoints because a late resolver can
+            # still reproduce their frozen target block, while a legacy
+            # current-head endpoint changes meaning as its queue waits.
+            stage = time.monotonic()
+            stage_deadline = next_stage_deadline()
+            if stage_deadline.remaining() < (
+                    EVIDENCE_OUTCOME_ITEM_RESERVE_SECONDS):
+                shadow_path_marks = {
+                    "selected": 0, "observed": 0,
+                    "entry_marketable": 0, "non_exitable": 0,
+                    "terminal_cascaded": 0, "failures": 0,
+                    "provider_unavailable": 0, "deferred": 0,
+                    "admission_deferred": True,
+                    "deferred_count_known": False,
+                    "reason": "completion_reserve_reached",
+                    "limit": max(0,int(shadow_path_mark_limit)),
+                    "policy_version": FLOW_SHADOW_PATH_POLICY_VERSION,
+                    "exact_target_blocks": True,
+                    "paper_only": True, "live_execution_enabled": False,
+                }
+            else:
+                self.store.mark_lane_stage(
+                    "evidence", "shadow_path_marks",
+                    run_id=self.cycle_run_uuid,
+                    remaining=stage_deadline.remaining(),
+                    completed=dict(timings))
+                try:
+                    with self._rpc_deadline(stage_deadline):
+                        path_head = int(self.rpc.get_block_number())
+                        shadow_path_marks = (
+                            self.observe_flow_shadow_path_marks(
+                                observed_at,path_head,
+                                limit=max(0,int(shadow_path_mark_limit)),
+                                deadline=stage_deadline,
+                            )
+                        )
+                except Exception as exc:
+                    if not (
+                        isinstance(exc,BackgroundRpcPriorityDeferred)
+                        or _rpc_rate_limited(exc)):
+                        raise
+                    shadow_path_marks = {
+                        "selected": 0, "observed": 0,
+                        "entry_marketable": 0, "non_exitable": 0,
+                        "terminal_cascaded": 0, "failures": 0,
+                        "provider_unavailable": 1, "deferred": 0,
+                        "admission_deferred": True,
+                        "deferred_count_known": False,
+                        "reason": (
+                            "provider_rate_limited"
+                            if _rpc_rate_limited(exc)
+                            else "stage_rpc_budget_exhausted"),
+                        "limit": max(0,int(shadow_path_mark_limit)),
+                        "policy_version": FLOW_SHADOW_PATH_POLICY_VERSION,
+                        "exact_target_blocks": True,
+                        "paper_only": True, "live_execution_enabled": False,
+                    }
+            timings["shadow_path_marks_seconds"] = round(
+                time.monotonic() - stage, 3)
+
             stage = time.monotonic()
             stage_deadline = next_stage_deadline()
             event_outcomes: dict
@@ -16913,6 +17726,7 @@ class RobinhoodLearningEngine:
             return {
                 "entry_quotes": entry_quotes,
                 "observation_quotes": observation_quotes,
+                "shadow_path_marks": shadow_path_marks,
                 "event_outcomes": event_outcomes,
                 "observation_outcomes": observation_outcomes,
                 "stage_timings_seconds": timings,
@@ -19798,6 +20612,7 @@ def dashboard_operational_snapshot(
             root, chain_root=chain_root, skill_root=skill_root)
     stabilization = store.stabilization_summary(integrity=integrity)
     from chainseer_recursive_learning import latest_shadow_learning
+    from chainseer_shadow_paths import latest_shadow_exit_evaluation
     return {
         "timestamp":_utc_now(),"network":"robinhood","chain_id":ROBINHOOD_NETWORK.chain_id,
         "learning":store.summary(),
@@ -19836,6 +20651,8 @@ def dashboard_operational_snapshot(
         },
         "stabilization": stabilization,
         "recursive_learning": latest_shadow_learning(root),
+        "shadow_paths": store.flow_shadow_path_summary(),
+        "shadow_exit_evaluation": latest_shadow_exit_evaluation(root),
         "decision_gate": _dashboard_decision_gate(root),
         "discovery_coverage":cursor.get("coverage") or summary.get("discovery_coverage") or {},
         "discovery_coverage_by_source":{
@@ -20467,7 +21284,7 @@ def main() -> None:
             "full-verification-once",
             "lanes", "status", "dashboard", "verify", "reflect",
             "audit", "repair-outcomes", "cohort-start", "cohort-status",
-            "recursive-once",
+            "recursive-once", "shadow-exit-once",
         ),
     )
     parser.add_argument(
@@ -20580,6 +21397,42 @@ def main() -> None:
             },
         )
         print(json.dumps(result, indent=2)); return
+    if args.command == "shadow-exit-once":
+        from chainseer_shadow_paths import run_shadow_exit_evaluation
+        exit_root = Path(args.root)
+        exit_store = RobinhoodLearningStore(
+            exit_root / "learning.sqlite3")
+        exit_integrity = _dashboard_integrity(
+            exit_root,chain_root=args.chain_root,
+            skill_root=args.skill_root)
+        exit_stabilization = exit_store.stabilization_summary(
+            integrity=exit_integrity)
+        exit_cohort = exit_stabilization.get("acceptance_cohort") or {}
+        exit_source_permissions = {
+            source: not exit_store.source_entry_risk(source)["quarantined"]
+            for source in (SOURCE_V2,SOURCE_V3,SOURCE_V4)
+        }
+        exit_source_permissions[SOURCE_V4] = bool(
+            exit_source_permissions[SOURCE_V4]
+            and V4_PAPER_ADMISSION_ENABLED)
+        result = run_shadow_exit_evaluation(
+            args.root,source_revision=_workspace_revision(),
+            source_digest=_worktree_source_digest(),
+            source_permissions=exit_source_permissions,
+            operational_evidence={
+                "stabilized": (
+                    str(exit_stabilization.get("status") or "").upper()
+                    == "STABILIZED"),
+                "cohort_id": exit_cohort.get("cohort_id"),
+                "revision": exit_cohort.get("revision"),
+                "policy_hash": exit_cohort.get("policy_hash"),
+                "criteria_passed": exit_stabilization.get(
+                    "criteria_passed",0),
+                "criteria_total": exit_stabilization.get(
+                    "criteria_total",0),
+            },
+        )
+        print(json.dumps(result,indent=2)); return
     if args.command=="lanes":
         result = supervise_lanes(
             args.root, chain_root=args.chain_root,
