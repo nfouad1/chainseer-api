@@ -2026,6 +2026,30 @@ class HybridCognitiveCompletionTests(unittest.TestCase):
                 service._deferred_queue.counts()["done"], 1
             )
 
+    def test_production_isolation_does_not_queue_cognitive_work(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(Settings(
+                environment="test", api_token="", chain_root=root,
+                queue_size=4, result_ttl_seconds=3600,
+                cache_ttl_seconds=300, rate_limit_per_minute=6,
+                shutdown_grace_seconds=10, watcher_enabled=False,
+                cognitive_completion_enabled=False,
+            ))
+            job = Job(id="job-1", address=TOKEN, status="succeeded")
+            report = {
+                "analysis_ring": 7,
+                "analysis_ring_hash": "analysis-hash",
+                "cognition": {"status": "pending"},
+            }
+
+            service._enqueue_cognitive_completion(job, report)
+
+            self.assertEqual(job.cognition_status, "isolated")
+            self.assertEqual(job.cognition_progress_percent, 100)
+            self.assertEqual(
+                service._deferred_queue.counts().get("queued", 0), 0
+            )
+
     def test_analysis_hash_collision_discards_completion(self):
         with tempfile.TemporaryDirectory() as root:
             service = self._service(root)

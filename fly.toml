@@ -28,6 +28,9 @@ primary_region = "fra"
   # The legacy global projection is rebuildable but too large to parse in a
   # 2 GiB request process. Keep authoritative Timechain evidence enabled.
   CHAINSEER_TEMPORAL_PROJECTION_ENABLED = "0"
+  # CPU-heavy cognitive completion belongs in the isolated learner, not the
+  # single-vCPU interactive API. The immutable evidence seal remains enabled.
+  CHAINSEER_COGNITIVE_COMPLETION_ENABLED = "0"
   CHAINSEER_WATCHER_INTERVAL_SECONDS = "60"
   CHAINSEER_WATCHER_CONFIRMATIONS = "2"
   CHAINSEER_BENCHMARK_CAPTURE_ENABLED = "1"

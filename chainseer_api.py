@@ -367,6 +367,11 @@ class Settings:
             "CHAINSEER_TEMPORAL_PROJECTION_ENABLED", True
         )
     )
+    cognitive_completion_enabled: bool = field(
+        default_factory=lambda: _env_bool(
+            "CHAINSEER_COGNITIVE_COMPLETION_ENABLED", True
+        )
+    )
 
     def validate(self) -> None:
         if self.environment not in {"development", "test", "production"}:
@@ -2068,6 +2073,15 @@ class AnalysisService:
         report: dict[str, Any],
     ) -> None:
         """Persist the bounded post-publication cognitive commit."""
+        if not self.settings.cognitive_completion_enabled:
+            job.cognition_status = "isolated"
+            job.cognition_stage_detail = (
+                "Deep learning is delegated to the isolated learner; "
+                "the risk result is already sealed"
+            )
+            job.cognition_progress_percent = 100
+            job.cognition_updated_at = time.time()
+            return
         ring_index = report.get("analysis_ring")
         ring_hash = report.get("analysis_ring_hash")
         cognition = report.get("cognition") or {}
@@ -2706,6 +2720,15 @@ class AnalysisService:
             return
         try:
             if item.kind == "cognitive_completion":
+                if not self.settings.cognitive_completion_enabled:
+                    self._deferred_queue.transition(item, "discarded")
+                    self._set_cognitive_progress(
+                        str(item.payload.get("job_id") or ""),
+                        "isolated",
+                        100,
+                        "Deep learning is delegated to the isolated learner",
+                    )
+                    return
                 outcome = self._execute_cognitive_completion(item)
                 if outcome in {"done", "idempotent"}:
                     self._deferred_queue.transition(item, outcome)
@@ -3982,6 +4005,9 @@ async def ready() -> dict[str, Any]:
         "queue_depth": SERVICE.work.qsize(),
         "environment": SETTINGS.environment,
         "watcher_enabled": SETTINGS.watcher_enabled,
+        "cognitive_completion_enabled": (
+            SETTINGS.cognitive_completion_enabled
+        ),
         "watcher_last_error": health["watcher_last_error"],
         "networks": ["robinhood", "base", "solana"],
         "base_rpc_configured": bool(SETTINGS.base_rpc_url),
