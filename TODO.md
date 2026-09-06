@@ -58,8 +58,8 @@ Generated from sealed 15-candidate or 15-signal checkpoints. Completion state is
   - Checkpoints: first 15, latest 225
 - [ ] `RH-FLOW-EXIT-TAIL-RISK` — Reduce non-exitable and catastrophic Flow outcomes
   - Recommendation: Investigate identity concentration, adverse direction, liquidity and quote failures before promotion.
-  - Evidence: Checkpoint 585: non-exit=0.18620689655172415, catastrophic=0.2637931034482759.
-  - Checkpoints: first 15, latest 585
+  - Evidence: Checkpoint 3000: non-exit=0.189648033126294, catastrophic=0.24389233954451345.
+  - Checkpoints: first 15, latest 3000
 - [ ] `RH-FLOW-PROSPECTIVE-SAMPLE` — Continue the frozen prospective Flow cohort
   - Recommendation: Do not tune Flow thresholds before the pre-registered evidence window is complete.
   - Evidence: Checkpoint 90: 89 completed 15m qualified outcomes.

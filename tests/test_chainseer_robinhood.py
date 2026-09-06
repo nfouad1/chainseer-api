@@ -7418,7 +7418,7 @@ class LaneSplitTests(unittest.TestCase):
             self.assertEqual(cohort["policy"]["sample_target"], 3)
             self.assertEqual(
                 cohort["policy"]["policy_version"],
-                "robinhood-operational-v24")
+                "robinhood-operational-v26")
             self.assertEqual(
                 cohort["policy"]["decision_head_rate_limit_policy"],
                 "bounded_retry_inside_protected_downstream_tail")
@@ -7455,7 +7455,9 @@ class LaneSplitTests(unittest.TestCase):
                 cohort["policy"][
                     "backfill_cooperative_minimum_window_seconds"], 5.0)
             self.assertEqual(
-                cohort["policy"]["backfill_ingest_event_chunk_size"], 100)
+                cohort["policy"]["backfill_ingest_event_chunk_size"], 500)
+            self.assertEqual(
+                cohort["policy"]["backfill_pressure_model_version"], 2)
             self.assertEqual(
                 cohort["policy"]["background_rpc_priority_gate_version"], 2)
             self.assertTrue(
@@ -11071,6 +11073,65 @@ class ControlledDeferralClassificationTests(unittest.TestCase):
 
 
 class BackfillConvergenceAttributionTests(unittest.TestCase):
+    @staticmethod
+    def _backfill_run(store, run_id, pending, recovered):
+        summary = {
+            "backlog": {"pending_blocks": pending},
+            "durable_gap_recovery": {"blocks_scanned": recovered},
+        }
+        with store.connection() as connection:
+            connection.execute(
+                "INSERT INTO runs(started_at,status,run_id,lane,"
+                " summary_json,heartbeat_at,deadline_seconds)"
+                " VALUES (?,'complete',?,'backfill',?,?,120)",
+                (rh._utc_now(), run_id, json.dumps(summary), time.time()),
+            )
+
+    def test_zero_arrivals_with_a_shrinking_backlog_is_not_pressure(self):
+        """A recovery/zero-arrival ratio is unbounded, never exactly 1.0."""
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            # The interval excludes the first run's recovery.  The following
+            # two runs recover 200 blocks while the measured queue falls 500;
+            # range completion/compaction therefore leaves inferred arrivals
+            # at zero.
+            self._backfill_run(store, "b0", 1_000, 100)
+            self._backfill_run(store, "b1", 750, 100)
+            self._backfill_run(store, "b2", 500, 100)
+            pressure = store.backfill_recovery_pressure(limit=3)
+            self.assertEqual(pressure["inferred_arrival_blocks"], 0)
+            self.assertIsNone(pressure["recovery_to_arrival_ratio"])
+            self.assertTrue(pressure["target_met"])
+            self.assertEqual(
+                pressure["assessment"],
+                "no_inferred_arrivals_backlog_decreasing")
+            self.assertFalse(pressure["priority"])
+
+    def test_zero_arrivals_without_progress_remains_pressure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            for index in range(3):
+                self._backfill_run(store, f"b{index}", 1_000, 0)
+            pressure = store.backfill_recovery_pressure(limit=3)
+            self.assertEqual(pressure["inferred_arrival_blocks"], 0)
+            self.assertFalse(pressure["target_met"])
+            self.assertEqual(
+                pressure["assessment"],
+                "no_inferred_arrivals_no_backlog_progress")
+            self.assertTrue(pressure["priority"])
+
+    def test_positive_arrivals_still_use_the_frozen_ratio(self):
+        with tempfile.TemporaryDirectory() as directory:
+            store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")
+            self._backfill_run(store, "b0", 1_000, 0)
+            self._backfill_run(store, "b1", 1_100, 500)
+            self._backfill_run(store, "b2", 1_200, 500)
+            pressure = store.backfill_recovery_pressure(limit=3)
+            self.assertEqual(pressure["inferred_arrival_blocks"], 1_200)
+            self.assertEqual(pressure["recovery_to_arrival_ratio"], 0.8333)
+            self.assertFalse(pressure["target_met"])
+            self.assertTrue(pressure["priority"])
+
     def test_red_net_trend_still_reports_productive_recovery_and_arrivals(self):
         with tempfile.TemporaryDirectory() as directory:
             store = rh.RobinhoodLearningStore(Path(directory) / "l.sqlite3")

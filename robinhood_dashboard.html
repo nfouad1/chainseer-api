@@ -23,6 +23,7 @@
 <body><main>
   <header><div><div class="eyebrow">Chainseer research</div><h1>Robinhood Flow Lab</h1><p>Prospective, execution-verified paper evidence.</p></div><div class="pill"><span class="dot"></span>Paper only · read only</div></header>
   <div class="data-state warming" id="historicalstate" aria-live="polite"><span class="state-dot"></span><div><strong id="historicalstatustitle">Loading operational data</strong><small id="historicalstatedetail">Historical analytics load independently and never block lane status.</small></div></div>
+  <div class="data-state warming" id="learnerstate" aria-live="polite"><span class="state-dot"></span><div><strong id="learnerstatustitle">Learner activity unknown</strong><small id="learnerstatedetail">A historical cohort pass does not prove current collection.</small><small id="evidenceactivity">Evidence activity unknown</small></div></div>
 
   <div class="metrics">
     <article class="metric"><div class="label">Prospective signals</div><div class="value" id="signals">—</div><div class="sub" id="signalssub">Frozen policy cohort</div></article>
@@ -53,7 +54,7 @@
   </div>
 
   <section class="panel" id="stabilizationpanel">
-    <div class="stabilization-head"><div><h2>Operational stabilization</h2><p>Infrastructure readiness, measured separately from investment-strategy promotion.</p></div><span class="status-badge collecting_data" id="stabilizationstatus">COLLECTING DATA</span></div>
+    <div class="stabilization-head"><div><h2>Operational acceptance cohort</h2><p>Recorded test results and integrity checks. Current learner activity is shown separately above.</p></div><span class="status-badge collecting_data" id="stabilizationstatus">COLLECTING DATA</span></div>
     <div class="progress" aria-label="stabilization criteria progress"><span id="stabilizationprogress" style="width:0%"></span></div>
     <div class="stabilization-grid" id="stabilizationgates"></div>
     <p class="sub" id="stabilizationnote">Waiting for authoritative lane evidence.</p>
@@ -95,6 +96,14 @@ const tokenCell=(name,address)=>{const td=document.createElement('td');td.classN
 const date=v=>v==null?'—':new Date(Number(v)*1000).toLocaleString(undefined,{month:'short',day:'numeric',hour:'2-digit',minute:'2-digit'});
 const gainCell=v=>cell(v==null?'—':`${Number(v)>=0?'+':''}${Number(v).toFixed(1)}%`,v==null?'':Number(v)>=0?'positive':'negative');
 
+function renderLearnerActivity(a){
+  a=a||{};const status=a.status||'unknown',e=a.evidence||{},age=v=>v==null?'unknown':`${Math.round(Number(v))}s ago`;
+  $('learnerstate').className=`data-state ${status==='active'?'ready':['stale','stalled','error','degraded'].includes(status)?'stale':'warming'}`;
+  $('learnerstatustitle').textContent=`Learner ${status.replaceAll('_',' ')}`;
+  $('learnerstatedetail').textContent=`${a.reason||'Current telemetry unavailable.'} Last live attempt: ${age(a.live_age_seconds)} (${a.live_status||'unknown'}). Historical cohort results are separate.`;
+  $('evidenceactivity').textContent=`Shadow evidence: ${(e.status||'unknown').replaceAll('_',' ')} · last batch ${age(e.age_seconds)} · ${e.observed_last_batch==null?'unknown':num(e.observed_last_batch)} quotes · ${e.stop_reason||'no current worker check'}${e.scheduling_constraint?(e.fair_service_due?' · bounded evidence slot due between workers':' · backfill recovery priority; evidence receives bounded service'):''}`;
+  $('evidenceactivity').className=['stale','error'].includes(e.status)?'negative':'';
+}
 function renderDataState(d){
   const state=d.historical_state||{},operational=d.operational_state||{},status=String(state.status||'warming'),operationalStatus=String(operational.status||'warming'),box=$('historicalstate'),age=state.age_seconds==null?'':` · ${Math.round(Number(state.age_seconds))}s old`;
   if(operationalStatus!=='ready'){box.className=`data-state ${operationalStatus}`;$('historicalstatustitle').textContent=`Operational snapshot ${operationalStatus}`;$('historicalstatedetail').textContent=operational.last_error||'Safety state is retained, but the operational snapshot needs attention.';return state.data_available===true}
@@ -144,6 +153,7 @@ async function refresh(){
   try{
     const r=await fetch('/api/status',{cache:'no-store'});if(!r.ok)throw Error(r.status);
     const d=await r.json(),historicalAvailable=renderDataState(d),operationalAvailable=d.operational_state?.data_available===true&&!!d.lanes;
+    renderLearnerActivity(d.learner_activity);
     const coverage=d.discovery_coverage_by_source?.uniswap_v4||{},risks=d.learning?.source_entry_risk||{},quarantined=Object.values(risks).filter(x=>x?.quarantined).map(x=>String(x.source_version||'').replace('uniswap_','').toUpperCase());
     if(operationalAvailable){renderLanes(d.lanes);renderStabilization(d.stabilization||{});renderPositions(d.positions||[]);renderClosed(d.closed_positions||[],d.closed_performance||{})}else{renderOperationalUnavailable();renderStabilization(d.stabilization||{})}renderRecursive(d.recursive_learning||{});renderShadowExit(d.shadow_paths||{},d.shadow_exit_evaluation||{});
     const pd=d.pool_discovery||{};
@@ -165,7 +175,7 @@ async function refresh(){
     renderReflection(d);
     const opTime=d.operational_state?.built_at?new Date(d.operational_state.built_at).toLocaleTimeString():'unavailable',historyStatus=String(d.historical_state?.status||'warming').replaceAll('_',' ');
     $('updated').textContent=`Operational ${opTime} · historical ${historyStatus}`;$('updated').className=d.operational_state?.status==='ready'?'':'warn';
-  }catch(err){$('updated').textContent=`Dashboard API unavailable: ${err.message}`;$('updated').className='warn'}
+  }catch(err){renderLearnerActivity({status:'unknown',reason:'Dashboard API unavailable; previous activity is not current proof.'});$('updated').textContent=`Dashboard API unavailable: ${err.message}`;$('updated').className='warn'}
 }
 refresh();setInterval(refresh,5000);
 </script></body></html>

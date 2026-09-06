@@ -269,7 +269,7 @@ class IngestionAdmissionTests(unittest.TestCase):
         self.assertEqual(
             policy["backfill_cooperative_minimum_window_seconds"], 5.0)
         self.assertEqual(
-            policy["backfill_ingest_event_chunk_size"], 100)
+            policy["backfill_ingest_event_chunk_size"], 500)
         self.assertEqual(policy["backfill_remote_attempts_per_chunk"], 1)
 
     def test_insufficient_ingestion_headroom_is_a_non_success_deferral(self):

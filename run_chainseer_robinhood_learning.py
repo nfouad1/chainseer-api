@@ -168,7 +168,7 @@ def _atomic_json(path: Path, value: dict) -> None:
 def _runner_status(root: Path, *, status: str, started: float,
                    error: str | None = None, result: dict | None = None,
                    filename: str = "runner_status.json") -> None:
-    terminal = status != "running"
+    terminal = status not in {"initializing", "running"}
     _atomic_json(root / filename, {
         "schema_version": 2,
         "mode": "native_python_job_supervisor",
@@ -230,9 +230,18 @@ def refresh_shadow_exit_report(root: Path) -> dict:
         return {"status": "deferred", "reason": "offline_evaluation_timeout"}
 
 
+DEFAULT_SUPERVISOR_DURATION_SECONDS = 19 * 60.0
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--duration-seconds", type=float, default=285.0)
+    # Stay below the Scheduled Task's 20-minute kill limit while avoiding the
+    # old five-minute tail, where too little time remained to launch a fully
+    # bounded backfill child. Repetition uses IgnoreNew, so intervening
+    # five-minute triggers are safely coalesced while this supervisor lives.
+    parser.add_argument(
+        "--duration-seconds", type=float,
+        default=DEFAULT_SUPERVISOR_DURATION_SECONDS)
     # The chain has recently grown faster than 500 blocks per five-minute
     # backfill cadence, so 500 guaranteed backlog growth even with perfect
     # runs. One thousand provides measured convergence headroom while the
