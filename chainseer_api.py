@@ -58,6 +58,7 @@ from chainseer_controls import (
     credential_safe_error,
 )
 from chainseer_deferred import DeferredQueueItem, DurableDeferredQueue
+from chainseer_job_store import SharedJobStore, create_shared_job_store
 from chainseer_memory import MemoryCore, MemoryCoreError
 from chainseer_outcome_ledger import analysis_evidence_binding
 from chainseer_solana_public import (
@@ -370,6 +371,24 @@ class Settings:
     cognitive_completion_enabled: bool = field(
         default_factory=lambda: _env_bool(
             "CHAINSEER_COGNITIVE_COMPLETION_ENABLED", True
+        )
+    )
+    shared_store_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_SHARED_STORE_URL", ""
+        ).strip()
+    )
+    shared_store_prefix: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_SHARED_STORE_PREFIX", "chainseer"
+        ).strip()
+    )
+    shared_store_timeout_seconds: float = field(
+        default_factory=lambda: _env_float(
+            "CHAINSEER_SHARED_STORE_TIMEOUT_SECONDS",
+            2.0,
+            0.1,
+            10.0,
         )
     )
 
@@ -950,8 +969,14 @@ class DeferredSealJob:
 
 
 class AnalysisService:
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        shared_job_store: SharedJobStore | None = None,
+    ):
         self.settings = settings
+        self._shared_job_store = shared_job_store
         self.jobs: dict[str, Job] = {}
         self.active_by_address: dict[str, str] = {}
         self.cache: dict[str, tuple[float, str]] = {}
@@ -1216,6 +1241,48 @@ class AnalysisService:
             and not self._stopping.is_set()
         )
 
+    def _publish_shared_job(self, job: Job) -> None:
+        """Publish a detached job snapshot without making Redis authoritative
+        for the currently executing worker.
+
+        A transient store failure must not discard an analysis that has already
+        started. New cross-replica submissions use strict shared-store calls,
+        while progress publication is best-effort and observable in logs.
+        """
+        if self._shared_job_store is None:
+            return
+        with self._lock:
+            snapshot = json.loads(json.dumps(job.public(), default=str))
+        try:
+            self._shared_job_store.put_job(
+                job.id,
+                snapshot,
+                max(900, self.settings.result_ttl_seconds),
+            )
+        except Exception:
+            LOGGER.exception(
+                "Could not publish shared job state",
+                extra={"job_id": job.id},
+            )
+
+    def get_public(self, job_id: str) -> dict[str, Any] | None:
+        """Return a local job or its cross-replica shared snapshot."""
+        local = self.get(job_id)
+        if local is not None:
+            return local.public()
+        if self._shared_job_store is None:
+            return None
+        try:
+            return self._shared_job_store.get_job(job_id)
+        except Exception as exc:
+            LOGGER.exception(
+                "Could not read shared job state",
+                extra={"job_id": job_id},
+            )
+            raise SharedStoreUnavailableError(
+                "shared scan state is temporarily unavailable"
+            ) from exc
+
     def submit(
         self,
         address: str,
@@ -1232,6 +1299,24 @@ class AnalysisService:
         )
         normalized = f"{network}:{normalized_address}"
         now = time.time()
+        if not force_refresh and self._shared_job_store is not None:
+            try:
+                shared_cached_id = self._shared_job_store.get_cache(normalized)
+                shared_cached = (
+                    self._shared_job_store.get_job(shared_cached_id)
+                    if shared_cached_id
+                    else None
+                )
+            except Exception as exc:
+                raise SharedStoreUnavailableError(
+                    "shared scan state is temporarily unavailable"
+                ) from exc
+            if shared_cached and shared_cached.get("status") == "succeeded":
+                return JobAccepted(
+                    job_id=str(shared_cached_id),
+                    status="succeeded",
+                    cached=True,
+                )
         # Keep the common hot-repeat path entirely in memory. Durable storage
         # is only consulted for a stale/forced refresh or after a restart.
         if not force_refresh:
@@ -1247,12 +1332,31 @@ class AnalysisService:
                             cached=True,
                         )
                     self.cache.pop(normalized, None)
-        previous = self._deferred_queue.get_public_result(
-            network,
-            normalized_address,
-            max_age_seconds=self.settings.stale_result_ttl_seconds,
-            now=now,
-        )
+        previous = None
+        if self._shared_job_store is not None:
+            try:
+                shared_previous = self._shared_job_store.get_latest_result(
+                    normalized
+                )
+            except Exception as exc:
+                raise SharedStoreUnavailableError(
+                    "shared scan state is temporarily unavailable"
+                ) from exc
+            if shared_previous is not None:
+                stored_at = float(shared_previous.get("stored_at") or 0)
+                age_seconds = max(0.0, now - stored_at)
+                if age_seconds <= self.settings.stale_result_ttl_seconds:
+                    previous = {
+                        "result": shared_previous.get("result"),
+                        "age_seconds": age_seconds,
+                    }
+        if previous is None:
+            previous = self._deferred_queue.get_public_result(
+                network,
+                normalized_address,
+                max_age_seconds=self.settings.stale_result_ttl_seconds,
+                now=now,
+            )
 
         def accepted_with_previous(job: Job) -> JobAccepted:
             return JobAccepted(
@@ -1296,17 +1400,69 @@ class AnalysisService:
             if self.work.full():
                 raise QueueFullError
 
+            proposed_job_id = uuid.uuid4().hex
+            if self._shared_job_store is not None:
+                try:
+                    lease_owner = self._shared_job_store.claim_active(
+                        normalized,
+                        proposed_job_id,
+                        max(900, self.settings.result_ttl_seconds),
+                    )
+                    if lease_owner != proposed_job_id:
+                        shared_active = self._shared_job_store.get_job(
+                            lease_owner
+                        )
+                        return JobAccepted(
+                            job_id=lease_owner,
+                            status=str(
+                                (shared_active or {}).get("status") or "queued"
+                            ),
+                            cached=False,
+                            refreshing=previous is not None,
+                            previous_result=(previous or {}).get("result"),
+                            previous_result_age_seconds=(
+                                (previous or {}).get("age_seconds")
+                            ),
+                        )
+                except Exception as exc:
+                    raise SharedStoreUnavailableError(
+                        "shared scan state is temporarily unavailable"
+                    ) from exc
             job = Job(
-                id=uuid.uuid4().hex,
+                id=proposed_job_id,
                 address=address,
                 network=network,
             )
+            if self._shared_job_store is not None:
+                try:
+                    self._shared_job_store.put_job(
+                        job.id,
+                        job.public(),
+                        max(900, self.settings.result_ttl_seconds),
+                    )
+                except Exception as exc:
+                    try:
+                        self._shared_job_store.release_active(
+                            normalized, job.id
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not roll back shared active-scan lease",
+                            extra={"job_id": job.id},
+                        )
+                    raise SharedStoreUnavailableError(
+                        "shared scan state is temporarily unavailable"
+                    ) from exc
             self.jobs[job.id] = job
             self.active_by_address[normalized] = job.id
             self.work.put_nowait(job.id)
-            if previous is not None:
-                return accepted_with_previous(job)
-            return JobAccepted(job_id=job.id, status=job.status)
+            accepted = (
+                accepted_with_previous(job)
+                if previous is not None
+                else JobAccepted(job_id=job.id, status=job.status)
+            )
+        self._publish_shared_job(job)
+        return accepted
 
     def _persist_public_result(self, job: Job) -> None:
         """Store a detached public snapshot without extending job lifetime."""
@@ -1325,6 +1481,24 @@ class AnalysisService:
                 "Could not persist latest public result",
                 extra={"job_id": job.id, "network": network},
             )
+        if self._shared_job_store is not None:
+            try:
+                self._shared_job_store.put_latest_result(
+                    f"{network}:{subject}",
+                    {"result": snapshot, "stored_at": time.time()},
+                    self.settings.stale_result_ttl_seconds,
+                )
+                if self.settings.cache_ttl_seconds:
+                    self._shared_job_store.put_cache(
+                        f"{network}:{subject}",
+                        job.id,
+                        self.settings.cache_ttl_seconds,
+                    )
+            except Exception:
+                LOGGER.exception(
+                    "Could not publish shared scan cache",
+                    extra={"job_id": job.id, "network": network},
+                )
 
     def get(self, job_id: str) -> Job | None:
         with self._lock:
@@ -1512,6 +1686,14 @@ class AnalysisService:
             "timechain_integrity": dict(self._integrity_status),
             "cypher_tempre_runtime": dict(self._cypher_tempre_runtime),
             "maintenance_queue_depth": self._maintenance_work.qsize(),
+            "shared_job_store": {
+                "enabled": self._shared_job_store is not None,
+                "backend": (
+                    self._shared_job_store.backend
+                    if self._shared_job_store is not None
+                    else "process_local"
+                ),
+            },
             "deferred_commits": self._deferred_queue.counts(),
             "faculty_pack": (
                 dict(getattr(self._agent, "faculty_pack_status", {}) or {})
@@ -1981,6 +2163,7 @@ class AnalysisService:
             job.stage_detail = str(detail)[:240]
             job.progress_percent = max(0, min(100, int(percent)))
             job.updated_at = now
+        self._publish_shared_job(job)
 
     @staticmethod
     def _read_current_rss_mb() -> float | None:
@@ -2066,6 +2249,7 @@ class AnalysisService:
             job.cognition_progress_percent = max(0, min(100, int(percent)))
             job.cognition_updated_at = time.time()
             job.updated_at = job.cognition_updated_at
+        self._publish_shared_job(job)
 
     def _enqueue_cognitive_completion(
         self,
@@ -3171,6 +3355,7 @@ class AnalysisService:
                 job.started_at = time.time()
                 job.stage_started_at = job.started_at
                 job.updated_at = job.started_at
+            self._publish_shared_job(job)
 
             self._analysis_active.set()
             retrying = False
@@ -3451,10 +3636,33 @@ class AnalysisService:
                         )
                 if not retrying and job.status == "succeeded":
                     self._persist_public_result(job)
+                self._publish_shared_job(job)
+                if not retrying and self._shared_job_store is not None:
+                    subject = (
+                        f"{job.network}:"
+                        + (
+                            job.address.lower()
+                            if job.network in EVM_NETWORKS
+                            else job.address
+                        )
+                    )
+                    try:
+                        self._shared_job_store.release_active(
+                            subject, job.id
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not release shared active-scan lease",
+                            extra={"job_id": job.id},
+                        )
                 self.work.task_done()
 
 
 class QueueFullError(Exception):
+    pass
+
+
+class SharedStoreUnavailableError(Exception):
     pass
 
 
@@ -3830,7 +4038,15 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
 
 SETTINGS = Settings()
 SETTINGS.validate()
-SERVICE = AnalysisService(SETTINGS)
+SHARED_JOB_STORE = create_shared_job_store(
+    SETTINGS.shared_store_url,
+    prefix=SETTINGS.shared_store_prefix,
+    socket_timeout_seconds=SETTINGS.shared_store_timeout_seconds,
+)
+SERVICE = AnalysisService(
+    SETTINGS,
+    shared_job_store=SHARED_JOB_STORE,
+)
 LIMITER = SlidingWindowRateLimiter(
     SETTINGS.rate_limit_per_minute,
     global_limit=SETTINGS.global_rate_limit_per_minute,
@@ -4016,6 +4232,10 @@ async def ready() -> dict[str, Any]:
         "timechain_integrity": health["timechain_integrity"],
         "cypher_tempre_runtime": health["cypher_tempre_runtime"],
         "maintenance_queue_depth": health["maintenance_queue_depth"],
+        "shared_job_store": health.get(
+            "shared_job_store",
+            {"enabled": False, "backend": "process_local"},
+        ),
         "maintenance_telemetry": health["maintenance_telemetry"],
         "faculty_pack": health["faculty_pack"],
         "memory": health["memory"],
@@ -4029,7 +4249,7 @@ async def ready() -> dict[str, Any]:
     status_code=status.HTTP_202_ACCEPTED,
     dependencies=[Depends(require_api_token)],
 )
-async def create_analysis(
+def create_analysis(
     payload: AnalyzeRequest, request: Request
 ) -> JobAccepted:
     if not LIMITER.allow(request_identity(request)):
@@ -4056,25 +4276,38 @@ async def create_analysis(
             detail="analysis queue is full; try again shortly",
             headers={"Retry-After": "30"},
         ) from exc
+    except SharedStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
 
 
 @app.get(
     "/v1/analyses/{job_id}",
     dependencies=[Depends(require_api_token)],
 )
-async def get_analysis(job_id: str) -> dict[str, Any]:
+def get_analysis(job_id: str) -> dict[str, Any]:
     if not re.fullmatch(r"[a-f0-9]{32}", job_id):
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="analysis job not found",
         )
-    job = SERVICE.get(job_id)
+    try:
+        job = SERVICE.get_public(job_id)
+    except SharedStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
     if job is None:
         raise HTTPException(
             status_code=status.HTTP_404_NOT_FOUND,
             detail="analysis job not found",
         )
-    return job.public()
+    return job
 
 
 @app.post(

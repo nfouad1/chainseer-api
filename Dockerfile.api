@@ -37,7 +37,7 @@ RUN python -m zipfile -e /tmp/cypher-tempre.zip /tmp/cypher-tempre \
     && test -f /opt/cypher-tempre-self-model/registry/senses.json \
     && test -f /opt/cypher-tempre-self-model/registry/modalities.json
 
-COPY chainseer.py chainseer_controls.py chainseer_deferred.py chainseer_base_public.py \
+COPY chainseer.py chainseer_controls.py chainseer_deferred.py chainseer_job_store.py chainseer_base_public.py \
     chainseer_solana_public.py chainseer_benchmark.py \
     chainseer_entity_graph.py chainseer_governance.py \
     chainseer_outcome_ledger.py chainseer_temporal_graph.py \
