@@ -62,6 +62,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable
+from urllib.parse import urlsplit
 
 # ── Force UTF-8 stdout/stderr (Windows defaults to cp1252 which corrupts
 #    em-dashes, smart quotes, and emojis when written to the Timechain) ─────
@@ -102,6 +103,20 @@ from chainseer_temporal_graph import (
 
 CHAINSEER_VERSION = "7.1"
 ADDRESS_RE = re.compile(r"^0x[a-fA-F0-9]{40}$")
+
+
+def _safe_rpc_label(rpc_url: str) -> str:
+    """Return a log-safe RPC origin without credentials, path, or query."""
+    try:
+        parsed = urlsplit(str(rpc_url))
+        if parsed.scheme and parsed.hostname:
+            port = f":{parsed.port}" if parsed.port is not None else ""
+            return f"{parsed.scheme}://{parsed.hostname}{port}"
+    except (TypeError, ValueError):
+        pass
+    return "configured"
+
+
 #: Foreground cognition may consult recent Timechain history, but it must not
 #: make user latency grow with the lifetime of the ledger.  The current
 #: report's provenance is supplied directly to PoQ, so this window is context
@@ -2473,7 +2488,7 @@ class Chainseer:
             f" Chainseer v{CHAINSEER_VERSION} -- "
             f"{self.network.name} On-Chain Intelligence"
         )
-        print(f" Chain ID: {self.chain_id} | RPC: {self.rpc_url}")
+        print(f" Chain ID: {self.chain_id} | RPC: {_safe_rpc_label(self.rpc_url)}")
         print(f" Timechain root: {self.chain_root}")
         print(f" Latest block: {self.rpc.get_block_number():,}")
         print()
