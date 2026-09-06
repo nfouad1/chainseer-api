@@ -35,6 +35,9 @@ chainseer_backups/
 chainseer_memory_federation/
 chainseer_api_repo/
 .sites-init-staging/
+.site-release-*/
+.site-release-*.tar.gz
+.site-source-*.tar
 
 node_modules
 dist
