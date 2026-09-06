@@ -23,6 +23,19 @@ tests
 chainseer_web
 .venv
 
+# Large local learning/runtime corpora are persistent operator data, not API
+# image inputs. Docker still uploaded them as build context even though the
+# Dockerfile copies only named source files (13+ GiB on the production host).
+robinhood_learning/
+robinhood_learning_*/
+robinhood_learning_chain/
+robinhood_learning_archives/
+robinhood_review_timechain_*/
+chainseer_backups/
+chainseer_memory_federation/
+chainseer_api_repo/
+.sites-init-staging/
+
 node_modules
 dist
 .next
