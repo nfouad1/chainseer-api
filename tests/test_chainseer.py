@@ -238,6 +238,24 @@ class BoundedTokenTrendTests(unittest.TestCase):
             self.assertEqual(trend["reason"], "projection_missing_or_invalid")
             self.assertEqual(trend["past_analyses"], [])
 
+    def test_memory_safe_mode_never_parses_the_monolithic_projection(self):
+        with tempfile.TemporaryDirectory() as temporary, patch.dict(
+            os.environ,
+            {"CHAINSEER_TEMPORAL_PROJECTION_ENABLED": "0"},
+        ), patch.object(
+            chainseer.TemporalGraphStore,
+            "load",
+            side_effect=AssertionError("disabled projection was parsed"),
+        ):
+            trend = self._agent(
+                temporary, "robinhood"
+            )._build_token_trend(self.TOKEN)
+
+        self.assertFalse(trend["available"])
+        self.assertEqual(
+            trend["reason"], "projection_disabled_for_memory_safety"
+        )
+
 
 class FailOnLPTokenRPC:
     def erc20_total_supply(self, _pair):

@@ -1804,6 +1804,79 @@ class CasValidateDeferredSealTests(unittest.TestCase):
 
 
 class PreparedWatcherCommitTests(unittest.TestCase):
+    def test_prepared_watcher_ring_carries_verifiable_evidence_binding(self):
+        from chainseer_outcome_ledger import analysis_reference_from_ring
+
+        with tempfile.TemporaryDirectory() as root:
+            service = AnalysisService(Settings(
+                environment="test", api_token="", chain_root=root,
+                queue_size=4, result_ttl_seconds=3600,
+                cache_ttl_seconds=300, rate_limit_per_minute=6,
+                shutdown_grace_seconds=10, watcher_enabled=False,
+            ))
+            report = sample_internal_report()
+            service._agent = SimpleNamespace(
+                tc=SimpleNamespace(),
+                cognitive_loop=SimpleNamespace(
+                    prepare=lambda _report: {"status": "prepared"}
+                ),
+                poq_module=SimpleNamespace(
+                    relevance_window=lambda _tc: [],
+                    PoQGate=lambda: SimpleNamespace(
+                        evaluate=lambda *_args, **_kwargs: {
+                            "decision": "SEAL",
+                            "scores": {"coherence": 230},
+                            "cited_rings": [],
+                        }
+                    ),
+                ),
+            )
+            service._current_commit_dependencies = lambda: (
+                "policy", "registry"
+            )
+            item = DeferredQueueItem(
+                id=1,
+                kind="watcher_commit",
+                subject_key=f"robinhood:{TOKEN}",
+                generation=1,
+                priority=20,
+                state="preparing",
+                payload={
+                    "network": "robinhood",
+                    "token_address": TOKEN,
+                    "anchor_kind": "confirmed_block",
+                    "anchor_value": 12345,
+                    "evidence_hash": service._stable_hash(
+                        report["provenance"]["facts"]
+                    ),
+                    "report_hash": service._stable_hash(report),
+                    "idempotency_key": f"robinhood:{TOKEN}:12345",
+                    "analyzer_version": "test",
+                    "observed_at_epoch": 1.0,
+                    "pinned_snapshot": report,
+                },
+                attempts=1,
+                created_at=0.0,
+                updated_at=0.0,
+            )
+
+            prepared = service._prepare_watcher_commit(item)
+            reference = analysis_reference_from_ring({
+                "index": 1,
+                "ring_type": "token_analysis",
+                "ring_hash": "a" * 64,
+                "timestamp": "2026-09-07T00:00:00+00:00",
+                "payload": prepared.payload,
+            })
+
+            self.assertEqual(reference["binding_state"], "sealed_at_analysis")
+            self.assertEqual(reference["subject"], TOKEN)
+            self.assertEqual(prepared.payload["anchor_type"], "block_pin")
+            self.assertEqual(
+                prepared.payload["evidence_manifest"]["pin"]["source_type"],
+                "confirmed_block",
+            )
+
     def test_unrelated_head_advancement_allows_exactly_one_minimal_append(self):
         with tempfile.TemporaryDirectory() as root:
             service = AnalysisService(Settings(
@@ -1860,7 +1933,7 @@ class PreparedWatcherCommitTests(unittest.TestCase):
 
             self.assertEqual(result, "committed:77")
             self.assertEqual(len(tc.seals), 1)
-            self.assertEqual(tc.seals[0][0], "watcher_analysis")
+            self.assertEqual(tc.seals[0][0], "token_analysis")
 
 
 class HybridCognitiveCompletionTests(unittest.TestCase):
@@ -2065,6 +2138,60 @@ class TrackedTimechainLockTests(unittest.TestCase):
                 self.assertEqual(job.lock_retry_count, 1)
                 self.assertTrue(service._worker.is_alive())
                 self.assertNotIn(f"robinhood:{TOKEN.lower()}", service.active_by_address)
+            finally:
+                service.stop()
+
+    def test_external_evidence_runs_outside_lock_and_only_seal_owns_lane(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            observed: list[tuple[str, str | None]] = []
+
+            class SplitAgent:
+                def analyze_token(
+                    self,
+                    address,
+                    full_report=False,
+                    progress_callback=None,
+                    *,
+                    seal=True,
+                    defer_cognition=False,
+                ):
+                    owner, _, reason = service._timechain_owner_snapshot()
+                    observed.append(("analysis", reason if owner else None))
+                    self.assertion = (seal, defer_cognition)
+                    report = sample_internal_report()
+                    report["token_address"] = address
+                    return report
+
+                def _seal_report(self, report, *, defer_cognition=False):
+                    owner, _, reason = service._timechain_owner_snapshot()
+                    observed.append(("seal", reason if owner else None))
+                    report["cognition"]["status"] = "complete"
+
+            agent = SplitAgent()
+            service._agent = agent
+            service._solana_agent = FakeSolanaAgent()
+            service.start()
+            try:
+                accepted = service.submit(TOKEN)
+                deadline = time.time() + 3
+                job = service.get(accepted.job_id)
+                while job and job.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    job = service.get(accepted.job_id)
+
+                self.assertEqual(job.status, "succeeded")
+                self.assertEqual(agent.assertion, (False, True))
+                self.assertEqual(
+                    observed,
+                    [
+                        ("analysis", None),
+                        ("seal", "user_analysis_append"),
+                    ],
+                )
+                self.assertIn("sealing_timechain", job.stage_timings_ms)
+                self.assertIsNotNone(job.public()["timing"]["analysis_latency_ms"])
             finally:
                 service.stop()
 

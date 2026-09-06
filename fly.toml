@@ -22,7 +22,12 @@ primary_region = "fra"
   CHAINSEER_SHUTDOWN_GRACE_SECONDS = "20"
   CHAINSEER_FULL_AUDIT_INTERVAL_SECONDS = "900"
   CHAINSEER_MEMORY_WARNING_MB = "1536"
-  CHAINSEER_WATCHER_ENABLED = "1"
+  # The user-facing API must not retain three-chain watcher scan allocations.
+  # Watchers run separately; this process owns only interactive analysis.
+  CHAINSEER_WATCHER_ENABLED = "0"
+  # The legacy global projection is rebuildable but too large to parse in a
+  # 2 GiB request process. Keep authoritative Timechain evidence enabled.
+  CHAINSEER_TEMPORAL_PROJECTION_ENABLED = "0"
   CHAINSEER_WATCHER_INTERVAL_SECONDS = "60"
   CHAINSEER_WATCHER_CONFIRMATIONS = "2"
   CHAINSEER_BENCHMARK_CAPTURE_ENABLED = "1"
@@ -57,5 +62,5 @@ primary_region = "fra"
     path = "/health/ready"
 
 [[vm]]
-  size = "shared-cpu-1x"
+  size = "performance-1x"
   memory = "2048mb"

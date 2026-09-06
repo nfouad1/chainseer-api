@@ -19,6 +19,7 @@ import logging
 import os
 import queue
 import re
+import statistics
 try:
     import resource  # POSIX only -- unavailable on Windows dev/test hosts
 except ImportError:
@@ -58,6 +59,7 @@ from chainseer_controls import (
 )
 from chainseer_deferred import DeferredQueueItem, DurableDeferredQueue
 from chainseer_memory import MemoryCore, MemoryCoreError
+from chainseer_outcome_ledger import analysis_evidence_binding
 from chainseer_solana_public import (
     SolanaMintError,
     SolanaPublicAnalyzer,
@@ -360,6 +362,11 @@ class Settings:
             16384,
         )
     )
+    temporal_projection_enabled: bool = field(
+        default_factory=lambda: _env_bool(
+            "CHAINSEER_TEMPORAL_PROJECTION_ENABLED", True
+        )
+    )
 
     def validate(self) -> None:
         if self.environment not in {"development", "test", "production"}:
@@ -612,6 +619,8 @@ class Job:
     cognition_stage_detail: str = "Cognitive completion starts after analysis"
     cognition_progress_percent: int = 0
     cognition_updated_at: float | None = None
+    stage_started_at: float | None = None
+    stage_timings_ms: dict[str, float] = field(default_factory=dict)
 
     def public(self) -> dict[str, Any]:
         return {
@@ -626,6 +635,19 @@ class Job:
             "updated_at": _iso(self.updated_at),
             "started_at": _iso(self.started_at),
             "finished_at": _iso(self.finished_at),
+            "timing": {
+                "queue_delay_ms": (
+                    round(max(0.0, (self.started_at - self.created_at) * 1000), 1)
+                    if self.started_at is not None
+                    else None
+                ),
+                "analysis_latency_ms": (
+                    round(self.analysis_latency_ms, 1)
+                    if self.analysis_latency_ms is not None
+                    else None
+                ),
+                "stages_ms": dict(self.stage_timings_ms),
+            },
             "result": self.result,
             "benchmark_capture": self.benchmark_capture,
             "cognitive_completion": {
@@ -989,7 +1011,15 @@ class AnalysisService:
         self._base_analysis_idempotency_keys: set[str] | None = None
         self._cypher_tempre_runtime = _cypher_tempre_runtime_status()
         self._last_memory_rss_mb: float | None = None
+        self._last_memory_peak_mb: float | None = None
         self._memory_warning_active = False
+        self._process_started_at = time.time()
+        self._process_instance_id = uuid.uuid4().hex[:16]
+        self._last_cpu_sample: tuple[float, float] | None = None
+        self._last_cpu_percent: float | None = None
+        self._cgroup_cpu: dict[str, int] = {}
+        self._recent_analysis_latencies_ms: deque[float] = deque(maxlen=100)
+        self._latest_analysis_summary: dict[str, Any] | None = None
         self._maintenance_telemetry = {
             "full_audit_deferred_analysis": 0,
             "full_audit_deferred_memory": 0,
@@ -1458,6 +1488,18 @@ class AnalysisService:
     def health_status(self) -> dict[str, Any]:
         """Return cached worker health without loading watcher state from disk."""
         watcher_status = self._watcher_status
+        owner, owner_since, owner_reason = self._timechain_owner_snapshot()
+        with self._lock:
+            running = next(
+                (
+                    job
+                    for job in self.jobs.values()
+                    if job.status in {"running", "waiting_for_timechain"}
+                ),
+                None,
+            )
+            latencies = list(self._recent_analysis_latencies_ms)
+        now = time.time()
         return {
             "watcher_last_error": watcher_status.get("last_error"),
             "watcher_last_deferred": watcher_status.get("last_deferred"),
@@ -1473,8 +1515,70 @@ class AnalysisService:
             ),
             "memory": {
                 "rss_mb": self._last_memory_rss_mb,
+                "peak_rss_mb": self._last_memory_peak_mb,
                 "warning_threshold_mb": self.settings.memory_warning_mb,
                 "warning": self._memory_warning_active,
+            },
+            "runtime": {
+                "process_instance_id": self._process_instance_id,
+                "started_at": _iso(self._process_started_at),
+                "uptime_seconds": round(
+                    max(0.0, now - self._process_started_at), 1
+                ),
+                "cpu_percent": self._last_cpu_percent,
+                "cgroup_cpu": dict(self._cgroup_cpu),
+                "workers": {
+                    "analysis": bool(self._worker and self._worker.is_alive()),
+                    "maintenance": bool(
+                        self._maintenance_worker
+                        and self._maintenance_worker.is_alive()
+                    ),
+                    "watcher": bool(
+                        self._watcher_worker
+                        and self._watcher_worker.is_alive()
+                    ),
+                },
+                "active_analysis": (
+                    {
+                        "network": running.network,
+                        "stage": running.stage,
+                        "age_seconds": round(
+                            max(0.0, now - (running.started_at or now)), 1
+                        ),
+                    }
+                    if running is not None
+                    else None
+                ),
+                "latest_analysis": dict(self._latest_analysis_summary or {}),
+                "analysis_latency_ms": {
+                    "sample_size": len(latencies),
+                    "p50": (
+                        round(statistics.median(latencies), 1)
+                        if latencies
+                        else None
+                    ),
+                    "p95": (
+                        round(
+                            sorted(latencies)[
+                                max(0, int(len(latencies) * 0.95) - 1)
+                            ],
+                            1,
+                        )
+                        if latencies
+                        else None
+                    ),
+                },
+                "timechain_lane": {
+                    "owner": owner.name if owner else None,
+                    "reason": owner_reason or None,
+                    "held_seconds": (
+                        round(
+                            max(0.0, time.monotonic() - owner_since), 1
+                        )
+                        if owner is not None and owner_since > 0
+                        else 0.0
+                    ),
+                },
             },
             "maintenance_telemetry": dict(self._maintenance_telemetry),
         }
@@ -1857,10 +1961,73 @@ class AnalysisService:
             job = self.jobs.get(job_id)
             if job is None or job.status in {"succeeded", "failed"}:
                 return
-            job.stage = str(stage)[:80]
+            now = time.time()
+            next_stage = str(stage)[:80]
+            if job.stage_started_at is not None and job.stage != next_stage:
+                elapsed_ms = max(0.0, (now - job.stage_started_at) * 1000)
+                job.stage_timings_ms[job.stage] = round(
+                    job.stage_timings_ms.get(job.stage, 0.0) + elapsed_ms,
+                    1,
+                )
+                job.stage_started_at = now
+            elif job.stage_started_at is None:
+                job.stage_started_at = now
+            job.stage = next_stage
             job.stage_detail = str(detail)[:240]
             job.progress_percent = max(0, min(100, int(percent)))
-            job.updated_at = time.time()
+            job.updated_at = now
+
+    @staticmethod
+    def _read_current_rss_mb() -> float | None:
+        if resource is None:
+            return None
+        # Prefer current Linux RSS so pressure can clear after objects are
+        # released; ru_maxrss remains useful as the fallback/high-water mark.
+        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
+        try:
+            with Path("/proc/self/status").open(encoding="utf-8") as handle:
+                for line in handle:
+                    if line.startswith("VmRSS:"):
+                        rss_mb = float(line.split()[1]) / 1024
+                        break
+        except (OSError, ValueError, IndexError):
+            pass
+        return round(rss_mb, 1)
+
+    def _sample_runtime_telemetry(self) -> None:
+        now = time.monotonic()
+        process_cpu = time.process_time()
+        previous = self._last_cpu_sample
+        if previous is not None and now > previous[0]:
+            self._last_cpu_percent = round(
+                max(
+                    0.0,
+                    (process_cpu - previous[1])
+                    / (now - previous[0])
+                    * 100,
+                ),
+                1,
+            )
+        self._last_cpu_sample = (now, process_cpu)
+        try:
+            values: dict[str, int] = {}
+            for line in Path("/sys/fs/cgroup/cpu.stat").read_text(
+                encoding="utf-8"
+            ).splitlines():
+                key, value = line.split(maxsplit=1)
+                values[key] = int(value)
+            self._cgroup_cpu = {
+                key: values[key]
+                for key in (
+                    "usage_usec",
+                    "nr_periods",
+                    "nr_throttled",
+                    "throttled_usec",
+                )
+                if key in values
+            }
+        except (OSError, ValueError):
+            pass
 
     def _enqueue_maintenance(self, job: Job, report: dict[str, Any]) -> None:
         task = MaintenanceTask(
@@ -1947,21 +2114,14 @@ class AnalysisService:
         into memory) -- this is the early signal so that's caught before
         the kernel does it for us, not silent until the crash.
         """
-        if resource is None:
+        self._sample_runtime_telemetry()
+        rss_mb = self._read_current_rss_mb()
+        if rss_mb is None:
             return
-        # Prefer current Linux RSS so a deferred audit can resume after
-        # pressure subsides. Fall back to the resource high-water mark on
-        # platforms without procfs.
-        rss_mb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss / 1024
-        try:
-            with Path("/proc/self/status").open(encoding="utf-8") as handle:
-                for line in handle:
-                    if line.startswith("VmRSS:"):
-                        rss_mb = float(line.split()[1]) / 1024
-                        break
-        except (OSError, ValueError, IndexError):
-            pass
-        self._last_memory_rss_mb = round(rss_mb, 1)
+        self._last_memory_rss_mb = rss_mb
+        self._last_memory_peak_mb = max(
+            rss_mb, self._last_memory_peak_mb or 0.0
+        )
         over_threshold = rss_mb >= self.settings.memory_warning_mb
         if over_threshold and not self._memory_warning_active:
             self._memory_warning_active = True
@@ -2384,6 +2544,11 @@ class AnalysisService:
         token = str(envelope["token_address"])
         anchor_kind = str(envelope["anchor_kind"])
         anchor_value = envelope.get("anchor_value")
+        evidence_binding = analysis_evidence_binding(
+            report.get("provenance") or {},
+            anchor_type=anchor_kind,
+            anchor_value=anchor_value,
+        )
         candidate = (
             f"Watcher observation for {network} subject {token} at "
             f"{anchor_kind} {anchor_value}: risk "
@@ -2420,7 +2585,8 @@ class AnalysisService:
             "risk_level": analysis.get("risk_level"),
             "legitimacy_score": analysis.get("legitimacy_score"),
             "action_label": analysis.get("action_label"),
-            "evidence_hash": envelope["evidence_hash"],
+            **evidence_binding,
+            "source_fact_hash": envelope["evidence_hash"],
             "report_hash": envelope["report_hash"],
             "analyzer_version": envelope.get("analyzer_version"),
             "idempotency_key": envelope["idempotency_key"],
@@ -2491,8 +2657,24 @@ class AnalysisService:
             previous_autoindex = os.environ.get("CT_AUTOINDEX")
             os.environ["CT_AUTOINDEX"] = "0"
             try:
+                ring_type = (
+                    "solana_token_analysis"
+                    if payload.get("network") == "solana"
+                    else "token_analysis"
+                )
+                if ring_type == "solana_token_analysis":
+                    payload.setdefault("mint", payload.get("token_address"))
+                    payload.setdefault("slot_anchor", payload.get("anchor_value"))
+                    payload.setdefault(
+                        "analysis",
+                        {
+                            "risk_level": payload.get("risk_level"),
+                            "legitimacy_score": payload.get("legitimacy_score"),
+                            "action_label": payload.get("action_label"),
+                        },
+                    )
                 ring = self._agent.tc.seal(
-                    "watcher_analysis", payload, poq=prepared.poq_scores
+                    ring_type, payload, poq=prepared.poq_scores
                 )
             finally:
                 if previous_autoindex is None:
@@ -2874,7 +3056,12 @@ class AnalysisService:
                 # it the first idle writer-lane opportunity.
                 self._drain_durable_commits()
                 temporal = task.report.get("temporal_entity_graph") or {}
-                needs_rebuild = not temporal.get("available", False)
+                needs_rebuild = (
+                    self.settings.temporal_projection_enabled
+                    and not temporal.get("available", False)
+                )
+                if not self.settings.temporal_projection_enabled:
+                    task.projection_done = True
                 if needs_rebuild and self._analysis_active.is_set():
                     try:
                         self._maintenance_work.put_nowait(task)
@@ -2959,6 +3146,7 @@ class AnalysisService:
                 job.stage_detail = "Preparing a block-pinned analysis"
                 job.progress_percent = 2
                 job.started_at = time.time()
+                job.stage_started_at = job.started_at
                 job.updated_at = job.started_at
 
             self._analysis_active.set()
@@ -2977,6 +3165,8 @@ class AnalysisService:
                         job.id, stage, percent, detail
                     )
 
+                seal_deferred = False
+                sealing_agent: Any = None
                 if job.network == "solana":
                     if self._solana_agent is None:
                         raise RuntimeError(
@@ -2995,10 +3185,17 @@ class AnalysisService:
                             kwargs["progress_callback"] = progress
                         if "defer_cognition" in parameters:
                             kwargs["defer_cognition"] = True
+                        if "seal" in parameters:
+                            kwargs["seal"] = False
+                            seal_deferred = True
+                            sealing_agent = self._solana_agent
                     except (TypeError, ValueError):
                         pass
-                    with self._tracked_timechain_lock("user_analysis"):
+                    if seal_deferred:
                         report = method(job.address, **kwargs)
+                    else:
+                        with self._tracked_timechain_lock("user_analysis"):
+                            report = method(job.address, **kwargs)
                 elif job.network == "base":
                     if self._base_agent is None:
                         raise RuntimeError(
@@ -3007,36 +3204,56 @@ class AnalysisService:
                     method = self._base_agent.analyze_token
                     kwargs: dict[str, Any] = {"full_report": False}
                     try:
-                        if (
-                            "progress_callback"
-                            in inspect.signature(method).parameters
-                        ):
+                        parameters = inspect.signature(method).parameters
+                        if "progress_callback" in parameters:
                             kwargs["progress_callback"] = progress
-                        if "defer_cognition" in inspect.signature(method).parameters:
+                        if "defer_cognition" in parameters:
                             kwargs["defer_cognition"] = True
+                        if "seal" in parameters:
+                            kwargs["seal"] = False
+                            seal_deferred = True
+                            sealing_agent = self._base_agent
                     except (TypeError, ValueError):
                         pass
-                    with self._tracked_timechain_lock("user_analysis"):
+                    if seal_deferred:
                         report = method(job.address, **kwargs)
+                    else:
+                        with self._tracked_timechain_lock("user_analysis"):
+                            report = method(job.address, **kwargs)
                 else:
                     method = self._agent.analyze_token
                     kwargs = {"full_report": False}
                     try:
-                        if (
-                            "progress_callback"
-                            in inspect.signature(method).parameters
-                        ):
+                        parameters = inspect.signature(method).parameters
+                        if "progress_callback" in parameters:
                             kwargs["progress_callback"] = progress
-                        if "defer_cognition" in inspect.signature(method).parameters:
+                        if "defer_cognition" in parameters:
                             kwargs["defer_cognition"] = True
+                        if "seal" in parameters:
+                            kwargs["seal"] = False
+                            seal_deferred = True
+                            sealing_agent = self._agent
                     except (TypeError, ValueError):
                         pass
-                    with self._tracked_timechain_lock("user_analysis"):
+                    if seal_deferred:
                         report = method(job.address, **kwargs)
+                    else:
+                        with self._tracked_timechain_lock("user_analysis"):
+                            report = method(job.address, **kwargs)
                 if report.get("error"):
                     raise PublicAnalysisError(
                         "analysis_rejected", str(report["error"])
                     )
+                if seal_deferred:
+                    progress(
+                        "sealing_timechain",
+                        90,
+                        "Verifying and appending the immutable analysis",
+                    )
+                    with self._tracked_timechain_lock("user_analysis_append"):
+                        sealing_agent._seal_report(
+                            report, defer_cognition=True
+                        )
                 progress(
                     "publishing",
                     98,
@@ -3064,6 +3281,16 @@ class AnalysisService:
                         else {"status": "disabled"}
                     )
                     job.status = "succeeded"
+                    completed_at = time.time()
+                    if job.stage_started_at is not None:
+                        elapsed_ms = max(
+                            0.0, (completed_at - job.stage_started_at) * 1000
+                        )
+                        job.stage_timings_ms[job.stage] = round(
+                            job.stage_timings_ms.get(job.stage, 0.0)
+                            + elapsed_ms,
+                            1,
+                        )
                     job.stage = "complete"
                     job.stage_detail = (
                         "Sealed analysis ready; cognitive audit continues in background"
@@ -3071,12 +3298,32 @@ class AnalysisService:
                         else "Sealed analysis ready"
                     )
                     job.progress_percent = 100
-                    job.updated_at = time.time()
+                    job.stage_started_at = completed_at
+                    job.updated_at = completed_at
                     job.analysis_latency_ms = max(
                         0.0,
                         (job.updated_at - (job.started_at or job.updated_at))
                         * 1000,
                     )
+                    self._recent_analysis_latencies_ms.append(
+                        job.analysis_latency_ms
+                    )
+                    self._latest_analysis_summary = {
+                        "network": job.network,
+                        "finished_at": _iso(job.updated_at),
+                        "latency_ms": round(job.analysis_latency_ms, 1),
+                        "queue_delay_ms": round(
+                            max(
+                                0.0,
+                                (
+                                    (job.started_at or job.created_at)
+                                    - job.created_at
+                                )
+                                * 1000,
+                            ),
+                            1,
+                        ),
+                    }
                     if self.settings.cache_ttl_seconds:
                         cache_address = (
                             job.address.lower()
@@ -3746,6 +3993,7 @@ async def ready() -> dict[str, Any]:
         "maintenance_telemetry": health["maintenance_telemetry"],
         "faculty_pack": health["faculty_pack"],
         "memory": health["memory"],
+        "runtime": health.get("runtime", {}),
     }
 
 

@@ -3691,6 +3691,23 @@ class Chainseer:
         Returns ordered list of past analyses with scores, timestamps, and
         computed trend metrics (direction, delta, volatility, metric shifts).
         """
+        # The legacy projection is one monolithic JSON document. On the
+        # production API it can be hundreds of megabytes and parsing it for a
+        # single token briefly needs several copies (text, decoded objects,
+        # canonical verification), which can OOM a 2 GiB machine. Keep the
+        # authoritative Timechain evidence available while allowing the
+        # latency-sensitive API to disable this rebuildable read model until
+        # the subject-sharded projection replaces it.
+        if os.environ.get(
+            "CHAINSEER_TEMPORAL_PROJECTION_ENABLED", "1"
+        ).strip().lower() in {"0", "false", "no", "off"}:
+            return {
+                "available": False,
+                "past_count": 0,
+                "past_analyses": [],
+                "history_source": "temporal_projection",
+                "reason": "projection_disabled_for_memory_safety",
+            }
         try:
             projection = TemporalGraphStore(self.chain_root).load()
             if projection is None:
