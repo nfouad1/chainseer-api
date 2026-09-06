@@ -45,6 +45,9 @@ api_smoke_chain/
 .chainseer-review-timechain/
 .chainseer-local.json
 .sites-init-staging/
+.site-release-*/
+.site-release-*.tar.gz
+.site-source-*.tar
 .zcode/
 .agents/
 .pnpm-store/
