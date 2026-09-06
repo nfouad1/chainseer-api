@@ -698,6 +698,76 @@ def _load_paths(
     return list(by_path.values())
 
 
+def _training_maturity_forecast(
+    paths: list[dict], common_signals: list[dict], *, observed_at: float,
+) -> dict:
+    """Describe when selection can first be honest without changing policy.
+
+    This is derived telemetry only. It does not admit paths, alter the frozen
+    policy hash, or permit a missing future checkpoint to count as evidence.
+    The timestamp is a lower bound: provider/archive recovery can make the
+    actual freeze later, never earlier.
+    """
+    terminal_index = max(
+        _terminal_index(definition["terminal_label"])
+        for definition in POLICIES.values()
+    )
+    terminal_label,terminal_offset = SCHEDULE[terminal_index]
+    marketable = sorted((
+        row for row in paths
+        if row.get("signal_role") == "qualified"
+        and 0 in row.get("marks", {})
+        and row["marks"][0].get("status") == "observed"
+        and bool(row["marks"][0].get("exit_valid"))
+    ), key=lambda row: (float(row["signaled_at"]),str(row["path_id"])))
+    candidates = marketable[:MINIMUM_TRAIN_PATHS]
+    complete_ids = {str(row["path_id"]) for row in common_signals}
+    targets = {
+        str(row["path_id"]): float(row["signaled_at"]) + terminal_offset
+        for row in candidates
+    }
+    matured = [
+        row for row in candidates
+        if targets[str(row["path_id"])] <= observed_at
+    ]
+    completed_candidates = [
+        row for row in candidates if str(row["path_id"]) in complete_ids
+    ]
+    lower_bound_at = (
+        max(targets.values())
+        if len(candidates) == MINIMUM_TRAIN_PATHS else None
+    )
+    if len(marketable) < MINIMUM_TRAIN_PATHS:
+        state = "collecting_entry_marketable_paths"
+    elif len(common_signals) >= MINIMUM_TRAIN_PATHS:
+        state = "ready_to_freeze"
+    elif lower_bound_at is not None and observed_at < lower_bound_at:
+        state = "awaiting_terminal_maturity"
+    else:
+        state = "recovering_due_measurements"
+    return {
+        "state": state,
+        "required_complete_paths": MINIMUM_TRAIN_PATHS,
+        "entry_marketable_qualified_paths": len(marketable),
+        "entry_marketable_shortfall": max(
+            0,MINIMUM_TRAIN_PATHS - len(marketable)),
+        "forecast_candidate_paths": len(candidates),
+        "terminal_time_matured_candidate_paths": len(matured),
+        "terminal_complete_candidate_paths": len(completed_candidates),
+        "common_complete_paths": len(common_signals),
+        "due_incomplete_candidate_paths": sum(
+            str(row["path_id"]) not in complete_ids for row in matured),
+        "terminal_label": terminal_label,
+        "terminal_nominal_offset_seconds": terminal_offset,
+        "earliest_selection_freeze_at": lower_bound_at,
+        "forecast_is_lower_bound": True,
+        "forecast_basis": (
+            "100th earliest currently entry-marketable qualified path plus "
+            "the maximum preregistered policy terminal offset"
+        ),
+    }
+
+
 def _ensure_evaluation_schema(connection: sqlite3.Connection) -> None:
     connection.executescript(
         """
@@ -906,6 +976,7 @@ def run_shadow_exit_evaluation(
     operational_evidence: dict | None = None,
 ) -> dict:
     root = Path(root)
+    evaluation_at = time.time()
     database_path = root / "learning.sqlite3"
     prior_evaluation_integrity = verify_evaluation_ledger(root)
     if database_path.exists():
@@ -951,6 +1022,8 @@ def run_shadow_exit_evaluation(
         and all(path["path_id"] in simulations[name] for name in common_policy_names)
     ]
     common_signals.sort(key=lambda row: (float(row["signaled_at"]), row["path_id"]))
+    maturity = _training_maturity_forecast(
+        paths,common_signals,observed_at=evaluation_at)
     experiment = (_load_experiment(root)
                   if prior_evaluation_integrity.get("ok") else None)
     if experiment is None:
@@ -996,6 +1069,8 @@ def run_shadow_exit_evaluation(
             and float(row["signaled_at"]) <= frozen_at
             for row in common_signals
         )
+        maturity["state"] = "selection_frozen"
+        maturity["selection_frozen_at"] = float(experiment["frozen_at"])
     else:
         train_pools = {row["pool_id"] for row in train_candidates}
         holdout = []
@@ -1115,7 +1190,7 @@ def run_shadow_exit_evaluation(
     }).encode("utf-8")).hexdigest()
     report = {
         "schema_version": 1, "policy_version": POLICY_VERSION,
-        "created_at": time.time(), "status": status,
+        "created_at": evaluation_at, "status": status,
         "source": {
             "revision": source_revision, "source_digest": source_digest,
             "evidence_hash": evidence_hash,
@@ -1147,6 +1222,7 @@ def run_shadow_exit_evaluation(
             "selection_frozen_at": (
                 experiment.get("frozen_at") if experiment else None),
             "split_rule": "post-freeze forward-time pool-disjoint holdout",
+            "training_maturity": maturity,
         },
         "integrity": integrity,
         "policy_metrics_available": policy_metrics,

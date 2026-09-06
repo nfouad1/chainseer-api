@@ -2498,7 +2498,7 @@ class RobinhoodLearningTests(unittest.TestCase):
         self.assertNotIn("fetch('/api/", html.replace("fetch('/api/status", ""))
         for section in ("Open paper positions", "Closed positions",
                         "Flow evidence", "Promotion", "Reflection",
-                        "Operational stabilization"):
+                        "Operational acceptance cohort"):
             self.assertIn(section, html)
         for renderer in ("renderPositions", "renderClosed", "renderEvidence",
                          "renderReflection", "renderStabilization"):

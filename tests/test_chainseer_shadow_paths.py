@@ -570,6 +570,44 @@ class ShadowExitEvaluationTests(unittest.TestCase):
                 second["selection"]["experiment"]["record_hash"],
                 frozen["record_hash"])
 
+    def test_training_maturity_forecast_is_a_seven_day_lower_bound(self):
+        paths = [
+            self._complete_path("train-a",1_000.0,"pool-a"),
+            self._complete_path("train-b",1_100.0,"pool-b"),
+        ]
+        with patch.object(sp,"MINIMUM_TRAIN_PATHS",2):
+            waiting = sp._training_maturity_forecast(
+                paths,[],observed_at=1_100.0)
+            recovering = sp._training_maturity_forecast(
+                paths,[paths[0]],observed_at=1_100.0 + 7 * 24 * 60 * 60)
+            ready = sp._training_maturity_forecast(
+                paths,paths,observed_at=1_100.0 + 7 * 24 * 60 * 60)
+        self.assertEqual(waiting["state"],"awaiting_terminal_maturity")
+        self.assertEqual(
+            waiting["earliest_selection_freeze_at"],
+            1_100.0 + 7 * 24 * 60 * 60)
+        self.assertTrue(waiting["forecast_is_lower_bound"])
+        self.assertEqual(recovering["state"],"recovering_due_measurements")
+        self.assertEqual(recovering["due_incomplete_candidate_paths"],1)
+        self.assertEqual(ready["state"],"ready_to_freeze")
+
+    def test_report_exposes_maturity_without_changing_policy_hash(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            paths = [self._complete_path("train",1_000.0,"pool")]
+            integrity = {"ok": True,"records": 18,"head": "1" * 64,
+                         "status": "verified"}
+            before = sp.policy_hash()
+            with (patch.object(sp,"_load_paths",return_value=paths),
+                  patch.object(sp,"verify_measurement_ledger",
+                               return_value=integrity)):
+                report = sp.run_shadow_exit_evaluation(root)
+            self.assertEqual(before,sp.policy_hash())
+            maturity = report["collection"]["training_maturity"]
+            self.assertEqual(maturity["entry_marketable_qualified_paths"],1)
+            self.assertEqual(maturity["state"],
+                             "collecting_entry_marketable_paths")
+
     def test_staged_proceeds_survive_a_later_nonexit(self):
         path = self._complete_path("signal",1_000,"pool")
         path["marks"][1]["net_return"] = 1.0

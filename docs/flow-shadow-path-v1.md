@@ -66,6 +66,10 @@ reads `flow_shadow_exit_v1.json` and current collection counters.
 
 The dashboard separates current collection from completed strategy evidence.
 An empty experiment correctly reports `collecting_training_paths`.
+It also reports an evidence-clock lower bound for the earliest possible policy
+freeze. The bound is the final seven-day target of the 100th earliest currently
+entry-marketable qualified path. It is visibility only: archive recovery can
+move the real freeze later, and it never makes an incomplete path admissible.
 
 ### Native-currency and process-exit repair
 
