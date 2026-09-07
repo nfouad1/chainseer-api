@@ -3,6 +3,7 @@ import threading
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
+from unittest.mock import patch
 
 from chainseer_api import (
     AnalysisService,
@@ -302,3 +303,27 @@ def test_redelivered_scan_restores_existing_ring_instead_of_appending():
     assert report["analysis_ring"] == 42
     assert report["analysis_ring_hash"] == "a" * 64
     assert report["cognitive_completion"]["status"] == "queued"
+
+
+def test_api_writer_replaces_buffered_append_with_fsynced_append():
+    with tempfile.TemporaryDirectory() as directory:
+        path = Path(directory) / "rings.jsonl"
+        attested = []
+        tc = SimpleNamespace(
+            rings_path=path,
+            _append=lambda _ring: None,
+            _auto_attest=attested.append,
+        )
+        agent = SimpleNamespace(tc=tc)
+        ring = {"index": 1, "ring_type": "test", "payload": {"ok": True}}
+
+        assert AnalysisService._install_durable_timechain_append(agent)
+        assert not AnalysisService._install_durable_timechain_append(agent)
+        with patch("chainseer_api.os.fsync") as fsync:
+            tc._append(ring)
+
+        fsync.assert_called_once()
+        assert path.read_text(encoding="utf-8") == (
+            '{"index": 1, "ring_type": "test", "payload": {"ok": true}}\n'
+        )
+        assert attested == [ring]

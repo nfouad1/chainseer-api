@@ -1232,6 +1232,50 @@ class AnalysisService:
         }
         self._last_full_audit_deferred_reason: str | None = None
 
+    @staticmethod
+    def _install_durable_timechain_append(agent: Any) -> bool:
+        """Replace the runtime's buffered append with write-through + fsync.
+
+        The pinned Cypher Tempre runtime closes its text handle after writing,
+        which flushes Python buffers but does not force the newest filesystem
+        extent to stable storage. A VM restart can therefore leave a valid
+        file length followed by NULs. The API owns the single writer, so this
+        instance-level adapter safely strengthens every ring append without
+        changing the vendored, commit-attested runtime.
+        """
+        tc = getattr(agent, "tc", None)
+        if tc is None or getattr(tc, "_chainseer_durable_append", False):
+            return False
+        if not callable(getattr(tc, "_append", None)):
+            return False
+        rings_path = Path(tc.rings_path)
+        auto_attest = getattr(tc, "_auto_attest", None)
+
+        def durable_append(ring: dict[str, Any]) -> None:
+            payload = (
+                json.dumps(ring, ensure_ascii=False) + "\n"
+            ).encode("utf-8")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+            if hasattr(os, "O_BINARY"):
+                flags |= os.O_BINARY
+            descriptor = os.open(str(rings_path), flags, 0o600)
+            try:
+                view = memoryview(payload)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("Timechain append made no progress")
+                    view = view[written:]
+                os.fsync(descriptor)
+            finally:
+                os.close(descriptor)
+            if callable(auto_attest):
+                auto_attest(ring)
+
+        tc._append = durable_append
+        tc._chainseer_durable_append = True
+        return True
+
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
             return
@@ -1250,6 +1294,7 @@ class AnalysisService:
                 rpc_url=self.settings.rpc_url,
                 chain_root=self.settings.chain_root,
             )
+        self._install_durable_timechain_append(self._agent)
         if self._memory is None and hasattr(self._agent, "tc"):
             self._memory = MemoryCore(
                 self._agent.tc,
