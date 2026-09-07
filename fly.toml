@@ -6,7 +6,7 @@ primary_region = "fra"
 
 [processes]
   gateway = "env CHAINSEER_PROCESS_ROLE=gateway python -X utf8 chainseer_api.py"
-  writer = "env CHAINSEER_PROCESS_ROLE=writer python -X utf8 chainseer_api.py"
+  writer = "env CHAINSEER_PROCESS_ROLE=writer CHAINSEER_API_HOST=:: python -X utf8 chainseer_api.py"
 
 [env]
   CHAINSEER_ENVIRONMENT = "production"
