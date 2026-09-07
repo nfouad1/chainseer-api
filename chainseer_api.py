@@ -4523,7 +4523,9 @@ SHARED_JOB_STORE = create_shared_job_store(
 WRITER_LEASE = DistributedWriterLease(
     SHARED_JOB_STORE,
     owner_id=(
-        f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+        f"fly-machine:{os.environ['FLY_MACHINE_ID']}"
+        if os.environ.get("FLY_MACHINE_ID")
+        else f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
     ),
     ttl_seconds=SETTINGS.writer_lease_ttl_seconds,
 )
