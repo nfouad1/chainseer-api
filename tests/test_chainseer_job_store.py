@@ -302,6 +302,27 @@ def test_gateway_start_is_redis_only_and_never_touches_chain_root():
             assert gateway.stop()
 
 
+def test_gateway_polling_never_masks_writer_state_with_local_queued_job():
+    store = RedisJobStore(client=FakeRedis(), prefix="test")
+    with tempfile.TemporaryDirectory() as directory:
+        configured = replace(
+            settings(Path(directory)),
+            process_role="gateway",
+            shared_store_url="redis://test",
+            shared_work_queue_enabled=True,
+        )
+        gateway = AnalysisService(configured, shared_job_store=store)
+
+        accepted = gateway.submit(TOKEN, force_refresh=True)
+        assert gateway.get(accepted.job_id) is None
+        completed = store.get_job(accepted.job_id)
+        completed["status"] = "succeeded"
+        completed["result"] = {"decision": {"score": 88}}
+        store.put_job(accepted.job_id, completed, 3600)
+
+        assert gateway.get_public(accepted.job_id)["status"] == "succeeded"
+
+
 def test_split_roles_fail_closed_without_shared_queue():
     with tempfile.TemporaryDirectory() as directory:
         for role in ("gateway", "writer"):

@@ -1659,9 +1659,14 @@ class AnalysisService:
 
     def get_public(self, job_id: str) -> dict[str, Any] | None:
         """Return a local job or its cross-replica shared snapshot."""
-        local = self.get(job_id)
-        if local is not None:
-            return local.public()
+        # Gateways never execute jobs, so any local copy can only be the
+        # submission-time ``queued`` snapshot.  Reading it before Redis lets
+        # that stale copy mask the writer's later running/completed state and
+        # makes polling nondeterministic across gateway replicas.
+        if not self._gateway_only:
+            local = self.get(job_id)
+            if local is not None:
+                return local.public()
         if self._shared_job_store is None:
             return None
         try:
@@ -1711,7 +1716,7 @@ class AnalysisService:
                 )
         # Keep the common hot-repeat path entirely in memory. Durable storage
         # is only consulted for a stale/forced refresh or after a restart.
-        if not force_refresh:
+        if not force_refresh and not self._gateway_only:
             with self._lock:
                 self._prune(now)
                 cached = self.cache.get(normalized)
@@ -1763,7 +1768,12 @@ class AnalysisService:
         with self._lock:
             self._prune(now)
             cached = self.cache.get(normalized)
-            if not force_refresh and cached and cached[0] > now:
+            if (
+                not self._gateway_only
+                and not force_refresh
+                and cached
+                and cached[0] > now
+            ):
                 cached_job = self.jobs.get(cached[1])
                 if cached_job is not None:
                     # Serve the existing completed job rather than minting a
@@ -1781,7 +1791,11 @@ class AnalysisService:
                 # configuration) -- fall through and treat this as a miss.
                 self.cache.pop(normalized, None)
 
-            active_id = self.active_by_address.get(normalized)
+            active_id = (
+                None
+                if self._gateway_only
+                else self.active_by_address.get(normalized)
+            )
             if active_id:
                 active = self.jobs.get(active_id)
                 if active and active.status in {
@@ -1845,8 +1859,12 @@ class AnalysisService:
                     raise SharedStoreUnavailableError(
                         "shared scan state is temporarily unavailable"
                     ) from exc
-            self.jobs[job.id] = job
-            self.active_by_address[normalized] = job.id
+            # Only the writer/combined role owns mutable in-process job state.
+            # A gateway relies on the Redis active lease for coalescing and on
+            # the shared job snapshot for polling.
+            if not self._gateway_only:
+                self.jobs[job.id] = job
+                self.active_by_address[normalized] = job.id
             try:
                 enqueued = self._enqueue_scan_job(job.id)
             except Exception as exc:
