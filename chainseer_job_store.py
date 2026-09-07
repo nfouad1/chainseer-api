@@ -1,9 +1,11 @@
-"""Optional shared job state for horizontally scaled Chainseer API replicas.
+"""Shared scan state and durable work coordination for Chainseer.
 
-The scanner remains process-local for now. This store makes accepted jobs,
-progress, completed results, hot-cache pointers, and active-scan leases visible
-to every web replica. No network connection is created unless an explicit
-Redis/Valkey URL is configured.
+The Redis implementation keeps accepted jobs, progress, completed results,
+hot-cache pointers, and active-scan leases visible to every web replica.  It
+also provides a reliable pending/processing queue and a renewable singleton
+lease for the one process allowed to append to the authoritative Timechain.
+No network connection is created unless an explicit Redis/Valkey URL is
+configured.
 """
 
 from __future__ import annotations
@@ -41,6 +43,24 @@ class SharedJobStore(Protocol):
 
     def release_active(self, subject_key: str, job_id: str) -> bool: ...
 
+    def enqueue_scan(self, job_id: str, maximum_depth: int) -> bool: ...
+
+    def claim_scan(self, timeout_seconds: int = 1) -> str | None: ...
+
+    def acknowledge_scan(self, job_id: str) -> bool: ...
+
+    def requeue_scan(self, job_id: str, maximum_depth: int) -> bool: ...
+
+    def recover_claimed_scans(self) -> int: ...
+
+    def scan_queue_depth(self) -> int: ...
+
+    def claim_writer(self, owner_id: str, ttl_seconds: int) -> bool: ...
+
+    def renew_writer(self, owner_id: str, ttl_seconds: int) -> bool: ...
+
+    def release_writer(self, owner_id: str) -> bool: ...
+
     def ping(self) -> bool: ...
 
 
@@ -53,6 +73,36 @@ class RedisJobStore:
             return redis.call('del', KEYS[1])
         end
         return 0
+    """
+    _COMPARE_EXPIRE = """
+        if redis.call('get', KEYS[1]) == ARGV[1] then
+            return redis.call('expire', KEYS[1], ARGV[2])
+        end
+        return 0
+    """
+    _BOUNDED_ENQUEUE = """
+        if redis.call('lpos', KEYS[1], ARGV[1]) or
+           redis.call('lpos', KEYS[2], ARGV[1]) then
+            return 1
+        end
+        local depth = redis.call('llen', KEYS[1]) + redis.call('llen', KEYS[2])
+        if depth >= tonumber(ARGV[2]) then
+            return 0
+        end
+        redis.call('lpush', KEYS[1], ARGV[1])
+        return 1
+    """
+    _REQUEUE = """
+        redis.call('lrem', KEYS[2], 0, ARGV[1])
+        if redis.call('lpos', KEYS[1], ARGV[1]) then
+            return 1
+        end
+        local depth = redis.call('llen', KEYS[1]) + redis.call('llen', KEYS[2])
+        if depth >= tonumber(ARGV[2]) then
+            return 0
+        end
+        redis.call('lpush', KEYS[1], ARGV[1])
+        return 1
     """
 
     def __init__(
@@ -194,6 +244,96 @@ class RedisJobStore:
             job_id,
         )
         return bool(deleted)
+
+    @property
+    def _scan_pending_key(self) -> str:
+        return self._key("scan_queue", "pending")
+
+    @property
+    def _scan_processing_key(self) -> str:
+        return self._key("scan_queue", "processing")
+
+    def enqueue_scan(self, job_id: str, maximum_depth: int) -> bool:
+        """Atomically add one job unless it is queued or the queue is full."""
+        accepted = self._client.eval(
+            self._BOUNDED_ENQUEUE,
+            2,
+            self._scan_pending_key,
+            self._scan_processing_key,
+            job_id,
+            max(1, int(maximum_depth)),
+        )
+        return bool(accepted)
+
+    def claim_scan(self, timeout_seconds: int = 1) -> str | None:
+        """Reliably claim the oldest pending scan into the processing list."""
+        value = self._client.brpoplpush(
+            self._scan_pending_key,
+            self._scan_processing_key,
+            timeout=max(1, int(timeout_seconds)),
+        )
+        return str(value) if value else None
+
+    def acknowledge_scan(self, job_id: str) -> bool:
+        return bool(
+            self._client.lrem(self._scan_processing_key, 1, job_id)
+        )
+
+    def requeue_scan(self, job_id: str, maximum_depth: int) -> bool:
+        requeued = self._client.eval(
+            self._REQUEUE,
+            2,
+            self._scan_pending_key,
+            self._scan_processing_key,
+            job_id,
+            max(1, int(maximum_depth)),
+        )
+        return bool(requeued)
+
+    def recover_claimed_scans(self) -> int:
+        """Move crash-stranded processing jobs back to the pending queue."""
+        recovered = 0
+        while True:
+            value = self._client.rpop(self._scan_processing_key)
+            if not value:
+                return recovered
+            # Pending jobs are claimed from the right. Put recovered work on
+            # that same side so the interrupted oldest job resumes first.
+            self._client.rpush(self._scan_pending_key, value)
+            recovered += 1
+
+    def scan_queue_depth(self) -> int:
+        return int(self._client.llen(self._scan_pending_key)) + int(
+            self._client.llen(self._scan_processing_key)
+        )
+
+    def claim_writer(self, owner_id: str, ttl_seconds: int) -> bool:
+        """Claim or refresh the one distributed Timechain-writer lease."""
+        key = self._key("lease", "timechain_writer")
+        ttl = max(5, int(ttl_seconds))
+        claimed = self._client.set(key, owner_id, ex=ttl, nx=True)
+        if claimed:
+            return True
+        return self.renew_writer(owner_id, ttl)
+
+    def renew_writer(self, owner_id: str, ttl_seconds: int) -> bool:
+        renewed = self._client.eval(
+            self._COMPARE_EXPIRE,
+            1,
+            self._key("lease", "timechain_writer"),
+            owner_id,
+            max(5, int(ttl_seconds)),
+        )
+        return bool(renewed)
+
+    def release_writer(self, owner_id: str) -> bool:
+        released = self._client.eval(
+            self._COMPARE_DELETE,
+            1,
+            self._key("lease", "timechain_writer"),
+            owner_id,
+        )
+        return bool(released)
 
     def ping(self) -> bool:
         return bool(self._client.ping())

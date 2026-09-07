@@ -391,6 +391,16 @@ class Settings:
             10.0,
         )
     )
+    shared_work_queue_enabled: bool = field(
+        default_factory=lambda: _env_bool(
+            "CHAINSEER_SHARED_WORK_QUEUE_ENABLED", False
+        )
+    )
+    writer_lease_ttl_seconds: int = field(
+        default_factory=lambda: _env_int(
+            "CHAINSEER_WRITER_LEASE_TTL_SECONDS", 30, 10, 300
+        )
+    )
 
     def validate(self) -> None:
         if self.environment not in {"development", "test", "production"}:
@@ -504,6 +514,11 @@ class Settings:
                     "CHAINSEER_BENCHMARK_ROOT must not be inside "
                     "CHAINSEER_CHAIN_ROOT"
                 )
+        if self.shared_work_queue_enabled and not self.shared_store_url:
+            raise RuntimeError(
+                "CHAINSEER_SHARED_WORK_QUEUE_ENABLED requires "
+                "CHAINSEER_SHARED_STORE_URL"
+            )
         backup_path = Path(self.memory_backup_root).resolve()
         chain_path = Path(self.chain_root).resolve()
         if backup_path == chain_path or chain_path in backup_path.parents:
@@ -690,11 +705,84 @@ class Job:
             ),
         }
 
+    @classmethod
+    def from_public(cls, value: dict[str, Any]) -> "Job":
+        """Rehydrate only worker-owned fields from a shared queue snapshot."""
+        job_id = str(value.get("job_id") or "")
+        address = str(value.get("address") or "")
+        network = str(value.get("network") or "")
+        if not re.fullmatch(r"[a-f0-9]{32}", job_id):
+            raise ValueError("shared scan job id is invalid")
+        if network not in SUPPORTED_NETWORKS:
+            raise ValueError("shared scan network is invalid")
+        if network in EVM_NETWORKS:
+            if not ADDRESS_RE.fullmatch(address):
+                raise ValueError("shared EVM scan address is invalid")
+        else:
+            validate_solana_mint(address)
+        timing = value.get("timing") or {}
+        cognition = value.get("cognitive_completion") or {}
+        error = value.get("error") or {}
+        return cls(
+            id=job_id,
+            address=address,
+            network=network,
+            status=str(value.get("status") or "queued"),
+            stage=str(value.get("stage") or "queued"),
+            stage_detail=str(
+                value.get("stage_detail") or "Waiting for the analysis worker"
+            ),
+            progress_percent=int(value.get("progress_percent") or 0),
+            created_at=_epoch_from_iso(value.get("created_at")) or time.time(),
+            updated_at=_epoch_from_iso(value.get("updated_at")) or time.time(),
+            started_at=_epoch_from_iso(value.get("started_at")),
+            finished_at=_epoch_from_iso(value.get("finished_at")),
+            analysis_latency_ms=(
+                float(timing["analysis_latency_ms"])
+                if timing.get("analysis_latency_ms") is not None
+                else None
+            ),
+            result=(
+                value.get("result")
+                if isinstance(value.get("result"), dict)
+                else None
+            ),
+            benchmark_capture=(
+                value.get("benchmark_capture")
+                if isinstance(value.get("benchmark_capture"), dict)
+                else None
+            ),
+            error_code=str(error.get("code")) if error.get("code") else None,
+            error_message=(
+                str(error.get("message")) if error.get("message") else None
+            ),
+            cognition_status=str(cognition.get("status") or "not_started"),
+            cognition_stage_detail=str(
+                cognition.get("stage_detail")
+                or "Cognitive completion starts after analysis"
+            ),
+            cognition_progress_percent=int(
+                cognition.get("progress_percent") or 0
+            ),
+            cognition_updated_at=_epoch_from_iso(cognition.get("updated_at")),
+        )
+
 
 def _iso(value: float | None) -> str | None:
     if value is None:
         return None
     return datetime.fromtimestamp(value, timezone.utc).isoformat()
+
+
+def _epoch_from_iso(value: Any) -> float | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(
+            str(value).replace("Z", "+00:00")
+        ).timestamp()
+    except (TypeError, ValueError):
+        return None
 
 
 #: case_bank_status()/append_observation() both reload and fully
@@ -968,15 +1056,103 @@ class DeferredSealJob:
     enqueued_at: float
 
 
+class DistributedWriterLease:
+    """Renewable Redis lease for the sole authoritative Timechain writer."""
+
+    def __init__(
+        self,
+        store: SharedJobStore | None,
+        *,
+        owner_id: str,
+        ttl_seconds: int,
+    ):
+        self.store = store
+        self.owner_id = owner_id
+        self.ttl_seconds = max(10, int(ttl_seconds))
+        self._stopping = threading.Event()
+        self._healthy = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._last_confirmed_monotonic = 0.0
+
+    @property
+    def enabled(self) -> bool:
+        return self.store is not None
+
+    @property
+    def healthy(self) -> bool:
+        return not self.enabled or self._healthy.is_set()
+
+    def acquire(self) -> None:
+        if self.store is None:
+            self._healthy.set()
+            return
+        if not self.store.claim_writer(self.owner_id, self.ttl_seconds):
+            raise RuntimeError(
+                "another process owns the authoritative Timechain writer lease"
+            )
+        self._stopping.clear()
+        self._healthy.set()
+        self._last_confirmed_monotonic = time.monotonic()
+        self._thread = threading.Thread(
+            target=self._renew_loop,
+            name="chainseer-writer-lease",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def _renew_loop(self) -> None:
+        interval = max(1.0, self.ttl_seconds / 3.0)
+        wait_seconds = interval
+        while not self._stopping.wait(wait_seconds):
+            try:
+                renewed = bool(
+                    self.store
+                    and self.store.renew_writer(
+                        self.owner_id, self.ttl_seconds
+                    )
+                )
+            except Exception:
+                LOGGER.exception("Timechain writer lease renewal failed")
+                renewed = False
+            if renewed:
+                self._last_confirmed_monotonic = time.monotonic()
+                wait_seconds = interval
+                continue
+            # A single network hiccup must not unnecessarily take production
+            # offline while the Redis lease is still valid. Retry quickly, but
+            # fence this process well before another owner could claim the TTL.
+            elapsed = time.monotonic() - self._last_confirmed_monotonic
+            if elapsed >= self.ttl_seconds * 0.6:
+                self._healthy.clear()
+                LOGGER.critical(
+                    "Timechain writer lease was lost; all new appends are fenced"
+                )
+                return
+            wait_seconds = 1.0
+
+    def release(self) -> None:
+        self._stopping.set()
+        if self._thread is not None:
+            self._thread.join(timeout=2.0)
+        if self.store is not None and self._healthy.is_set():
+            try:
+                self.store.release_writer(self.owner_id)
+            except Exception:
+                LOGGER.exception("Could not release Timechain writer lease")
+        self._healthy.clear()
+
+
 class AnalysisService:
     def __init__(
         self,
         settings: Settings,
         *,
         shared_job_store: SharedJobStore | None = None,
+        writer_lease: DistributedWriterLease | None = None,
     ):
         self.settings = settings
         self._shared_job_store = shared_job_store
+        self._writer_lease = writer_lease
         self.jobs: dict[str, Job] = {}
         self.active_by_address: dict[str, str] = {}
         self.cache: dict[str, tuple[float, str]] = {}
@@ -1059,6 +1235,8 @@ class AnalysisService:
     def start(self) -> None:
         if self._worker and self._worker.is_alive():
             return
+        if self._writer_lease is not None and not self._writer_lease.healthy:
+            raise RuntimeError("authoritative Timechain writer lease is unavailable")
         self._stopping.clear()
         if (
             self.settings.environment == "production"
@@ -1155,6 +1333,14 @@ class AnalysisService:
                 ),
                 network="base",
             )
+        if self.settings.shared_work_queue_enabled:
+            if self._shared_job_store is None:
+                raise RuntimeError("shared scan work queue is unavailable")
+            recovered = self._shared_job_store.recover_claimed_scans()
+            if recovered:
+                LOGGER.warning(
+                    "Recovered %d crash-stranded scan job(s)", recovered
+                )
         self._worker = threading.Thread(
             target=self._run,
             name="chainseer-analysis-worker",
@@ -1238,8 +1424,56 @@ class AnalysisService:
                 )
             )
             and self._integrity_status.get("status") != "failed"
+            and (
+                self._writer_lease is None or self._writer_lease.healthy
+            )
             and not self._stopping.is_set()
         )
+
+    def _shared_work_queue(self) -> bool:
+        return bool(
+            self.settings.shared_work_queue_enabled
+            and self._shared_job_store is not None
+        )
+
+    def _scan_queue_depth(self) -> int:
+        if not self._shared_work_queue():
+            return self.work.qsize()
+        try:
+            return self._shared_job_store.scan_queue_depth()
+        except Exception:
+            LOGGER.exception("Could not read shared scan queue depth")
+            return -1
+
+    def _enqueue_scan_job(self, job_id: str) -> bool:
+        if not self._shared_work_queue():
+            try:
+                self.work.put_nowait(job_id)
+                return True
+            except queue.Full:
+                return False
+        return self._shared_job_store.enqueue_scan(
+            job_id, self.settings.queue_size
+        )
+
+    def _requeue_scan_job(self, job_id: str) -> bool:
+        if not self._shared_work_queue():
+            return self._enqueue_scan_job(job_id)
+        return self._shared_job_store.requeue_scan(
+            job_id, self.settings.queue_size
+        )
+
+    def _claim_scan_job(self) -> tuple[str | None, bool]:
+        """Return (job id, requires shared acknowledgement)."""
+        if not self._shared_work_queue():
+            return self.work.get(), False
+        return self._shared_job_store.claim_scan(timeout_seconds=1), True
+
+    def _acknowledge_scan_job(self, job_id: str, shared: bool) -> None:
+        if shared:
+            self._shared_job_store.acknowledge_scan(job_id)
+        else:
+            self.work.task_done()
 
     def _publish_shared_job(self, job: Job) -> None:
         """Publish a detached job snapshot without making Redis authoritative
@@ -1397,7 +1631,7 @@ class AnalysisService:
                 }:
                     return accepted_with_previous(active)
 
-            if self.work.full():
+            if not self._shared_work_queue() and self.work.full():
                 raise QueueFullError
 
             proposed_job_id = uuid.uuid4().hex
@@ -1455,7 +1689,40 @@ class AnalysisService:
                     ) from exc
             self.jobs[job.id] = job
             self.active_by_address[normalized] = job.id
-            self.work.put_nowait(job.id)
+            try:
+                enqueued = self._enqueue_scan_job(job.id)
+            except Exception as exc:
+                self.jobs.pop(job.id, None)
+                self.active_by_address.pop(normalized, None)
+                if self._shared_job_store is not None:
+                    try:
+                        self._shared_job_store.release_active(
+                            normalized, job.id
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not roll back shared scan lease after "
+                            "queue failure",
+                            extra={"job_id": job.id},
+                        )
+                raise SharedStoreUnavailableError(
+                    "shared scan queue is temporarily unavailable"
+                ) from exc
+            if not enqueued:
+                self.jobs.pop(job.id, None)
+                self.active_by_address.pop(normalized, None)
+                if self._shared_job_store is not None:
+                    try:
+                        self._shared_job_store.release_active(
+                            normalized, job.id
+                        )
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not roll back shared scan lease after "
+                            "queue rejection",
+                            extra={"job_id": job.id},
+                        )
+                raise QueueFullError
             accepted = (
                 accepted_with_previous(job)
                 if previous is not None
@@ -1692,6 +1959,21 @@ class AnalysisService:
                     self._shared_job_store.backend
                     if self._shared_job_store is not None
                     else "process_local"
+                ),
+                "work_queue": (
+                    "shared_reliable"
+                    if self._shared_work_queue()
+                    else "process_local"
+                ),
+                "queue_depth": self._scan_queue_depth(),
+            },
+            "timechain_writer": {
+                "distributed_lease": bool(
+                    self._writer_lease and self._writer_lease.enabled
+                ),
+                "lease_healthy": bool(
+                    self._writer_lease is None
+                    or self._writer_lease.healthy
                 ),
             },
             "deferred_commits": self._deferred_queue.counts(),
@@ -2002,6 +2284,8 @@ class AnalysisService:
         timeout: float | None = None,
     ) -> bool:
         """Acquire the writer lock and atomically publish its real owner."""
+        if self._writer_lease is not None and not self._writer_lease.healthy:
+            return False
         if not blocking:
             acquired = self._timechain_lock.acquire(blocking=False)
         elif timeout is None:
@@ -2009,6 +2293,9 @@ class AnalysisService:
         else:
             acquired = self._timechain_lock.acquire(timeout=timeout)
         if not acquired:
+            return False
+        if self._writer_lease is not None and not self._writer_lease.healthy:
+            self._timechain_lock.release()
             return False
         me = threading.current_thread()
         with self._timechain_owner_guard:
@@ -3338,16 +3625,146 @@ class AnalysisService:
                     )
                 )
 
+    @staticmethod
+    def _restore_sealed_report(
+        report: dict[str, Any], ring: dict[str, Any]
+    ) -> None:
+        """Reconstruct request output after append-before-ack recovery."""
+        payload = ring.get("payload") or {}
+        report["analysis_ring"] = ring.get("index")
+        report["analysis_ring_hash"] = ring.get("ring_hash")
+        report["analysis_evidence_hash"] = payload.get("evidence_hash")
+        report["poq_verdict"] = payload.get("poq_verdict") or {
+            "decision": "SEAL",
+            "cited_rings": [],
+        }
+        report["_analysis_ring_record"] = ring
+        cognition = payload.get("cognitive_loop") or report.get("cognition") or {}
+        cognition["status"] = "pending"
+        cognition["analysis_ring"] = ring.get("index")
+        cognition["growth_status"] = "excluded_from_online_completion"
+        report["cognition"] = cognition
+        report["cognitive_completion"] = {
+            "status": "queued",
+            "analysis_ring": ring.get("index"),
+        }
+        report["temporal_entity_graph"] = {
+            "available": False,
+            "status": "queued",
+            "reason": "temporal_projection_pending",
+        }
+
+    def _seal_user_report_once(
+        self,
+        sealing_agent: Any,
+        report: dict[str, Any],
+        job_id: str,
+        *,
+        exhaustive_recovery: bool = False,
+    ) -> None:
+        """Append once even when a reliable queue redelivers after a crash."""
+        if self._agent is None:
+            raise RuntimeError("Timechain writer is unavailable")
+        key = f"public_analysis:{job_id}"
+        report["_idempotency_key"] = key
+        tc = getattr(self._agent, "tc", None)
+        if tc is None:
+            # Lightweight test/adaptor agents may expose only _seal_report.
+            # Production Chainseer agents always expose their Timechain.
+            sealing_agent._seal_report(report, defer_cognition=True)
+            return
+        rings = tc.tail_rings(512)
+        existing = next(
+            (
+                ring
+                for ring in reversed(rings)
+                if (ring.get("payload") or {}).get("idempotency_key") == key
+            ),
+            None,
+        )
+        if existing is None and exhaustive_recovery:
+            existing = next(
+                (
+                    ring
+                    for ring in tc.iter_rings()
+                    if (ring.get("payload") or {}).get("idempotency_key")
+                    == key
+                ),
+                None,
+            )
+        if existing is not None:
+            payload = existing.get("payload") or {}
+            expected_address = (
+                report.get("token_address") or report.get("mint")
+            )
+            stored_address = payload.get("token_address") or payload.get("mint")
+            if str(stored_address) != str(expected_address):
+                raise RuntimeError("analysis idempotency key subject collision")
+            self._restore_sealed_report(report, existing)
+            return
+        sealing_agent._seal_report(report, defer_cognition=True)
+
     def _run(self) -> None:
         while not self._stopping.is_set():
-            job_id = self.work.get()
+            try:
+                job_id, claimed_shared = self._claim_scan_job()
+            except Exception:
+                LOGGER.exception("Could not claim scan work")
+                self._stopping.wait(0.5)
+                continue
+            if job_id is None and claimed_shared:
+                continue
             if job_id is None:
                 return
             with self._lock:
                 job = self.jobs.get(job_id)
+                recovered_execution = False
                 if not job:
-                    self.work.task_done()
-                    continue
+                    shared_snapshot = None
+                    if claimed_shared and self._shared_job_store is not None:
+                        try:
+                            shared_snapshot = self._shared_job_store.get_job(
+                                job_id
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "Could not load claimed shared scan",
+                                extra={"job_id": job_id},
+                            )
+                    if shared_snapshot is not None:
+                        try:
+                            job = Job.from_public(shared_snapshot)
+                        except (TypeError, ValueError):
+                            LOGGER.exception(
+                                "Discarding invalid shared scan snapshot",
+                                extra={"job_id": job_id},
+                            )
+                    if job is None or job.status not in {
+                        "queued", "running", "waiting_for_timechain"
+                    }:
+                        try:
+                            self._acknowledge_scan_job(
+                                job_id, claimed_shared
+                            )
+                        except Exception:
+                            LOGGER.exception(
+                                "Could not acknowledge unusable shared scan",
+                                extra={"job_id": job_id},
+                            )
+                        continue
+                    recovered_execution = job.status in {
+                        "running", "waiting_for_timechain"
+                    }
+                    self.jobs[job.id] = job
+                    subject = (
+                        job.address.lower()
+                        if job.network in EVM_NETWORKS
+                        else job.address
+                    )
+                    self.active_by_address[f"{job.network}:{subject}"] = job.id
+                recovered_execution = recovered_execution or job.status in {
+                    "running", "waiting_for_timechain"
+                }
                 job.status = "running"
                 job.stage = "initializing"
                 job.stage_detail = "Preparing a block-pinned analysis"
@@ -3459,8 +3876,11 @@ class AnalysisService:
                         "Verifying and appending the immutable analysis",
                     )
                     with self._tracked_timechain_lock("user_analysis_append"):
-                        sealing_agent._seal_report(
-                            report, defer_cognition=True
+                        self._seal_user_report_once(
+                            sealing_agent,
+                            report,
+                            job.id,
+                            exhaustive_recovery=recovered_execution,
                         )
                 progress(
                     "publishing",
@@ -3580,9 +4000,14 @@ class AnalysisService:
                         job.updated_at = time.time()
                     # Re-enqueue for retry.
                     try:
-                        self.work.put_nowait(job.id)
-                        retrying = True
-                    except queue.Full:
+                        retrying = self._requeue_scan_job(job.id)
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not requeue scan after Timechain timeout",
+                            extra={"job_id": job.id},
+                        )
+                        retrying = False
+                    if not retrying:
                         with self._lock:
                             job.status = "failed"
                             job.stage = "failed"
@@ -3655,7 +4080,14 @@ class AnalysisService:
                             "Could not release shared active-scan lease",
                             extra={"job_id": job.id},
                         )
-                self.work.task_done()
+                if not retrying or not claimed_shared:
+                    try:
+                        self._acknowledge_scan_job(job.id, claimed_shared)
+                    except Exception:
+                        LOGGER.exception(
+                            "Could not acknowledge completed scan work",
+                            extra={"job_id": job.id},
+                        )
 
 
 class QueueFullError(Exception):
@@ -4043,9 +4475,17 @@ SHARED_JOB_STORE = create_shared_job_store(
     prefix=SETTINGS.shared_store_prefix,
     socket_timeout_seconds=SETTINGS.shared_store_timeout_seconds,
 )
+WRITER_LEASE = DistributedWriterLease(
+    SHARED_JOB_STORE,
+    owner_id=(
+        f"{socket.gethostname()}:{os.getpid()}:{uuid.uuid4().hex}"
+    ),
+    ttl_seconds=SETTINGS.writer_lease_ttl_seconds,
+)
 SERVICE = AnalysisService(
     SETTINGS,
     shared_job_store=SHARED_JOB_STORE,
+    writer_lease=WRITER_LEASE,
 )
 LIMITER = SlidingWindowRateLimiter(
     SETTINGS.rate_limit_per_minute,
@@ -4085,12 +4525,17 @@ def request_identity(request: Request) -> str:
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     LEASE.acquire()
+    writer_lease_acquired = False
     try:
+        WRITER_LEASE.acquire()
+        writer_lease_acquired = True
         SERVICE.start()
         yield
     finally:
         stopped = SERVICE.stop()
         if stopped:
+            if writer_lease_acquired:
+                WRITER_LEASE.release()
             LEASE.release()
         else:
             LOGGER.error(
@@ -4218,7 +4663,12 @@ async def ready() -> dict[str, Any]:
     health = SERVICE.health_status()
     return {
         "status": "ready",
-        "queue_depth": SERVICE.work.qsize(),
+        "queue_depth": (
+            (health.get("shared_job_store") or {}).get("queue_depth")
+            if (health.get("shared_job_store") or {}).get("queue_depth")
+            is not None
+            else SERVICE.work.qsize()
+        ),
         "environment": SETTINGS.environment,
         "watcher_enabled": SETTINGS.watcher_enabled,
         "cognitive_completion_enabled": (
@@ -4236,6 +4686,7 @@ async def ready() -> dict[str, Any]:
             "shared_job_store",
             {"enabled": False, "backend": "process_local"},
         ),
+        "timechain_writer": health.get("timechain_writer", {}),
         "maintenance_telemetry": health["maintenance_telemetry"],
         "faculty_pack": health["faculty_pack"],
         "memory": health["memory"],
