@@ -1,3 +1,4 @@
+import asyncio
 import tempfile
 import threading
 from dataclasses import replace
@@ -5,11 +6,16 @@ from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import httpx
+from starlette.requests import Request
+
 from chainseer_api import (
     AnalysisService,
     DistributedWriterLease,
     Job,
     Settings,
+    SlidingWindowRateLimiter,
+    gateway_authoritative_proxy,
 )
 from chainseer_job_store import RedisJobStore
 
@@ -21,6 +27,7 @@ class FakeRedis:
     def __init__(self):
         self.values = {}
         self.lists = {}
+        self.sorted_sets = {}
         self.lock = threading.Lock()
 
     def set(self, key, value, ex=None, nx=False):
@@ -38,6 +45,30 @@ class FakeRedis:
         with self.lock:
             keys = args[:key_count]
             argv = args[key_count:]
+            if "zremrangebyscore" in script:
+                identity_key, global_key = keys
+                now_ms, window_ms, identity_limit, global_limit, member = argv
+                cutoff = int(now_ms) - int(window_ms)
+                for key in keys:
+                    entries = self.sorted_sets.setdefault(key, {})
+                    self.sorted_sets[key] = {
+                        item: score
+                        for item, score in entries.items()
+                        if score > cutoff
+                    }
+                identity_entries = self.sorted_sets[identity_key]
+                global_entries = self.sorted_sets[global_key]
+                if len(identity_entries) >= int(identity_limit):
+                    return 0
+                if (
+                    int(global_limit) > 0
+                    and len(global_entries) >= int(global_limit)
+                ):
+                    return 0
+                identity_entries[member] = int(now_ms)
+                if int(global_limit) > 0:
+                    global_entries[member] = int(now_ms)
+                return 1
             if "lpos" in script and "lpush" in script:
                 pending, processing = keys
                 job_id, maximum_depth = argv
@@ -242,6 +273,145 @@ def test_shared_work_queue_detaches_submission_from_writer_process():
         assert recovered.address == TOKEN
         assert recovered.network == "robinhood"
         assert store.acknowledge_scan(claimed)
+
+
+def test_gateway_start_is_redis_only_and_never_touches_chain_root():
+    store = RedisJobStore(client=FakeRedis(), prefix="test")
+    with tempfile.TemporaryDirectory() as directory:
+        root = Path(directory) / "must-not-exist"
+        configured = replace(
+            settings(root),
+            process_role="gateway",
+            shared_store_url="redis://test",
+            shared_work_queue_enabled=True,
+            benchmark_capture_enabled=True,
+        )
+        gateway = AnalysisService(configured, shared_job_store=store)
+
+        gateway.start()
+        try:
+            assert gateway.ready
+            assert gateway._agent is None
+            assert gateway._deferred_queue is None
+            assert (
+                gateway.health_status()["runtime"]["process_role"]
+                == "gateway"
+            )
+            assert not root.exists()
+        finally:
+            assert gateway.stop()
+
+
+def test_split_roles_fail_closed_without_shared_queue():
+    with tempfile.TemporaryDirectory() as directory:
+        for role in ("gateway", "writer"):
+            configured = replace(
+                settings(Path(directory) / role),
+                process_role=role,
+            )
+            try:
+                configured.validate()
+            except RuntimeError as exc:
+                assert "shared Redis work queue" in str(exc)
+            else:  # pragma: no cover - explicit fail-closed assertion
+                raise AssertionError(f"{role} accepted process-local state")
+
+
+def test_rate_limits_are_atomic_across_gateway_replicas():
+    store = RedisJobStore(client=FakeRedis(), prefix="test")
+    first = SlidingWindowRateLimiter(
+        2, global_limit=3, shared_store=store
+    )
+    second = SlidingWindowRateLimiter(
+        2, global_limit=3, shared_store=store
+    )
+
+    assert first.allow("identity-a", now=100.0)
+    assert second.allow("identity-a", now=100.1)
+    assert not first.allow("identity-a", now=100.2)
+    assert second.allow("identity-b", now=100.3)
+    assert not first.allow("identity-c", now=100.4)
+    assert first.allow("identity-c", now=161.0)
+
+
+def test_fly_process_groups_isolate_gateway_from_timechain_volume():
+    root = Path(__file__).resolve().parents[1]
+    config = (root / "fly.toml").read_text(encoding="utf-8")
+
+    assert "CHAINSEER_PROCESS_ROLE=gateway" in config
+    assert "CHAINSEER_PROCESS_ROLE=writer" in config
+    assert 'processes = ["gateway"]' in config
+    assert 'processes = ["writer"]' in config
+    mount = config.split("[[mounts]]", 1)[1].split("[http_service]", 1)[0]
+    assert 'processes = ["writer"]' in mount
+    service = config.split("[http_service]", 1)[1].split("[[vm]]", 1)[0]
+    assert 'processes = ["gateway"]' in service
+
+
+def test_gateway_proxies_disk_backed_routes_to_private_writer():
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, **kwargs):
+            captured["client"] = kwargs
+
+        async def __aenter__(self):
+            return self
+
+        async def __aexit__(self, *_args):
+            return None
+
+        async def request(self, method, url, **kwargs):
+            captured.update(method=method, url=url, request=kwargs)
+            return httpx.Response(
+                200,
+                json={"state": "ready"},
+                headers={"content-type": "application/json"},
+            )
+
+    messages = [{"type": "http.request", "body": b"", "more_body": False}]
+
+    async def receive():
+        return messages.pop(0)
+
+    async def call_next(_request):  # pragma: no cover - must be bypassed
+        raise AssertionError("gateway executed the disk-backed route locally")
+
+    request = Request(
+        {
+            "type": "http",
+            "method": "GET",
+            "scheme": "https",
+            "path": "/v1/memory/status",
+            "raw_path": b"/v1/memory/status",
+            "query_string": b"detail=1",
+            "headers": [(b"authorization", b"Bearer test-token")],
+            "client": ("127.0.0.1", 1234),
+            "server": ("testserver", 443),
+        },
+        receive=receive,
+    )
+    configured = replace(
+        settings(Path("gateway-proxy-test")),
+        process_role="gateway",
+        writer_internal_url="http://writer.internal:8000",
+    )
+    with patch("chainseer_api.SETTINGS", configured), patch(
+        "chainseer_api.httpx.AsyncClient", FakeClient
+    ):
+        response = asyncio.run(
+            gateway_authoritative_proxy(request, call_next)
+        )
+
+    assert response.status_code == 200
+    assert response.body == b'{"state":"ready"}'
+    assert captured["method"] == "GET"
+    assert captured["url"] == (
+        "http://writer.internal:8000/v1/memory/status?detail=1"
+    )
+    assert captured["request"]["headers"]["authorization"] == (
+        "Bearer test-token"
+    )
 
 
 def test_distributed_writer_lease_refuses_second_process():

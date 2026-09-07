@@ -4,6 +4,10 @@ primary_region = "fra"
 [build]
   dockerfile = "Dockerfile.api"
 
+[processes]
+  gateway = "env CHAINSEER_PROCESS_ROLE=gateway python -X utf8 chainseer_api.py"
+  writer = "env CHAINSEER_PROCESS_ROLE=writer python -X utf8 chainseer_api.py"
+
 [env]
   CHAINSEER_ENVIRONMENT = "production"
   CHAINSEER_RPC_URL = "https://rpc.mainnet.chain.robinhood.com"
@@ -12,7 +16,7 @@ primary_region = "fra"
   CHAINSEER_SKILL_DIR = "/opt/cypher-tempre-self-model"
   CHAINSEER_FACULTY_PACK_PATH = "/app/faculties/chainseer-production-v1.json"
   CHAINSEER_ALLOWED_ORIGINS = "https://usechainseer.com,https://www.usechainseer.com"
-  CHAINSEER_ALLOWED_HOSTS = "*.fly.dev,api.usechainseer.com"
+  CHAINSEER_ALLOWED_HOSTS = "*.fly.dev,api.usechainseer.com,writer.process.chainseer-api.internal"
   CHAINSEER_QUEUE_SIZE = "20"
   CHAINSEER_RATE_LIMIT_PER_MINUTE = "6"
   CHAINSEER_GLOBAL_RATE_LIMIT_PER_MINUTE = "60"
@@ -37,6 +41,8 @@ primary_region = "fra"
   CHAINSEER_SHARED_STORE_TIMEOUT_SECONDS = "2"
   CHAINSEER_SHARED_WORK_QUEUE_ENABLED = "1"
   CHAINSEER_WRITER_LEASE_TTL_SECONDS = "30"
+  CHAINSEER_WRITER_INTERNAL_URL = "http://writer.process.chainseer-api.internal:8000"
+  CHAINSEER_WRITER_PROXY_TIMEOUT_SECONDS = "30"
   CHAINSEER_WATCHER_INTERVAL_SECONDS = "60"
   CHAINSEER_WATCHER_CONFIRMATIONS = "2"
   CHAINSEER_BENCHMARK_CAPTURE_ENABLED = "1"
@@ -55,8 +61,10 @@ primary_region = "fra"
 [[mounts]]
   source = "chainseer_timechain"
   destination = "/data"
+  processes = ["writer"]
 
 [http_service]
+  processes = ["gateway"]
   internal_port = 8000
   force_https = true
   auto_stop_machines = false
@@ -71,5 +79,11 @@ primary_region = "fra"
     path = "/health/ready"
 
 [[vm]]
+  processes = ["gateway"]
+  size = "shared-cpu-1x"
+  memory = "512mb"
+
+[[vm]]
+  processes = ["writer"]
   size = "performance-1x"
   memory = "2048mb"

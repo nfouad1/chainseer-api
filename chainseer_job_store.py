@@ -55,6 +55,17 @@ class SharedJobStore(Protocol):
 
     def scan_queue_depth(self) -> int: ...
 
+    def allow_request(
+        self,
+        identity: str,
+        *,
+        identity_limit: int,
+        global_limit: int | None,
+        window_seconds: int,
+        now_ms: int,
+        request_id: str,
+    ) -> bool: ...
+
     def claim_writer(self, owner_id: str, ttl_seconds: int) -> bool: ...
 
     def renew_writer(self, owner_id: str, ttl_seconds: int) -> bool: ...
@@ -102,6 +113,31 @@ class RedisJobStore:
             return 0
         end
         redis.call('lpush', KEYS[1], ARGV[1])
+        return 1
+    """
+    _SLIDING_WINDOW_ALLOW = """
+        local now = tonumber(ARGV[1])
+        local window = tonumber(ARGV[2])
+        local identity_limit = tonumber(ARGV[3])
+        local global_limit = tonumber(ARGV[4])
+        local member = ARGV[5]
+        local cutoff = now - window
+
+        redis.call('zremrangebyscore', KEYS[1], '-inf', cutoff)
+        redis.call('zremrangebyscore', KEYS[2], '-inf', cutoff)
+        if redis.call('zcard', KEYS[1]) >= identity_limit then
+            return 0
+        end
+        if global_limit > 0 and redis.call('zcard', KEYS[2]) >= global_limit then
+            return 0
+        end
+
+        redis.call('zadd', KEYS[1], now, member)
+        redis.call('pexpire', KEYS[1], window)
+        if global_limit > 0 then
+            redis.call('zadd', KEYS[2], now, member)
+            redis.call('pexpire', KEYS[2], window)
+        end
         return 1
     """
 
@@ -306,6 +342,30 @@ class RedisJobStore:
         return int(self._client.llen(self._scan_pending_key)) + int(
             self._client.llen(self._scan_processing_key)
         )
+
+    def allow_request(
+        self,
+        identity: str,
+        *,
+        identity_limit: int,
+        global_limit: int | None,
+        window_seconds: int,
+        now_ms: int,
+        request_id: str,
+    ) -> bool:
+        """Apply one atomic cross-replica sliding-window admission check."""
+        allowed = self._client.eval(
+            self._SLIDING_WINDOW_ALLOW,
+            2,
+            self._key("rate", identity),
+            self._key("rate", "global"),
+            int(now_ms),
+            max(1, int(window_seconds)) * 1000,
+            max(1, int(identity_limit)),
+            max(0, int(global_limit or 0)),
+            str(request_id),
+        )
+        return bool(allowed)
 
     def claim_writer(self, owner_id: str, ttl_seconds: int) -> bool:
         """Claim or refresh the one distributed Timechain-writer lease."""

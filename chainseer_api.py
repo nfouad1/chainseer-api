@@ -37,10 +37,11 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlparse
 
+import httpx
 from fastapi import Depends, FastAPI, Header, HTTPException, Request, status
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field, field_validator, model_validator
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 from chainseer import Chainseer, RobinhoodRPC
 from chainseer_base_public import BasePublicAnalyzer
@@ -230,6 +231,22 @@ class Settings:
             "CHAINSEER_SCAN_CACHE_TTL_SECONDS", 300, 0, 3600
         )
     )
+    process_role: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_PROCESS_ROLE", "combined"
+        ).strip().lower()
+    )
+    writer_internal_url: str = field(
+        default_factory=lambda: os.environ.get(
+            "CHAINSEER_WRITER_INTERNAL_URL",
+            "http://writer.process.chainseer-api.internal:8000",
+        ).strip().rstrip("/")
+    )
+    writer_proxy_timeout_seconds: float = field(
+        default_factory=lambda: _env_float(
+            "CHAINSEER_WRITER_PROXY_TIMEOUT_SECONDS", 30.0, 1.0, 300.0
+        )
+    )
     stale_result_ttl_seconds: int = field(
         default_factory=lambda: _env_int(
             "CHAINSEER_STALE_RESULT_TTL_SECONDS", 86400, 300, 604800
@@ -403,6 +420,10 @@ class Settings:
     )
 
     def validate(self) -> None:
+        if self.process_role not in {"combined", "gateway", "writer"}:
+            raise RuntimeError(
+                "CHAINSEER_PROCESS_ROLE must be combined, gateway, or writer"
+            )
         if self.environment not in {"development", "test", "production"}:
             raise RuntimeError(
                 "CHAINSEER_ENVIRONMENT must be development, test, or production"
@@ -519,6 +540,20 @@ class Settings:
                 "CHAINSEER_SHARED_WORK_QUEUE_ENABLED requires "
                 "CHAINSEER_SHARED_STORE_URL"
             )
+        if self.process_role in {"gateway", "writer"}:
+            if not self.shared_work_queue_enabled or not self.shared_store_url:
+                raise RuntimeError(
+                    "split gateway/writer roles require the shared Redis work queue"
+                )
+        if self.process_role == "gateway":
+            writer_url = urlparse(self.writer_internal_url)
+            if (
+                writer_url.scheme not in {"http", "https"}
+                or not writer_url.hostname
+            ):
+                raise RuntimeError(
+                    "CHAINSEER_WRITER_INTERNAL_URL must be an HTTP(S) URL"
+                )
         backup_path = Path(self.memory_backup_root).resolve()
         chain_path = Path(self.chain_root).resolve()
         if backup_path == chain_path or chain_path in backup_path.parents:
@@ -801,9 +836,16 @@ BENCHMARK_SUMMARY_REFRESH_MIN_INTERVAL_SECONDS = 30
 class BenchmarkCaptureRecorder:
     """Append fresh analysis predictions to the durable benchmark ledger."""
 
-    def __init__(self, settings: Settings):
+    def __init__(
+        self,
+        settings: Settings,
+        *,
+        enabled: bool | None = None,
+    ):
         self.settings = settings
-        self.enabled = settings.benchmark_capture_enabled
+        self.enabled = (
+            settings.benchmark_capture_enabled if enabled is None else enabled
+        )
         self.root = Path(settings.benchmark_root)
         self.observations_path = self.root / "observations-v1.jsonl"
         self.outcomes_path = self.root / "outcomes-v1.jsonl"
@@ -957,6 +999,7 @@ class SlidingWindowRateLimiter:
         window_seconds: int = 60,
         *,
         global_limit: int | None = None,
+        shared_store: SharedJobStore | None = None,
     ):
         self.limit = limit
         self.window_seconds = window_seconds
@@ -964,11 +1007,27 @@ class SlidingWindowRateLimiter:
         # if every request claims a different identity, total throughput
         # across all of them combined is still bounded. None disables it.
         self.global_limit = global_limit
+        self.shared_store = shared_store
         self._events: "OrderedDict[str, deque[float]]" = OrderedDict()
         self._global_events: deque[float] = deque()
         self._lock = threading.Lock()
 
     def allow(self, identity: str, now: float | None = None) -> bool:
+        if self.shared_store is not None:
+            wall_now = now if now is not None else time.time()
+            try:
+                return self.shared_store.allow_request(
+                    identity,
+                    identity_limit=self.limit,
+                    global_limit=self.global_limit,
+                    window_seconds=self.window_seconds,
+                    now_ms=int(wall_now * 1000),
+                    request_id=f"{int(wall_now * 1_000_000)}:{uuid.uuid4().hex}",
+                )
+            except Exception as exc:
+                raise SharedStoreUnavailableError(
+                    "shared rate limiter is temporarily unavailable"
+                ) from exc
         now = now if now is not None else time.monotonic()
         cutoff = now - self.window_seconds
         with self._lock:
@@ -1151,6 +1210,7 @@ class AnalysisService:
         writer_lease: DistributedWriterLease | None = None,
     ):
         self.settings = settings
+        self._gateway_only = settings.process_role == "gateway"
         self._shared_job_store = shared_job_store
         self._writer_lease = writer_lease
         self.jobs: dict[str, Job] = {}
@@ -1172,8 +1232,12 @@ class AnalysisService:
         self._timechain_owner_reason: str = ""
         self._timechain_owner_depth: int = 0
         self._timechain_owner_guard = threading.Lock()
-        self._deferred_queue = DurableDeferredQueue(
-            Path(settings.chain_root) / "deferred_commits.sqlite3"
+        self._deferred_queue = (
+            None
+            if self._gateway_only
+            else DurableDeferredQueue(
+                Path(settings.chain_root) / "deferred_commits.sqlite3"
+            )
         )
         # Compatibility-only seam for pre-durable-queue callers/tests.  No
         # production path enqueues here.
@@ -1213,9 +1277,19 @@ class AnalysisService:
             "last_error": None,
             "last_deferred": None,
         }
-        self._benchmark = BenchmarkCaptureRecorder(settings)
+        self._benchmark = BenchmarkCaptureRecorder(
+            settings,
+            enabled=False if self._gateway_only else None,
+        )
         self._base_analysis_idempotency_keys: set[str] | None = None
-        self._cypher_tempre_runtime = _cypher_tempre_runtime_status()
+        self._cypher_tempre_runtime = (
+            {
+                "status": "delegated",
+                "reason": "authoritative_writer_process",
+            }
+            if self._gateway_only
+            else _cypher_tempre_runtime_status()
+        )
         self._last_memory_rss_mb: float | None = None
         self._last_memory_peak_mb: float | None = None
         self._memory_warning_active = False
@@ -1277,6 +1351,24 @@ class AnalysisService:
         return True
 
     def start(self) -> None:
+        if self._gateway_only:
+            if not self._shared_work_queue():
+                raise RuntimeError(
+                    "stateless gateway requires the shared Redis work queue"
+                )
+            if not self._shared_job_store or not self._shared_job_store.ping():
+                raise RuntimeError("stateless gateway cannot reach Redis")
+            self._stopping.clear()
+            self._integrity_status = {
+                "status": "delegated",
+                "writer_role": "writer",
+                "last_full_audit_at": None,
+                "last_full_audit_duration_seconds": None,
+                "last_error": None,
+                "full_audit_progress": None,
+            }
+            self._ready.set()
+            return
         if self._worker and self._worker.is_alive():
             return
         if self._writer_lease is not None and not self._writer_lease.healthy:
@@ -1421,6 +1513,8 @@ class AnalysisService:
     def stop(self) -> bool:
         self._ready.clear()
         self._stopping.set()
+        if self._gateway_only:
+            return True
         try:
             self.work.put_nowait(None)
         except queue.Full:
@@ -1455,6 +1549,16 @@ class AnalysisService:
 
     @property
     def ready(self) -> bool:
+        if self._gateway_only:
+            if not self._ready.is_set() or self._stopping.is_set():
+                return False
+            try:
+                return bool(
+                    self._shared_job_store
+                    and self._shared_job_store.ping()
+                )
+            except Exception:
+                return False
         return bool(
             self._ready.is_set()
             and self._worker
@@ -1629,7 +1733,7 @@ class AnalysisService:
                         "result": shared_previous.get("result"),
                         "age_seconds": age_seconds,
                     }
-        if previous is None:
+        if previous is None and self._deferred_queue is not None:
             previous = self._deferred_queue.get_public_result(
                 network,
                 normalized_address,
@@ -2021,7 +2125,11 @@ class AnalysisService:
                     or self._writer_lease.healthy
                 ),
             },
-            "deferred_commits": self._deferred_queue.counts(),
+            "deferred_commits": (
+                self._deferred_queue.counts()
+                if self._deferred_queue is not None
+                else {"status": "delegated"}
+            ),
             "faculty_pack": (
                 dict(getattr(self._agent, "faculty_pack_status", {}) or {})
                 if self._agent is not None
@@ -2034,6 +2142,7 @@ class AnalysisService:
                 "warning": self._memory_warning_active,
             },
             "runtime": {
+                "process_role": self.settings.process_role,
                 "process_instance_id": self._process_instance_id,
                 "started_at": _iso(self._process_started_at),
                 "uptime_seconds": round(
@@ -4520,8 +4629,9 @@ SHARED_JOB_STORE = create_shared_job_store(
     prefix=SETTINGS.shared_store_prefix,
     socket_timeout_seconds=SETTINGS.shared_store_timeout_seconds,
 )
+AUTHORITATIVE_PROCESS = SETTINGS.process_role != "gateway"
 WRITER_LEASE = DistributedWriterLease(
-    SHARED_JOB_STORE,
+    SHARED_JOB_STORE if AUTHORITATIVE_PROCESS else None,
     owner_id=(
         f"fly-machine:{os.environ['FLY_MACHINE_ID']}"
         if os.environ.get("FLY_MACHINE_ID")
@@ -4537,6 +4647,7 @@ SERVICE = AnalysisService(
 LIMITER = SlidingWindowRateLimiter(
     SETTINGS.rate_limit_per_minute,
     global_limit=SETTINGS.global_rate_limit_per_minute,
+    shared_store=SHARED_JOB_STORE,
 )
 LEASE = SingleProcessLease(SETTINGS.chain_root)
 
@@ -4571,6 +4682,13 @@ def request_identity(request: Request) -> str:
 
 @asynccontextmanager
 async def lifespan(_: FastAPI):
+    if not AUTHORITATIVE_PROCESS:
+        SERVICE.start()
+        try:
+            yield
+        finally:
+            SERVICE.stop()
+        return
     LEASE.acquire()
     writer_lease_acquired = False
     try:
@@ -4605,6 +4723,69 @@ app.add_middleware(
     allow_methods=["GET", "POST", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Request-ID"],
 )
+
+_AUTHORITATIVE_ROUTE_PREFIXES = (
+    "/v1/memory",
+    "/v1/watch",
+    "/v1/admin",
+)
+
+
+@app.middleware("http")
+async def gateway_authoritative_proxy(request: Request, call_next):
+    """Forward disk-backed APIs while keeping gateway Machines stateless.
+
+    Analysis submission and polling stay on the horizontally scalable Redis
+    gateway. Memory, watch, and import endpoints retain their existing public
+    URLs but execute only inside the private writer process that owns /data.
+    """
+    if not (
+        SETTINGS.process_role == "gateway"
+        and request.url.path.startswith(_AUTHORITATIVE_ROUTE_PREFIXES)
+    ):
+        return await call_next(request)
+    target = f"{SETTINGS.writer_internal_url}{request.url.path}"
+    if request.url.query:
+        target = f"{target}?{request.url.query}"
+    forwarded_headers = {
+        name: value
+        for name, value in request.headers.items()
+        if name.lower()
+        in {
+            "authorization",
+            "content-type",
+            "x-chainseer-client",
+            "x-request-id",
+        }
+    }
+    try:
+        async with httpx.AsyncClient(
+            timeout=SETTINGS.writer_proxy_timeout_seconds,
+            trust_env=False,
+        ) as client:
+            upstream = await client.request(
+                request.method,
+                target,
+                headers=forwarded_headers,
+                content=await request.body(),
+            )
+    except httpx.HTTPError:
+        LOGGER.exception("Authoritative writer proxy request failed")
+        return JSONResponse(
+            {"detail": "authoritative service is temporarily unavailable"},
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            headers={"Retry-After": "5"},
+        )
+    response_headers = {}
+    for name in ("content-type", "retry-after"):
+        value = upstream.headers.get(name)
+        if value:
+            response_headers[name] = value
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
 # Health-check paths are exempt from Host validation below. Infrastructure
 # health probes (Fly.io's proxy, Render's, etc.) routinely hit the app over
 # an internal network path without setting a Host header that matches any
@@ -4750,7 +4931,15 @@ async def ready() -> dict[str, Any]:
 def create_analysis(
     payload: AnalyzeRequest, request: Request
 ) -> JobAccepted:
-    if not LIMITER.allow(request_identity(request)):
+    try:
+        admitted = LIMITER.allow(request_identity(request))
+    except SharedStoreUnavailableError as exc:
+        raise HTTPException(
+            status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
+            detail=str(exc),
+            headers={"Retry-After": "5"},
+        ) from exc
+    if not admitted:
         raise HTTPException(
             status_code=status.HTTP_429_TOO_MANY_REQUESTS,
             detail="analysis rate limit exceeded",
