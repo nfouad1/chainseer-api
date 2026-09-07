@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -1285,6 +1286,41 @@ class ServiceTests(unittest.TestCase):
             self.assertFalse(result["execution"])
             self.assertEqual(service.memory_status()["status"], "healthy")
             self.assertEqual(service.memory_citation(7)["ring"], 7)
+
+    def test_production_memory_status_serves_background_snapshot(self):
+        class FakeMemory:
+            def __init__(self):
+                self.calls = 0
+
+            def status(self, *, cache_seconds=30):
+                self.calls += 1
+                return {
+                    "status": "healthy",
+                    "status_hash": "a" * 64,
+                    "cache_seconds": cache_seconds,
+                }
+
+        with tempfile.TemporaryDirectory() as root:
+            configured = replace(
+                self.settings(root),
+                environment="production",
+            )
+            service = AnalysisService(configured)
+            memory = FakeMemory()
+            service._memory = memory
+
+            service._refresh_memory_status_snapshot()
+            started = time.monotonic()
+            result = service.memory_status()
+
+            self.assertLess(time.monotonic() - started, 0.1)
+            self.assertEqual(result["status"], "healthy")
+            self.assertEqual(
+                result["delivery"]["mode"],
+                "background_verified_snapshot",
+            )
+            self.assertTrue(result["delivery"]["may_trail_new_rings"])
+            self.assertEqual(memory.calls, 1)
 
     def test_worker_routes_solana_and_keeps_network_cache_separate(self):
         with tempfile.TemporaryDirectory() as root:

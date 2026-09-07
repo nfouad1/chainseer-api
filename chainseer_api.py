@@ -1253,6 +1253,10 @@ class AnalysisService:
         self._base_watch_analysis_agent: BasePublicAnalyzer | None = None
         self._solana_watch_analysis_agent: SolanaPublicAnalyzer | None = None
         self._memory: MemoryCore | None = None
+        self._memory_status_snapshot: tuple[float, dict[str, Any]] | None = None
+        self._memory_status_snapshot_lock = threading.Lock()
+        self._memory_status_refresh_lock = threading.Lock()
+        self._memory_status_worker: threading.Thread | None = None
         self._stopping = threading.Event()
         self._ready = threading.Event()
         self._integrity_status: dict[str, Any] = {
@@ -1501,6 +1505,11 @@ class AnalysisService:
         self._maintenance_worker.start()
         if self._watcher_worker is not None:
             self._watcher_worker.start()
+        if (
+            self.settings.environment == "production"
+            and self._memory is not None
+        ):
+            self._start_memory_status_refresh()
         self._integrity_status = {
             "status": "verified",
             "last_full_audit_at": datetime.now(timezone.utc).isoformat(),
@@ -2003,7 +2012,60 @@ class AnalysisService:
     def memory_status(self) -> dict[str, Any]:
         if self._memory is None:
             raise RuntimeError("Timechain Memory Core is not initialized")
-        return self._memory.status()
+        if self.settings.environment != "production":
+            return self._memory.status()
+        with self._memory_status_snapshot_lock:
+            snapshot = self._memory_status_snapshot
+        if snapshot is None:
+            self._start_memory_status_refresh()
+            raise RuntimeError("Timechain Memory Core status is warming")
+        captured_at, value = snapshot
+        age_seconds = max(0.0, time.time() - captured_at)
+        refreshing = bool(
+            self._memory_status_worker
+            and self._memory_status_worker.is_alive()
+        )
+        if age_seconds >= 300 and not refreshing:
+            self._start_memory_status_refresh()
+            refreshing = True
+        result = json.loads(json.dumps(value))
+        result["delivery"] = {
+            "mode": "background_verified_snapshot",
+            "snapshot_age_seconds": round(age_seconds, 1),
+            "refreshing": refreshing,
+            "may_trail_new_rings": True,
+        }
+        return result
+
+    def _start_memory_status_refresh(self) -> None:
+        """Start at most one expensive Memory status rebuild off-request."""
+        with self._memory_status_refresh_lock:
+            if (
+                self._memory_status_worker
+                and self._memory_status_worker.is_alive()
+            ):
+                return
+            self._memory_status_worker = threading.Thread(
+                target=self._refresh_memory_status_snapshot,
+                name="chainseer-memory-status-refresh",
+                daemon=True,
+            )
+            self._memory_status_worker.start()
+
+    def _refresh_memory_status_snapshot(self) -> None:
+        memory = self._memory
+        if memory is None or self._stopping.is_set():
+            return
+        try:
+            value = memory.status(cache_seconds=0)
+        except Exception:
+            LOGGER.exception("Background Memory Core status refresh failed")
+            return
+        with self._memory_status_snapshot_lock:
+            self._memory_status_snapshot = (
+                time.time(),
+                json.loads(json.dumps(value)),
+            )
 
     def memory_citation(self, ring_index: int) -> dict[str, Any]:
         if self._memory is None:
