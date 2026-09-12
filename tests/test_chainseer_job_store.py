@@ -1,6 +1,7 @@
 import asyncio
 import tempfile
 import threading
+import time
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -454,6 +455,47 @@ def test_distributed_writer_lease_refuses_second_process():
             raise AssertionError("second Timechain writer lease was accepted")
     finally:
         first.release()
+
+
+def test_distributed_writer_lease_recovers_after_transient_loss():
+    class RecoveryStore:
+        def __init__(self):
+            self.claims = 0
+            self.renewals = 0
+
+        def claim_writer(self, _owner, _ttl):
+            self.claims += 1
+            return True
+
+        def renew_writer(self, _owner, _ttl):
+            self.renewals += 1
+            return False
+
+        def release_writer(self, _owner):
+            return True
+
+    class BoundedWait:
+        def __init__(self):
+            self.calls = 0
+
+        def wait(self, _seconds):
+            self.calls += 1
+            return self.calls > 2
+
+    store = RecoveryStore()
+    lease = DistributedWriterLease(
+        store, owner_id="writer-1", ttl_seconds=10
+    )
+    lease._healthy.set()
+    lease._last_confirmed_monotonic = time.monotonic() - 10
+    lease._stopping = BoundedWait()
+
+    lease._renew_loop()
+
+    assert lease.healthy
+    assert lease.recovery_count == 1
+    assert store.renewals == 1
+    assert store.claims == 1
 
 
 def test_redelivered_scan_restores_existing_ring_instead_of_appending():

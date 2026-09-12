@@ -21,6 +21,7 @@ from chainseer_api import (
     Settings,
     SingleProcessLease,
     SlidingWindowRateLimiter,
+    WriterLeaseUnavailableError,
     WatcherBusyError,
     WatchRequest,
     _cypher_tempre_runtime_status,
@@ -2168,6 +2169,64 @@ class TrackedTimechainLockTests(unittest.TestCase):
                 service._timechain_owner,
                 "owner tracking not cleared after an exception",
             )
+
+    def test_unhealthy_writer_lease_is_not_reported_as_lock_contention(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            service._writer_lease = SimpleNamespace(
+                enabled=True,
+                healthy=False,
+                wait_until_healthy=lambda _timeout: False,
+            )
+
+            with self.assertRaises(
+                WriterLeaseUnavailableError
+            ) as ctx:
+                with service._tracked_timechain_lock(
+                    "user_analysis_append"
+                ):
+                    pass
+
+            message = str(ctx.exception)
+            self.assertIn("writer lease", message)
+            self.assertNotIn("_timechain_lock", message)
+
+    def test_append_retry_reuses_prepared_report_without_reanalysis(self):
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+            service._agent = SimpleNamespace(tc=None)
+            job = Job(id="b" * 32, address=TOKEN, status="running")
+            service.jobs[job.id] = job
+            attempts = {"lock": 0, "seal": 0}
+
+            class LockAttempt:
+                def __enter__(self):
+                    attempts["lock"] += 1
+                    if attempts["lock"] < 3:
+                        raise WriterLeaseUnavailableError(
+                            "synthetic lease interruption"
+                        )
+
+                def __exit__(self, *_args):
+                    return False
+
+            service._tracked_timechain_lock = (
+                lambda _reason: LockAttempt()
+            )
+            sealing_agent = SimpleNamespace(
+                _seal_report=lambda *_args, **_kwargs: attempts.__setitem__(
+                    "seal", attempts["seal"] + 1
+                )
+            )
+            report = sample_internal_report()
+
+            service._seal_user_report_resilient(
+                sealing_agent, report, job
+            )
+
+            self.assertEqual(attempts, {"lock": 3, "seal": 1})
+            self.assertEqual(job.lock_retry_count, 2)
+            self.assertEqual(job.progress_percent, 90)
 
     def test_worker_survives_timeout_and_retries_same_active_job(self):
         with tempfile.TemporaryDirectory() as root:

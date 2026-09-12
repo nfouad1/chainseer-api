@@ -1115,6 +1115,10 @@ class DeferredSealJob:
     enqueued_at: float
 
 
+class WriterLeaseUnavailableError(TimeoutError):
+    """The distributed authority lease is unavailable, not locally locked."""
+
+
 class DistributedWriterLease:
     """Renewable Redis lease for the sole authoritative Timechain writer."""
 
@@ -1132,6 +1136,8 @@ class DistributedWriterLease:
         self._healthy = threading.Event()
         self._thread: threading.Thread | None = None
         self._last_confirmed_monotonic = 0.0
+        self._last_failure_log_monotonic = 0.0
+        self._recovery_count = 0
 
     @property
     def enabled(self) -> bool:
@@ -1140,6 +1146,16 @@ class DistributedWriterLease:
     @property
     def healthy(self) -> bool:
         return not self.enabled or self._healthy.is_set()
+
+    @property
+    def recovery_count(self) -> int:
+        return int(self._recovery_count)
+
+    def wait_until_healthy(self, timeout: float) -> bool:
+        """Wait briefly for the renewal loop to reclaim its same-owner lease."""
+        if not self.enabled:
+            return True
+        return self._healthy.wait(max(0.0, float(timeout)))
 
     def acquire(self) -> None:
         if self.store is None:
@@ -1164,17 +1180,36 @@ class DistributedWriterLease:
         wait_seconds = interval
         while not self._stopping.wait(wait_seconds):
             try:
-                renewed = bool(
-                    self.store
-                    and self.store.renew_writer(
+                was_healthy = self._healthy.is_set()
+                renewed = bool(self.store and (
+                    self.store.renew_writer(
                         self.owner_id, self.ttl_seconds
                     )
-                )
+                    if was_healthy
+                    else self.store.claim_writer(
+                        self.owner_id, self.ttl_seconds
+                    )
+                ))
             except Exception:
-                LOGGER.exception("Timechain writer lease renewal failed")
+                now = time.monotonic()
+                if (
+                    self._healthy.is_set()
+                    or now - self._last_failure_log_monotonic >= 60.0
+                ):
+                    LOGGER.exception(
+                        "Timechain writer lease renewal failed"
+                    )
+                    self._last_failure_log_monotonic = now
                 renewed = False
             if renewed:
                 self._last_confirmed_monotonic = time.monotonic()
+                if not self._healthy.is_set():
+                    self._recovery_count += 1
+                    LOGGER.warning(
+                        "Timechain writer lease recovered; authoritative "
+                        "appends are unfenced"
+                    )
+                self._healthy.set()
                 wait_seconds = interval
                 continue
             # A single network hiccup must not unnecessarily take production
@@ -1182,11 +1217,16 @@ class DistributedWriterLease:
             # fence this process well before another owner could claim the TTL.
             elapsed = time.monotonic() - self._last_confirmed_monotonic
             if elapsed >= self.ttl_seconds * 0.6:
-                self._healthy.clear()
-                LOGGER.critical(
-                    "Timechain writer lease was lost; all new appends are fenced"
-                )
-                return
+                if self._healthy.is_set():
+                    self._healthy.clear()
+                    LOGGER.critical(
+                        "Timechain writer lease was lost; all new appends are fenced"
+                    )
+                # Stay alive in fenced recovery mode. claim_writer is safe:
+                # it renews only this owner, claims an expired vacancy, and
+                # refuses while any different writer owns the lease.
+                wait_seconds = 1.0
+                continue
             wait_seconds = 1.0
 
     def release(self) -> None:
@@ -2204,6 +2244,10 @@ class AnalysisService:
                     self._writer_lease is None
                     or self._writer_lease.healthy
                 ),
+                "lease_recoveries": (
+                    self._writer_lease.recovery_count
+                    if self._writer_lease is not None else 0
+                ),
             },
             "deferred_commits": (
                 self._deferred_queue.counts()
@@ -2593,8 +2637,25 @@ class AnalysisService:
         acquired within ``timechain_lock_timeout_seconds``.
         """
         timeout = self.settings.timechain_lock_timeout_seconds
-        acquired = self._acquire_timechain(reason, timeout=timeout)
+        wait_started = time.monotonic()
+        lease = self._writer_lease
+        if lease is not None and lease.enabled and not lease.healthy:
+            if not lease.wait_until_healthy(timeout):
+                raise WriterLeaseUnavailableError(
+                    f"Authoritative Timechain writer lease remained "
+                    f"unavailable for {timeout:.1f}s while sealing "
+                    f"'{reason}'"
+                )
+        lock_timeout = max(
+            0.0, timeout - (time.monotonic() - wait_started)
+        )
+        acquired = self._acquire_timechain(reason, timeout=lock_timeout)
         if not acquired:
+            if lease is not None and lease.enabled and not lease.healthy:
+                raise WriterLeaseUnavailableError(
+                    "Authoritative Timechain writer lease was lost while "
+                    f"sealing '{reason}'"
+                )
             owner, since, owner_reason = self._timechain_owner_snapshot()
             held = (
                 f"{max(0.0, time.monotonic() - since):.1f}s"
@@ -3938,6 +3999,76 @@ class AnalysisService:
             return
         sealing_agent._seal_report(report, defer_cognition=True)
 
+    def _seal_user_report_resilient(
+        self,
+        sealing_agent: Any,
+        report: dict[str, Any],
+        job: Job,
+        *,
+        exhaustive_recovery: bool = False,
+    ) -> None:
+        """Retry only the append boundary, never the expensive scan.
+
+        A distributed-lease interruption happens after external analysis has
+        already finished. Retrying the whole job repeats every provider call
+        and can turn a short Redis interruption into a request storm. Keep the
+        prepared report in this worker and retry only its idempotent append.
+        """
+        for attempt in range(1, 4):
+            try:
+                with self._tracked_timechain_lock(
+                    "user_analysis_append"
+                ):
+                    self._seal_user_report_once(
+                        sealing_agent,
+                        report,
+                        job.id,
+                        exhaustive_recovery=exhaustive_recovery,
+                    )
+                return
+            except TimeoutError as exc:
+                lease_unavailable = isinstance(
+                    exc, WriterLeaseUnavailableError
+                )
+                with self._lock:
+                    job.lock_retry_count += 1
+                LOGGER.warning(
+                    "%s for job %s during append-only retry "
+                    "(attempt %d/3): %s",
+                    (
+                        "Timechain writer lease unavailable"
+                        if lease_unavailable
+                        else "Timechain lock timeout"
+                    ),
+                    job.id,
+                    attempt,
+                    exc,
+                )
+                if attempt >= 3:
+                    raise PublicAnalysisError(
+                        (
+                            "timechain_writer_lease_unavailable"
+                            if lease_unavailable
+                            else "timechain_lock_timeout"
+                        ),
+                        "The analysis completed, but its verified Timechain "
+                        "publication is temporarily unavailable. Please "
+                        "retry shortly.",
+                    ) from exc
+                self._set_job_progress(
+                    job.id,
+                    "waiting_for_timechain",
+                    90,
+                    (
+                        "Analysis complete; waiting for the authoritative "
+                        "writer lease"
+                        if lease_unavailable
+                        else "Analysis complete; waiting for the Timechain "
+                        "append lane"
+                    ),
+                )
+                self._stopping.wait(0.5)
+
     def _run(self) -> None:
         while not self._stopping.is_set():
             try:
@@ -4109,13 +4240,12 @@ class AnalysisService:
                         90,
                         "Verifying and appending the immutable analysis",
                     )
-                    with self._tracked_timechain_lock("user_analysis_append"):
-                        self._seal_user_report_once(
-                            sealing_agent,
-                            report,
-                            job.id,
-                            exhaustive_recovery=recovered_execution,
-                        )
+                    self._seal_user_report_resilient(
+                        sealing_agent,
+                        report,
+                        job,
+                        exhaustive_recovery=recovered_execution,
+                    )
                 progress(
                     "publishing",
                     98,
@@ -4215,11 +4345,19 @@ class AnalysisService:
                     job.error_code = exc.code
                     job.error_message = exc.message
             except TimeoutError as exc:
+                lease_unavailable = isinstance(
+                    exc, WriterLeaseUnavailableError
+                )
                 with self._lock:
                     job.lock_retry_count += 1
                     retries = job.lock_retry_count
                 LOGGER.warning(
-                    "Timechain lock timeout for job %s (attempt %d/3): %s",
+                    "%s for job %s (attempt %d/3): %s",
+                    (
+                        "Timechain writer lease unavailable"
+                        if lease_unavailable
+                        else "Timechain lock timeout"
+                    ),
                     job.id,
                     retries,
                     exc,
@@ -4229,7 +4367,11 @@ class AnalysisService:
                         job.status = "waiting_for_timechain"
                         job.stage = "waiting_for_timechain"
                         job.stage_detail = (
-                            f"Waiting for timechain lock (attempt {retries}/3)"
+                            f"Waiting for authoritative writer lease "
+                            f"(attempt {retries}/3)"
+                            if lease_unavailable
+                            else f"Waiting for timechain lock "
+                            f"(attempt {retries}/3)"
                         )
                         job.updated_at = time.time()
                     # Re-enqueue for retry.
@@ -4258,6 +4400,10 @@ class AnalysisService:
                         )
                         job.updated_at = time.time()
                         job.error_code = "timechain_lock_timeout"
+                        if lease_unavailable:
+                            job.error_code = (
+                                "timechain_writer_lease_unavailable"
+                            )
                         job.error_message = str(exc)
             except Exception:
                 LOGGER.exception(
