@@ -166,6 +166,26 @@ type PublicReport = {
 
 type ScanState = "idle" | "submitting" | "analyzing" | "succeeded" | "failed";
 
+type PaperPosition = {
+  token_address: string;
+  name?: string;
+  symbol?: string;
+  entry_price_usd?: number | null;
+  current_price_usd?: number | null;
+  entry_market_cap_usd?: number | null;
+  current_market_cap_usd?: number | null;
+  gain_pct?: number | null;
+  market_observation_verified?: boolean;
+  market_observed_at?: number | null;
+};
+
+type PaperTelemetry = {
+  positions?: PaperPosition[];
+  closed_performance?: { net_pnl_usd?: number | null; closed?: number; winners?: number };
+  wallet_cohort?: { members?: number; observations?: number; agreement_events?: number; integrity?: { ok?: boolean } };
+  paper_only?: boolean;
+};
+
 type ActiveScan = {
   jobId: string;
   address: string;
@@ -1376,6 +1396,60 @@ const demoReport: PublicReport = {
     "SAMPLE DATA · NOT LIVE. This report was not generated from a token, no external source was queried, and nothing was sealed. It is not financial advice.",
 };
 
+function PaperTradingWorkspace() {
+  const [telemetry, setTelemetry] = useState<PaperTelemetry | null>(null);
+  const [unavailable, setUnavailable] = useState(false);
+
+  useEffect(() => {
+    let active = true;
+    async function load() {
+      try {
+        const response = await fetch("/api/paper", { cache: "no-store" });
+        const body = await response.json().catch(() => null);
+        if (!active) return;
+        if (!response.ok || !body?.paper_only) {
+          setUnavailable(true);
+          return;
+        }
+        setTelemetry(body as PaperTelemetry);
+        setUnavailable(false);
+      } catch {
+        if (active) setUnavailable(true);
+      }
+    }
+    void load();
+    const timer = window.setInterval(() => void load(), 15_000);
+    return () => { active = false; window.clearInterval(timer); };
+  }, []);
+
+  const positions = telemetry?.positions || [];
+  const portfolio = telemetry?.wallet_cohort;
+  return (
+    <>
+      <section className="paper-workspace" id="paper-trading" aria-labelledby="paper-trading-title">
+        <div className="section-heading">
+          <div><div className="eyebrow muted">Operator view · simulated capital only</div><h2 id="paper-trading-title">Paper Trading</h2></div>
+          <p>Positions are marked from verified market observations. This page never connects a wallet, signs, approves, or submits a transaction.</p>
+        </div>
+        <div className="paper-boundary"><span>SIMULATION ONLY</span><p>Manual exits are intentionally kept in the local operator dashboard and require a fresh verified mark.</p></div>
+        {unavailable ? (
+          <div className="paper-empty"><strong>Paper telemetry is not connected to this public deployment.</strong><p>The learner can continue independently. Connect the read-only telemetry publisher before using this page as an operational view.</p></div>
+        ) : (
+          <>
+            <div className="paper-stats"><article><span>Open positions</span><strong>{positions.length}</strong></article><article><span>Closed paper P&amp;L</span><strong>{formatMoney(telemetry?.closed_performance?.net_pnl_usd)}</strong></article><article><span>Closed outcomes</span><strong>{telemetry?.closed_performance?.closed ?? "—"}</strong></article><article><span>Boundary</span><strong>Paper only</strong></article></div>
+            <div className="paper-table-wrap"><table><thead><tr><th>Token</th><th>Entry price / MC</th><th>Current price / MC</th><th>Paper gain</th><th>Mark</th></tr></thead><tbody>{positions.length ? positions.map((position) => <tr key={position.token_address}><td><strong>{position.symbol || position.name || "Unknown"}</strong><small>{shortAddress(position.token_address)}</small></td><td>{formatMoney(position.entry_price_usd)}<small>{formatMoney(position.entry_market_cap_usd)} MC</small></td><td>{formatMoney(position.current_price_usd)}<small>{formatMoney(position.current_market_cap_usd)} MC</small></td><td className={(position.gain_pct || 0) >= 0 ? "paper-positive" : "paper-negative"}>{position.gain_pct == null ? "—" : `${position.gain_pct >= 0 ? "+" : ""}${position.gain_pct.toFixed(1)}%`}</td><td>{position.market_observation_verified ? "Verified" : "Awaiting"}<small>{position.market_observed_at ? new Date(position.market_observed_at * 1000).toLocaleTimeString() : "No mark"}</small></td></tr>) : <tr><td colSpan={5}>No open paper positions.</td></tr>}</tbody></table></div>
+          </>
+        )}
+      </section>
+      <section className="portfolio-follow" id="portfolio-follow" aria-labelledby="portfolio-follow-title">
+        <div className="section-heading"><div><div className="eyebrow muted">Prepared · observation only</div><h2 id="portfolio-follow-title">Portfolio Follow</h2></div><p>A future view for outcome-backed source portfolios—not copy trading. Sources must be frozen, attributable, and independently evaluated first.</p></div>
+        <div className="paper-stats"><article><span>Eligible sources</span><strong>{portfolio?.members ?? "—"}</strong></article><article><span>Observed activity</span><strong>{portfolio?.observations ?? "—"}</strong></article><article><span>Agreement events</span><strong>{portfolio?.agreement_events ?? "—"}</strong></article><article><span>Execution</span><strong>Disabled</strong></article></div>
+        <p className="portfolio-note">{portfolio?.integrity?.ok ? "Source integrity is verified. Portfolio data remain observational and cannot create or mirror a trade." : "No source is active until the eligibility and integrity gates pass. The page is prepared without implying performance or future execution."}</p>
+      </section>
+    </>
+  );
+}
+
 export default function Home() {
   const [network, setNetwork] = useState<Network>("robinhood");
   const [address, setAddress] = useState("");
@@ -1924,6 +1998,8 @@ export default function Home() {
           <a href="#method">Method</a>
           <a href="#faq">Q&amp;A</a>
           <a href="#memory-core">Memory Core</a>
+          <a href="#paper-trading">Paper Trading</a>
+          <a href="#portfolio-follow">Portfolio Follow</a>
           <a href="#timechain">Timechain</a>
           <a href="#evidence" onClick={() => setShowExample(true)}>Evidence</a>
         </nav>
@@ -2091,6 +2167,8 @@ export default function Home() {
         <div><strong>Block / slot</strong><span>anchored evidence</span></div>
         <div><strong>Timechain</strong><span>tamper-evident memory</span></div>
       </section>
+
+      <PaperTradingWorkspace />
 
       {monitorNotice && (
         <p className="monitor-notice" role="status">{monitorNotice}</p>

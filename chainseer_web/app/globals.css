@@ -2046,6 +2046,21 @@ footer p { max-width: 430px; margin: 0 auto; line-height: 1.6; text-align: cente
   .footer-links { justify-self: start; flex-wrap: wrap; }
 }
 
+.paper-workspace, .portfolio-follow { max-width: 1180px; margin: 100px auto 0; padding: 0 28px; }
+.portfolio-follow { margin-top: 34px; margin-bottom: 100px; }
+.paper-boundary { display: flex; align-items: center; justify-content: space-between; gap: 18px; border: 1px solid rgba(255, 181, 87, .35); background: rgba(255, 181, 87, .06); border-radius: 16px; padding: 15px 18px; margin: 26px 0 16px; }
+.paper-boundary span { color: #ffcf71; letter-spacing: .12em; font-size: 11px; font-weight: 800; white-space: nowrap; }
+.paper-boundary p, .portfolio-note { margin: 0; color: var(--muted); font-size: 14px; }
+.paper-stats { display: grid; grid-template-columns: repeat(4, 1fr); gap: 10px; }
+.paper-stats article, .paper-empty { border: 1px solid var(--line); border-radius: 15px; background: color-mix(in srgb, var(--panel) 90%, transparent); padding: 17px; }
+.paper-stats span, .paper-stats small { display: block; color: var(--muted); font-size: 11px; text-transform: uppercase; letter-spacing: .08em; }
+.paper-stats strong { display: block; margin-top: 8px; font-size: 20px; }
+.paper-empty { text-align: center; padding: 32px; }.paper-empty strong { display: block; }.paper-empty p { color: var(--muted); margin: 8px auto 0; max-width: 590px; }
+.paper-table-wrap { overflow-x: auto; margin-top: 16px; border: 1px solid var(--line); border-radius: 15px; background: color-mix(in srgb, var(--panel) 90%, transparent); }
+.paper-table-wrap table { width: 100%; min-width: 720px; border-collapse: collapse; }.paper-table-wrap th, .paper-table-wrap td { padding: 14px 16px; text-align: left; border-bottom: 1px solid var(--line); }.paper-table-wrap th { color: var(--muted); font-size: 10px; letter-spacing: .08em; text-transform: uppercase; }.paper-table-wrap td strong, .paper-table-wrap td small { display: block; }.paper-table-wrap td small { color: var(--muted); font-size: 11px; margin-top: 3px; }.paper-table-wrap tbody tr:last-child td { border-bottom: 0; }.paper-positive { color: #5de0a4; font-weight: 800; }.paper-negative { color: #ff8790; font-weight: 800; }.portfolio-note { margin-top: 18px; }
+
+@media (max-width: 760px) { .paper-workspace, .portfolio-follow { margin-top: 72px; padding: 0 18px; }.paper-stats { grid-template-columns: 1fr 1fr; }.paper-boundary { align-items: flex-start; flex-direction: column; } }
+
 @media (prefers-reduced-motion: reduce) {
   html { scroll-behavior: auto; }
   * { transition: none !important; }
