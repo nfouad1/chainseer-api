@@ -175,6 +175,9 @@ class Settings:
     api_token: str = field(
         default_factory=lambda: os.environ.get("CHAINSEER_API_TOKEN", "")
     )
+    paper_telemetry_token: str = field(
+        default_factory=lambda: os.environ.get("CHAINSEER_PAPER_TELEMETRY_TOKEN", "")
+    )
     rpc_url: str = field(
         default_factory=lambda: os.environ.get(
             "CHAINSEER_RPC_URL",
@@ -4872,6 +4875,17 @@ async def gateway_authoritative_proxy(request: Request, call_next):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             headers={"Retry-After": "5"},
         )
+
+
+async def require_paper_telemetry_token(
+    authorization: str | None = Header(default=None),
+) -> None:
+    if not SETTINGS.paper_telemetry_token:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="paper telemetry publisher is not configured")
+    if not authorization or not authorization.startswith("Bearer "):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing paper telemetry credentials")
+    if not hmac.compare_digest(authorization[7:], SETTINGS.paper_telemetry_token):
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid paper telemetry credentials")
     response_headers = {}
     for name in ("content-type", "retry-after"):
         value = upstream.headers.get(name)
@@ -5040,7 +5054,7 @@ def get_paper_telemetry() -> dict[str, Any]:
     return payload
 
 
-@app.post("/v1/paper/telemetry", dependencies=[Depends(require_api_token)])
+@app.post("/v1/paper/telemetry", dependencies=[Depends(require_paper_telemetry_token)])
 def publish_paper_telemetry(payload: PaperTelemetryRequest) -> dict[str, Any]:
     # No analysis, Timechain, or trader state is modified: this is a compact
     # read model written atomically by the separate learner-side publisher.
