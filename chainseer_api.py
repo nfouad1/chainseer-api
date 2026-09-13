@@ -4875,6 +4875,16 @@ async def gateway_authoritative_proxy(request: Request, call_next):
             status_code=status.HTTP_503_SERVICE_UNAVAILABLE,
             headers={"Retry-After": "5"},
         )
+    response_headers = {}
+    for name in ("content-type", "retry-after"):
+        value = upstream.headers.get(name)
+        if value:
+            response_headers[name] = value
+    return Response(
+        content=upstream.content,
+        status_code=upstream.status_code,
+        headers=response_headers,
+    )
 
 
 async def require_paper_telemetry_token(
@@ -4886,16 +4896,6 @@ async def require_paper_telemetry_token(
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="missing paper telemetry credentials")
     if not hmac.compare_digest(authorization[7:], SETTINGS.paper_telemetry_token):
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="invalid paper telemetry credentials")
-    response_headers = {}
-    for name in ("content-type", "retry-after"):
-        value = upstream.headers.get(name)
-        if value:
-            response_headers[name] = value
-    return Response(
-        content=upstream.content,
-        status_code=upstream.status_code,
-        headers=response_headers,
-    )
 # Health-check paths are exempt from Host validation below. Infrastructure
 # health probes (Fly.io's proxy, Render's, etc.) routinely hit the app over
 # an internal network path without setting a Host header that matches any
