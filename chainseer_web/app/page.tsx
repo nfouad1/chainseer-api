@@ -1396,7 +1396,7 @@ const demoReport: PublicReport = {
     "SAMPLE DATA · NOT LIVE. This report was not generated from a token, no external source was queried, and nothing was sealed. It is not financial advice.",
 };
 
-function PaperTradingWorkspace() {
+export function PaperTradingWorkspace() {
   const [telemetry, setTelemetry] = useState<PaperTelemetry | null>(null);
   const [unavailable, setUnavailable] = useState(false);
 
@@ -1998,8 +1998,7 @@ export default function Home() {
           <a href="#method">Method</a>
           <a href="#faq">Q&amp;A</a>
           <a href="#memory-core">Memory Core</a>
-          <a href="#paper-trading">Paper Trading</a>
-          <a href="#portfolio-follow">Portfolio Follow</a>
+          <a href="/paper-trading">Paper Trading</a>
           <a href="#timechain">Timechain</a>
           <a href="#evidence" onClick={() => setShowExample(true)}>Evidence</a>
         </nav>
@@ -2167,8 +2166,6 @@ export default function Home() {
         <div><strong>Block / slot</strong><span>anchored evidence</span></div>
         <div><strong>Timechain</strong><span>tamper-evident memory</span></div>
       </section>
-
-      <PaperTradingWorkspace />
 
       {monitorNotice && (
         <p className="monitor-notice" role="status">{monitorNotice}</p>

@@ -643,6 +643,22 @@ class MemoryQueryRequest(AnalyzeRequest):
         return normalized
 
 
+class PaperTelemetryRequest(BaseModel):
+    """Bounded read-only snapshot supplied by the paper learner."""
+
+    payload: dict[str, Any]
+
+    @field_validator("payload")
+    @classmethod
+    def validate_payload(cls, value: dict[str, Any]) -> dict[str, Any]:
+        positions = value.get("positions", [])
+        if not isinstance(positions, list) or len(positions) > 250:
+            raise ValueError("paper telemetry positions must contain at most 250 rows")
+        if value.get("paper_only") is not True:
+            raise ValueError("paper telemetry must explicitly declare paper_only")
+        return value
+
+
 class JobAccepted(BaseModel):
     job_id: str
     status: str
@@ -4875,6 +4891,7 @@ async def gateway_authoritative_proxy(request: Request, call_next):
 # anything that actually needs it.
 _HOST_CHECK_EXEMPT_PATHS = {"/health/live", "/health/ready"}
 ADMIN_IMPORT_MAX_REQUEST_BYTES = 3_000_000
+PAPER_TELEMETRY_MAX_REQUEST_BYTES = 256_000
 
 
 def _host_header_allowed(host_header: str, patterns: tuple[str, ...]) -> bool:
@@ -4911,6 +4928,8 @@ def _max_request_bytes_for(path: str) -> int:
     # still-bounded cap here doesn't loosen the guard on public routes.
     if path == "/v1/admin/rings/import":
         return ADMIN_IMPORT_MAX_REQUEST_BYTES
+    if path == "/v1/paper/telemetry":
+        return PAPER_TELEMETRY_MAX_REQUEST_BYTES
     return SETTINGS.max_request_bytes
 
 
@@ -5000,6 +5019,42 @@ async def ready() -> dict[str, Any]:
         "memory": health["memory"],
         "runtime": health.get("runtime", {}),
     }
+
+
+def _paper_telemetry_path() -> Path:
+    return Path(SETTINGS.chain_root).resolve().parent / "paper_telemetry.json"
+
+
+@app.get("/v1/paper/status", dependencies=[Depends(require_api_token)])
+def get_paper_telemetry() -> dict[str, Any]:
+    path = _paper_telemetry_path()
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="paper telemetry is not connected") from exc
+    except (OSError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="paper telemetry is unavailable") from exc
+    if payload.get("paper_only") is not True:
+        raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="paper telemetry failed its safety boundary")
+    payload["telemetry_age_seconds"] = round(max(0.0, time.time() - float(payload.get("published_at", 0))), 1)
+    return payload
+
+
+@app.post("/v1/paper/telemetry", dependencies=[Depends(require_api_token)])
+def publish_paper_telemetry(payload: PaperTelemetryRequest) -> dict[str, Any]:
+    # No analysis, Timechain, or trader state is modified: this is a compact
+    # read model written atomically by the separate learner-side publisher.
+    snapshot = dict(payload.payload)
+    snapshot["published_at"] = time.time()
+    encoded = json.dumps(snapshot, sort_keys=True, separators=(",", ":"))
+    if len(encoded.encode("utf-8")) > 256_000:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="paper telemetry is too large")
+    path = _paper_telemetry_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(".next")
+    temporary.write_text(encoded, encoding="utf-8")
+    os.replace(temporary, path)
+    return {"accepted": True, "positions": len(snapshot.get("positions", [])), "paper_only": True}
 
 
 @app.post(
