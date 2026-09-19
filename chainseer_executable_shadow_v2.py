@@ -14,9 +14,8 @@ import time
 from pathlib import Path
 from typing import Any
 
-from chainseer import WETH_ADDRESS, RobinhoodRPC
+from chainseer import WETH_ADDRESS, RobinhoodRPC, UNISWAP_V2_FACTORY
 from chainseer_core import atomic_json_write
-from chainseer_fresh_discovery import LEDGER_NAME as DISCOVERY_LEDGER_NAME
 
 POLICY_VERSION = "v2-executable-shadow-v2-first-liquidity"
 LEDGER_NAME = "v2_executable_shadow_v2.sqlite3"
@@ -28,6 +27,7 @@ BLOCKS_PER_SECOND, FINALITY_BLOCKS, FRICTION_BPS = 10, 20, 100
 ENTRY_ANCHOR_RAW = {"wrapped_native": 30_000_000_000_000_000, "stable": 100_000_000}
 SCHEDULE = (("entry", 0), ("15m", 900), ("1h", 3600), ("6h", 21600), ("24h", 86400))
 SYNC_TOPIC = "0x1c411e9a96e071241c2f21f7726b17ae89e3cab4c78be50e062b03a9fffbbad1"
+PAIR_CREATED_TOPIC = "0x0d3648bd0f6ba80134a33ba9275ac585d9d315f0ad8355cddefde31afa28d0e9"
 GET_RESERVES_SELECTOR, TOKEN0_SELECTOR, TOKEN1_SELECTOR = "0902f1ac", "0dfe1681", "d21220a7"
 USDG_ADDRESS = "0x5fc5360d0400a0fd4f2af552add042d716f1d168"
 
@@ -46,6 +46,15 @@ def _address(raw: str) -> str:
 
 def _integer(raw: object) -> int:
     return int(str(raw or "0x0"), 16)
+
+
+def _topic_address(raw: str) -> str:
+    return "0x" + str(raw or "")[-40:].lower()
+
+
+def _data_address(raw: str) -> str:
+    data = str(raw or "").removeprefix("0x")
+    return "0x" + data[24:64].lower() if len(data) >= 64 else ""
 
 
 def _reserves(raw: str) -> tuple[int, int]:
@@ -106,6 +115,15 @@ class Store:
             if row: return float(row[0])
             db.execute("INSERT INTO state VALUES('armed_at',?)",(str(now),))
         return now
+
+    def state(self, key: str) -> str | None:
+        with self._connect() as db:
+            row = db.execute("SELECT value FROM state WHERE key=?", (key,)).fetchone()
+        return str(row[0]) if row else None
+
+    def set_state(self, key: str, value: object) -> None:
+        with self._connect() as db:
+            db.execute("INSERT INTO state(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
 
     def append_observation(self, envelope: dict) -> bool:
         if str(envelope.get("source_version")) != SOURCE_VERSION: return False
@@ -182,12 +200,53 @@ class V2ExecutableShadowV2:
         valid=[x for x in logs if (_integer(x.get("blockNumber"))>int(row["created_block"]) or _integer(x.get("logIndex"))>int(row["created_log_index"]))]
         return min(valid,key=lambda x:(_integer(x.get("blockNumber")),_integer(x.get("logIndex")))) if valid else None
 
+    def _capture_new_launches(self, head: int, now: float) -> int:
+        """Follow the V2 factory directly; never wait for the V4 radar.
+
+        The first invocation arms at the present head. Later invocations read
+        only a short head-adjacent range.  Any gap is intentionally discarded:
+        this is prospective evidence, never historical recovery.
+        """
+        next_block = self.store.state("v2_factory_next_block")
+        if next_block is None:
+            self.store.set_state("v2_factory_next_block", head + 1)
+            return 0
+        start = max(int(next_block), int(head) - 30)
+        if start > head:
+            return 0
+        logs = self.rpc.get_logs(start, int(head), address=UNISWAP_V2_FACTORY,
+                                 topics=[PAIR_CREATED_TOPIC])
+        self.store.set_state("v2_factory_next_block", head + 1)
+        added = 0
+        anchors = {WETH_ADDRESS.lower(), USDG_ADDRESS}
+        for log in logs:
+            topics = log.get("topics") or []
+            if len(topics) < 3:
+                continue
+            token0, token1 = _topic_address(topics[1]), _topic_address(topics[2])
+            if (token0 in anchors) == (token1 in anchors):
+                continue
+            token = token1 if token0 in anchors else token0
+            pool = _data_address(log.get("data"))
+            if not pool or pool == "0x" + "0" * 40:
+                continue
+            event = {
+                "envelope_id": digest({"source": SOURCE_VERSION,
+                    "transaction_hash": log.get("transactionHash"),
+                    "log_index": _integer(log.get("logIndex"))}),
+                "source_version": SOURCE_VERSION, "currency0": token0,
+                "currency1": token1, "pool_address": pool,
+                "token_address": token, "block_number": _integer(log.get("blockNumber")),
+                "log_index": _integer(log.get("logIndex")),
+                "observed_head": int(head), "created_at": now,
+            }
+            added += self.store.append_observation(event)
+        return added
+
     def run_once(self,*,head_block:int|None=None,entry_limit:int=8,outcome_limit:int=8)->dict:
-        now=time.time(); armed=self.store.arm(now); enrolled=0; discovery=self.root/DISCOVERY_LEDGER_NAME
-        if discovery.exists():
-            with sqlite3.connect(f"file:{discovery.resolve().as_posix()}?mode=ro",uri=True) as db:
-                db.row_factory=sqlite3.Row; envelopes=db.execute("SELECT * FROM launch_envelopes WHERE source_version=? AND created_at>=? AND observed_head-block_number<=? ORDER BY created_at,envelope_id LIMIT 50",(SOURCE_VERSION,armed,MAXIMUM_OBSERVATION_LAG_BLOCKS)).fetchall(); enrolled=sum(self.store.append_observation(dict(x)) for x in envelopes)
-        head=int(head_block if head_block is not None else self.rpc.get_block_number()); selected=rejected=expired=0
+        now=time.time(); armed=self.store.arm(now)
+        head=int(head_block if head_block is not None else self.rpc.get_block_number())
+        enrolled=self._capture_new_launches(head,now); selected=rejected=expired=0
         for row in self.store.pending_entries(head,entry_limit):
             log=self._first_sync(row,head)
             if log:

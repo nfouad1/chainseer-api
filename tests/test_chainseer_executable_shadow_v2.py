@@ -1,6 +1,8 @@
 from __future__ import annotations
 
-from chainseer_executable_shadow_v2 import V2ExecutableShadowV2, WETH_ADDRESS
+from chainseer_executable_shadow_v2 import (
+    PAIR_CREATED_TOPIC, UNISWAP_V2_FACTORY, V2ExecutableShadowV2, WETH_ADDRESS,
+)
 
 
 def _word(value: int) -> str:
@@ -38,3 +40,17 @@ def test_missing_sync_expires_without_relaxing_freshness(tmp_path):
     result=worker.run_once(head_block=221)
     assert result["expired_without_liquidity"] == 1
     assert result["selected_entries"] == 0
+
+
+def test_direct_factory_capture_does_not_depend_on_v4_discovery(tmp_path):
+    class FactoryRpc(FakeRpc):
+        def get_logs(self, start, end, *, address=None, topics=None):
+            if address == UNISWAP_V2_FACTORY and topics == [PAIR_CREATED_TOPIC]:
+                return [{"topics":[PAIR_CREATED_TOPIC, "0x"+"0"*24+WETH_ADDRESS.removeprefix("0x"), "0x"+"0"*24+"11"*20],
+                         "data":"0x"+"0"*24+"22"*20+"0"*64,
+                         "blockNumber":"0x65", "logIndex":"0x1", "transactionHash":"0xabc"}]
+            return super().get_logs(start,end,address=address,topics=topics)
+    worker=V2ExecutableShadowV2(tmp_path,rpc=FactoryRpc())
+    worker.run_once(head_block=100)  # arms the dedicated factory cursor
+    result=worker.run_once(head_block=101)
+    assert result["enrolled"] == 1
