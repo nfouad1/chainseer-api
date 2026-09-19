@@ -1431,31 +1431,36 @@ class AnalysisService:
                 self.settings.base_rpc_url,
                 timechain_agent=self._agent,
             )
-        if (
-            self._watch_analysis_agent is None
-            and isinstance(self._agent, Chainseer)
-        ):
-            self._watch_analysis_agent = Chainseer(
-                rpc_url=self.settings.rpc_url,
-                timechain_agent=self._agent,
-            )
-        if (
-            self._base_watch_analysis_agent is None
-            and isinstance(self._agent, Chainseer)
-        ):
-            self._base_watch_analysis_agent = BasePublicAnalyzer(
-                self.settings.base_rpc_url,
-                timechain_agent=self._agent,
-            )
-        if (
-            self._solana_watch_analysis_agent is None
-            and isinstance(self._agent, Chainseer)
-        ):
-            self._solana_watch_analysis_agent = SolanaPublicAnalyzer(
-                self.settings.solana_rpc_url,
-                timechain_agent=self._agent,
-                jupiter_api_key=self.settings.jupiter_api_key or None,
-            )
+        # Watcher analyzers duplicate sizable RPC and Timechain-facing state.
+        # Keep the lightweight watcher stores for the authenticated watch API,
+        # but only allocate dedicated observer analyzers when their background
+        # polling worker is enabled.
+        if self.settings.watcher_enabled:
+            if (
+                self._watch_analysis_agent is None
+                and isinstance(self._agent, Chainseer)
+            ):
+                self._watch_analysis_agent = Chainseer(
+                    rpc_url=self.settings.rpc_url,
+                    timechain_agent=self._agent,
+                )
+            if (
+                self._base_watch_analysis_agent is None
+                and isinstance(self._agent, Chainseer)
+            ):
+                self._base_watch_analysis_agent = BasePublicAnalyzer(
+                    self.settings.base_rpc_url,
+                    timechain_agent=self._agent,
+                )
+            if (
+                self._solana_watch_analysis_agent is None
+                and isinstance(self._agent, Chainseer)
+            ):
+                self._solana_watch_analysis_agent = SolanaPublicAnalyzer(
+                    self.settings.solana_rpc_url,
+                    timechain_agent=self._agent,
+                    jupiter_api_key=self.settings.jupiter_api_key or None,
+                )
         if self._watcher is None:
             self._watcher = ChainseerWatcher(
                 self._agent,
