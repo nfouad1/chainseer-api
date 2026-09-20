@@ -5,7 +5,7 @@ from pathlib import Path
 from chainseer_executable_shadow_v2 import V2ExecutableShadowV2, digest, canonical, TOKEN0_SELECTOR, _address
 from chainseer_core import atomic_json_write
 
-POLICY="v2-quality-arm-v1"; LEDGER="v2_quality_arm.sqlite3"; STATUS="v2_quality_arm_status.json"
+POLICY="v2-quality-arm-v2-prospective"; LEDGER="v2_quality_arm_v2.sqlite3"; STATUS="v2_quality_arm_v2_status.json"
 SWAP="0xd78ad95fa46c994b6551d0da85fc275fe613ce37657fb8d5e3d130840159d822"
 MIN_RATIO=.98; MIN_SWAPS=3; MIN_TX=2; WINDOW=120; BPS=10; HORIZONS=(("15m",900),("1h",3600),("6h",21600),("24h",86400))
 
@@ -19,17 +19,22 @@ class QualityArm:
  def _c(self):
   c=sqlite3.connect(self.db,timeout=.1); c.row_factory=sqlite3.Row; return c
  def _init(self):
-  with self._c() as c:c.executescript("""CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY,observation_id TEXT UNIQUE,status TEXT NOT NULL,decision_block INTEGER,quote_json TEXT,flow_json TEXT,created_at REAL NOT NULL);CREATE TABLE IF NOT EXISTS marks(observation_id TEXT,label TEXT,target_block INTEGER,status TEXT,quote_json TEXT,net_return REAL,PRIMARY KEY(observation_id,label));""")
- def _candidates(self):
+  with self._c() as c:c.executescript("""CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS decisions(id TEXT PRIMARY KEY,observation_id TEXT UNIQUE,status TEXT NOT NULL,decision_block INTEGER,quote_json TEXT,flow_json TEXT,created_at REAL NOT NULL);CREATE TABLE IF NOT EXISTS marks(observation_id TEXT,label TEXT,target_block INTEGER,status TEXT,quote_json TEXT,net_return REAL,PRIMARY KEY(observation_id,label));""")
+ def _armed(self,now):
+  with self._c() as c:
+   row=c.execute("SELECT value FROM state WHERE key='armed_at'").fetchone()
+   if row:return float(row[0])
+   c.execute("INSERT INTO state VALUES('armed_at',?)",(str(now),));return now
+ def _candidates(self,armed):
   if not self.base.exists(): return []
   with sqlite3.connect(self.base) as c:
    c.row_factory=sqlite3.Row
-   return [dict(r) for r in c.execute("SELECT o.*,e.entry_block,e.quote_json FROM observations o JOIN entry_selections e USING(observation_id) WHERE e.status='selected'").fetchall()]
+   return [dict(r) for r in c.execute("SELECT o.*,e.entry_block,e.quote_json FROM observations o JOIN entry_selections e USING(observation_id) WHERE e.status='selected' AND o.created_at>=?",(armed,)).fetchall()]
  def run(self,head):
-  now=time.time(); decided=outcomes=0
+  now=time.time(); armed=self._armed(now); decided=outcomes=0
   with self._c() as q:
    known={r[0] for r in q.execute("SELECT observation_id FROM decisions")}
-  for row in self._candidates():
+  for row in self._candidates(armed):
    if row['observation_id'] in known: continue
    entry=json.loads(row['quote_json']); start=int(row['entry_block']); end=min(head,start+WINDOW)
    logs=self.rpc.get_logs(start,end,address=row['pool_address'],topics=[SWAP])
@@ -46,7 +51,7 @@ class QualityArm:
    block=_i(logs[-1]['blockNumber']); quote=self.quoter._quote(row,block)
    ok=len(tx)>=MIN_TX and flow>0 and quote.get('round_trip_ratio',0)>=MIN_RATIO and quote.get('verified')
    self._decide(row,'selected' if ok else 'rejected',block,quote,{'swaps':len(logs),'transactions':len(tx),'net_anchor_flow':str(flow)}); decided+=1
-  status={'policy_version':POLICY,'head_block':head,'decisions_added':decided,'outcomes_resolved':outcomes,'shadow_only':True,'paper_execution_enabled':False,'live_execution_enabled':False}
+  status={'policy_version':POLICY,'armed_at':armed,'head_block':head,'decisions_added':decided,'outcomes_resolved':outcomes,'shadow_only':True,'paper_execution_enabled':False,'live_execution_enabled':False}
   atomic_json_write(self.root/STATUS,status); return status
  def _decide(self,row,status,block,quote,flow):
   with self._c() as c:c.execute("INSERT OR IGNORE INTO decisions VALUES(?,?,?,?,?,?,?)",(digest({'p':POLICY,'o':row['observation_id']}),row['observation_id'],status,block,canonical(quote) if quote else None,canonical(flow),time.time()))
