@@ -12,7 +12,11 @@ class V4QualityArm:
  def _c(self):
   c=sqlite3.connect(self.db,timeout=.1);c.row_factory=sqlite3.Row;return c
  def _init(self):
-  with self._c() as c:c.executescript("""CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS decisions(candidate_id TEXT PRIMARY KEY,policy_version TEXT NOT NULL,status TEXT NOT NULL,decision_block INTEGER NOT NULL,reason TEXT NOT NULL,evidence_json TEXT NOT NULL,created_at REAL NOT NULL);CREATE TABLE IF NOT EXISTS schedules(candidate_id TEXT,label TEXT,target_at REAL NOT NULL,status TEXT NOT NULL DEFAULT 'pending',PRIMARY KEY(candidate_id,label));""")
+  with self._c() as c:
+   c.executescript("""CREATE TABLE IF NOT EXISTS state(key TEXT PRIMARY KEY,value TEXT NOT NULL);CREATE TABLE IF NOT EXISTS decisions(candidate_id TEXT PRIMARY KEY,policy_version TEXT NOT NULL,status TEXT NOT NULL,decision_block INTEGER NOT NULL,reason TEXT NOT NULL,evidence_json TEXT NOT NULL,created_at REAL NOT NULL);CREATE TABLE IF NOT EXISTS schedules(candidate_id TEXT,label TEXT,target_at REAL NOT NULL,status TEXT NOT NULL DEFAULT 'pending',target_block INTEGER,quote_json TEXT,net_return REAL,PRIMARY KEY(candidate_id,label));""")
+   cols={x[1] for x in c.execute('pragma table_info(schedules)')}
+   for name,decl in [('target_block','INTEGER'),('quote_json','TEXT'),('net_return','REAL')]:
+    if name not in cols:c.execute('alter table schedules add column '+name+' '+decl)
  def arm(self,now):
   with self._c() as c:
    r=c.execute("SELECT value FROM state WHERE key='armed_at'").fetchone()
@@ -34,8 +38,8 @@ class V4QualityArm:
       reason='accepted_shadow' if ok else 'quote_or_custody_gate'; evidence={'quote':quote,'hooks_address':hooks,'custody_verdict':cv,'sample_count':r['sample_count']}
       q.execute('INSERT INTO decisions VALUES(?,?,?,?,?,?,?)',(r['candidate_id'],POLICY,'selected' if ok else 'rejected',r['observed_block'],reason,json.dumps(evidence,sort_keys=True),now));
       if ok:
-       for label,seconds in HORIZONS:q.execute('INSERT INTO schedules VALUES(?,?,?,?)',(r['candidate_id'],label,now+seconds,'pending'))
+       for label,seconds in HORIZONS:q.execute('INSERT INTO schedules(candidate_id,label,target_at,status,target_block) VALUES(?,?,?,?,?)',(r['candidate_id'],label,now+seconds,'pending',int(r['observed_block'])+seconds*10))
       added+=1
   with self._c() as c:
-   summary={x[0]:x[1] for x in c.execute('SELECT status,count(*) FROM decisions GROUP BY status')}; pending=c.execute("SELECT count(*) FROM schedules WHERE status='pending'").fetchone()[0]
-  out={'policy_version':POLICY,'armed_at':armed,'decisions_added':added,'decisions':summary,'pending_outcomes':pending,'shadow_only':True,'paper_execution_enabled':False,'live_execution_enabled':False};atomic_json_write(self.root/STATUS,out);return out
+   summary={x[0]:x[1] for x in c.execute('SELECT status,count(*) FROM decisions GROUP BY status')}; pending=c.execute("SELECT count(*) FROM schedules WHERE status='pending'").fetchone()[0]; observed=c.execute("SELECT count(*) FROM schedules WHERE status='observed'").fetchone()[0]
+  out={'policy_version':POLICY,'armed_at':armed,'decisions_added':added,'decisions':summary,'pending_outcomes':pending,'observed_outcomes':observed,'outcome_binding':'exact_target_block','shadow_only':True,'paper_execution_enabled':False,'live_execution_enabled':False};atomic_json_write(self.root/STATUS,out);return out
