@@ -26,7 +26,15 @@ def main() -> int:
     root = Path(options.root)
     worker = V2ExecutableShadowV2(root, rpc=RobinhoodRPC(ROBINHOOD_NETWORK.rpc_url, timeout=8))
     while True:
-        print(worker.run_once(entry_limit=options.limit, outcome_limit=options.limit), flush=True)
+        try:
+            print(worker.run_once(entry_limit=options.limit, outcome_limit=options.limit), flush=True)
+        except Exception as error:
+            # A throttled provider must not terminate the prospective collector
+            # or turn an operational failure into market evidence.
+            print({"status": "deferred", "reason": type(error).__name__,
+                   "detail": str(error)[:180]}, flush=True)
+            time.sleep(30.0)
+            continue
         if not options.continuous:
             return 0
         time.sleep(max(1.0, options.cadence_seconds))
