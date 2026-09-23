@@ -1,6 +1,6 @@
 "use client";
 
-import { FormEvent, useEffect, useId, useState } from "react";
+import { FormEvent, useEffect, useId, useRef, useState } from "react";
 
 const ADDRESS_RE = /^0x[a-fA-F0-9]{40}$/;
 const SOLANA_ADDRESS_RE = /^[1-9A-HJ-NP-Za-km-z]{32,44}$/;
@@ -1466,6 +1466,9 @@ export default function Home() {
   const [criticalAlerts, setCriticalAlerts] = useState<CriticalAlert[]>([]);
   const [monitorBusy, setMonitorBusy] = useState(false);
   const [monitorNotice, setMonitorNotice] = useState("");
+  // Polling can outlive a completed scan while its cognitive status refreshes.
+  // Only the newest scan epoch may repaint the shared report panel.
+  const activeScanEpoch = useRef(0);
 
   useEffect(() => {
     let active = true;
@@ -1492,8 +1495,9 @@ export default function Home() {
         setScanState("analyzing");
         setScanProgress(2);
         setNotice("Reconnecting to the accepted scan…");
-        void continueAcceptedScan(saved, true).catch((error) => {
-          if (!active) return;
+        const epoch = ++activeScanEpoch.current;
+        void continueAcceptedScan(saved, true, epoch).catch((error) => {
+          if (!active || activeScanEpoch.current !== epoch) return;
           const recoverable = error instanceof RecoverableScanError;
           setScanState(recoverable ? "analyzing" : "failed");
           if (!recoverable) {
@@ -1738,18 +1742,28 @@ export default function Home() {
     }
   }
 
-  async function continueAcceptedScan(activeScan: ActiveScan, recovered = false) {
+  async function continueAcceptedScan(
+    activeScan: ActiveScan,
+    recovered = false,
+    epoch = activeScanEpoch.current,
+  ) {
+    const isCurrent = () => activeScanEpoch.current === epoch;
+    const clearIfCurrent = () => {
+      if (isCurrent()) window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+    };
     let reconnectAttempts = 0;
     let resultPublished = false;
     const deadline = activeScan.acceptedAt + ACTIVE_SCAN_MAX_AGE_MS;
-    while (Date.now() < deadline) {
+    while (Date.now() < deadline && isCurrent()) {
       if (reconnectAttempts === 0) await delay(2_000);
+      if (!isCurrent()) return;
       try {
         const response = await fetch(
           `/api/analyses?job=${encodeURIComponent(activeScan.jobId)}`,
           { cache: "no-store" },
         );
         const job = (await response.json().catch(() => null)) as AnalysisJob | null;
+        if (!isCurrent()) return;
         const transient =
           response.status === 429 ||
           response.status === 502 ||
@@ -1760,7 +1774,7 @@ export default function Home() {
           throw new TypeError("temporary polling interruption");
         }
         if (!response.ok || !job) {
-          window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+          clearIfCurrent();
           throw new Error(
             errorMessage(job, "The analysis status could not be retrieved."),
           );
@@ -1805,6 +1819,7 @@ export default function Home() {
               scanTelemetry("recovered_completed", activeScan.jobId, 0);
             }
             window.setTimeout(() => {
+              if (!isCurrent()) return;
               document.getElementById("live-report")?.scrollIntoView({
                 behavior: "smooth",
                 block: "start",
@@ -1816,16 +1831,17 @@ export default function Home() {
             cognitive.status === "complete" ||
             cognitive.status === "failed"
           ) {
-            window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+            clearIfCurrent();
             return;
           }
         } else if (job.status === "failed") {
-          window.localStorage.removeItem(ACTIVE_SCAN_STORAGE_KEY);
+          clearIfCurrent();
           throw new Error(
             errorMessage(job, "The analysis failed without publishing a result."),
           );
         }
       } catch (error) {
+        if (!isCurrent()) return;
         if (error instanceof TypeError) {
           reconnectAttempts += 1;
           if (reconnectAttempts === 1) {
@@ -1845,6 +1861,7 @@ export default function Home() {
         throw error;
       }
     }
+    if (!isCurrent()) return;
     scanTelemetry("recovery_deadline_exceeded", activeScan.jobId, reconnectAttempts);
     throw new RecoverableScanError(
       "The scan is still saved, but the connection could not be restored yet. Reload this page to check the accepted job again.",
@@ -1868,6 +1885,10 @@ export default function Home() {
       setScanState("failed");
       return;
     }
+
+    // A previous scan may still be polling its post-result cognitive state.
+    // Invalidate it before the new submit can change any shared UI state.
+    const epoch = ++activeScanEpoch.current;
 
     setScanState("submitting");
     setScanProgress(1);
@@ -1952,8 +1973,9 @@ export default function Home() {
       }
       setForceRefresh(false);
 
-      await continueAcceptedScan(activeScan);
+      await continueAcceptedScan(activeScan, false, epoch);
     } catch (error) {
+      if (activeScanEpoch.current !== epoch) return;
       const recoverable = error instanceof RecoverableScanError;
       setScanState(recoverable ? "analyzing" : "failed");
       if (!recoverable) setScanProgress(0);
@@ -1966,6 +1988,7 @@ export default function Home() {
   }
 
   function loadExample() {
+    activeScanEpoch.current += 1;
     setShowExample(true);
     setNotice("Demo report opened. Its token, evidence, score, and Timechain proof are fictional.");
     setScanState("idle");
@@ -1977,6 +2000,7 @@ export default function Home() {
 
   function selectNetwork(nextNetwork: Network) {
     if (nextNetwork === network) return;
+    activeScanEpoch.current += 1;
     setNetwork(nextNetwork);
     setAddress("");
     setNotice("");
