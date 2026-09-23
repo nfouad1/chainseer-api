@@ -4,6 +4,7 @@ import tempfile
 import threading
 import time
 import unittest
+from contextlib import contextmanager
 from dataclasses import replace
 from pathlib import Path
 from types import SimpleNamespace
@@ -21,6 +22,7 @@ from chainseer_api import (
     Settings,
     SingleProcessLease,
     SlidingWindowRateLimiter,
+    TimechainWriterUnavailableError,
     WatcherBusyError,
     WatchRequest,
     _cypher_tempre_runtime_status,
@@ -2252,6 +2254,61 @@ class TrackedTimechainLockTests(unittest.TestCase):
                 )
                 self.assertIn("sealing_timechain", job.stage_timings_ms)
                 self.assertIsNotNone(job.public()["timing"]["analysis_latency_ms"])
+            finally:
+                service.stop()
+
+    def test_user_report_publishes_when_final_timechain_append_is_deferred(self):
+        """A temporary writer outage must not discard completed evidence."""
+        with tempfile.TemporaryDirectory() as root:
+            service = self._service(root)
+
+            class SplitAgent:
+                def analyze_token(
+                    self, address, full_report=False, progress_callback=None,
+                    *, seal=True, defer_cognition=False,
+                ):
+                    report = sample_internal_report()
+                    report["token_address"] = address
+                    return report
+
+                def _seal_report(self, report, *, defer_cognition=False):
+                    report["analysis_ring"] = 99
+                    report["analysis_ring_hash"] = "deferred-seal"
+
+            service._agent = SplitAgent()
+            original = service._tracked_timechain_lock
+            attempts = {"append": 0}
+
+            @contextmanager
+            def flaky_lock(reason):
+                if reason == "user_analysis_append" and attempts["append"] == 0:
+                    attempts["append"] += 1
+                    raise TimechainWriterUnavailableError("lease flap")
+                with original(reason):
+                    yield
+
+            service._tracked_timechain_lock = flaky_lock
+            service.start()
+            try:
+                accepted = service.submit(TOKEN)
+                deadline = time.time() + 3
+                job = service.get(accepted.job_id)
+                while job and job.status not in {"succeeded", "failed"}:
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.01)
+                    job = service.get(accepted.job_id)
+
+                self.assertEqual(job.status, "succeeded")
+                self.assertEqual(
+                    job.result["timechain"]["seal_status"], "queued"
+                )
+
+                deadline = time.time() + 3
+                while job.result["timechain"]["seal_status"] != "sealed":
+                    self.assertLess(time.time(), deadline)
+                    time.sleep(0.02)
+                self.assertEqual(job.result["timechain"]["seal_status"], "sealed")
+                self.assertEqual(job.result["timechain"]["ring"], 99)
             finally:
                 service.stop()
 

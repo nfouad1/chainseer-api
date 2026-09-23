@@ -2617,8 +2617,20 @@ class AnalysisService:
         acquired within ``timechain_lock_timeout_seconds``.
         """
         timeout = self.settings.timechain_lock_timeout_seconds
+        # The distributed writer lease fences this process before it tries the
+        # in-process mutex.  Reporting that condition as an anonymous lock
+        # holder is actively misleading (and used to make a usable analysis
+        # look like a service outage).
+        if self._writer_lease is not None and not self._writer_lease.healthy:
+            raise TimechainWriterUnavailableError(
+                "authoritative Timechain writer lease is temporarily unavailable"
+            )
         acquired = self._acquire_timechain(reason, timeout=timeout)
         if not acquired:
+            if self._writer_lease is not None and not self._writer_lease.healthy:
+                raise TimechainWriterUnavailableError(
+                    "authoritative Timechain writer lease became unavailable"
+                )
             owner, since, owner_reason = self._timechain_owner_snapshot()
             held = (
                 f"{max(0.0, time.monotonic() - since):.1f}s"
@@ -3439,6 +3451,7 @@ class AnalysisService:
             return
         item = self._deferred_queue.claim(
             kinds=(
+                "user_analysis_commit",
                 "cognitive_completion",
                 "watcher_commit",
                 "watcher_outcome",
@@ -3448,6 +3461,15 @@ class AnalysisService:
         if item is None:
             return
         try:
+            if item.kind == "user_analysis_commit":
+                outcome = self._execute_deferred_user_analysis_seal(item)
+                if outcome == "done":
+                    self._deferred_queue.transition(item, "done")
+                else:
+                    self._deferred_queue.retry(
+                        item, outcome, delay_seconds=0.25
+                    )
+                return
             if item.kind == "cognitive_completion":
                 if not self.settings.cognitive_completion_enabled:
                     self._deferred_queue.transition(item, "discarded")
@@ -3962,6 +3984,85 @@ class AnalysisService:
             return
         sealing_agent._seal_report(report, defer_cognition=True)
 
+    def _sealing_agent_for_network(self, network: str) -> Any:
+        """Return the analyzer that owns a public report's seal format."""
+        if network == "solana":
+            return self._solana_agent
+        if network == "base":
+            return self._base_agent
+        return self._agent
+
+    def _queue_user_report_seal(self, job: Job, report: dict[str, Any]) -> None:
+        """Durably defer only the final append; never discard a completed scan.
+
+        A user report has already completed its expensive external evidence
+        collection at this point.  If the sole writer is temporarily fenced or
+        busy, retaining that result and retrying the small idempotent append is
+        preferable to re-running the full analysis (and prevents a transient
+        Redis lease issue from presenting as an unavailable analysis service).
+        """
+        if self._deferred_queue is None:
+            raise RuntimeError("durable deferred queue is unavailable")
+        canonical = json.dumps(report, sort_keys=True, separators=(",", ":"), default=str)
+        report["_timechain_seal_status"] = "queued"
+        self._deferred_queue.enqueue(
+            kind="user_analysis_commit",
+            subject_key=f"{job.network}:{job.id}",
+            priority=0,
+            payload={
+                "job_id": job.id,
+                "network": job.network,
+                "token_address": job.address,
+                "anchor_value": int((report.get("provenance") or {}).get("block_pin") or 0),
+                "observed_at_epoch": time.time(),
+                "report_hash": hashlib.sha256(canonical.encode("utf-8")).hexdigest(),
+                "report": report,
+            },
+        )
+
+    def _execute_deferred_user_analysis_seal(
+        self, item: DeferredQueueItem
+    ) -> str:
+        """Commit a previously published user report when the writer is idle."""
+        if self._analysis_active.is_set() or not self.work.empty():
+            return "user analysis has priority"
+        payload = item.payload
+        network = str(payload.get("network") or "robinhood")
+        sealing_agent = self._sealing_agent_for_network(network)
+        if sealing_agent is None:
+            return "analysis writer unavailable"
+        raw_report = payload.get("report")
+        if not isinstance(raw_report, dict):
+            raise ValueError("deferred user analysis report is missing")
+        report = json.loads(json.dumps(raw_report, default=str))
+        if not self._acquire_timechain("deferred_user_analysis_append", blocking=False):
+            return "timechain busy"
+        try:
+            if self._analysis_active.is_set() or not self.work.empty():
+                return "user analysis has priority"
+            self._seal_user_report_once(
+                sealing_agent,
+                report,
+                str(payload["job_id"]),
+                exhaustive_recovery=item.attempts > 1,
+            )
+        finally:
+            self._release_timechain()
+
+        report.pop("_timechain_seal_status", None)
+        job_id = str(payload["job_id"])
+        with self._lock:
+            job = self.jobs.get(job_id)
+            if job is not None:
+                job.result = build_public_report(report)
+                job.stage_detail = "Sealed analysis ready; cognitive audit continues in background"
+                job.updated_at = time.time()
+                self._enqueue_cognitive_completion(job, report)
+        if job is not None:
+            self._persist_public_result(job)
+            self._enqueue_maintenance(job, report)
+        return "done"
+
     def _run(self) -> None:
         while not self._stopping.is_set():
             try:
@@ -4133,12 +4234,26 @@ class AnalysisService:
                         90,
                         "Verifying and appending the immutable analysis",
                     )
-                    with self._tracked_timechain_lock("user_analysis_append"):
-                        self._seal_user_report_once(
-                            sealing_agent,
-                            report,
+                    try:
+                        with self._tracked_timechain_lock("user_analysis_append"):
+                            self._seal_user_report_once(
+                                sealing_agent,
+                                report,
+                                job.id,
+                                exhaustive_recovery=recovered_execution,
+                            )
+                    except (TimeoutError, TimechainWriterUnavailableError) as exc:
+                        # The report is complete; only the authoritative append
+                        # is delayed.  Persist it before acknowledging success
+                        # so a lease flap or a busy writer never turns a user
+                        # scan into a full, expensive retry.
+                        self._queue_user_report_seal(job, report)
+                        seal_deferred = False
+                        report["_timechain_seal_status"] = "queued"
+                        LOGGER.warning(
+                            "deferred user-analysis seal for job %s: %s",
                             job.id,
-                            exhaustive_recovery=recovered_execution,
+                            exc,
                         )
                 progress(
                     "publishing",
@@ -4178,11 +4293,16 @@ class AnalysisService:
                             1,
                         )
                     job.stage = "complete"
-                    job.stage_detail = (
-                        "Sealed analysis ready; cognitive audit continues in background"
-                        if job.cognition_status == "queued"
-                        else "Sealed analysis ready"
-                    )
+                    if report.get("_timechain_seal_status") == "queued":
+                        job.stage_detail = (
+                            "Analysis ready; immutable Timechain seal is queued"
+                        )
+                    else:
+                        job.stage_detail = (
+                            "Sealed analysis ready; cognitive audit continues in background"
+                            if job.cognition_status == "queued"
+                            else "Sealed analysis ready"
+                        )
                     job.progress_percent = 100
                     job.stage_started_at = completed_at
                     job.updated_at = completed_at
@@ -4358,6 +4478,10 @@ class SharedStoreUnavailableError(Exception):
 
 class IntegrityUnavailableError(Exception):
     pass
+
+
+class TimechainWriterUnavailableError(TimeoutError):
+    """The distributed writer lease fenced this process before an append."""
 
 
 class WatcherBusyError(Exception):
@@ -4712,6 +4836,7 @@ def build_public_report(report: dict[str, Any]) -> dict[str, Any]:
         "timechain": {
             "ring": report.get("analysis_ring"),
             "ring_hash": report.get("analysis_ring_hash"),
+            "seal_status": report.get("_timechain_seal_status", "sealed"),
             "decision": (report.get("poq_verdict") or {}).get("decision"),
             "scores": report.get("poq_scores") or {},
             "cognition": report.get("cognition") or {},
